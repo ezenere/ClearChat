@@ -632,6 +632,24 @@ export function createMockApi(scenario: string): ClearApi {
           }, 40)
         }, 200)
       }
+      if (scenario === 'markdown') {
+        // Markdown difícil: cercas aninhadas, LaTeX em todos os delimitadores, preços; e um
+        // rascunho em streaming parado no meio de um bloco aninhado e de uma fórmula.
+        const s2 = sessions.find((x) => x.id === 's2')!
+        const um = msg('s2', { role: 'user', content: 'Mostra um README e umas fórmulas.' })
+        const am = msg('s2', { role: 'assistant', content: MARKDOWN_SAMPLE }, { model: cfg.model })
+        const u2 = msg('s2', { role: 'user', content: 'E em streaming?' })
+        messages.push(um, am, u2)
+        setTimeout(() => {
+          s2.status = 'running'
+          emit({ type: 'session-updated', session: { ...s2 } })
+          emit({
+            type: 'draft',
+            sessionId: 's2',
+            draft: { reasoning: '', content: MARKDOWN_STREAM, toolCalls: [] }
+          })
+        }, 200)
+      }
       return () => listeners.delete(cb)
     }
   }
@@ -653,3 +671,56 @@ Também vale lembrar do WAL: leituras longas não bloqueiam escritas, então pag
 Se a ordenação for por uma coluna não única (título, por exemplo), o mesmo princípio vale: chave composta (title, id) e um índice correspondente. Se o usuário puder escolher a ordenação livremente, um índice por ordenação suportada; colunas sem índice ficam com OFFSET mesmo, mas limitadas.
 
 Resposta final: recomendar keyset com índice composto, mostrar a query, mencionar o desempate e o EXPLAIN QUERY PLAN. Manter curto.`
+
+const MARKDOWN_SAMPLE = [
+  'Aqui está o README:',
+  '',
+  '```markdown',
+  '# Projeto',
+  '',
+  '## Instalação',
+  '',
+  '```bash',
+  'npm install',
+  '```',
+  '',
+  '## Uso',
+  '',
+  '```',
+  'npm start',
+  '```',
+  '```',
+  '',
+  'A energia é \\(E = mc^2\\) e a média é $\\bar{x} = \\frac{1}{n}\\sum_i x_i$. O plano custa $5 e o extra $10.',
+  '',
+  '\\[',
+  '\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}',
+  '\\]',
+  '',
+  '$$',
+  'f(x) = \\sum_{k=0}^{\\infty} \\frac{f^{(k)}(a)}{k!}(x-a)^k + \\underbrace{a_0 + a_1 x + a_2 x^2 + a_3 x^3 + a_4 x^4 + a_5 x^5 + a_6 x^6 + a_7 x^7 + a_8 x^8}_{\\text{bem larga}}',
+  '$$',
+  '',
+  '- Em lista: \\(\\alpha + \\beta\\)',
+  '  \\[ \\nabla \\cdot \\vec{E} = \\frac{\\rho}{\\varepsilon_0} \\]',
+  '- TeX inválido: $\\frac{1}{$ e \\(\\badcommand{x}\\)',
+  '',
+  'Código inline fica intacto: `\\(x\\)` e `$5`.'
+].join('\n')
+
+const MARKDOWN_STREAM = [
+  'Claro:',
+  '',
+  '```markdown',
+  '# Outro',
+  '',
+  '```python',
+  'print("oi")',
+  '```',
+  '```',
+  '',
+  'Fórmula:',
+  '',
+  '\\[',
+  '\\frac{a}{b'
+].join('\n')
