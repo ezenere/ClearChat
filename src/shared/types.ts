@@ -3,6 +3,8 @@
 export interface Provider {
   id: string
   name: string
+  /** Adaptador (ver providerKinds.ts). Ausente = inferido pela baseUrl (`providerKind()`). */
+  kind?: import('./providerKinds').ProviderKind
   baseUrl: string
   apiKey: string
   headers: Record<string, string>
@@ -43,7 +45,7 @@ export type ToolName =
   | 'find_files'
   | 'write_file'
   | 'edit_file'
-  | 'bash'
+  | 'shell'
   | 'web_search'
   | 'browse_url'
   | 'list_models'
@@ -56,8 +58,34 @@ export type ToolName =
   | 'wait_subagents'
   | 'cancel_subagent'
   | 'message_subagent'
+  | 'process_start'
+  | 'process_logs'
+  | 'process_list'
+  | 'process_stop'
+  | 'ask_user'
 
-export const CONFIRM_TOOLS: ToolName[] = ['bash', 'web_search', 'browse_url']
+export const CONFIRM_TOOLS: ToolName[] = [
+  'shell',
+  'process_start',
+  'process_stop',
+  'web_search',
+  'browse_url'
+]
+
+/** Nomes antigos de tools → atuais (alias de leitura: configs/históricos antigos, modelos). */
+export const TOOL_ALIASES: Record<string, ToolName> = { bash: 'shell' }
+
+/** Lista de ToolName com aliases antigos mapeados (sem duplicatas, ordem preservada). */
+export function normalizeToolList(list: unknown): ToolName[] | undefined {
+  if (!Array.isArray(list)) return undefined
+  const out: ToolName[] = []
+  for (const t of list) {
+    if (typeof t !== 'string') continue
+    const n = (TOOL_ALIASES[t] ?? t) as ToolName
+    if (!out.includes(n)) out.push(n)
+  }
+  return out
+}
 
 export interface ChatConfig {
   providerId: string
@@ -81,7 +109,7 @@ export interface ChatConfig {
   cwd: string
   /** Tools de arquivo rejeitam caminhos fora do diretório raiz (após realpath). Padrão true. */
   confineToRoot: boolean
-  /** Roda o bash via bubblewrap (raiz gravável, resto do FS somente leitura). Padrão false. */
+  /** Roda o shell (tool `shell` e process_start) via bubblewrap (raiz gravável, resto do FS somente leitura). Padrão false. */
   sandboxBash: boolean
   /** Janela de contexto (tokens) — sobrescreve a informada pelo provider (/models). */
   contextWindow?: number | null
@@ -187,6 +215,8 @@ export type SessionStatus =
   | 'interrupted'
   /** Subagente que encerrou o turno com subagentes em segundo plano pendentes: dorme até os callbacks. */
   | 'waiting'
+  /** Sessão principal esperando o usuário responder um questionário (tool ask_user). */
+  | 'awaiting_input'
 
 export interface Session {
   id: string
@@ -264,7 +294,11 @@ export type ApiMessage =
   | { role: 'system'; content: string | ContentPart[] }
   | { role: 'user'; content: string | ContentPart[] }
   | { role: 'assistant'; content: string | null; tool_calls?: ToolCall[]; reasoning?: string }
-  | { role: 'tool'; tool_call_id: string; content: string }
+  /**
+   * content em parts só no read_file de imagem/PDF: `[{type:'text', text:'[imagem: …]'}, <part por
+   * referência>]` (ver SPEC.md → "Tools" / read_file). Os demais resultados continuam string.
+   */
+  | { role: 'tool'; tool_call_id: string; content: string | ContentPart[] }
 
 export interface Usage {
   promptTokens: number
@@ -300,7 +334,7 @@ export interface MessageMeta {
   /** Em mensagens tool de delegate_task. */
   subSessionId?: string
   toolStatus?: 'ok' | 'error' | 'denied' | 'cancelled'
-  /** bash: diretório do shell ao final do comando (persistido entre chamadas da sessão). */
+  /** shell: diretório do shell ao final do comando (persistido entre chamadas da sessão). */
   shellCwd?: string
   // ---- compactação (kind 'compaction') ----
   /** Faixa de seq resumida (inclusive). */
@@ -334,6 +368,9 @@ export interface MessageMeta {
   smartApprove?: SmartApproveRecord
   /** Executada por liberação explícita do usuário ("Executar mesmo assim") após uma rejeição. */
   smartOverride?: boolean
+  // ---- questionário (mensagem tool de ask_user) ----
+  /** Perguntas (com imagens já resolvidas no store) + respostas estruturadas, para o card. */
+  askUser?: AskUserRecord
 }
 
 export interface StoredMessage {
@@ -368,6 +405,58 @@ export interface ApprovalRequest {
   smartApprove?: SmartApproveRecord
 }
 
+// ---- Questionário (tool ask_user) — ver SPEC.md → "Questionário (ask_user)" ----
+
+/** Ícone de uma opção já resolvido: nome lucide, texto/emoji ou imagem do store. */
+export type AskUserIcon =
+  { kind: 'lucide'; name: string } | { kind: 'text'; text: string } | { kind: 'image'; url: string }
+
+/** Ajuda de uma opção: texto (monospace) ou imagem do store. */
+export type AskUserHelp = { kind: 'text'; text: string } | { kind: 'image'; url: string }
+
+/** Opção como a UI mostra (campos ausentes não aparecem). `url` = `clearchat-attachment://…`. */
+export interface AskUserOption {
+  title: string
+  description?: string
+  icon?: AskUserIcon
+  /** Imagem grande mostrada ao passar o mouse sobre a opção. */
+  image?: string
+  help?: AskUserHelp
+}
+
+export interface AskUserQuestion {
+  title: string
+  description?: string
+  multiple: boolean
+  options: AskUserOption[]
+}
+
+/** Resposta a uma pergunta: índices das opções marcadas (0-based) + texto de "Outro". */
+export interface QuestionAnswer {
+  selected: number[]
+  other?: string
+}
+
+/** Questionário pendente (memória do main; some ao responder/cancelar). */
+export interface QuestionRequest {
+  id: string
+  chatId: string
+  sessionId: string
+  toolCallId: string
+  questions: AskUserQuestion[]
+  /** Imagens/ícones que não puderam ser carregados (também vão no resultado ao modelo). */
+  notes?: string[]
+  createdAt: number
+}
+
+/** meta.askUser da mensagem tool: o que foi mostrado e o que o usuário respondeu. */
+export interface AskUserRecord {
+  questions: AskUserQuestion[]
+  outcome: 'answered' | 'cancelled' | 'app-closed'
+  answers?: QuestionAnswer[]
+  notes?: string[]
+}
+
 export interface StreamDraft {
   content: string
   reasoning: string
@@ -382,6 +471,29 @@ export interface DirEntry {
   mtime: number
 }
 
+/** Processo em segundo plano iniciado por process_start (escopo: chat). */
+export interface ProcessInfo {
+  /** Id curto no chat ("p1", "p2"…). */
+  id: string
+  chatId: string
+  /** Sessão que iniciou (principal ou subagente). */
+  sessionId: string
+  name: string
+  command: string
+  cwd: string
+  pid: number | null
+  status: 'running' | 'exited'
+  exitCode: number | null
+  signal: string | null
+  startedAt: number
+  endedAt: number | null
+  /** Total de linhas já produzidas (numeração global do log). */
+  lines: number
+  lastLine: string
+  /** Arquivo com o log completo. */
+  logFile: string
+}
+
 export type AgentEvent =
   | { type: 'session-created'; session: Session }
   | { type: 'session-updated'; session: Session }
@@ -392,7 +504,7 @@ export type AgentEvent =
   | { type: 'message-deleted'; sessionId: string; messageId: string }
   /** Throttled ~30–60ms; null = fim do stream. */
   | { type: 'draft'; sessionId: string; draft: StreamDraft | null }
-  /** Output parcial (bash) opcional. */
+  /** Output parcial (shell) opcional. */
   | {
       type: 'tool-running'
       sessionId: string
@@ -405,6 +517,9 @@ export type AgentEvent =
   | { type: 'queue-updated'; sessionId: string; queue: QueuedMessage[] }
   | { type: 'approval-requested'; request: ApprovalRequest }
   | { type: 'approval-resolved'; id: string }
+  /** Questionário (ask_user) aguardando o usuário / respondido ou cancelado. */
+  | { type: 'question-requested'; request: QuestionRequest }
+  | { type: 'question-resolved'; id: string }
   | { type: 'chat-updated'; chat: Chat }
   /** Compactação: agendada (próximo passo), rodando (com o texto parcial do resumo) ou null (fim). */
   | {
@@ -414,3 +529,5 @@ export type AgentEvent =
       text?: string
     }
   | { type: 'error'; sessionId: string; error: string }
+  /** Processos em segundo plano (process_start) do chat mudaram (início, saída, parada). */
+  | { type: 'processes-updated'; chatId: string; processes: ProcessInfo[] }

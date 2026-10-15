@@ -1,6 +1,6 @@
 // Conteúdo dos ícones (i): o que exatamente vai para a API e como. Fonte única para toda a UI.
 import { useEffect, useState } from 'react'
-import { TOOL_DEFINITIONS } from '@shared/tools'
+import { currentToolDefinition } from '@shared/tools'
 import { COMPACTION_NOTE, compactionMessageText } from '@shared/defaults'
 import { LIMITS } from '@shared/limits'
 import { audioFormat, contentText, formatSize, messageAttachments } from '@shared/attachments'
@@ -132,7 +132,7 @@ export function ToolDefInfo({
   return (
     <ApiInfo
       title={<span className="font-mono text-[12px]">{name}</span>}
-      code={JSON.stringify(TOOL_DEFINITIONS[name], null, 2)}
+      code={JSON.stringify(currentToolDefinition(name), null, 2)}
       codeLabel="Definição exata (um item do array tools):"
       side="left"
     >
@@ -205,7 +205,7 @@ function EnvBlock({
   cwd: string
   deps?: string
 }): React.JSX.Element {
-  const fallback = `<environment>\nroot: ${cwd}\nos: (sistema operacional detectado pelo app)\nshell: bash\n…\n</environment>`
+  const fallback = `<environment>\nroot: ${cwd}\nos: (sistema operacional detectado pelo app)\nshell: (shell do usuário)\n…\n</environment>`
   const [text, setText] = useState<string | null>(null)
   useEffect(() => {
     if (!sessionId) return
@@ -261,7 +261,7 @@ export function RootInfo({ side }: { side?: Side }): React.JSX.Element {
         que caminhos relativos resolvem a partir dele.
       </p>
       <p>
-        Localmente: base dos caminhos relativos das ferramentas e diretório onde o <C>bash</C>{' '}
+        Localmente: base dos caminhos relativos das ferramentas e diretório onde o <C>shell</C>{' '}
         começa (o <C>cd</C> persiste entre chamadas da mesma sessão).
       </p>
     </ApiInfo>
@@ -275,7 +275,7 @@ export function ConfineInfo(): React.JSX.Element {
         Localmente, <C>list_dir</C>, <C>read_file</C>, <C>write_file</C>, <C>edit_file</C>,{' '}
         <C>search_files</C> e <C>find_files</C> recusam caminhos que (após resolver <C>..</C> e
         links simbólicos) saiam do diretório raiz; o erro volta ao modelo como{' '}
-        <C>{'role: "tool"'}</C>. O bash sempre começa no raiz e volta a ele se terminar fora.
+        <C>{'role: "tool"'}</C>. O shell sempre começa no raiz e volta a ele se terminar fora.
       </p>
       <p>
         Com o bloco de ambiente ativo, adiciona ao system prompt a linha:{' '}
@@ -287,15 +287,15 @@ export function ConfineInfo(): React.JSX.Element {
 
 export function SandboxInfo(): React.JSX.Element {
   return (
-    <ApiInfo title="Bash em sandbox (bubblewrap)" side="left">
+    <ApiInfo title="Shell em sandbox (bubblewrap)" side="left">
       <p>
-        Localmente, o bash roda via <C>bwrap</C>: o diretório raiz é montado com leitura e escrita,
-        o resto do sistema de arquivos fica somente leitura, <C>/tmp</C> é privado e a rede continua
-        liberada.
+        Localmente, o shell (tools <C>shell</C> e <C>process_start</C>) roda via <C>bwrap</C>: o
+        diretório raiz é montado com leitura e escrita, o resto do sistema de arquivos fica somente
+        leitura, <C>/tmp</C> é privado e a rede continua liberada.
       </p>
       <p>
         Com o bloco de ambiente ativo, adiciona ao system prompt a linha:{' '}
-        <C>O bash roda em sandbox: só o diretório raiz (e um /tmp privado) é gravável.</C>
+        <C>O shell roda em sandbox: só o diretório raiz (e um /tmp privado) é gravável.</C>
       </p>
     </ApiInfo>
   )
@@ -353,7 +353,7 @@ export function MaxOutputInfo(): React.JSX.Element {
         linhas sem offset/limit e corta linhas acima de{' '}
         {LIMITS.readMaxLineChars.toLocaleString('pt-BR')} caracteres; <C>list_dir</C> até{' '}
         {LIMITS.listMaxEntries} entradas; <C>search_files</C> até {LIMITS.searchMaxResults}{' '}
-        resultados; <C>list_models</C> até {LIMITS.modelsMaxResults} modelos; <C>bash</C> mantém
+        resultados; <C>list_models</C> até {LIMITS.modelsMaxResults} modelos; <C>shell</C> mantém
         início e fim; <C>browse_url</C> pagina o texto com <C>offset</C>.
       </p>
       <p className="text-subtle">Não é um campo da request.</p>

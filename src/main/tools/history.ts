@@ -1,7 +1,7 @@
 // read_history: lê o histórico PERSISTIDO da sessão chamadora — inclusive as mensagens anteriores
 // às fronteiras de compactação (que não vão mais para a API). Busca (query) ou faixa (from/to).
 // Tudo puro sobre StoredMessage[] — testado em e2e/unit.test.ts.
-import { contentText, messageAttachments } from '@shared/attachments'
+import { contentText, messageAttachments, toolContentText } from '@shared/attachments'
 import { LIMITS } from '@shared/limits'
 import type { ApiMessage, StoredMessage } from '@shared/types'
 import {
@@ -91,8 +91,8 @@ export function describeMessage(
       return {
         label: `tool (${name}${st})`,
         text: includeToolResults
-          ? msg.content
-          : `[resultado omitido · ${fmtNum(msg.content.length)} caracteres — use include_tool_results=true para ver]`
+          ? messageText(msg) // read_file de imagem/PDF: texto + `[anexos: a.png]`
+          : `[resultado omitido · ${fmtNum(toolContentText(msg.content).length)} caracteres${typeof msg.content === 'string' ? '' : ` + ${msg.content.filter((p) => p._attachment).length} anexo(s)`} — use include_tool_results=true para ver]`
       }
     }
     default:
@@ -171,7 +171,7 @@ function searchable(m: StoredMessage, names: Map<string, string>): string {
   }
   if (msg.role === 'tool') {
     // resultados do próprio read_history repetiriam trechos já encontrados
-    return names.get(msg.tool_call_id) === 'read_history' ? '' : msg.content
+    return names.get(msg.tool_call_id) === 'read_history' ? '' : toolContentText(msg.content)
   }
   return messageText(msg)
 }

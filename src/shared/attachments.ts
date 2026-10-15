@@ -1,6 +1,7 @@
 // Anexos — partes puras compartilhadas por main e renderer (classificação, referências, modalidades).
 // Ver SPEC.md → "Anexos".
 import type { ApiMessage, AttachmentKind, AttachmentMeta, ContentPart, ModelInfo } from './types'
+import type { ProviderKind } from './providerKinds'
 
 /** Esquema das referências persistidas e do protocolo que serve os arquivos ao renderer. */
 export const ATTACHMENT_SCHEME = 'clearchat-attachment'
@@ -130,22 +131,44 @@ export type ModalitySupport =
   | 'ok'
   /** PDF num modelo sem suporte nativo, via OpenRouter: o OpenRouter extrai o texto (plugin). */
   | 'parsed'
-  /** O modelo declara as modalidades e não inclui esta. */
+  /** O modelo declara as modalidades e não inclui esta (ou o adaptador não suporta o tipo). */
   | 'unsupported'
   /** Modalidades desconhecidas (provider que não informa) — assume só texto. */
   | 'unknown'
 
+/**
+ * Suporte do modelo a um tipo de anexo, considerando o adaptador do provider:
+ * - openrouter: `input_modalities`; PDF sem `file` → 'parsed' (file-parser do OpenRouter);
+ * - anthropic: modalidades vêm de `capabilities` (image_input → image, pdf_input → file);
+ *   áudio nunca (a API não aceita);
+ * - openai (genérico): `input_modalities` se o /models informar; senão 'unknown'.
+ * `provider` aceita boolean por compatibilidade (true = openrouter).
+ */
 export function modalitySupport(
   kind: AttachmentKind,
   model: Pick<ModelInfo, 'inputModalities'> | null | undefined,
-  openRouter: boolean
+  provider: ProviderKind | boolean
 ): ModalitySupport {
+  const pk: ProviderKind =
+    typeof provider === 'boolean' ? (provider ? 'openrouter' : 'openai') : provider
   const need = requiredModality(kind)
   if (!need) return 'ok'
+  if (pk === 'anthropic' && need === 'audio') return 'unsupported'
   const mods = model?.inputModalities
   if (mods?.includes(need)) return 'ok'
-  if (kind === 'pdf' && openRouter) return 'parsed'
+  if (kind === 'pdf' && pk === 'openrouter') return 'parsed'
   return mods ? 'unsupported' : 'unknown'
+}
+
+/** Tipos de anexo que o modelo aceita com certeza (ok/parsed). 'text' sempre. */
+export function acceptedKinds(
+  model: Pick<ModelInfo, 'inputModalities'> | null | undefined,
+  provider: ProviderKind | boolean
+): AttachmentKind[] {
+  return (['image', 'pdf', 'audio', 'text'] as AttachmentKind[]).filter((k) => {
+    const s = modalitySupport(k, model, provider)
+    return s === 'ok' || s === 'parsed'
+  })
 }
 
 /** Aviso pt-BR para um tipo não suportado (null se ok/parsed). */
@@ -166,7 +189,7 @@ export function partAttachment(p: ContentPart): AttachmentMeta | null {
 
 /** Anexos de uma mensagem (na ordem). */
 export function messageAttachments(m: ApiMessage): AttachmentMeta[] {
-  if ((m.role !== 'user' && m.role !== 'system') || typeof m.content === 'string') return []
+  if (m.role === 'assistant' || typeof m.content === 'string' || !m.content) return []
   return m.content.map((p) => p._attachment).filter((a): a is AttachmentMeta => !!a)
 }
 
@@ -179,6 +202,9 @@ export function contentText(content: string | ContentPart[] | null | undefined):
     .map((p) => (p as { text: string }).text)
     .join('')
 }
+
+/** Texto de um resultado de tool (string, ou o texto dos parts — read_file de imagem/PDF descreve o arquivo num text part). */
+export const toolContentText = (content: string | ContentPart[]): string => contentText(content)
 
 /** Escapa aspas/sinais do nome dentro do atributo `name="…"` do bloco <file>. */
 export const escapeAttr = (s: string): string =>

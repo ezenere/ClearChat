@@ -10,7 +10,10 @@ import type {
   DirEntry,
   ModelInfo,
   Preset,
+  ProcessInfo,
   Provider,
+  QuestionAnswer,
+  QuestionRequest,
   QueuedMessage,
   Session,
   SmartApproveRecord,
@@ -82,6 +85,16 @@ export const IPC = {
   attachments: {
     pick: 'attachments:pick',
     add: 'attachments:add'
+  },
+  questions: {
+    answer: 'questions:answer',
+    cancel: 'questions:cancel',
+    pending: 'questions:pending'
+  },
+  processes: {
+    list: 'processes:list',
+    stop: 'processes:stop',
+    logs: 'processes:logs'
   }
 } as const
 
@@ -101,6 +114,7 @@ export const ALL_CHANNELS: IpcChannel[] = Object.values(IPC).flatMap(
 export type ProviderInput = Omit<Provider, 'id' | 'createdAt'>
 export type ProviderPatch = Partial<Omit<Provider, 'id' | 'createdAt'>>
 export interface ProviderTestInput {
+  kind?: import('./providerKinds').ProviderKind
   baseUrl: string
   apiKey: string
   headers?: Record<string, string>
@@ -168,10 +182,18 @@ export interface CompactOptions {
 }
 
 export interface AppCapabilities {
-  /** bubblewrap disponível → opção "bash em sandbox". */
+  /** bubblewrap disponível → opção "shell em sandbox". */
   bwrap: boolean
   /** ripgrep disponível (search_files/find_files usam; senão, busca em JS). */
   ripgrep: boolean
+  /** Shell do usuário detectado no start (descrição da tool `shell`). */
+  shell?: import('./shellInfo').ShellInfoLite
+}
+
+/** Últimas linhas de um processo em segundo plano (popover da UI). */
+export interface ProcessLogsResult {
+  info: ProcessInfo
+  lines: { n: number; text: string }[]
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -277,6 +299,21 @@ export interface ClearApi {
     pick(): Promise<AttachmentPickResult>
     /** Salva bytes vindos do renderer (arrastar/colar). Erro legível se grande demais/não suportado. */
     add(input: AttachmentAddInput): Promise<AttachmentInfo>
+  }
+  /** Questionários pendentes (tool ask_user). */
+  questions: {
+    /** Envia as respostas (uma por pergunta, na ordem). Erro legível se incompletas. */
+    answer(id: string, answers: QuestionAnswer[]): Promise<void>
+    /** Cancela: o resultado vira "[O usuário não respondeu ao questionário]" e o agente para. */
+    cancel(id: string): Promise<void>
+    pending(): Promise<QuestionRequest[]>
+  }
+  /** Processos em segundo plano (process_start) do chat. */
+  processes: {
+    list(chatId: string): Promise<ProcessInfo[]>
+    /** SIGTERM no grupo; SIGKILL após ~3 s. */
+    stop(chatId: string, id: string): Promise<void>
+    logs(chatId: string, id: string, tail?: number): Promise<ProcessLogsResult>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

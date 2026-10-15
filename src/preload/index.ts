@@ -69,6 +69,16 @@ const api: ClearApi = {
     pick: () => invoke(IPC.attachments.pick),
     add: (input) => invoke(IPC.attachments.add, input)
   },
+  questions: {
+    answer: (id, answers) => invoke(IPC.questions.answer, id, answers),
+    cancel: (id) => invoke(IPC.questions.cancel, id),
+    pending: () => invoke(IPC.questions.pending)
+  },
+  processes: {
+    list: (chatId) => invoke(IPC.processes.list, chatId),
+    stop: (chatId, id) => invoke(IPC.processes.stop, chatId, id),
+    logs: (chatId, id, tail) => invoke(IPC.processes.logs, chatId, id, tail)
+  },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)
     ipcRenderer.on(EVENT_CHANNEL, listener)

@@ -31,7 +31,10 @@ import {
 import { invalidateModels, listModels, testProvider } from './providers'
 import * as fsapi from './fsapi'
 import * as runner from './agent/runner'
+import { answerQuestion } from './agent/questions'
 import { bwrapAvailable } from './tools/bash'
+import { listProcesses, processLogLines, stopChatProcesses, stopProcess } from './tools/processes'
+import { shellInfoLite } from './tools/shellEnv'
 import { ripgrepAvailable } from './tools/search'
 import { readFile as readFileAsync, stat } from 'fs/promises'
 import { basename } from 'path'
@@ -95,6 +98,7 @@ export function registerIpc(): void {
     },
     [IPC.chats.delete]: async (id: string) => {
       await runner.stopChat(id)
+      await stopChatProcesses(id)
       chatsRepo.delete(id)
     },
 
@@ -178,8 +182,22 @@ export function registerIpc(): void {
     // ---- app ----
     [IPC.app.capabilities]: (): AppCapabilities => ({
       bwrap: bwrapAvailable(),
-      ripgrep: ripgrepAvailable()
+      ripgrep: ripgrepAvailable(),
+      shell: shellInfoLite()
     }),
+
+    // ---- questionários (ask_user) ----
+    [IPC.questions.answer]: (id: string, answers: unknown) => answerQuestion(id, answers),
+    [IPC.questions.cancel]: (id: string) => runner.cancelQuestionRequest(id),
+    [IPC.questions.pending]: () => runner.pendingQuestions(),
+
+    // ---- processos em segundo plano (process_start) ----
+    [IPC.processes.list]: (chatId: string) => listProcesses(chatId),
+    [IPC.processes.stop]: async (chatId: string, id: string) => {
+      await stopProcess(chatId, id, 'SIGTERM')
+    },
+    [IPC.processes.logs]: (chatId: string, id: string, tail?: number) =>
+      processLogLines(chatId, id, tail),
 
     // ---- presets (personas) ----
     [IPC.presets.list]: () => presetsRepo.list(),

@@ -2,13 +2,34 @@
 // Compartilhadas: o main as envia na request; o renderer as mostra no (i) de cada tool.
 import type { ToolName } from './types'
 import { LIMITS } from './limits'
+import { ASK_USER_LIMITS as AL } from './askUser'
+import { shellDescriptionPrefix, toolShellInfo, type ShellInfoLite } from './shellInfo'
+
+const shellDescription = (info: ShellInfoLite | null): string => {
+  const p = shellDescriptionPrefix(info)
+  return `${p}${/[.!]$/.test(p) ? '' : '.'} ${SHELL_DESC_REST}`
+}
+
+/** Resto da descrição da tool `shell` (o início diz qual shell — ver shellInfo.ts). */
+const SHELL_DESC_REST =
+  'O ambiente do shell de login/interativo do usuário (PATH, nvm etc.) já vem carregado. A primeira chamada começa no diretório raiz; o diretório atual (cd) persiste entre chamadas desta sessão. Retorna stdout+stderr e o código de saída; o comando precisa TERMINAR (há tempo limite). Para algo que deve continuar rodando (servidor, emulador, watcher, logcat), use process_start — nunca `&`/nohup aqui. Saídas longas são cortadas no meio (mantém início e fim): para saídas grandes, redirecione para um arquivo e use grep/head/tail ou read_file com offset/limit.'
+
+/** Propriedade de JSON Schema (recursiva: arrays de objetos, ex.: ask_user). */
+export interface JsonSchemaProp {
+  type: string
+  description?: string
+  enum?: string[]
+  items?: JsonSchemaProp
+  properties?: Record<string, JsonSchemaProp>
+  required?: string[]
+  minItems?: number
+  maxItems?: number
+  additionalProperties?: boolean
+}
 
 export interface JsonSchema {
   type: 'object'
-  properties: Record<
-    string,
-    { type: string; description?: string; enum?: string[]; items?: { type: string } }
-  >
+  properties: Record<string, JsonSchemaProp>
   required?: string[]
   additionalProperties?: boolean
 }
@@ -25,7 +46,11 @@ export const TOOL_NAMES: ToolName[] = [
   'find_files',
   'write_file',
   'edit_file',
-  'bash',
+  'shell',
+  'process_start',
+  'process_logs',
+  'process_list',
+  'process_stop',
   'web_search',
   'browse_url',
   'list_models',
@@ -37,7 +62,8 @@ export const TOOL_NAMES: ToolName[] = [
   'check_subagents',
   'wait_subagents',
   'cancel_subagent',
-  'message_subagent'
+  'message_subagent',
+  'ask_user'
 ]
 
 /** Rótulos curtos (pt-BR) para a UI. */
@@ -48,7 +74,11 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   find_files: 'Encontrar arquivos',
   write_file: 'Escrever arquivo',
   edit_file: 'Editar arquivo',
-  bash: 'Terminal (bash)',
+  shell: 'Terminal (shell)',
+  process_start: 'Iniciar processo',
+  process_logs: 'Logs do processo',
+  process_list: 'Listar processos',
+  process_stop: 'Parar processo',
   web_search: 'Pesquisa na web',
   browse_url: 'Abrir URL',
   list_models: 'Listar modelos',
@@ -60,7 +90,8 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   check_subagents: 'Ver subagentes',
   wait_subagents: 'Aguardar subagentes',
   cancel_subagent: 'Cancelar subagente',
-  message_subagent: 'Mensagem ao subagente'
+  message_subagent: 'Mensagem ao subagente',
+  ask_user: 'Perguntar ao usuário'
 }
 
 const def = (
@@ -88,7 +119,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   read_file: def(
     'read_file',
-    `Lê um arquivo de texto. Retorna as linhas numeradas no formato "N\\tconteúdo" e sempre informa o total de linhas. Sem offset/limit lê no máximo ${n(L.readDefaultLines)} linhas; linhas com mais de ${n(L.readMaxLineChars)} caracteres são cortadas e a saída total é limitada. Arquivos acima de ${L.readHardMaxBytes / 1024 / 1024} MB só podem ser lidos em partes (offset/limit). Para arquivos grandes, localize o trecho com search_files e leia só a faixa necessária.`,
+    `Lê um arquivo de texto — e, se o modelo desta sessão aceitar, imagens (png/jpg/webp/gif) e PDF, que voltam como imagem/documento para você ver (ideal para conferir screenshots que você gerou; imagens grandes são reduzidas). Texto: retorna as linhas numeradas no formato "N\\tconteúdo" e sempre informa o total de linhas. Sem offset/limit lê no máximo ${n(L.readDefaultLines)} linhas; linhas com mais de ${n(L.readMaxLineChars)} caracteres são cortadas e a saída total é limitada. Arquivos acima de ${L.readHardMaxBytes / 1024 / 1024} MB só podem ser lidos em partes (offset/limit). Para arquivos grandes, localize o trecho com search_files e leia só a faixa necessária.`,
     {
       path: {
         type: 'string',
@@ -164,14 +195,82 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
     },
     ['path', 'old_string', 'new_string']
   ),
-  bash: def(
-    'bash',
-    'Executa um comando no bash (bash -lc). A primeira chamada começa no diretório raiz; o diretório atual (cd) persiste entre chamadas desta sessão. Retorna stdout+stderr e o código de saída. Saídas longas são cortadas no meio (mantém início e fim): para saídas grandes, redirecione para um arquivo e use grep/head/tail ou read_file com offset/limit.',
+  shell: def(
+    'shell',
+    shellDescription(null),
     {
       command: { type: 'string', description: 'Comando a executar.' },
       timeout_ms: { type: 'number', description: 'Tempo limite em ms (padrão 120000).' }
     },
     ['command']
+  ),
+  process_start: def(
+    'process_start',
+    `Inicia um processo em SEGUNDO PLANO que continua rodando depois que a ferramenta retorna (dev server, emulador/AVD, \`adb logcat\`, watcher, banco local…). Para comandos que terminam, use shell. Roda no shell do usuário (mesmo ambiente do shell), com stdout+stderr capturados num log. O processo sobrevive entre turnos e é encerrado com process_stop ou quando o ClearChat fecha. Retorna o id (ex.: "p1"), pid e as primeiras linhas de saída. Para esperar ficar pronto, use wait_for (regex casada contra cada linha da saída, ex.: "Listening on|ready in") em vez de sleep/polling: retorna quando casar, quando o processo sair (erro com o código e o fim do log) ou no tempo limite (o processo continua rodando). A saída não é um terminal: se um programa fizer buffer do stdout, force line-buffering (ex.: \`stdbuf -oL cmd\`). Interromper a espera não mata o processo. Depois, use process_logs (pattern / since_line) para inspecionar. Máx. ${L.processMaxPerChat} processos rodando por chat.`,
+    {
+      command: { type: 'string', description: 'Comando a executar (shell -c).' },
+      name: { type: 'string', description: 'Rótulo curto (ex.: "vite", "emulador").' },
+      cwd: {
+        type: 'string',
+        description:
+          'Diretório (relativo ao raiz ou absoluto). Padrão: o diretório atual do shell desta sessão.'
+      },
+      wait_for: {
+        type: 'string',
+        description:
+          'Regex: espera até uma linha da saída casar (ex.: "boot completed|Listening on").'
+      },
+      timeout_s: {
+        type: 'number',
+        description: `Espera máxima do wait_for em segundos (padrão ${L.processWaitDefaultS}, máx. ${L.processWaitMaxS}). Sem wait_for, espera só ~1 s para capturar falhas imediatas.`
+      }
+    },
+    ['command']
+  ),
+  process_logs: def(
+    'process_logs',
+    `Lê a saída (stdout+stderr) de um processo de process_start, com as linhas numeradas pela posição no log ("N\ttexto"). Padrão: as últimas ${L.processLogsDefaultLines} linhas. Para acompanhar incrementalmente, passe since_line com o número da última linha já vista (só vem o que é novo). pattern filtra por regex. Informa o estado (rodando / encerrado com código), o total de linhas e o caminho do arquivo com o log completo (a memória guarda só as últimas ${n(L.processBufferLines)} linhas; para buscar no log inteiro use search_files/read_file nesse arquivo).`,
+    {
+      id: { type: 'string', description: 'Id do processo (ex.: "p1").' },
+      pattern: { type: 'string', description: 'Regex para filtrar as linhas.' },
+      case_insensitive: {
+        type: 'boolean',
+        description: 'pattern sem diferenciar maiúsculas (padrão false).'
+      },
+      tail: {
+        type: 'number',
+        description: `Últimas N linhas (ou ocorrências, com pattern). Padrão ${L.processLogsDefaultLines}, máx. ${n(L.processLogsMaxLines)}.`
+      },
+      since_line: {
+        type: 'number',
+        description:
+          'Só linhas com número maior que este (leitura incremental; vem em ordem, a partir da primeira nova).'
+      },
+      offset: { type: 'number', description: 'Linha inicial (1 = primeira) para ler uma faixa.' },
+      limit: {
+        type: 'number',
+        description: 'Máximo de linhas com since_line/offset (padrão = tail).'
+      }
+    },
+    ['id']
+  ),
+  process_list: def(
+    'process_list',
+    'Lista os processos em segundo plano deste chat (iniciados por esta sessão, pela principal ou por subagentes): id, nome, comando, pid, diretório, estado, há quanto tempo roda, nº de linhas de log e a última linha.',
+    {}
+  ),
+  process_stop: def(
+    'process_stop',
+    'Para um processo de process_start: envia o sinal ao grupo de processos inteiro (filhos inclusos) e, se não sair em ~3 s, SIGKILL. Retorna o código final e o fim do log.',
+    {
+      id: { type: 'string', description: 'Id do processo (ex.: "p1").' },
+      signal: {
+        type: 'string',
+        enum: ['SIGTERM', 'SIGINT', 'SIGKILL'],
+        description: 'Sinal inicial (padrão SIGTERM).'
+      }
+    },
+    ['id']
   ),
   web_search: def(
     'web_search',
@@ -220,7 +319,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   delegate_task: def(
     'delegate_task',
-    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Com background=true retorna na hora e o resultado chega depois sozinho, como mensagem (você é acordado se tiver encerrado o turno): use para tarefas independentes ou longas e para rodar várias em paralelo; não fique consultando em loop — use wait_subagents ou apenas encerre o turno. Para outro modelo (ou o mesmo modelo por outro provedor), consulte list_models e passe model/provider; se o modelo falhar, tente outro.',
+    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Com background=true retorna na hora e o resultado chega depois sozinho, como mensagem: se você estiver no meio de um turno, ele entra no próximo passo; se tiver encerrado o turno, você é acordado. Use para tarefas independentes ou longas e para rodar várias em paralelo. Sem mais nada a fazer enquanto eles rodam, ENCERRE O TURNO (pode dizer ao usuário o que está em andamento) — não precisa chamar wait_subagents nem consultar check_subagents; só use wait_subagents se o seu próximo passo, no mesmo turno, depende do resultado. Para outro modelo (ou o mesmo modelo por outro provedor), consulte list_models e passe model/provider; se o modelo falhar, tente outro.',
     {
       task: { type: 'string', description: 'Descrição completa e autocontida da tarefa.' },
       model: {
@@ -293,12 +392,12 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   check_subagents: def(
     'check_subagents',
-    'Lista os subagentes desta sessão: id, título, modelo, estado, duração, última atividade e se o resultado já foi entregue. Não use em loop para esperar: use wait_subagents ou encerre o turno.',
+    'Lista os subagentes desta sessão: id, título, modelo, estado, duração, última atividade e se o resultado já foi entregue. Não use para esperar: se não há mais nada a fazer, encerre o turno — os resultados chegam sozinhos e te acordam.',
     {}
   ),
   wait_subagents: def(
     'wait_subagents',
-    `Aguarda subagentes em segundo plano terminarem e retorna os resultados (que então não chegam de novo como mensagem). mode "all" (padrão) espera todos; "any", o primeiro. Sem ids: todos os pendentes desta sessão. No tempo limite (padrão ${L.subagentWaitDefaultS}s), retorna os estados.`,
+    `Aguarda subagentes em segundo plano terminarem e retorna os resultados (que então não chegam de novo como mensagem). mode "all" (padrão) espera todos; "any", o primeiro. Sem ids: todos os pendentes desta sessão. No tempo limite (padrão ${L.subagentWaitDefaultS}s), retorna os estados. Raramente necessário: os resultados de subagentes em segundo plano já chegam sozinhos como mensagem (e te acordam se o turno tiver encerrado). Use só quando precisa do resultado para continuar NESTE turno; se não há mais nada a fazer, prefira encerrar o turno.`,
     {
       ids: { type: 'array', items: { type: 'string' }, description: 'Ids dos subagentes.' },
       mode: { type: 'string', enum: ['all', 'any'], description: 'all (padrão) ou any.' },
@@ -330,7 +429,78 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
       }
     },
     ['id', 'message']
+  ),
+  ask_user: def(
+    'ask_user',
+    `Faz um questionário de múltipla escolha ao usuário (1 a ${AL.maxQuestions} perguntas, 1 a ${AL.maxOptions} opções cada) — a interface mostra uma pergunta por vez no lugar do campo de mensagem e o resultado chega quando ele envia as respostas (a ferramenta aguarda). Use quando há uma decisão com opções claras (ex.: qual banco de dados, qual abordagem) ou para coletar várias preferências de uma vez antes de começar. NÃO use para uma pergunta aberta simples ou para confirmar algo trivial — nesse caso apenas escreva a pergunta no chat e encerre o turno. O usuário sempre pode escolher "Outro" e escrever a própria resposta (a opção "Outro" é adicionada automaticamente: não a inclua). Ele não pode pular perguntas. Se ele cancelar, o resultado diz que não respondeu e o seu turno termina; não insista com o mesmo questionário. Campos opcionais por opção: icon (nome de ícone lucide em kebab-case como "database", um emoji, ou uma imagem pequena: URL http(s), caminho de arquivo dentro do diretório raiz ou "<svg…>" inline), description, image (imagem grande mostrada ao passar o mouse — URL, caminho ou "<svg…>") e help (texto de ajuda exibido em fonte monoespaçada, preservando espaços/ASCII art, ou uma imagem nas mesmas formas). Use imagens/ajuda só quando realmente ajudam a decidir.`,
+    {
+      questions: {
+        type: 'array',
+        minItems: 1,
+        maxItems: AL.maxQuestions,
+        description: `Perguntas (1 a ${AL.maxQuestions}), mostradas na ordem.`,
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'Pergunta (curta).' },
+            description: { type: 'string', description: 'Contexto extra (opcional).' },
+            multiple: {
+              type: 'boolean',
+              description: 'Permite marcar várias opções (padrão false = uma só).'
+            },
+            options: {
+              type: 'array',
+              minItems: 1,
+              maxItems: AL.maxOptions,
+              description: `1 a ${AL.maxOptions} opções (sem "Outro" — é adicionada automaticamente).`,
+              items: {
+                type: 'object',
+                properties: {
+                  title: { type: 'string', description: 'Texto da opção.' },
+                  icon: {
+                    type: 'string',
+                    description:
+                      'Opcional: ícone lucide (kebab-case, ex. "database"), emoji, ou imagem pequena (URL http(s), caminho no diretório raiz ou "<svg…>").'
+                  },
+                  description: { type: 'string', description: 'Opcional: detalhe da opção.' },
+                  image: {
+                    type: 'string',
+                    description:
+                      'Opcional: imagem grande mostrada ao passar o mouse (URL http(s), caminho no diretório raiz ou "<svg…>").'
+                  },
+                  help: {
+                    type: 'string',
+                    description:
+                      'Opcional: ajuda no botão "?" — texto (monoespaçado, preserva espaços) ou imagem (mesmas formas de image).'
+                  }
+                },
+                required: ['title'],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ['title', 'options'],
+          additionalProperties: false
+        }
+      }
+    },
+    ['questions']
   )
+}
+
+/** Definição da tool `shell` com o shell detectado na descrição (null = genérica). */
+export function shellToolDefinition(info: ShellInfoLite | null): ToolDefinition {
+  const d = TOOL_DEFINITIONS.shell
+  if (!info) return d
+  return {
+    ...d,
+    function: { ...d.function, description: shellDescription(info) }
+  }
+}
+
+/** Definição "como enviada" independente de provedores (shell com o shell detectado). */
+export function currentToolDefinition(name: ToolName): ToolDefinition {
+  return name === 'shell' ? shellToolDefinition(toolShellInfo()) : TOOL_DEFINITIONS[name]
 }
 
 /** Tools com o argumento `provider` (escolha entre os provedores configurados). */
@@ -343,6 +513,7 @@ const PROVIDER_ARG_TOOLS: ToolName[] = ['list_models', 'delegate_task']
  */
 export function toolDefinitionFor(name: ToolName, providerNames: string[]): ToolDefinition {
   const d = TOOL_DEFINITIONS[name]
+  if (name === 'shell') return currentToolDefinition(name)
   if (!PROVIDER_ARG_TOOLS.includes(name)) return d
   const { provider, ...rest } = d.function.parameters.properties
   if (!provider) return d

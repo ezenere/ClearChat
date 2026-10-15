@@ -18,6 +18,7 @@ import { CONFIRM_TOOLS } from '@shared/types'
 import type { Chat, ChatConfig, Session, ToolName } from '@shared/types'
 import { normalizeSmartApprove, smartApproveActive, smartApproveTools } from '@shared/smartApprove'
 import { sessionProviderId } from '@shared/models'
+import { providerKind } from '@shared/providerKinds'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
 import { isBusy, useStore } from '../../store'
 import { api } from '../../lib/api'
@@ -28,8 +29,10 @@ import { Popover } from '../ui/layers'
 import { ModelLabel } from '../ui/ModelLabel'
 import { Tip } from '../ui/Tooltip'
 import { Composer } from './Composer'
+import { useAttachmentSupport } from './attachmentSupport'
 import { ContextMeter } from './ContextMeter'
 import { MessageList } from './MessageList'
+import { ProcessesBadge } from './ProcessesBadge'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
 
 function ModelPill({
@@ -53,8 +56,10 @@ function ModelPill({
           <span className="font-mono">{model || 'sem modelo'}</span>
           <span className="block text-[11px] text-subtle">
             Enviado como <code className="font-mono">model</code> para{' '}
-            {provider ? `${provider.baseUrl}/chat/completions` : 'o endpoint do provedor'} · clique
-            para trocar
+            {provider
+              ? `${provider.baseUrl}/${providerKind(provider) === 'anthropic' ? 'messages' : 'chat/completions'}`
+              : 'o endpoint do provedor'}{' '}
+            · clique para trocar
           </span>
         </span>
       }
@@ -322,6 +327,7 @@ export function ChatHeader({
         model={isSub ? session.model : chat.config.model}
       />
       <SessionSwitcher chatId={chat.id} currentId={session?.id ?? chat.mainSessionId} />
+      <ProcessesBadge chatId={chat.id} />
       <AutoApproveBadge chat={chat} />
     </TopBar>
   )
@@ -397,6 +403,7 @@ export function ChatView({
 }): React.JSX.Element {
   const session = useStore((s) => s.sessions[sessionId])
   const addFiles = useStore((s) => s.addFiles)
+  const { dropText } = useAttachmentSupport(session)
   const [dragging, setDragging] = useState(false)
   const depth = useRef(0)
   if (!session) {
@@ -447,8 +454,7 @@ export function ChatView({
             </span>
             <span className="text-[14px] font-medium">Solte para anexar</span>
             <span className="text-[12px] text-subtle">
-              Imagens, PDF, áudio (wav/mp3) e arquivos de texto · até{' '}
-              {ATTACHMENT_LIMITS.maxFileBytes / 1024 / 1024} MB cada
+              {dropText} · até {ATTACHMENT_LIMITS.maxFileBytes / 1024 / 1024} MB cada
             </span>
           </div>
         </div>

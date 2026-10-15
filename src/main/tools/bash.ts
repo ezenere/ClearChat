@@ -1,4 +1,6 @@
-// bash: roda `bash -lc` num process group próprio (kill do grupo em abort/timeout).
+// shell (tool `shell`, antes `bash`): roda o comando no shell do usuário (zsh ou bash — ver
+// shellEnv.ts: `-c` com o ambiente do shell de login/interativo resolvido uma vez) num process
+// group próprio (kill do grupo em abort/timeout). Helpers exportados são reusados por processes.ts.
 // - Começa no diretório do shell da sessão (ctx.shell.dir; 1ª chamada = diretório raiz) e, ao sair,
 //   um trap EXIT escreve o `pwd` final no fd 3 — o diretório persiste entre chamadas.
 // - Confinação: se o shell terminar fora do raiz, a próxima chamada volta ao raiz (e o resultado avisa).
@@ -6,6 +8,8 @@
 import { spawn, spawnSync } from 'child_process'
 import { existsSync, realpathSync, statSync } from 'fs'
 import { LIMITS } from '@shared/limits'
+import { shellLaunch } from './shellEnv'
+export { shellLabel } from './shellEnv'
 import {
   abortError,
   fail,
@@ -40,7 +44,7 @@ export function bwrapAvailable(): boolean {
   return bwrapCache
 }
 
-function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+export function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   if (!pid) return
   try {
     process.kill(-pid, signal)
@@ -53,7 +57,7 @@ function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
   }
 }
 
-const isDir = (p: string): boolean => {
+export const isDir = (p: string): boolean => {
   try {
     return statSync(p).isDirectory()
   } catch {
@@ -61,7 +65,7 @@ const isDir = (p: string): boolean => {
   }
 }
 
-const real = (p: string): string => {
+export const real = (p: string): string => {
   try {
     return realpathSync(p)
   } catch {
@@ -79,7 +83,42 @@ export function wrapCommand(command: string): string {
   )
 }
 
-export function bash(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+/** Comando + argv para rodar `script` no shell (via bubblewrap se `sandbox`). */
+export function shellArgv(
+  shellPath: string,
+  flag: string,
+  script: string,
+  sandbox: boolean,
+  rootReal: string
+): [string, string[]] {
+  return sandbox
+    ? [
+        'bwrap',
+        [
+          '--ro-bind',
+          '/',
+          '/',
+          '--dev',
+          '/dev',
+          '--proc',
+          '/proc',
+          '--tmpfs',
+          '/tmp',
+          '--bind',
+          rootReal,
+          rootReal,
+          '--chdir',
+          rootReal,
+          '--die-with-parent',
+          shellPath,
+          flag,
+          script
+        ]
+      ]
+    : [shellPath, [flag, script]]
+}
+
+export function shell(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const command = requireString(args, 'command')
   const timeoutMs = Math.min(
     MAX_TIMEOUT,
@@ -100,40 +139,28 @@ export function bash(args: Record<string, unknown>, ctx: ToolContext): Promise<T
   const max = maxOutputOf(ctx)
   const sandbox = !!ctx.sandbox && bwrapAvailable()
 
+  return shellLaunch({ CLEAR_START_DIR: start, CLEAR_ROOT_DIR: root }).then((launch) =>
+    runShell(launch, command, start, root, timeoutMs, notes, max, sandbox, ctx)
+  )
+}
+
+function runShell(
+  launch: Awaited<ReturnType<typeof shellLaunch>>,
+  command: string,
+  start: string,
+  root: string,
+  timeoutMs: number,
+  notes: string[],
+  max: number,
+  sandbox: boolean,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (ctx.signal.aborted) return Promise.reject(abortError())
   return new Promise<ToolResult>((resolvePromise, reject) => {
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      CLEAR_START_DIR: start,
-      CLEAR_ROOT_DIR: root
-    }
-    delete env.ELECTRON_RUN_AS_NODE
+    const env = launch.env
     const script = wrapCommand(command)
     const rootReal = real(root)
-    const [cmd, argv] = sandbox
-      ? [
-          'bwrap',
-          [
-            '--ro-bind',
-            '/',
-            '/',
-            '--dev',
-            '/dev',
-            '--proc',
-            '/proc',
-            '--tmpfs',
-            '/tmp',
-            '--bind',
-            rootReal,
-            rootReal,
-            '--chdir',
-            rootReal,
-            '--die-with-parent',
-            'bash',
-            '-lc',
-            script
-          ]
-        ]
-      : ['bash', ['-lc', script]]
+    const [cmd, argv] = shellArgv(launch.shell.path, launch.flag, script, sandbox, rootReal)
     const child = spawn(cmd, argv as string[], {
       cwd: start,
       env,
@@ -202,7 +229,7 @@ export function bash(args: Record<string, unknown>, ctx: ToolContext): Promise<T
         return
       }
       if (err) {
-        resolvePromise(fail(`Erro ao executar bash: ${err.message}`))
+        resolvePromise(fail(`Erro ao executar o shell: ${err.message}`))
         return
       }
       // diretório final do shell
@@ -244,3 +271,6 @@ export function bash(args: Record<string, unknown>, ctx: ToolContext): Promise<T
     })
   })
 }
+
+/** Nome antigo (testes/compatibilidade). */
+export const bash = shell

@@ -7,8 +7,11 @@ import type {
   ChatConfig,
   ModelInfo,
   Preset,
+  ProcessInfo,
   Provider,
   QueuedMessage,
+  QuestionAnswer,
+  QuestionRequest,
   Session,
   StoredMessage,
   StreamDraft
@@ -16,7 +19,8 @@ import type {
 import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
 import { api, errorMessage } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
-import { formatSize } from '@shared/attachments'
+import { contentText, formatSize } from '@shared/attachments'
+import { setToolShellInfo } from '@shared/shellInfo'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -107,6 +111,8 @@ interface State {
   toolRuns: Record<string, Record<string, ToolRun>>
   queues: Record<string, QueuedMessage[]>
   approvals: ApprovalRequest[]
+  /** Questionários pendentes (ask_user). */
+  questions: QuestionRequest[]
   errors: Record<string, string | undefined>
   models: Record<string, ModelsEntry>
   panelOpen: boolean
@@ -123,6 +129,8 @@ interface State {
   configFocus: string | null
   /** Anexos ainda não enviados, por sessão (composer). */
   pendingAttachments: Record<string, PendingAttachment[]>
+  /** Processos em segundo plano (process_start) por chat (evento `processes-updated`). */
+  processes: Record<string, ProcessInfo[]>
 }
 
 interface Actions {
@@ -153,6 +161,10 @@ interface Actions {
   removeAttachment(sessionId: string, id: string): void
   clearAttachments(sessionId: string): void
   approve(id: string, decision: ApprovalDecision): Promise<void>
+  /** Envia as respostas do questionário; false se falhou (o formulário continua). */
+  answerQuestion(id: string, answers: QuestionAnswer[]): Promise<boolean>
+  /** Cancela o questionário (o agente para). */
+  cancelQuestion(id: string): Promise<void>
   loadModels(providerId: string, force?: boolean): Promise<void>
   setPanel(open: boolean, tab?: PanelTab): void
   setSettingsOpen(open: boolean, tab?: SettingsTab): void
@@ -163,6 +175,9 @@ interface Actions {
   /** Compactar a conversa (idle → já; rodando → agenda). */
   compact(sessionId: string, retry?: boolean): Promise<void>
   focusConfig(section: string | null): void
+  /** Recarrega os processos em segundo plano do chat. */
+  loadProcesses(chatId: string): Promise<void>
+  stopProcess(chatId: string, id: string): Promise<void>
   /** Executa uma chamada de API; em caso de erro mostra um toast e retorna undefined. */
   run<T>(fn: () => Promise<T>, label?: string): Promise<T | undefined>
 }
@@ -228,6 +243,7 @@ export const useStore = create<Store>()((set, get) => ({
   toolRuns: {},
   queues: {},
   approvals: [],
+  questions: [],
   errors: {},
   models: {},
   panelOpen: true,
@@ -241,6 +257,7 @@ export const useStore = create<Store>()((set, get) => ({
   capabilities: { bwrap: false, ripgrep: false },
   configFocus: null,
   pendingAttachments: {},
+  processes: {},
 
   async run(fn, label) {
     try {
@@ -261,25 +278,29 @@ export const useStore = create<Store>()((set, get) => ({
         return fallback
       }
     }
-    const [providers, chats, presets, homeDir, approvals, capabilities, ...values] =
+    const [providers, chats, presets, homeDir, approvals, questions, capabilities, ...values] =
       await Promise.all([
         safe(() => api.providers.list(), [] as Provider[]),
         safe(() => api.chats.list(), [] as Chat[]),
         safe(() => api.presets.list(), [] as Preset[]),
         safe(() => api.fs.homeDir(), null as string | null),
         safe(() => api.agent.pendingApprovals(), [] as ApprovalRequest[]),
+        safe(() => api.questions.pending(), [] as QuestionRequest[]),
         safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
         ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
       ])
     const settings = Object.fromEntries(
       SETTINGS_KEYS.map((k, i) => [k, values[i] ?? null])
     ) as unknown as AppSettings
+    // descrição da tool `shell` com o shell detectado no main (mesmo texto da request)
+    setToolShellInfo(capabilities.shell ?? null)
     set({
       providers,
       chats: sortChats(chats),
       presets,
       homeDir,
       approvals,
+      questions,
       capabilities,
       settings,
       booted: true
@@ -359,7 +380,21 @@ export const useStore = create<Store>()((set, get) => ({
         return { sessions: next }
       })
     }
+    void get().loadProcesses(chatId)
     await get().loadMessages(target)
+  },
+
+  async loadProcesses(chatId) {
+    try {
+      const list = await api.processes.list(chatId)
+      set((s) => ({ processes: { ...s.processes, [chatId]: list } }))
+    } catch {
+      /* sem processos */
+    }
+  },
+
+  async stopProcess(chatId, id) {
+    await get().run(() => api.processes.stop(chatId, id), 'Erro ao parar o processo')
   },
 
   async openSession(sessionId) {
@@ -411,6 +446,7 @@ export const useStore = create<Store>()((set, get) => ({
         chats: s.chats.filter((c) => c.id !== chatId),
         sessions,
         approvals: s.approvals.filter((a) => a.chatId !== chatId),
+        questions: s.questions.filter((q) => q.chatId !== chatId),
         view
       }
     })
@@ -528,6 +564,19 @@ export const useStore = create<Store>()((set, get) => ({
     await get().run(() => api.agent.approve(id, decision), 'Falha ao responder aprovação')
   },
 
+  async answerQuestion(id, answers) {
+    const ok = await get().run(async () => {
+      await api.questions.answer(id, answers)
+      return true
+    }, 'Falha ao enviar as respostas')
+    if (ok) set((s) => ({ questions: s.questions.filter((q) => q.id !== id) }))
+    return !!ok
+  },
+
+  async cancelQuestion(id) {
+    await get().run(() => api.questions.cancel(id), 'Falha ao cancelar o questionário')
+  },
+
   async loadModels(providerId, force) {
     const cur = get().models[providerId]
     if (!force && cur && cur.status !== 'error') return
@@ -618,6 +667,7 @@ function applyEvent(e: AgentEvent): void {
           queues: drop(s.queues),
           errors: drop(s.errors),
           approvals: s.approvals.filter((a) => a.sessionId !== e.sessionId),
+          questions: s.questions.filter((q) => q.sessionId !== e.sessionId),
           view
         }
       })
@@ -636,9 +686,7 @@ function applyEvent(e: AgentEvent): void {
         const isToolResult =
           e.type === 'message-added' &&
           (m.role === 'tool' ||
-            (m.role === 'user' &&
-              typeof m.content === 'string' &&
-              m.content.startsWith('<tool_result')))
+            (m.role === 'user' && contentText(m.content).startsWith('<tool_result')))
         const chatId = s.sessions[sid]?.chatId
         const fsTick =
           isToolResult && chatId ? { ...s.fsTick, [chatId]: (s.fsTick[chatId] ?? 0) + 1 } : s.fsTick
@@ -694,6 +742,14 @@ function applyEvent(e: AgentEvent): void {
     case 'approval-resolved':
       set((s) => ({ approvals: s.approvals.filter((a) => a.id !== e.id) }))
       break
+    case 'question-requested':
+      set((s) => ({
+        questions: [...s.questions.filter((q) => q.id !== e.request.id), e.request]
+      }))
+      break
+    case 'question-resolved':
+      set((s) => ({ questions: s.questions.filter((q) => q.id !== e.id) }))
+      break
     case 'chat-updated':
       set((s) => {
         const chat = withPending(e.chat)
@@ -707,6 +763,9 @@ function applyEvent(e: AgentEvent): void {
       break
     case 'error':
       set((s) => ({ errors: { ...s.errors, [e.sessionId]: e.error } }))
+      break
+    case 'processes-updated':
+      set((s) => ({ processes: { ...s.processes, [e.chatId]: e.processes } }))
       break
   }
 }
@@ -737,9 +796,18 @@ export const selectPendingAttachments =
     s.pendingAttachments[sessionId] ?? EMPTY_ATTACHMENTS
 
 export const isBusy = (status: Session['status'] | undefined): boolean =>
-  status === 'running' || status === 'awaiting_approval' || status === 'waiting'
+  status === 'running' ||
+  status === 'awaiting_approval' ||
+  status === 'awaiting_input' ||
+  status === 'waiting'
 
 export const currentChat = (s: Store): Chat | undefined =>
   s.view.kind === 'chat'
     ? s.chats.find((c) => c.id === (s.view as { chatId: string }).chatId)
     : undefined
+
+const EMPTY_PROCESSES: ProcessInfo[] = []
+export const selectProcesses =
+  (chatId: string) =>
+  (s: Store): ProcessInfo[] =>
+    s.processes[chatId] ?? EMPTY_PROCESSES

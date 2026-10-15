@@ -39,7 +39,7 @@ export const LIMITS = {
   browseCacheMs: 5 * 60_000,
   browseMaxLinks: 40,
 
-  /** bash: fração do limite mantida do início (o resto vem do fim). */
+  /** shell: fração do limite mantida do início (o resto vem do fim). */
   bashHeadRatio: 0.4,
 
   /** list_chats: padrão / máximo de chats listados. */
@@ -65,7 +65,23 @@ export const LIMITS = {
 
   /** wait_subagents / message_subagent (wait_for_reply): espera padrão / máxima, em segundos. */
   subagentWaitDefaultS: 600,
-  subagentWaitMaxS: 3600
+  subagentWaitMaxS: 3600,
+
+  /** Processos em segundo plano (process_*): máximo rodando por chat. */
+  processMaxPerChat: 8,
+  /** Buffer em memória por processo: linhas / caracteres (o log completo fica em arquivo). */
+  processBufferLines: 20_000,
+  processBufferChars: 5_000_000,
+  /** Linhas mais longas que isso são cortadas (buffer e arquivo). */
+  processMaxLineChars: 2000,
+  /** process_start wait_for: espera padrão / máxima, em segundos. */
+  processWaitDefaultS: 60,
+  processWaitMaxS: 600,
+  /** process_logs: linhas padrão (tail) / máximo de resultados. */
+  processLogsDefaultLines: 100,
+  processLogsMaxLines: 2000,
+  /** Logs mais antigos que isso são apagados no start do app. */
+  processLogMaxAgeDays: 7
 } as const
 
 /** Aproximação usada na UI: ~4 caracteres por token. */

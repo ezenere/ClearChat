@@ -265,7 +265,7 @@ function MessageActions({
 }): React.JSX.Element {
   const run = useStore((s) => s.run)
   const [confirm, setConfirm] = useState(false)
-  const text = messageText(msg.message.role === 'tool' ? msg.message.content : msg.message.content)
+  const text = messageText(msg.message.content)
   return (
     <div
       className={cn(
@@ -403,7 +403,7 @@ function SyntheticMessage({
   canEdit: boolean
 }): React.JSX.Element {
   const m = msg.message
-  const text = m.role === 'tool' ? m.content : messageText(m.content as string)
+  const text = messageText(m.content)
   const isToolResult = /^<tool_result/.test(text)
   return (
     <div className="group/msg flex items-center gap-2 py-1.5 pl-1 text-[12px] text-subtle">
@@ -463,9 +463,7 @@ function ErrorRow({
 /** Erro HTTP/do modelo persistido (meta.kind 'error'): só exibição, nunca enviado à API. */
 function ErrorMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React.JSX.Element {
   const run = useStore((s) => s.run)
-  const text =
-    msg.meta.error ??
-    (msg.message.role === 'tool' ? msg.message.content : messageText(msg.message.content ?? ''))
+  const text = msg.meta.error ?? messageText(msg.message.content ?? '')
   const canEdit = !ctx.readOnly && !ctx.busy
   const isLast = msg.id === ctx.lastAssistantId
   const ctxError = isLast && !ctx.readOnly && !ctx.busy && isContextLengthError(text)
@@ -938,7 +936,7 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
 }
 
 function OrphanTool({ msg, canEdit }: { msg: StoredMessage; canEdit: boolean }): React.JSX.Element {
-  const text = msg.message.role === 'tool' ? msg.message.content : ''
+  const text = msg.message.role === 'tool' ? messageText(msg.message.content) : ''
   return (
     <div className="group/msg py-1.5">
       <div className="rounded-xl border border-border bg-surface/70 px-3.5 py-2.5">

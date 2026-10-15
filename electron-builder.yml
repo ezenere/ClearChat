@@ -18,8 +18,6 @@ files:
   - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
   # headers de compilação (o better-sqlite3 usa os binários de prebuilds/)
   - '!node_modules/node-addon-api{,/**}'
-  # Fica aqui (e não em linux.files): um `files` por plataforma substitui esta lista inteira.
-  - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
 asarUnpack:
   - resources/**
   - node_modules/better-sqlite3/**
@@ -31,6 +29,10 @@ electronLanguages:
 
 linux:
   executableName: clearchat
+  # O `files` por plataforma se soma à lista acima (não a substitui): cada uma exclui só os
+  # binários das outras plataformas.
+  files:
+    - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
   # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
   # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
   syncDesktopName: true

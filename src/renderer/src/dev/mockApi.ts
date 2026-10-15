@@ -1,6 +1,7 @@
 // SOMENTE DESENVOLVIMENTO: window.api simulado para validar o design sem backend.
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import type { ClearApi } from '@shared/ipc'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
 import type {
@@ -9,8 +10,10 @@ import type {
   Chat,
   ModelInfo,
   Preset,
+  ProcessInfo,
   Provider,
   QueuedMessage,
+  QuestionRequest,
   Session,
   StoredMessage
 } from '@shared/types'
@@ -22,6 +25,25 @@ const id = (p: string): string => `${p}-${++seq}`
 
 export function createMockApi(scenario: string): ClearApi {
   const listeners = new Set<(e: AgentEvent) => void>()
+  const processes: ProcessInfo[] = [
+    {
+      id: 'p1',
+      chatId: 'c1',
+      sessionId: 's1',
+      name: 'vite',
+      command: 'npm run dev',
+      cwd: `${HOME}/projetos/clearchat`,
+      pid: 4242,
+      status: 'running',
+      exitCode: null,
+      signal: null,
+      startedAt: now - 7 * 60_000,
+      endedAt: null,
+      lines: 38,
+      lastLine: '  ➜  Local:   http://localhost:5173/',
+      logFile: `${HOME}/.config/ClearChat/processes/c1-p1.log`
+    }
+  ]
   const emit = (e: AgentEvent): void => listeners.forEach((l) => l(e))
 
   const providers: Provider[] =
@@ -31,6 +53,7 @@ export function createMockApi(scenario: string): ClearApi {
           {
             id: 'p1',
             name: 'OpenRouter',
+            kind: 'openrouter',
             baseUrl: 'https://openrouter.ai/api/v1',
             apiKey: 'sk-or-v1-9f8e7d6c5b4a3f2e1d0c',
             headers: {},
@@ -39,6 +62,7 @@ export function createMockApi(scenario: string): ClearApi {
           {
             id: 'p2',
             name: 'Local (LM Studio)',
+            kind: 'openai',
             baseUrl: 'http://localhost:1234/v1',
             apiKey: '',
             headers: {},
@@ -109,7 +133,8 @@ export function createMockApi(scenario: string): ClearApi {
   const cfg = DEFAULT_CHAT_CONFIG(`${HOME}/projetos/clearchat`, {
     providerId: 'p1',
     model: 'anthropic/claude-sonnet-4.5',
-    baseUrl: 'https://openrouter.ai/api/v1'
+    baseUrl: 'https://openrouter.ai/api/v1',
+    kind: 'openrouter'
   })
   cfg.params = { temperature: 0.7 }
   cfg.autoApprove = ['web_search', 'browse_url']
@@ -287,7 +312,7 @@ export function createMockApi(scenario: string): ClearApi {
           {
             id: 'tc2',
             type: 'function',
-            function: { name: 'bash', arguments: '{"command":"npm test -- --run src/main/agent"}' }
+            function: { name: 'shell', arguments: '{"command":"npm test -- --run src/main/agent"}' }
           }
         ]
       },
@@ -338,7 +363,7 @@ export function createMockApi(scenario: string): ClearApi {
             chatId: 'c1',
             sessionId: 's1',
             toolCallId: 'tc2',
-            toolName: 'bash',
+            toolName: 'shell',
             args: { command: 'npm test -- --run src/main/agent' },
             createdAt: now
           },
@@ -409,11 +434,92 @@ export function createMockApi(scenario: string): ClearApi {
   const delay = <T>(v: T, ms = 60): Promise<T> =>
     new Promise((r) => setTimeout(() => r(structuredClone(v)), ms))
 
+  // Questionário (ask_user) pendente na sessão s2 — cenário "question" (VITE_CLEAR_MOCK=question)
+  type MockOpt = { title: string; icon?: string; description?: string; help?: string }
+  type MockQ = { title: string; description?: string; multiple?: boolean; options: MockOpt[] }
+  const askArgs: { questions: MockQ[] } = {
+    questions: [
+      {
+        title: 'Qual banco de dados?',
+        description: 'Para o serviço de pedidos.',
+        options: [
+          { title: 'PostgreSQL', icon: 'database', description: 'Relacional, robusto' },
+          {
+            title: 'SQLite',
+            icon: '🪶',
+            help: '┌──────────┐\n│ app.db   │  arquivo único\n└──────────┘'
+          },
+          { title: 'MongoDB', icon: 'leaf' }
+        ]
+      },
+      {
+        title: 'Quais recursos?',
+        multiple: true,
+        options: [{ title: 'Cache' }, { title: 'Filas' }, { title: 'Busca full-text' }]
+      }
+    ]
+  }
+  const questions: QuestionRequest[] = []
+  if (scenario === 'question') {
+    const s2 = sessions.find((s) => s.id === 's2')
+    if (s2) s2.status = 'awaiting_input'
+    const a = msg('s2', {
+      role: 'assistant',
+      content: 'Antes de começar, preciso de algumas decisões.',
+      tool_calls: [
+        {
+          id: 'ask1',
+          type: 'function',
+          function: { name: 'ask_user', arguments: JSON.stringify(askArgs) }
+        }
+      ]
+    })
+    messages.push(msg('s2', { role: 'user', content: 'Monte o serviço de pedidos.' }), a)
+    questions.push({
+      id: 'q1',
+      chatId: 'c2',
+      sessionId: 's2',
+      toolCallId: 'ask1',
+      createdAt: now,
+      questions: askArgs.questions.map((q) => ({
+        title: q.title,
+        ...(q.description ? { description: q.description } : {}),
+        multiple: !!q.multiple,
+        options: q.options.map((o) => ({
+          title: o.title,
+          ...(o.description ? { description: o.description } : {}),
+          ...(o.icon
+            ? {
+                icon: /^[a-z-]+$/.test(o.icon)
+                  ? { kind: 'lucide' as const, name: o.icon }
+                  : { kind: 'text' as const, text: o.icon }
+              }
+            : {}),
+          ...(o.help ? { help: { kind: 'text' as const, text: o.help } } : {})
+        }))
+      }))
+    })
+  }
+  const resolveQuestion = (qid: string, content: string, meta: StoredMessage['meta']): void => {
+    const q = questions.find((x) => x.id === qid)
+    if (!q) return
+    questions.splice(questions.indexOf(q), 1)
+    emit({ type: 'question-resolved', id: qid })
+    const m = msg(q.sessionId, { role: 'tool', tool_call_id: q.toolCallId, content }, meta)
+    messages.push(m)
+    emit({ type: 'message-added', message: m })
+    const s = sessions.find((x) => x.id === q.sessionId)
+    if (s) {
+      s.status = 'idle'
+      emit({ type: 'session-updated', session: { ...s } })
+    }
+  }
+
   return {
     providers: {
       list: () => delay(providers),
       create: async (p) => {
-        const np = { ...p, id: id('p'), createdAt: Date.now() }
+        const np = { ...p, kind: providerKind(p), id: id('p'), createdAt: Date.now() }
         providers.push(np)
         return delay(np)
       },
@@ -540,7 +646,7 @@ export function createMockApi(scenario: string): ClearApi {
       previewRequest: async (sid) => {
         const s = sessions.find((x) => x.id === sid)!
         const c = chats.find((x) => x.id === s.chatId)!
-        const sys = `${c.config.systemPrompt}\n\n<environment>\nroot: ${c.config.cwd}\nos: linux (Arch Linux)\nshell: bash\n</environment>`
+        const sys = `${c.config.systemPrompt}\n\n<environment>\nroot: ${c.config.cwd}\nos: linux (Arch Linux)\nshell: zsh 5.9\n</environment>`
         return delay({
           url: 'https://openrouter.ai/api/v1/chat/completions',
           headers: {
@@ -598,7 +704,12 @@ export function createMockApi(scenario: string): ClearApi {
       mkdir: (p) => delay(p)
     },
     app: {
-      capabilities: () => delay({ bwrap: true, ripgrep: true })
+      capabilities: () =>
+        delay({
+          bwrap: true,
+          ripgrep: true,
+          shell: { name: 'zsh' as const, version: '5.9', os: 'Linux' }
+        })
     },
     presets: {
       list: () => delay(presets),
@@ -659,6 +770,55 @@ export function createMockApi(scenario: string): ClearApi {
           kind: 'text' as const,
           file: `${'b'.repeat(64)}.txt`
         })
+    },
+    questions: {
+      answer: async (qid, answers) => {
+        const q = questions.find((x) => x.id === qid)
+        if (!q) return
+        resolveQuestion(qid, 'Respostas do usuário: (mock)', {
+          toolStatus: 'ok',
+          askUser: { questions: q.questions, outcome: 'answered', answers }
+        })
+      },
+      cancel: async (qid) => {
+        const q = questions.find((x) => x.id === qid)
+        if (!q) return
+        resolveQuestion(qid, '[O usuário não respondeu ao questionário]', {
+          toolStatus: 'cancelled',
+          synthetic: true,
+          kind: 'tool-cancelled',
+          askUser: { questions: q.questions, outcome: 'cancelled' }
+        })
+      },
+      pending: () => delay(questions)
+    },
+    processes: {
+      list: (chatId) => delay(processes.filter((p) => p.chatId === chatId)),
+      stop: async (chatId, pid) => {
+        const p = processes.find((x) => x.chatId === chatId && x.id === pid)
+        if (p && p.status === 'running') {
+          Object.assign(p, {
+            status: 'exited',
+            exitCode: null,
+            signal: 'SIGTERM',
+            endedAt: Date.now()
+          })
+          emit({
+            type: 'processes-updated',
+            chatId,
+            processes: processes.filter((x) => x.chatId === chatId).map((x) => ({ ...x }))
+          })
+        }
+        return delay(undefined)
+      },
+      logs: (chatId, pid, tail = 200) => {
+        const p = processes.find((x) => x.chatId === chatId && x.id === pid)!
+        const all = Array.from({ length: p.lines }, (_, i) => ({
+          n: i + 1,
+          text: i === p.lines - 1 ? p.lastLine : `[vite] hmr update /src/App.tsx (${i + 1})`
+        }))
+        return delay({ info: { ...p }, lines: all.slice(-tail) })
+      }
     },
     onEvent: (cb) => {
       listeners.add(cb)

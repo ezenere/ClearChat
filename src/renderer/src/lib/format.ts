@@ -13,7 +13,8 @@ export function messageText(content: string | ContentPart[] | null | undefined):
  * os parts de anexo ficam intactos (mesma ordem) e o texto digitado vira um único text part no fim.
  */
 export function withText(message: ApiMessage, text: string): ApiMessage {
-  if (message.role === 'tool') return { ...message, content: text }
+  if (message.role === 'tool' && typeof message.content === 'string')
+    return { ...message, content: text }
   if (message.role === 'assistant') return { ...message, content: text }
   if (typeof message.content === 'string') return { ...message, content: text }
   const parts = message.content
@@ -23,6 +24,9 @@ export function withText(message: ApiMessage, text: string): ApiMessage {
     const first = parts.find((p) => p.type === 'text') ?? { type: 'text' as const, text: '' }
     return { ...message, content: [{ ...first, text } as ContentPart] }
   }
+  // tool (read_file de imagem/PDF): texto primeiro, como foi gravado
+  if (message.role === 'tool')
+    return { ...message, content: [{ type: 'text', text }, ...attachments] }
   const next: ContentPart[] = [...attachments]
   if (text.trim()) next.push({ type: 'text', text })
   return { ...message, content: next }

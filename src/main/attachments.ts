@@ -56,6 +56,8 @@ const MIME_BY_EXT: Record<string, string> = Object.fromEntries(
   Object.entries(EXT_BY_MIME).map(([m, e]) => [e, m])
 )
 MIME_BY_EXT.txt = 'text/plain; charset=utf-8'
+// imagens do questionário (ask_user): SVG só é exibido via <img> (scripts nunca executam)
+MIME_BY_EXT.svg = 'image/svg+xml'
 
 /** Mime para servir um arquivo do store (protocolo clearchat-attachment://). */
 export function mimeForFile(file: string): string {
@@ -138,6 +140,32 @@ export function saveAttachment(input: AttachmentInput): AttachmentInfo {
     }
   }
   return { sha256, name, mime, size: data.byteLength, kind, file }
+}
+
+/**
+ * Salva bytes já validados no store com a extensão dada (content-addressed, escrita atômica,
+ * dedup renova o mtime). Usado pelas imagens do questionário (ask_user). Retorna o nome do arquivo.
+ */
+export function saveStoreFile(data: Uint8Array, ext: string): string {
+  if (!/^[a-z0-9]{1,10}$/.test(ext)) throw new Error(`Extensão inválida: ${ext}`)
+  const sha256 = createHash('sha256').update(data).digest('hex')
+  const file = `${sha256}.${ext}`
+  const d = attachmentsDir()
+  mkdirSync(d, { recursive: true })
+  const path = join(d, file)
+  if (!existsSync(path)) {
+    const tmp = join(d, `.tmp-${randomUUID()}`)
+    writeFileSync(tmp, data)
+    renameSync(tmp, path)
+  } else {
+    const t = new Date()
+    try {
+      utimesSync(path, t, t)
+    } catch {
+      /* */
+    }
+  }
+  return file
 }
 
 // leitura com cache LRU (o histórico é reenviado a cada passo do agente)
@@ -346,10 +374,62 @@ export function expandAttachments(
   read: (file: string, name?: string) => Buffer = readAttachment
 ): ApiMessage[] {
   return messages.map((m) => {
-    if ((m.role !== 'user' && m.role !== 'system') || typeof m.content === 'string') return m
+    // user/system (anexos) e tool (read_file de imagem/PDF)
+    if (m.role === 'assistant' || typeof m.content === 'string' || !m.content) return m
     if (!m.content.some((p) => p._attachment || hasRef(p))) return m
     return { ...m, content: m.content.map((p) => expandPart(p, read)) } as ApiMessage
   })
+}
+
+/**
+ * OpenAI-compatible (openai/openrouter): a mensagem `role: tool` só aceita texto no Chat Completions
+ * — verificado via OpenRouter: `openai/gpt-4o-mini` → 400 "Image URLs are only allowed for messages
+ * with role 'user'" (Anthropic e Gemini aceitavam, mas o formato precisa servir a todos). Então, na
+ * CÓPIA enviada, os parts de mídia de cada bloco de mensagens `tool` consecutivas saem do resultado
+ * (fica o texto + "[… anexado na próxima mensagem]") e entram numa mensagem `user` sintética logo
+ * depois do bloco: `[arquivos retornados por read_file: a.png]` + os parts. Não é persistida:
+ * derivada só do histórico (determinística → o prefixo de cache não muda) e o histórico continua no
+ * formato neutro (trocar para Anthropic nativo usa tool_result com imagem). Roda ANTES de
+ * expandAttachments (ainda com as referências e `_attachment`).
+ */
+export function hoistToolMedia(messages: ApiMessage[]): ApiMessage[] {
+  if (!messages.some((m) => m.role === 'tool' && Array.isArray(m.content))) return messages
+  const out: ApiMessage[] = []
+  let pending: ContentPart[] = []
+  const flush = (): void => {
+    if (!pending.length) return
+    const names = pending.map((p) => p._attachment?.name ?? 'arquivo')
+    // mídia antes do texto (como os anexos): o breakpoint de cache no último text part cobre tudo
+    out.push({
+      role: 'user',
+      content: [
+        ...pending,
+        { type: 'text', text: `[arquivos retornados por read_file: ${names.join(', ')}]` }
+      ]
+    })
+    pending = []
+  }
+  for (const m of messages) {
+    if (m.role !== 'tool') flush()
+    if (m.role !== 'tool' || typeof m.content === 'string') {
+      out.push(m)
+      continue
+    }
+    const media = m.content.filter((p) => p.type !== 'text')
+    const text = m.content
+      .filter((p) => p.type === 'text')
+      .map((p) => (p as { text: string }).text)
+      .join('\n')
+    if (!media.length) {
+      out.push({ ...m, content: text })
+      continue
+    }
+    const what = media.every((p) => p.type === 'image_url') ? 'imagem anexada' : 'arquivo anexado'
+    out.push({ ...m, content: `${text}${text ? '\n' : ''}[${what} na próxima mensagem]` })
+    pending.push(...media)
+  }
+  flush()
+  return out
 }
 
 function hasRef(p: ContentPart): boolean {
@@ -385,10 +465,19 @@ export function truncateBodyForPreview(body: Record<string, unknown>): {
     const m = /^data:[^;,]+;base64,/.exec(s)
     return m ? m[0] : null
   }
-  const next = msgs.map((m: { content?: unknown }) => {
-    if (!m || !Array.isArray(m.content)) return m
+  const shortenParts = (parts: ContentPart[]): { parts: ContentPart[]; changed: boolean } => {
     let changed = false
-    const content = (m.content as ContentPart[]).map((p) => {
+    const out = parts.map((p): ContentPart => {
+      // Anthropic: tool_result com blocos (read_file de imagem/PDF)
+      const inner = (p as { type: string; content?: unknown }).content
+      if ((p as { type: string }).type === 'tool_result' && Array.isArray(inner)) {
+        const r = shortenParts(inner as ContentPart[])
+        if (r.changed) {
+          changed = true
+          return { ...p, content: r.parts } as unknown as ContentPart
+        }
+        return p
+      }
       if (p.type === 'image_url' && p.image_url.url.length > 200) {
         const pre = dataPrefix(p.image_url.url)
         if (pre) {
@@ -405,6 +494,13 @@ export function truncateBodyForPreview(body: Record<string, unknown>): {
           return { ...p, file: { ...p.file, file_data: shortB64(p.file.file_data, pre) } }
         }
       }
+      // formato nativo Anthropic: { type: 'image' | 'document', source: { type: 'base64', media_type, data } }
+      const src = (p as { source?: { type?: string; media_type?: string; data?: unknown } }).source
+      if (src?.type === 'base64' && typeof src.data === 'string' && src.data.length > 200) {
+        changed = true
+        truncated++
+        return { ...p, source: { ...src, data: shortB64(src.data, '') } } as unknown as ContentPart
+      }
       if (p.type === 'input_audio' && p.input_audio.data.length > 200) {
         changed = true
         truncated++
@@ -412,7 +508,12 @@ export function truncateBodyForPreview(body: Record<string, unknown>): {
       }
       return p
     })
-    return changed ? { ...m, content } : m
+    return { parts: out, changed }
+  }
+  const next = msgs.map((m: { content?: unknown }) => {
+    if (!m || !Array.isArray(m.content)) return m
+    const r = shortenParts(m.content as ContentPart[])
+    return r.changed ? { ...m, content: r.parts } : m
   })
   return truncated ? { body: { ...body, messages: next }, truncated } : { body, truncated: 0 }
 }
@@ -429,18 +530,24 @@ export function referencedFiles(messageJsons: Iterable<string>): Set<string> {
   return out
 }
 
-/** Lê do banco só as mensagens com referência (LIKE barato) — `db` é um better-sqlite3. */
+/**
+ * Lê do banco só as mensagens com referência (LIKE barato) — `db` é um better-sqlite3. Considera
+ * `message_json` (anexos) E `meta_json` (imagens do questionário ask_user, em `meta.askUser`).
+ */
 export function referencedFilesInDb(db: {
   prepare(sql: string): { iterate(...a: unknown[]): IterableIterator<unknown> }
 }): Set<string> {
   const rows = db
     .prepare(
-      "SELECT message_json FROM messages WHERE message_json LIKE '%clearchat-attachment://%'"
+      "SELECT message_json, meta_json FROM messages WHERE message_json LIKE '%clearchat-attachment://%' OR meta_json LIKE '%clearchat-attachment://%'"
     )
-    .iterate() as IterableIterator<{ message_json: string }>
+    .iterate() as IterableIterator<{ message_json: string; meta_json: string | null }>
   return referencedFiles(
     (function* () {
-      for (const r of rows) yield r.message_json
+      for (const r of rows) {
+        yield r.message_json
+        if (r.meta_json) yield r.meta_json
+      }
     })()
   )
 }

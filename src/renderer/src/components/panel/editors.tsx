@@ -5,11 +5,11 @@ import { useState, type ReactNode } from 'react'
 import {
   DEFAULT_COMPACT_PROMPT,
   DEFAULT_COMPACT_THRESHOLD,
-  defaultToolsPrompt,
-  isOpenRouter
+  defaultToolsPrompt
 } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import { LIMITS, approxTokens, clampToolOutput } from '@shared/limits'
-import { TOOL_DEFINITIONS, TOOL_LABELS, TOOL_NAMES } from '@shared/tools'
+import { currentToolDefinition, TOOL_LABELS, TOOL_NAMES } from '@shared/tools'
 import { CONFIRM_TOOLS, type ChatConfig, type ChatParams, type ToolName } from '@shared/types'
 import { cn, formatTokens, modelMeta } from '../../lib/format'
 import { useStore } from '../../store'
@@ -161,7 +161,7 @@ export function SystemPromptSection({ cfg, patch }: CfgProps): React.JSX.Element
 
 function useOpenRouter(providerId: string): boolean {
   const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
-  return provider ? isOpenRouter(provider.baseUrl) : false
+  return provider ? providerKind(provider) === 'openrouter' : false
 }
 
 export function ParamsSection({
@@ -323,7 +323,7 @@ export function RootOptions({
       />
       {caps.bwrap ? (
         <ToggleRow
-          label="Bash em sandbox"
+          label="Shell em sandbox"
           description="bubblewrap: só a raiz é gravável; rede liberada"
           checked={!!cfg.sandboxBash}
           onChange={(sandboxBash) => patch({ sandboxBash })}
@@ -331,7 +331,7 @@ export function RootOptions({
         />
       ) : (
         <p className="text-[11.5px] leading-snug text-subtle">
-          Sandbox do bash indisponível: instale o <span className="font-mono">bubblewrap</span>{' '}
+          Sandbox do shell indisponível: instale o <span className="font-mono">bubblewrap</span>{' '}
           (bwrap) para isolar o terminal na raiz.
         </p>
       )}
@@ -514,8 +514,8 @@ export function ToolsListSection({ cfg, patch }: CfgProps): React.JSX.Element {
 }
 
 export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element {
-  const enabledDefs = TOOL_NAMES.filter((t) => cfg.enabledTools.includes(t)).map(
-    (t) => TOOL_DEFINITIONS[t]
+  const enabledDefs = TOOL_NAMES.filter((t) => cfg.enabledTools.includes(t)).map((t) =>
+    currentToolDefinition(t)
   )
   const toolsText = cfg.toolsPromptText ?? defaultToolsPrompt(enabledDefs, cfg.nativeTools)
   return (

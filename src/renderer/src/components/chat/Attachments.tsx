@@ -244,3 +244,18 @@ export function MessageAttachments({ parts }: { parts: ContentPart[] }): React.J
     </div>
   )
 }
+
+/** Imagens/PDF devolvidos por read_file (resultado de tool) — miniatura clicável / chip. */
+export function ToolResultMedia({ parts }: { parts: ContentPart[] }): React.JSX.Element | null {
+  const items = parts.filter((p) => p._attachment)
+  if (!items.length) return null
+  return (
+    <div className="flex flex-wrap gap-2" data-tool-media>
+      {items.map((p, i) => {
+        const meta = p._attachment!
+        if (meta.kind === 'image') return <ImageThumb key={i} meta={meta} />
+        return <FileChip key={i} meta={meta} />
+      })}
+    </div>
+  )
+}

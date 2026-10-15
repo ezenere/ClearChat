@@ -1,6 +1,8 @@
-// Cliente SSE streaming para POST {baseUrl}/chat/completions (OpenAI-compatible).
+// Cliente SSE streaming: POST {baseUrl}/chat/completions (OpenAI-compatible) ou, com
+// BuiltRequest.kind === 'anthropic', POST {baseUrl}/messages (SSE nativo — adapters/anthropic.ts).
 import type { StreamDraft, Usage } from '@shared/types'
 import type { BuiltRequest } from './request'
+import { applyAnthropicEvent, applyAnthropicMessage } from './adapters/anthropic'
 
 export interface AccToolCall {
   id: string
@@ -41,7 +43,10 @@ export class LlmHttpError extends Error {
   }
 }
 
-/** Extrai uma mensagem legível de um body de erro (JSON OpenAI/OpenRouter ou texto). */
+/**
+ * Extrai uma mensagem legível de um body de erro (JSON OpenAI/OpenRouter, Anthropic
+ * `{type:'error', error:{type, message}}` ou texto).
+ */
 export function readableError(status: number, statusText: string, body: string): string {
   let msg = ''
   try {
@@ -214,10 +219,13 @@ async function doStream(
 
   const ctype = res.headers.get('content-type') ?? ''
   if (!res.body) throw new Error('Resposta sem corpo.')
+  const anthropic = req.kind === 'anthropic'
+  const apply = anthropic ? applyAnthropicEvent : applyChunk
   if (ctype.includes('application/json')) {
     // Provider ignorou stream:true — resposta completa em JSON.
     const j = (await res.json()) as Record<string, unknown>
-    applyChunk(acc, j)
+    if (anthropic) applyAnthropicMessage(acc, j)
+    else applyChunk(acc, j)
     acc.completed = true
     onUpdate()
     return acc
@@ -244,7 +252,7 @@ async function doStream(
         const line = buf.slice(0, nl).replace(/\r$/, '')
         buf = buf.slice(nl + 1)
         if (!line || line.startsWith(':')) continue // comentários (": OPENROUTER PROCESSING")
-        if (!line.startsWith('data:')) continue
+        if (!line.startsWith('data:')) continue // `event: …` (Anthropic: o tipo também vem no JSON)
         const data = line.slice(5).trim()
         if (data === '[DONE]') {
           done = true
@@ -256,8 +264,12 @@ async function doStream(
         } catch {
           continue
         }
-        applyChunk(acc, chunk)
+        apply(acc, chunk)
         changed = true
+        if (anthropic && chunk.type === 'message_stop') {
+          done = true
+          break
+        }
       }
       if (changed) onUpdate()
     }

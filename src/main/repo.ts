@@ -4,6 +4,8 @@ import { homedir } from 'os'
 import { getDb } from './db'
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
+import { providerKind } from '@shared/providerKinds'
+import { migrateConfigTools } from '@shared/toolRename'
 import type {
   ApiMessage,
   Chat,
@@ -48,6 +50,7 @@ interface ProviderRow {
   id: string
   name: string
   base_url: string
+  kind?: string
   api_key: string
   headers_json: string
   created_at: number
@@ -56,6 +59,7 @@ interface ProviderRow {
 const toProvider = (r: ProviderRow): Provider => ({
   id: r.id,
   name: r.name,
+  kind: providerKind({ baseUrl: r.base_url, kind: r.kind }),
   baseUrl: r.base_url,
   apiKey: r.api_key,
   headers: parse<Record<string, string>>(r.headers_json, {}),
@@ -81,18 +85,20 @@ export const providersRepo = {
       id: randomUUID(),
       name: p.name?.trim() || 'Provider',
       baseUrl: normBaseUrl(p.baseUrl ?? ''),
+      kind: providerKind({ baseUrl: p.baseUrl ?? '', kind: p.kind }),
       apiKey: (p.apiKey ?? '').trim(),
       headers: p.headers ?? {},
       createdAt: Date.now()
     }
     getDb()
       .prepare(
-        'INSERT INTO providers (id, name, base_url, api_key, headers_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+        'INSERT INTO providers (id, name, base_url, kind, api_key, headers_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
       )
       .run(
         prov.id,
         prov.name,
         prov.baseUrl,
+        prov.kind,
         prov.apiKey,
         JSON.stringify(prov.headers),
         prov.createdAt
@@ -106,14 +112,24 @@ export const providersRepo = {
       ...cur,
       ...(patch.name !== undefined ? { name: patch.name } : {}),
       ...(patch.baseUrl !== undefined ? { baseUrl: normBaseUrl(patch.baseUrl) } : {}),
+      ...(patch.kind !== undefined
+        ? { kind: providerKind({ baseUrl: '', kind: patch.kind }) }
+        : {}),
       ...(patch.apiKey !== undefined ? { apiKey: patch.apiKey.trim() } : {}),
       ...(patch.headers !== undefined ? { headers: patch.headers ?? {} } : {})
     }
     getDb()
       .prepare(
-        'UPDATE providers SET name = ?, base_url = ?, api_key = ?, headers_json = ? WHERE id = ?'
+        'UPDATE providers SET name = ?, base_url = ?, kind = ?, api_key = ?, headers_json = ? WHERE id = ?'
       )
-      .run(next.name, next.baseUrl, next.apiKey, JSON.stringify(next.headers), id)
+      .run(
+        next.name,
+        next.baseUrl,
+        next.kind ?? providerKind(next),
+        next.apiKey,
+        JSON.stringify(next.headers),
+        id
+      )
     return next
   },
   delete(id: string): void {
@@ -227,12 +243,12 @@ export const sessionsRepo = {
   markStaleInterrupted(): string[] {
     const rows = getDb()
       .prepare(
-        "SELECT id FROM sessions WHERE status IN ('running', 'awaiting_approval', 'waiting')"
+        "SELECT id FROM sessions WHERE status IN ('running', 'awaiting_approval', 'awaiting_input', 'waiting')"
       )
       .all() as { id: string }[]
     getDb()
       .prepare(
-        "UPDATE sessions SET status = 'interrupted' WHERE status IN ('running', 'awaiting_approval', 'waiting')"
+        "UPDATE sessions SET status = 'interrupted' WHERE status IN ('running', 'awaiting_approval', 'awaiting_input', 'waiting')"
       )
       .run()
     return rows.map((r) => r.id)
@@ -375,7 +391,8 @@ interface ChatRow {
 
 const toChat = (r: ChatRow): Chat => {
   const fallback = DEFAULT_CHAT_CONFIG(homedir())
-  const cfg = parse<Partial<ChatConfig>>(r.config_json, {})
+  // alias de leitura: nomes antigos de tools ('bash' → 'shell')
+  const cfg = migrateConfigTools(parse<Partial<ChatConfig>>(r.config_json, {}))
   return {
     id: r.id,
     title: r.title,
@@ -425,11 +442,14 @@ export const chatsRepo = {
       providerId,
       model: s('defaultModel'),
       systemPrompt: settingsRepo.get<string>('defaultSystemPrompt') ?? undefined,
-      baseUrl: provider?.baseUrl
+      baseUrl: provider?.baseUrl,
+      kind: provider?.kind
     })
-    const definedCfg = Object.fromEntries(
-      Object.entries(inCfg).filter(([, v]) => v !== undefined)
-    ) as Partial<ChatConfig>
+    const definedCfg = migrateConfigTools(
+      Object.fromEntries(
+        Object.entries(inCfg).filter(([, v]) => v !== undefined)
+      ) as Partial<ChatConfig>
+    )
     const config: ChatConfig = {
       ...base,
       ...definedCfg,
@@ -466,9 +486,11 @@ export const chatsRepo = {
     if (!cur) throw new Error(`Chat não encontrado: ${id}`)
     let config = cur.config
     if (patch?.config) {
-      const definedCfg = Object.fromEntries(
-        Object.entries(patch.config).filter(([k, v]) => v !== undefined && k !== 'params')
-      ) as Partial<ChatConfig>
+      const definedCfg = migrateConfigTools(
+        Object.fromEntries(
+          Object.entries(patch.config).filter(([k, v]) => v !== undefined && k !== 'params')
+        ) as Partial<ChatConfig>
+      )
       config = {
         ...cur.config,
         ...definedCfg,

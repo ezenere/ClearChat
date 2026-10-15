@@ -50,11 +50,11 @@ export const SMART_APPROVE_EXTRA_TOOLS: ToolName[] = [
 
 /** Placeholders aceitos no prompt e no template (cola na UI). */
 export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
-  { key: 'tool', desc: 'nome da tool (ex.: bash)' },
+  { key: 'tool', desc: 'nome da tool (ex.: shell)' },
   { key: 'args', desc: 'argumentos da chamada (JSON formatado)' },
   { key: 'cwd', desc: 'diretório raiz do chat' },
   { key: 'confine', desc: 'tools de arquivo confinadas à raiz (yes/no)' },
-  { key: 'sandbox', desc: 'bash em sandbox (yes/no)' },
+  { key: 'sandbox', desc: 'shell em sandbox (yes/no)' },
   { key: 'last_user_message', desc: 'última mensagem do usuário na sessão' },
   { key: 'recent_context', desc: 'últimas N mensagens da sessão, compactas' },
   { key: 'labels', desc: 'os três rótulos separados por " | "' },
@@ -258,7 +258,7 @@ function messageLine(m: ApiMessage, toolNames: Map<string, string>): string {
       return `[assistant] ${parts.join('\n  ') || '(empty)'}`
     }
     case 'tool':
-      return `[tool ${toolNames.get(m.tool_call_id) ?? '?'}] ${cut(m.content, 300)}`
+      return `[tool ${toolNames.get(m.tool_call_id) ?? '?'}] ${cut(contentText(m.content), 300)}`
   }
 }
 
@@ -371,15 +371,17 @@ export function argsSummary(tool: string, args: unknown): string {
   const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const pick = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '')
   const main =
-    tool === 'bash'
-      ? pick('command')
-      : tool === 'web_search'
-        ? pick('query')
-        : tool === 'browse_url'
-          ? pick('url')
-          : tool === 'write_file' || tool === 'edit_file'
-            ? pick('path')
-            : ''
+    tool === 'shell' || tool === 'bash' || tool === 'process_start'
+      ? pick('command') + (tool === 'process_start' && pick('cwd') ? ` (cwd ${pick('cwd')})` : '')
+      : tool === 'process_stop'
+        ? pick('id')
+        : tool === 'web_search'
+          ? pick('query')
+          : tool === 'browse_url'
+            ? pick('url')
+            : tool === 'write_file' || tool === 'edit_file'
+              ? pick('path')
+              : ''
   const s = main || JSON.stringify(a)
   const flat = s.replace(/\s+/g, ' ').trim()
   return flat.length > 160 ? `${flat.slice(0, 160)}…` : flat
@@ -392,7 +394,7 @@ export function overrideMessageText(tool: string, args: unknown): string {
 
 /** Exemplo usado no (i) e no "Testar" do editor. */
 export const SMART_APPROVE_SAMPLE = {
-  tool: 'bash' as ToolName,
+  tool: 'shell' as ToolName,
   args: { command: 'rm -rf node_modules && npm install' },
   history: [
     {
@@ -415,7 +417,7 @@ export const SMART_APPROVE_SAMPLE = {
             id: 'call_sample',
             type: 'function',
             function: {
-              name: 'bash',
+              name: 'shell',
               arguments: '{"command":"rm -rf node_modules && npm install"}'
             }
           }

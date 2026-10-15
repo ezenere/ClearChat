@@ -2,6 +2,7 @@ import { FolderOpen, Pencil, Plus, RotateCcw, Server, Trash2 } from 'lucide-reac
 import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_BASE_URL, DEFAULT_SYSTEM_PROMPT } from '@shared/defaults'
 import { defaultModelRef } from '@shared/models'
+import { inferProviderKind, PROVIDER_KIND_LABEL, providerKind } from '@shared/providerKinds'
 import type { Provider } from '@shared/types'
 import { api, errorMessage } from '../lib/api'
 import { cn, shortPath } from '../lib/format'
@@ -21,11 +22,19 @@ function toDraft(p?: Provider): ProviderDraft {
   return p
     ? {
         name: p.name,
+        kind: providerKind(p),
+        kindTouched: true,
         baseUrl: p.baseUrl,
         apiKey: p.apiKey,
         headersText: Object.keys(p.headers ?? {}).length ? JSON.stringify(p.headers, null, 2) : ''
       }
-    : { name: '', baseUrl: DEFAULT_BASE_URL, apiKey: '', headersText: '' }
+    : {
+        name: '',
+        kind: inferProviderKind(DEFAULT_BASE_URL),
+        baseUrl: DEFAULT_BASE_URL,
+        apiKey: '',
+        headersText: ''
+      }
 }
 
 function ProviderEditor({
@@ -108,7 +117,12 @@ function ProviderRow({
         <Server className="size-3.5 text-muted" />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] font-medium">{provider.name}</div>
+        <div className="flex items-baseline gap-2 text-[13px] font-medium">
+          {provider.name}
+          <span className="text-[11px] font-normal text-subtle">
+            {PROVIDER_KIND_LABEL[providerKind(provider)]}
+          </span>
+        </div>
         <div className="truncate font-mono text-[11px] text-subtle">
           {provider.baseUrl}
           {provider.apiKey && (
@@ -322,7 +336,8 @@ export function SettingsModal(): React.JSX.Element {
       {tab === 'providers' ? (
         <div className="space-y-2.5">
           <p className="mb-3 text-xs text-subtle">
-            Endpoints compatíveis com a API da OpenAI (chat/completions).
+            Endpoints compatíveis com a API da OpenAI (chat/completions), OpenRouter ou a API nativa
+            da Anthropic.
           </p>
           {providers.map((p) =>
             editing === p.id ? (

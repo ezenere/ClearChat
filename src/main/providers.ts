@@ -1,8 +1,10 @@
-// providers.listModels / providers.test — GET {baseUrl}/models (mapeia campos do OpenRouter).
-import { isOpenRouter } from '@shared/defaults'
+// providers.listModels / providers.test — GET {baseUrl}/models pelo adaptador do provider
+// (OpenAI-compatible/OpenRouter: mapModel; Anthropic nativa: mapAnthropicModel, paginado).
+import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import type { ProviderTestInput, ProviderTestResult } from '@shared/ipc'
 import type { ModelInfo, Provider } from '@shared/types'
-import { buildHeaders } from './agent/request'
+import { adapterFor } from './agent/adapters'
+import { fetchAnthropicModels } from './agent/adapters/anthropic'
 import { readableError } from './agent/llm'
 
 const CACHE_MS = 5 * 60_000
@@ -43,16 +45,13 @@ export function mapModel(m: Record<string, unknown>): ModelInfo | null {
   return info
 }
 
-async function fetchModels(
-  p: Pick<Provider, 'baseUrl' | 'apiKey' | 'headers'>
-): Promise<ModelInfo[]> {
-  const base = p.baseUrl.replace(/\/+$/, '')
-  if (!/^https?:\/\//i.test(base)) throw new Error('Base URL inválida (use http:// ou https://).')
-  const headers = buildHeaders({ id: '', name: '', createdAt: 0, ...p, headers: p.headers ?? {} })
-  delete headers['Content-Type']
+type ModelsInput = Pick<Provider, 'baseUrl' | 'apiKey' | 'headers'> & { kind?: ProviderKind }
+
+/** GET com erro legível (rede / HTTP / JSON inválido). */
+async function getJson(url: string, headers: Record<string, string>): Promise<unknown> {
   let res: Response
   try {
-    res = await fetch(`${base}/models`, { headers, signal: AbortSignal.timeout(20_000) })
+    res = await fetch(url, { headers, signal: AbortSignal.timeout(20_000) })
   } catch (e) {
     const cause = (e as { cause?: { message?: string } }).cause
     throw new Error(
@@ -62,12 +61,23 @@ async function fetchModels(
   }
   const text = await res.text()
   if (!res.ok) throw new Error(readableError(res.status, res.statusText, text))
-  let j: unknown
   try {
-    j = JSON.parse(text)
+    return JSON.parse(text)
   } catch {
     throw new Error('Resposta de /models não é JSON.')
   }
+}
+
+async function fetchModels(p: ModelsInput): Promise<ModelInfo[]> {
+  const base = p.baseUrl.replace(/\/+$/, '')
+  if (!/^https?:\/\//i.test(base)) throw new Error('Base URL inválida (use http:// ou https://).')
+  const adapter = adapterFor(p)
+  const headers = adapter.getHeaders({ apiKey: p.apiKey, headers: p.headers ?? {} })
+  if (adapter.kind === 'anthropic') {
+    const models = await fetchAnthropicModels(base, (url) => getJson(url, headers))
+    return models.sort((a, b) => a.id.localeCompare(b.id))
+  }
+  const j = await getJson(`${base}/models`, headers)
   const list = Array.isArray(j)
     ? j
     : Array.isArray((j as { data?: unknown }).data)
@@ -83,7 +93,7 @@ async function fetchModels(
 }
 
 export async function listModels(provider: Provider): Promise<ModelInfo[]> {
-  const key = `${provider.baseUrl}|${provider.apiKey}|${JSON.stringify(provider.headers)}`
+  const key = `${providerKind(provider)}|${provider.baseUrl}|${provider.apiKey}|${JSON.stringify(provider.headers)}`
   const c = cache.get(provider.id)
   if (c && c.key === key && Date.now() - c.at < CACHE_MS) return c.models
   const models = await fetchModels(provider)
@@ -98,14 +108,14 @@ export function invalidateModels(providerId: string): void {
 export async function testProvider(p: ProviderTestInput): Promise<ProviderTestResult> {
   try {
     const base = (p.baseUrl ?? '').trim().replace(/\/+$/, '')
-    const input = { baseUrl: base, apiKey: (p.apiKey ?? '').trim(), headers: p.headers ?? {} }
+    const kind = providerKind({ baseUrl: base, kind: p.kind })
+    const input = { kind, baseUrl: base, apiKey: (p.apiKey ?? '').trim(), headers: p.headers ?? {} }
     const models = await fetchModels(input)
     // /models do OpenRouter é público: valida a key em /key.
-    if (isOpenRouter(base)) {
+    if (kind === 'openrouter') {
       if (!input.apiKey)
         return { ok: false, error: 'Informe a API key.', modelCount: models.length }
-      const headers = buildHeaders({ id: '', name: '', createdAt: 0, ...input })
-      delete headers['Content-Type']
+      const headers = adapterFor(kind).getHeaders(input)
       const res = await fetch(`${base}/key`, { headers, signal: AbortSignal.timeout(20_000) })
       if (!res.ok) {
         const text = await res.text().catch(() => '')

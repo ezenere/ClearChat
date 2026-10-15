@@ -3,11 +3,13 @@
 // provedor. O valor é o par { providerId, model } — o mesmo id em dois provedores são duas opções.
 import {
   AlertTriangle,
+  AudioLines,
   Check,
   ChevronDown,
   ChevronRight,
   CornerDownLeft,
   Eye,
+  FileText,
   RefreshCw,
   Search,
   Settings2,
@@ -287,6 +289,8 @@ export function ModelPicker({
         const m = r.model
         const price = priceLine(m)
         const vision = m.inputModalities?.includes('image')
+        const pdf = m.inputModalities?.includes('file')
+        const audio = m.inputModalities?.includes('audio')
         return (
           <button
             type="button"
@@ -320,6 +324,8 @@ export function ModelPicker({
                   />
                 )}
                 {vision && <Eye aria-label="visão" className="size-3 shrink-0 text-subtle" />}
+                {pdf && <FileText aria-label="PDF" className="size-3 shrink-0 text-subtle" />}
+                {audio && <AudioLines aria-label="áudio" className="size-3 shrink-0 text-subtle" />}
               </span>
               <span className="block truncate font-mono text-[10.5px] text-subtle">{m.id}</span>
             </span>

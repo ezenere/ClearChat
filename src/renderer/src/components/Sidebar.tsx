@@ -14,13 +14,15 @@ export function Sidebar(): React.JSX.Element {
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const sessions = useStore((s) => s.sessions)
   const approvals = useStore((s) => s.approvals)
+  const questions = useStore((s) => s.questions)
 
   const status = useMemo(() => {
-    const out: Record<string, 'running' | 'approval' | undefined> = {}
+    const out: Record<string, 'running' | 'approval' | 'input' | undefined> = {}
     for (const ss of Object.values(sessions)) if (isBusy(ss.status)) out[ss.chatId] = 'running'
+    for (const q of questions) out[q.chatId] = 'input'
     for (const a of approvals) out[a.chatId] = 'approval'
     return out
-  }, [sessions, approvals])
+  }, [sessions, approvals, questions])
 
   return (
     <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-surface">
@@ -93,7 +95,7 @@ function ChatItem({
 }: {
   chat: Chat
   active: boolean
-  status: 'running' | 'approval' | undefined
+  status: 'running' | 'approval' | 'input' | undefined
 }): React.JSX.Element {
   const openChat = useStore((s) => s.openChat)
   const renameChat = useStore((s) => s.renameChat)
@@ -149,6 +151,14 @@ function ChatItem({
       {status === 'running' && (
         <Tip label="Executando">
           <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent-strong" />
+        </Tip>
+      )}
+      {status === 'input' && (
+        <Tip label="Aguardando sua resposta">
+          <span
+            data-testid="chat-awaiting-input"
+            className="size-1.5 shrink-0 rounded-full bg-warning shadow-[0_0_0_3px_rgb(245_181_68/0.15)]"
+          />
         </Tip>
       )}
       {status === 'approval' && (

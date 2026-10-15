@@ -372,8 +372,8 @@ test('GC: apaga só órfãos antigos do store; poupa referenciados, recentes e a
 
   // referências a partir do banco (só mensagens com clearchat-attachment://)
   const db = new Database(':memory:')
-  db.exec('CREATE TABLE messages (id TEXT, message_json TEXT)')
-  db.prepare('INSERT INTO messages VALUES (?, ?)').run(
+  db.exec('CREATE TABLE messages (id TEXT, message_json TEXT, meta_json TEXT)')
+  db.prepare('INSERT INTO messages (id, message_json) VALUES (?, ?)').run(
     '1',
     JSON.stringify({
       role: 'user',
@@ -389,7 +389,7 @@ test('GC: apaga só órfãos antigos do store; poupa referenciados, recentes e a
       ])
     })
   )
-  db.prepare('INSERT INTO messages VALUES (?, ?)').run(
+  db.prepare('INSERT INTO messages (id, message_json) VALUES (?, ?)').run(
     '2',
     JSON.stringify({ role: 'user', content: 'oi' })
   )

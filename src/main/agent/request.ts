@@ -1,12 +1,15 @@
 // Construção da request (função pura). Usada pelo runner E pelo previewRequest.
 // Ver SPEC.md → "Construção da request" e "Token caching".
 import * as os from 'os'
-import { defaultToolsPrompt, isOpenRouter } from '@shared/defaults'
+import { defaultToolsPrompt } from '@shared/defaults'
+import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
 import { TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
 import { activeHistory } from '@shared/context'
-import { bwrapAvailable } from '../tools/bash'
-import { expandAttachments } from '../attachments'
+import { bwrapAvailable, shellLabel } from '../tools/bash'
+import { expandAttachments, hoistToolMedia } from '../attachments'
+import { adapterFor, buildHeaders, chatCompletionsUrl } from './adapters'
+import { buildAnthropicBody, dropAudioParts } from './adapters/anthropic'
 import type {
   ApiMessage,
   Chat,
@@ -24,12 +27,19 @@ export interface BuiltRequest {
   url: string
   headers: Record<string, string>
   body: Record<string, unknown>
+  /**
+   * Adaptador que montou a request (formato do body e do stream). Ausente = OpenAI-compatible.
+   * streamChat usa para escolher o parser; o preview pode mostrar.
+   */
+  kind?: ProviderKind
 }
+
+export { buildHeaders, chatCompletionsUrl }
 
 export interface EnvInfo {
   os: string
   shell: string
-  /** bubblewrap instalado (o sandbox do bash só vale se existir). */
+  /** bubblewrap instalado (o sandbox do shell só vale se existir). */
   bwrap?: boolean
 }
 
@@ -45,7 +55,7 @@ export function defaultEnvInfo(): EnvInfo {
           : process.platform
   return {
     os: `${name} ${os.release()} (${process.arch})`,
-    shell: 'bash',
+    shell: shellLabel(),
     bwrap: bwrapAvailable()
   }
 }
@@ -62,12 +72,12 @@ export function environmentBlock(
     `root: ${cfg.cwd}`,
     `os: ${env.os}`,
     `shell: ${env.shell}`,
-    'Diretório raiz (workspace) desta sessão: root acima. Caminhos relativos nas ferramentas resolvem a partir dele e o bash começa nele (o diretório do shell persiste entre chamadas).'
+    'Diretório raiz (workspace) desta sessão: root acima. Caminhos relativos nas ferramentas resolvem a partir dele e o shell começa nele (o diretório do shell persiste entre chamadas).'
   ]
   if (cfg.confineToRoot)
     lines.push('As ferramentas de arquivo só acessam caminhos dentro do diretório raiz.')
   if (cfg.sandboxBash && env.bwrap)
-    lines.push('O bash roda em sandbox: só o diretório raiz (e um /tmp privado) é gravável.')
+    lines.push('O shell roda em sandbox: só o diretório raiz (e um /tmp privado) é gravável.')
   return `<environment>\n${lines.join('\n')}\n</environment>`
 }
 
@@ -90,7 +100,7 @@ export function hasDelegated(history: StoredMessage[]): boolean {
 
 /**
  * Tools disponíveis para a sessão: habilitadas no chat, na ordem fixa de TOOL_NAMES; delegate só se
- * depth < 2. As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
+ * depth < 2; ask_user só na principal (depth 0). As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
  * num SUBAGENTE, e quando o histórico é informado (request), só depois que ele criou algum
  * subagente: modelos fracos não as confundem com "responder" a quem delegou (o prefixo de cache
  * muda uma vez, no primeiro delegate). A principal as vê sempre (para planejar). Sem histórico
@@ -110,6 +120,8 @@ export function availableTools(
     (n) =>
       enabled.has(n) &&
       (n !== 'delegate_task' || session.depth < 2) &&
+      // só a sessão principal pergunta ao usuário (subagentes decidem sozinhos)
+      (n !== 'ask_user' || session.depth === 0) &&
       (!SUBAGENT_TOOLS.includes(n) || canDelegate)
   )
 }
@@ -283,28 +295,9 @@ export function applyCacheBreakpoints(messages: ApiMessage[]): WireMessage[] {
 }
 
 /**
- * Headers: Content-Type, Authorization, assinatura de app (HTTP-Referer/X-Title, qualquer provider)
- * e por último provider.headers (sobrescrevem).
- */
-export function buildHeaders(
-  provider: Provider,
-  appSignature: Record<string, string> = {}
-): Record<string, string> {
-  const h: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (provider.apiKey) h['Authorization'] = `Bearer ${provider.apiKey}`
-  Object.assign(h, appSignature)
-  for (const [k, v] of Object.entries(provider.headers ?? {})) {
-    if (typeof v === 'string') h[k] = v
-  }
-  return h
-}
-
-export function chatCompletionsUrl(baseUrl: string): string {
-  return `${baseUrl.replace(/\/+$/, '')}/chat/completions`
-}
-
-/**
- * Monta a request EXATA para `POST {baseUrl}/chat/completions`.
+ * Monta a request EXATA da próxima chamada, no formato do adaptador do provider:
+ * 'openai'/'openrouter' → `POST {baseUrl}/chat/completions`; 'anthropic' → `POST {baseUrl}/messages`
+ * (ver adapters/anthropic.ts).
  * - Só o histórico a partir da fronteira de compactação mais recente (meta.kind 'compaction') vai;
  *   as mensagens anteriores continuam salvas (e visíveis), mas não são enviadas.
  * - Mensagens com meta.kind === 'error' (se existirem) não são enviadas.
@@ -319,7 +312,8 @@ export function buildRequest(
   env: EnvInfo = defaultEnvInfo()
 ): BuiltRequest {
   const cfg = chat.config
-  const openRouter = isOpenRouter(provider.baseUrl)
+  const kind = providerKind(provider)
+  const openRouter = kind === 'openrouter'
 
   const sys = systemContent(chat, session, env, history)
   const hist = sanitizeHistory(
@@ -332,8 +326,36 @@ export function buildRequest(
   if (sys) messages.push({ role: 'system', content: sys })
   messages.push(...hist)
 
+  const signature = resolveAppSignatureHeaders(
+    cfg.appSignature ?? DEFAULT_APP_SIGNATURE,
+    cfg.appSignatureCustom
+  )
+  const adapter = adapterFor(kind)
+  const tools = availableTools(chat, session, history)
+  const params = cfg.params ?? {}
+
+  if (kind === 'anthropic') {
+    // Anexos: áudio vira placeholder (a API não aceita); demais referências → base64 (na cópia).
+    const sent = expandAttachments(dropAudioParts(messages))
+    return {
+      url: adapter.chatUrl(provider.baseUrl),
+      headers: adapter.headers(provider, signature),
+      body: buildAnthropicBody({
+        model: session.model,
+        messages: sent,
+        tools: cfg.nativeTools && tools.length ? toolDefinitions(tools) : undefined,
+        params,
+        cacheEnabled: cfg.cacheEnabled,
+        extra: parseExtraBody(params.extraBody)
+      }),
+      kind
+    }
+  }
+
   // Anexos: referências clearchat-attachment:// → base64 e `_attachment` removido (só na cópia).
-  const sent = expandAttachments(messages)
+  // Mídia de resultados de tool (read_file) → mensagem user logo após o bloco de tools (role:tool
+  // só aceita texto no Chat Completions — ver hoistToolMedia).
+  const sent = expandAttachments(hoistToolMedia(messages))
   const wire: WireMessage[] = cfg.cacheEnabled ? applyCacheBreakpoints(sent) : sent
 
   const body: Record<string, unknown> = {
@@ -343,10 +365,8 @@ export function buildRequest(
     stream_options: { include_usage: true }
   }
 
-  const tools = availableTools(chat, session, history)
   if (cfg.nativeTools && tools.length) body.tools = toolDefinitions(tools)
 
-  const params = cfg.params ?? {}
   for (const k of PARAM_KEYS) {
     const v = params[k]
     if (v !== undefined && v !== null && !(typeof v === 'number' && Number.isNaN(v))) body[k] = v
@@ -360,14 +380,11 @@ export function buildRequest(
   const extra = parseExtraBody(params.extraBody)
   if (extra) Object.assign(body, extra)
 
-  const signature = resolveAppSignatureHeaders(
-    cfg.appSignature ?? DEFAULT_APP_SIGNATURE,
-    cfg.appSignatureCustom
-  )
   return {
-    url: chatCompletionsUrl(provider.baseUrl),
-    headers: buildHeaders(provider, signature),
-    body
+    url: adapter.chatUrl(provider.baseUrl),
+    headers: adapter.headers(provider, signature),
+    body,
+    kind
   }
 }
 
@@ -378,7 +395,7 @@ export function maskKey(key: string): string {
   return `${key.slice(0, 6)}…${key.slice(-4)}`
 }
 
-/** Versão para exibição (preview): Authorization com a key mascarada. */
+/** Versão para exibição (preview): qualquer header com a key (Authorization, x-api-key) mascarado. */
 export function maskRequest(req: BuiltRequest, apiKey: string): BuiltRequest {
   const headers: Record<string, string> = {}
   for (const [k, v] of Object.entries(req.headers)) {

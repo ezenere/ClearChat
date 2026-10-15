@@ -246,17 +246,20 @@ async function waitRunning(ms = 30_000): Promise<void> {
 /** Pede um comando bash e espera ele estar executando (modelos baratos às vezes hesitam: reenvia). */
 async function askLongBash(cmd: string): Promise<void> {
   const prompts = [
-    `Run this exact bash command with the bash tool: ${cmd}`,
-    `Call the bash tool right now with command "${cmd}". The file exists in the working directory. Do not ask questions, just call the tool.`,
-    `bash tool, command: ${cmd} — call it immediately.`
+    `Run this exact shell command with the shell tool: ${cmd}`,
+    `Call the shell tool right now with command "${cmd}". The file exists in the working directory. Do not ask questions, just call the tool.`,
+    `shell tool, command: ${cmd} — call it immediately.`
   ]
   for (const p of prompts) {
-    const before = await toolCards('Terminal (bash)').count()
+    const before = await toolCards('Terminal (shell)').count()
     await sendMessage(p)
     const t0 = Date.now()
     while (Date.now() - t0 < 60_000) {
-      const n = await toolCards('Terminal (bash)').count()
-      if (n > before && (await toolCards('Terminal (bash)').last().getByText('executando').count()))
+      const n = await toolCards('Terminal (shell)').count()
+      if (
+        n > before &&
+        (await toolCards('Terminal (shell)').last().getByText('executando').count())
+      )
         return
       if (!(await stopBtn().count()) && Date.now() - t0 > 1500) break
       await sleep(200)
@@ -639,13 +642,13 @@ async function main(): Promise<void> {
   )
 
   await step('bash → Permitir', async () => {
-    await sendMessage('Run this exact bash command with the bash tool: echo hello-ui-allow')
+    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-allow')
     await page.getByRole('button', { name: 'Permitir' }).waitFor({ timeout: 60_000 })
     await page.getByText('Aguardando aprovação').first().waitFor()
     await shot('approval-card')
     await page.getByRole('button', { name: 'Permitir' }).click()
     await waitIdle()
-    const card = toolCards('Terminal (bash)').last()
+    const card = toolCards('Terminal (shell)').last()
     await card.getByText('ok', { exact: true }).waitFor({ timeout: 5000 })
     await card.locator('div[role="button"]').click()
     await card
@@ -656,11 +659,11 @@ async function main(): Promise<void> {
   })
 
   await step('bash → Negar', async () => {
-    await sendMessage('Run this exact bash command with the bash tool: echo hello-ui-deny')
+    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-deny')
     await page.getByRole('button', { name: 'Negar' }).waitFor({ timeout: 60_000 })
     await page.getByRole('button', { name: 'Negar' }).click()
     await waitIdle()
-    await toolCards('Terminal (bash)').last().getByText('negada').waitFor({ timeout: 5000 })
+    await toolCards('Terminal (shell)').last().getByText('negada').waitFor({ timeout: 5000 })
     const { msgs } = await currentState()
     assert(
       msgs.some((m) => m.meta.toolStatus === 'denied' && /negou/.test(m.message.content)),
@@ -669,19 +672,19 @@ async function main(): Promise<void> {
   })
 
   await step('bash → Sempre neste chat', async () => {
-    await sendMessage('Run this exact bash command with the bash tool: echo hello-ui-always')
+    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-always')
     await page.getByRole('button', { name: 'Sempre neste chat' }).waitFor({ timeout: 60_000 })
     await page.getByRole('button', { name: 'Sempre neste chat' }).click()
     await waitIdle()
     await page.getByRole('button', { name: /Auto-aprovação/ }).waitFor({ timeout: 5000 })
     const { chat } = await currentState()
-    assert(chat.config.autoApprove.includes('bash'), 'autoApprove bash')
+    assert(chat.config.autoApprove.includes('shell'), 'autoApprove bash')
     await shot('always')
   })
 
   await step('fila: mensagem durante execução vira chip e é injetada depois', async () => {
-    await sendMessage('Run this exact bash command with the bash tool: sleep 6 && echo slept-ok')
-    await toolCards('Terminal (bash)').last().getByText('executando').waitFor({ timeout: 60_000 })
+    await sendMessage('Run this exact shell command with the shell tool: sleep 6 && echo slept-ok')
+    await toolCards('Terminal (shell)').last().getByText('executando').waitFor({ timeout: 60_000 })
     await sendMessage('Depois disso, responda apenas: FILA-OK')
     const chip = page.locator('p.line-clamp-2', { hasText: 'FILA-OK' })
     await chip.waitFor({ timeout: 5000 })
@@ -714,7 +717,7 @@ async function main(): Promise<void> {
     await page.getByText('enviada agora (interrompeu o agente)').waitFor({ timeout: 10_000 })
     const took = Date.now() - t0
     await waitIdle()
-    await toolCards('Terminal (bash)').last().getByText('interrompida').waitFor({ timeout: 5000 })
+    await toolCards('Terminal (shell)').last().getByText('interrompida').waitFor({ timeout: 5000 })
     const { msgs } = await currentState()
     assert(
       msgs.some((m) => m.meta.kind === 'forced'),
@@ -733,7 +736,7 @@ async function main(): Promise<void> {
     const t0 = Date.now()
     await stopBtn().click()
     await waitIdle(15_000)
-    await toolCards('Terminal (bash)').last().getByText('interrompida').waitFor({ timeout: 5000 })
+    await toolCards('Terminal (shell)').last().getByText('interrompida').waitFor({ timeout: 5000 })
     await page.getByPlaceholder('Mensagem…').waitFor()
     return `parou em ${Date.now() - t0}ms`
   })
@@ -1491,7 +1494,7 @@ async function main(): Promise<void> {
     await ed.getByLabel('System prompt', { exact: true }).fill('System editado nas configurações.')
     await shot('preset-editor')
     await ed.getByRole('tab', { name: 'Tools' }).click()
-    await ed.getByRole('switch', { name: 'Terminal (bash)' }).first().click()
+    await ed.getByRole('switch', { name: 'Terminal (shell)' }).first().click()
     await shot('preset-editor-tools')
     await ed.getByRole('button', { name: 'Salvar persona' }).click()
     await presetRow('Revisor E2E 2').waitFor({ timeout: 5000 })
@@ -1499,7 +1502,7 @@ async function main(): Promise<void> {
     assert(p.name === 'Revisor E2E 2', `nome ${p.name}`)
     assert(p.config.systemPrompt === 'System editado nas configurações.', 'system editado')
     assert(
-      Array.isArray(p.config.enabledTools) && !p.config.enabledTools.includes('bash'),
+      Array.isArray(p.config.enabledTools) && !p.config.enabledTools.includes('shell'),
       `tools ${JSON.stringify(p.config.enabledTools)}`
     )
     assert(p.config.model === MODEL, 'modelo mantido')
@@ -1557,7 +1560,7 @@ async function main(): Promise<void> {
     await page.getByRole('button', { name: 'Começar' }).click()
     await composer().waitFor({ timeout: 10_000 })
     await sendMessage(
-      'Use the delegate_task tool to ask a subagent to run the bash command "echo sub-approval-ok" with its bash tool and report the output. Then tell me the output.'
+      'Use the delegate_task tool to ask a subagent to run the bash command "echo sub-approval-ok" with its shell tool and report the output. Then tell me the output.'
     )
     const indicator = page.getByRole('button', { name: /Aprovação pendente/ })
     await indicator.waitFor({ timeout: 90_000 })

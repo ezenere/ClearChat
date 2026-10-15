@@ -1,7 +1,8 @@
 // Registro das tools executadas localmente. delegate_task é tratado pelo runner (precisa do loop).
 // send_to_chat também (precisa do loop do chat de destino).
 import type { ToolName } from '@shared/types'
-import { bash } from './bash'
+import { shell } from './bash'
+import { processList, processLogs, processStart, processStop } from './processes'
 import { editFile, listDir, readFile, writeFile } from './files'
 import { findFiles, searchFiles } from './search'
 import { listModelsTool } from './models'
@@ -22,7 +23,7 @@ import {
 
 export type { ShellState, ToolContext, ToolResult } from './util'
 
-/** Diretório do shell (bash) por sessão — persiste entre chamadas; volta ao raiz se o raiz mudar. */
+/** Diretório do shell (tool shell) por sessão — persiste entre chamadas; volta ao raiz se o raiz mudar. */
 const shells = new Map<string, ShellState>()
 
 export function shellStateFor(
@@ -53,7 +54,11 @@ const IMPLS: Partial<Record<ToolName, Impl>> = {
   find_files: findFiles,
   write_file: writeFile,
   edit_file: editFile,
-  bash,
+  shell,
+  process_start: processStart,
+  process_logs: processLogs,
+  process_list: processList,
+  process_stop: processStop,
   web_search: webSearch,
   browse_url: browseUrl,
   list_models: listModelsTool,

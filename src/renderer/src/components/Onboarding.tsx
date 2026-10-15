@@ -1,6 +1,7 @@
 import { ArrowRight } from 'lucide-react'
 import { useState } from 'react'
 import { DEFAULT_BASE_URL, DEFAULT_PROVIDER_NAME } from '@shared/defaults'
+import { inferProviderKind } from '@shared/providerKinds'
 import { api, errorMessage } from '../lib/api'
 import { useStore } from '../store'
 import { Logo } from './Logo'
@@ -11,6 +12,7 @@ import { Button } from './ui/controls'
 export function Onboarding(): React.JSX.Element {
   const [draft, setDraft] = useState<ProviderDraft>({
     name: DEFAULT_PROVIDER_NAME,
+    kind: inferProviderKind(DEFAULT_BASE_URL),
     baseUrl: DEFAULT_BASE_URL,
     apiKey: '',
     headersText: ''
@@ -44,8 +46,8 @@ export function Onboarding(): React.JSX.Element {
             <Logo className="mb-5 size-11" />
             <h1 className="text-[22px] font-semibold tracking-tight">Bem-vindo ao ClearChat</h1>
             <p className="mt-2 max-w-[320px] text-[13px] leading-relaxed text-muted">
-              Conecte um provedor compatível com a API da OpenAI para começar. Você pode adicionar
-              outros depois.
+              Conecte um provedor (OpenRouter, Anthropic ou qualquer API compatível com a da OpenAI)
+              para começar. Você pode adicionar outros depois.
             </p>
           </div>
           <form

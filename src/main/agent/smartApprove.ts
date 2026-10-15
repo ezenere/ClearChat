@@ -1,12 +1,13 @@
 // Smart-Approve no main: chamada ao juiz (fora do histórico) e liberações de uma vez só
 // ("Executar mesmo assim"). As regras puras ficam em @shared/smartApprove.
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
-import { isOpenRouter } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import {
   argsKey,
   buildJudgeBody,
   buildJudgeMessages,
   parseJudgeOutput,
+  SMART_APPROVE_DEFAULTS,
   type JudgeContext
 } from '@shared/smartApprove'
 import type {
@@ -17,7 +18,9 @@ import type {
   ToolName
 } from '@shared/types'
 import { newAccumulator, streamChat } from './llm'
-import { buildHeaders, chatCompletionsUrl, maskRequest, type BuiltRequest } from './request'
+import { maskRequest, type BuiltRequest } from './request'
+import { adapterFor } from './adapters'
+import { buildAnthropicBody } from './adapters/anthropic'
 
 export interface JudgeInput {
   /** Config já normalizada (normalizeSmartApprove). */
@@ -38,14 +41,26 @@ export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltReque
     input.chatConfig.appSignature ?? DEFAULT_APP_SIGNATURE,
     input.chatConfig.appSignatureCustom
   )
+  const kind = providerKind(provider)
+  const adapter = adapterFor(kind)
+  const messages = buildJudgeMessages(sa, input.ctx)
+  // Anthropic nativa: mesmos parâmetros (temperature 0, max_tokens) no formato /messages.
+  const body =
+    kind === 'anthropic'
+      ? buildAnthropicBody({
+          model: sa.model,
+          messages,
+          params: {
+            temperature: SMART_APPROVE_DEFAULTS.temperature,
+            max_tokens: SMART_APPROVE_DEFAULTS.maxTokens
+          }
+        })
+      : buildJudgeBody(sa.model, messages, kind === 'openrouter')
   return {
-    url: chatCompletionsUrl(provider.baseUrl),
-    headers: buildHeaders(provider, signature),
-    body: buildJudgeBody(
-      sa.model,
-      buildJudgeMessages(sa, input.ctx),
-      isOpenRouter(provider.baseUrl)
-    )
+    url: adapter.chatUrl(provider.baseUrl),
+    headers: adapter.headers(provider, signature),
+    body,
+    kind
   }
 }
 

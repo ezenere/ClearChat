@@ -2,11 +2,12 @@ import { promises as fs } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { LIMITS } from '@shared/limits'
-import type { ModelInfo, StoredMessage } from '@shared/types'
+import type { ContentPart, ModelInfo, StoredMessage } from '@shared/types'
+import type { MediaContext } from './media'
 
 export const MAX_OUTPUT: number = LIMITS.maxToolOutputChars
 
-/** Estado do shell de uma sessão (bash): diretório atual, persistido entre chamadas. */
+/** Estado do shell de uma sessão (tool shell): diretório atual, persistido entre chamadas. */
 export interface ShellState {
   root: string
   dir: string
@@ -22,10 +23,13 @@ export interface ToolContext {
   signal: AbortSignal
   /** Saída parcial (ex.: bash) — o chamador faz throttle e emite `tool-running`. */
   onOutput?: (partial: string) => void
-  /** bash: diretório do shell persistido entre chamadas (por sessão). */
+  /** shell / process_start: diretório do shell persistido entre chamadas (por sessão). */
   shell?: ShellState
-  /** bash: roda via bubblewrap (raiz gravável, resto somente leitura). */
+  /** shell / process_start: roda via bubblewrap (raiz gravável, resto somente leitura). */
   sandbox?: boolean
+  /** Chat / sessão chamadores (process_*: registro de processos por chat). */
+  chatId?: string
+  sessionId?: string
   /** Chave de cache por sessão (browse_url). */
   cacheKey?: string
   /**
@@ -47,6 +51,11 @@ export interface ToolContext {
   chats?: { self: () => ChatInfoData; list: () => ChatListEntry[] }
   /** read_history: mensagens persistidas da sessão chamadora (inclui as anteriores às fronteiras). */
   history?: () => StoredMessage[]
+  /**
+   * read_file: provider + modelo da sessão — decide se imagens/PDF podem ser devolvidos ao modelo
+   * (mesma regra de capacidade dos anexos). Ausente = só texto.
+   */
+  media?: MediaContext
 }
 
 /** get_chat_info: o chat/sessão que chamou a tool. */
@@ -69,7 +78,7 @@ export interface ChatListEntry {
   id: string
   title: string
   model: string
-  status: 'idle' | 'running' | 'awaiting_approval'
+  status: 'idle' | 'running' | 'awaiting_approval' | 'awaiting_input'
   updatedAt: number
   self: boolean
 }
@@ -78,6 +87,12 @@ export interface ToolResult {
   content: string
   status: 'ok' | 'error'
   meta?: { shellCwd?: string }
+  /**
+   * Conteúdo multimodal (read_file de imagem/PDF): parts persistidos por referência
+   * (`clearchat-attachment://…` + `_attachment`). Quando presente, é o conteúdo da mensagem tool;
+   * `content` fica como o texto equivalente.
+   */
+  parts?: ContentPart[]
 }
 
 export class ToolError extends Error {}

@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { join } from 'path'
 import Database from 'better-sqlite3'
 import { DB_FILENAME } from './migrate'
+import { migrateToolShellRename } from './migrateTools'
 
 // Schema: ver SPEC.md → "Banco". JSON fica em colunas *_json; IDs = crypto.randomUUID(); timestamps = Date.now().
 const SCHEMA = `
@@ -88,6 +89,26 @@ function migrate(conn: Database.Database): void {
   )
   // provedor da subsessão (a principal segue o do chat)
   if (!cols.includes('provider_id')) conn.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT')
+  // tipo do provider (adaptador); vazio = inferido pela base_url — preenchido aqui uma vez
+  const pcols = (conn.prepare('PRAGMA table_info(providers)').all() as { name: string }[]).map(
+    (c) => c.name
+  )
+  if (!pcols.includes('kind')) {
+    conn.exec("ALTER TABLE providers ADD COLUMN kind TEXT NOT NULL DEFAULT ''")
+    conn.exec(
+      "UPDATE providers SET kind = CASE WHEN base_url LIKE '%openrouter.ai%' THEN 'openrouter' WHEN base_url LIKE '%api.anthropic.com%' THEN 'anthropic' ELSE 'openai' END"
+    )
+  }
+  // tool `bash` renomeada para `shell` (histórico, configs de chats e personas) — uma vez
+  try {
+    const r = migrateToolShellRename(conn)
+    if (!r.skipped)
+      console.log(
+        `[clearchat] migração bash→shell: ${r.messages} mensagens, ${r.metas} metas, ${r.chats} chats, ${r.presets} personas`
+      )
+  } catch (e) {
+    console.error('[clearchat] migração bash→shell', e)
+  }
 }
 
 export function closeDb(): void {

@@ -70,7 +70,7 @@ test('system + env + tools + cache_control na cópia', () => {
   assert.equal(
     body.messages[0].content[0].text,
     'SYS\n\n<environment>\nroot: /work\nos: Linux 6.0 (x64)\nshell: bash\n' +
-      'Diretório raiz (workspace) desta sessão: root acima. Caminhos relativos nas ferramentas resolvem a partir dele e o bash começa nele (o diretório do shell persiste entre chamadas).\n' +
+      'Diretório raiz (workspace) desta sessão: root acima. Caminhos relativos nas ferramentas resolvem a partir dele e o shell começa nele (o diretório do shell persiste entre chamadas).\n' +
       'As ferramentas de arquivo só acessam caminhos dentro do diretório raiz.\n</environment>'
   )
   // último user com cache_control; o primeiro user continua string
@@ -79,10 +79,10 @@ test('system + env + tools + cache_control na cópia', () => {
     { type: 'text', text: 'leia x', cache_control: { type: 'ephemeral' } }
   ])
   assert.equal(JSON.stringify(hist), before, 'histórico não pode ser mutado')
-  assert.equal(body.tools.length, 19)
-  // num subagente, as tools de gerenciar subagentes só aparecem depois do primeiro delegate_task
+  assert.equal(body.tools.length, 24)
+  // num subagente (sem ask_user: subagentes não perguntam ao usuário), as tools de gerenciar subagentes só aparecem depois do primeiro delegate_task
   const sub1 = buildRequest(mkChat(), { depth: 1, model: 'm' }, hist, orProvider, env).body as any
-  assert.equal(sub1.tools.length, 15)
+  assert.equal(sub1.tools.length, 19)
   assert.ok(!sub1.tools.some((t: any) => t.function.name === 'message_subagent'))
   const delegated = [
     ...hist,
@@ -96,7 +96,8 @@ test('system + env + tools + cache_control na cópia', () => {
     sm({ role: 'tool', tool_call_id: 'd1', content: 'ok' })
   ]
   const req2 = buildRequest(mkChat(), { depth: 1, model: 'm' }, delegated, orProvider, env)
-  assert.equal((req2.body as any).tools.length, 19)
+  assert.equal((req2.body as any).tools.length, 23)
+  assert.ok(!(req2.body as any).tools.some((t: any) => t.function.name === 'ask_user'))
   assert.equal(body.tools[0].function.name, 'list_dir')
   assert.ok(body.tools.some((t: any) => t.function.name === 'search_files'))
   assert.equal(req.headers['Authorization'], `Bearer ${orProvider.apiKey}`)
@@ -163,7 +164,7 @@ test('sem cache, sem env, system vazio → sem mensagem system; depth 2 sem dele
   assert.ok(!body.tools.some((t: any) => t.function.name === 'delegate_task'))
   // ferramentas de subagentes só existem com delegate_task disponível
   assert.ok(!body.tools.some((t: any) => t.function.name === 'check_subagents'))
-  assert.equal(body.tools.length, 14)
+  assert.equal(body.tools.length, 18)
 })
 
 test('toolsInPrompt usa só as tools disponíveis; nativeTools=false omite tools', () => {
@@ -1035,6 +1036,7 @@ test('migração: no-op sem banco antigo; não sobrescreve banco novo; banco ant
 import {
   delegateEmptyText,
   delegateFailureText,
+  isNetworkError,
   fmtContext,
   formatModelLine,
   formatModelList,
@@ -1344,7 +1346,7 @@ test('toolDefinitionFor: provider some com 1 provedor, enum com vários', () => 
   assert.ok(!('enum' in props('list_models', ['A', 'A'])).provider)
   // o resto não muda; outras tools: o mesmo objeto
   assert.ok('task' in props('delegate_task', []))
-  assert.equal(toolDefinitionFor('bash', ['A', 'B']), TOOL_DEFINITIONS.bash)
+  assert.equal(toolDefinitionFor('read_file', ['A', 'B']), TOOL_DEFINITIONS.read_file)
   assert.ok('provider' in TOOL_DEFINITIONS.delegate_task.function.parameters.properties)
 })
 
@@ -1476,6 +1478,28 @@ test('delegate_task: falha do modelo do subagente vira erro acionável', () => {
   assert.match(delegateEmptyText('x/y:free'), /possível falha do modelo x\/y:free/)
 })
 
+test('delegate_task: falha de rede (tampa fechada, Wi-Fi) não culpa o modelo', () => {
+  for (const err of [
+    'terminated',
+    'TypeError: terminated',
+    'Falha de rede ao chamar https://api.anthropic.com/v1/messages: fetch failed (getaddrinfo ENOTFOUND api.anthropic.com)',
+    'other side closed',
+    'read ECONNRESET',
+    'Sem resposta do provider por 120s (timeout).'
+  ]) {
+    assert.ok(isNetworkError(err), err)
+    const t = delegateFailureText('claude-opus-5-5', err)
+    assert.match(t, /^\[falha de conexão com o provedor \(modelo claude-opus-5-5\)/, err)
+    assert.match(t, /message_subagent/)
+    assert.doesNotMatch(t, /Tente outro modelo/)
+  }
+  for (const err of [
+    'Erro HTTP 429 Too Many Requests: rate limited',
+    'Erro HTTP 400: invalid request'
+  ])
+    assert.ok(!isNetworkError(err), err)
+})
+
 // ---------------- personas (presets) ----------------
 import {
   PRESET_FIELDS,
@@ -1491,8 +1515,8 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   const cfg = {
     ...DEFAULT_CHAT_CONFIG('/proj', { providerId: 'p1', model: 'm1', systemPrompt: 'SYS' }),
     params: { temperature: 0.2, top_p: null, extraBody: '{"a":1}' },
-    enabledTools: ['read_file', 'bash'],
-    autoApprove: ['bash'],
+    enabledTools: ['read_file', 'shell'],
+    autoApprove: ['shell'],
     nativeTools: false,
     toolsInPrompt: true,
     toolsPromptText: 'TXT',
@@ -1517,8 +1541,8 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   assert.equal(snap.model, 'm1')
   assert.equal(snap.systemPrompt, 'SYS')
   assert.deepEqual(snap.params, { temperature: 0.2, extraBody: '{"a":1}' }) // null removido
-  assert.deepEqual(snap.enabledTools, ['read_file', 'bash'])
-  assert.deepEqual(snap.autoApprove, ['bash'])
+  assert.deepEqual(snap.enabledTools, ['read_file', 'shell'])
+  assert.deepEqual(snap.autoApprove, ['shell'])
   assert.equal(snap.toolsPromptText, 'TXT')
   assert.deepEqual(snap.appSignatureCustom, { referer: 'https://x.dev', title: 'X' })
   assert.equal(snap.contextWindow, 64000)
@@ -1527,7 +1551,7 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   assert.ok(!('cwd' in snap) && !('presetId' in snap))
   // cópia profunda: mexer no snapshot não altera o chat
   ;(snap.enabledTools as string[]).push('write_file')
-  assert.deepEqual(cfg.enabledTools, ['read_file', 'bash'])
+  assert.deepEqual(cfg.enabledTools, ['read_file', 'shell'])
   // cwd só com includeCwd
   assert.equal(snapshotPreset(cfg, { includeCwd: true }).cwd, '/proj')
   assert.ok(!('cwd' in withoutCwd(snapshotPreset(cfg, { includeCwd: true }))))
@@ -1749,7 +1773,7 @@ test('compactação: nota menciona read_history (faixa) só se a tool estiver ha
     new RegExp(`mensagens #${hist[0].seq}–#${hist[1].seq}\\).*read_history`)
   )
   const without = compactionMeta(
-    mkChat({ enabledTools: ['bash'] }),
+    mkChat({ enabledTools: ['shell'] }),
     { depth: 0 },
     hist,
     'R',

@@ -56,9 +56,9 @@ async function readBody(req: IncomingMessage): Promise<string> {
 const textOf = (c: any): string =>
   typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => p.text ?? '').join('') : ''
 
-/** Comando pedido na última mensagem do usuário: "rode: <cmd>" ou "Pode executar bash `<cmd>`". */
+/** Comando pedido na última mensagem do usuário: "rode: <cmd>" ou "Pode executar shell `<cmd>`". */
 function commandFrom(text: string): string | null {
-  const m = /rode:\s*(.+)$/m.exec(text) ?? /Pode executar bash `([^`]+)`/.exec(text)
+  const m = /rode:\s*(.+)$/m.exec(text) ?? /Pode executar shell `([^`]+)`/.exec(text)
   return m ? m[1].trim() : null
 }
 
@@ -139,7 +139,7 @@ async function startFake(): Promise<void> {
                 index: 0,
                 id: `call_${Date.now().toString(36)}`,
                 type: 'function',
-                function: { name: 'bash', arguments: JSON.stringify({ command: cmd }) }
+                function: { name: 'shell', arguments: JSON.stringify({ command: cmd }) }
               }
             ]
           }
@@ -229,7 +229,7 @@ const composer = (): Locator =>
   page.locator('textarea[placeholder="Mensagem…"], textarea[placeholder="Enviar para a fila…"]')
 const stopBtn = (): Locator => page.getByRole('button', { name: 'Parar', exact: true })
 const bashCards = (): Locator =>
-  page.locator('div.rounded-xl').filter({ has: page.locator('span:text-is("Terminal (bash)")') })
+  page.locator('div.rounded-xl').filter({ has: page.locator('span:text-is("Terminal (shell)")') })
 const section = (): Locator => page.locator('section[data-section="smart-approve"]')
 
 async function sendMessage(text: string): Promise<void> {
@@ -443,7 +443,7 @@ async function main(): Promise<void> {
       const before = judgeHits().length
       const card = bashCards().nth((await bashCards().count()) - 1)
       await card.getByRole('button', { name: 'Executar mesmo assim' }).click()
-      await page.getByText('Pode executar bash `echo SA-REJECTED`; eu aprovo.').first().waitFor()
+      await page.getByText('Pode executar shell `echo SA-REJECTED`; eu aprovo.').first().waitFor()
       await waitIdle()
       await card.getByTestId('smart-overridden').waitFor()
       const runCard = bashCards().last()
@@ -554,11 +554,11 @@ async function main(): Promise<void> {
       await pop.getByText('fake/judge-1'.split('/').pop()!).waitFor()
       await sleep(400) // animação de entrada
       await shot('header-popover')
-      await pop.getByRole('button', { name: 'Revogar Terminal (bash)' }).click()
+      await pop.getByRole('button', { name: 'Revogar Terminal (shell)' }).click()
       await sleep(300)
       let cfg = (await chatState()).chat.config
       assert(
-        !cfg.autoApprove.includes('bash') && cfg.autoApprove.length === 2,
+        !cfg.autoApprove.includes('shell') && cfg.autoApprove.length === 2,
         `revogou ${cfg.autoApprove}`
       )
       assert((await pop.getByTestId('auto-approve-item').count()) === 2, '2 tools')

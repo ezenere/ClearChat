@@ -37,7 +37,8 @@ export function fmtAgo(ts: number, now = Date.now()): string {
 const STATUS_LABEL: Record<ChatListEntry['status'], string> = {
   idle: 'ocioso',
   running: 'rodando',
-  awaiting_approval: 'aguardando aprovação'
+  awaiting_approval: 'aguardando aprovação',
+  awaiting_input: 'aguardando resposta do usuário'
 }
 
 export function formatChatInfo(i: ChatInfoData): string {

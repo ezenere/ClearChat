@@ -19,6 +19,7 @@ import {
   type ToolContext,
   type ToolResult
 } from './util'
+import { MEDIA_LIMITS, readMediaFile, sniffMedia } from './media'
 
 export async function listDir(
   args: Record<string, unknown>,
@@ -158,9 +159,27 @@ export async function readFile(
   const limArg = optNumber(args, 'limit')
   const explicit = offArg !== undefined || limArg !== undefined
   const head = await readHead(path, 8000)
+  // Imagem/PDF: devolve ao modelo se ele lê o tipo (ver media.ts); SVG é XML → cai no texto.
+  const media = sniffMedia(head)
+  if (media) {
+    if (st.size > MEDIA_LIMITS.imageMaxInputBytes)
+      return fail(
+        `Erro: "${shown}" é um arquivo binário (${binaryKind(head)}, ${fmtSize(st.size)}) grande demais para devolver ao modelo.`
+      )
+    const r = await readMediaFile({
+      data: await fs.readFile(path),
+      kind: media.kind,
+      mime: media.mime,
+      shown,
+      media: ctx.media,
+      ignoredArgs: explicit
+    })
+    if (r.status === 'error' || !r.parts) return fail(r.text)
+    return { content: r.text, status: 'ok', parts: r.parts }
+  }
   if (isBinary(head)) {
     return fail(
-      `Erro: "${shown}" é um arquivo binário (${binaryKind(head)}, ${fmtSize(st.size)}). read_file só lê arquivos de texto.`
+      `Erro: "${shown}" é um arquivo binário (${binaryKind(head)}, ${fmtSize(st.size)}). read_file lê arquivos de texto e, se o modelo aceitar, imagens (png/jpg/webp/gif) e PDF.`
     )
   }
   if (st.size > LIMITS.readHardMaxBytes && !explicit) {

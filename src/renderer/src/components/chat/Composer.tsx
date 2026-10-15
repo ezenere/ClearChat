@@ -1,9 +1,7 @@
 import { ArrowUp, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { isOpenRouter } from '@shared/defaults'
-import { modalitySupport, modalityWarning, type ModalitySupport } from '@shared/attachments'
-import { sessionProviderId } from '@shared/models'
-import type { AttachmentInfo, QueuedMessage, Session } from '@shared/types'
+import { modalityWarning } from '@shared/attachments'
+import type { QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { splitInterChatText } from '@shared/interChat'
@@ -12,7 +10,9 @@ import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
 import { AutoTextarea } from '../ui/controls'
 import { ComposerAttachmentChip } from './Attachments'
+import { useAttachmentSupport } from './attachmentSupport'
 import { CompactBanner, ContextMeter } from './ContextMeter'
+import { QuestionForm } from './AskUser'
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
 function pastedName(file: File, i: number): File {
@@ -22,21 +22,6 @@ function pastedName(file: File, i: number): File {
   const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg')
   const name = `colado-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${i ? `-${i + 1}` : ''}.${ext}`
   return new File([file], name, { type: file.type })
-}
-
-/** Suporte do modelo atual a cada tipo de anexo (inputModalities do /models). */
-function useModalitySupport(session: Session): (a: AttachmentInfo) => ModalitySupport {
-  const chat = useStore((s) => s.chats.find((c) => c.id === session.chatId))
-  const providerId = chat ? sessionProviderId(chat.config, session) : ''
-  const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
-  const models = useStore((s) => s.models[providerId])
-  const loadModels = useStore((s) => s.loadModels)
-  useEffect(() => {
-    if (providerId) void loadModels(providerId)
-  }, [providerId, loadModels])
-  const model = models?.list.find((m) => m.id === session.model)
-  const openRouter = !!provider && isOpenRouter(provider.baseUrl)
-  return (a) => modalitySupport(a.kind, model, openRouter)
 }
 
 /** Origem de um item da fila que não foi digitado pelo usuário (outro chat, pai, subagente). */
@@ -112,6 +97,8 @@ export function Composer({
   const send = useStore((s) => s.send)
   const run = useStore((s) => s.run)
   const busy = isBusy(session.status)
+  /** Questionário (ask_user) pendente nesta sessão: substitui o campo de texto. */
+  const question = useStore((s) => s.questions.find((q) => q.sessionId === session.id))
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
   const pending = useStore(selectPendingAttachments(session.id))
@@ -119,7 +106,7 @@ export function Composer({
   const pickFiles = useStore((s) => s.pickFiles)
   const removeAttachment = useStore((s) => s.removeAttachment)
   const clearAttachments = useStore((s) => s.clearAttachments)
-  const supportOf = useModalitySupport(session)
+  const { supportOf, tooltip: attachTip } = useAttachmentSupport(session)
   /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
@@ -200,7 +187,8 @@ export function Composer({
           )}
           onClick={() => ref.current?.focus()}
         >
-          {pending.length > 0 && (
+          {question && <QuestionForm key={question.id} request={question} />}
+          {!question && pending.length > 0 && (
             <div className="flex flex-wrap gap-2 px-3 pt-3" onClick={(e) => e.stopPropagation()}>
               {pending.map((a) => (
                 <ComposerAttachmentChip
@@ -212,7 +200,7 @@ export function Composer({
               ))}
             </div>
           )}
-          {warnings.length > 0 && (
+          {!question && warnings.length > 0 && (
             <div
               role="alert"
               onClick={(e) => e.stopPropagation()}
@@ -242,59 +230,65 @@ export function Composer({
               </button>
             </div>
           )}
-          <AutoTextarea
-            ref={ref}
-            value={text}
-            minRows={1}
-            maxRows={14}
-            placeholder={
-              busy
-                ? 'Enviar para a fila…'
-                : session.depth > 0
-                  ? 'Mensagem ao subagente…'
-                  : 'Mensagem…'
-            }
-            onChange={(e) => setText(e.target.value)}
-            onPaste={(e) => {
-              const files = [...e.clipboardData.files]
-              if (!files.length) return
-              e.preventDefault()
-              void addFiles(session.id, files.map(pastedName))
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                e.preventDefault()
-                void submit()
+          {!question && (
+            <AutoTextarea
+              ref={ref}
+              value={text}
+              minRows={1}
+              maxRows={14}
+              placeholder={
+                busy
+                  ? 'Enviar para a fila…'
+                  : session.depth > 0
+                    ? 'Mensagem ao subagente…'
+                    : 'Mensagem…'
               }
-            }}
-            className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
-          />
+              onChange={(e) => setText(e.target.value)}
+              onPaste={(e) => {
+                const files = [...e.clipboardData.files]
+                if (!files.length) return
+                e.preventDefault()
+                void addFiles(session.id, files.map(pastedName))
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault()
+                  void submit()
+                }
+              }}
+              className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
+            />
+          )}
           <div className="flex items-center gap-2 px-2.5 pb-2.5">
-            <Tip label="Anexar arquivos (imagens, PDF, áudio, texto) — ou arraste/cole">
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  void pickFiles(session.id)
-                }}
-                className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
-                aria-label="Anexar arquivos"
-              >
-                <Paperclip className="size-4" />
-              </button>
-            </Tip>
+            {!question && (
+              <Tip label={attachTip}>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    void pickFiles(session.id)
+                  }}
+                  className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
+                  aria-label="Anexar arquivos"
+                >
+                  <Paperclip className="size-4" />
+                </button>
+              </Tip>
+            )}
             <span className="flex items-center gap-1.5 text-[11px] text-faint">
               <ComposerInfo running={busy} />
               {busy ? (
                 <span className="flex items-center gap-1.5 text-subtle">
                   <span className="size-1.5 animate-pulse-soft rounded-full bg-accent-strong" />
-                  {session.status === 'awaiting_approval'
-                    ? 'Aguardando aprovação'
-                    : session.status === 'waiting'
-                      ? 'Aguardando subagentes'
-                      : compaction?.state === 'running'
-                        ? 'Compactando conversa…'
-                        : 'Trabalhando…'}
+                  {question || session.status === 'awaiting_input'
+                    ? 'Aguardando sua resposta'
+                    : session.status === 'awaiting_approval'
+                      ? 'Aguardando aprovação'
+                      : session.status === 'waiting'
+                        ? 'Aguardando subagentes'
+                        : compaction?.state === 'running'
+                          ? 'Compactando conversa…'
+                          : 'Trabalhando…'}
                 </span>
               ) : (
                 <span>
@@ -320,20 +314,22 @@ export function Composer({
                   </button>
                 </Tip>
               )}
-              <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
-                <button
-                  type="button"
-                  disabled={!canSend}
-                  onClick={(e) => {
-                    e.stopPropagation()
-                    void submit()
-                  }}
-                  className="flex size-8 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
-                  aria-label="Enviar"
-                >
-                  <ArrowUp className="size-4" strokeWidth={2.25} />
-                </button>
-              </Tip>
+              {!question && (
+                <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
+                  <button
+                    type="button"
+                    disabled={!canSend}
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      void submit()
+                    }}
+                    className="flex size-8 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
+                    aria-label="Enviar"
+                  >
+                    <ArrowUp className="size-4" strokeWidth={2.25} />
+                  </button>
+                </Tip>
+              )}
             </div>
           </div>
         </div>

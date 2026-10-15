@@ -1,10 +1,45 @@
 import { CircleAlert, CircleCheck, Eye, EyeOff, PlugZap } from 'lucide-react'
 import { useState } from 'react'
 import type { ProviderTestResult } from '@shared/ipc'
-import { parseHeaders, type ProviderDraft } from '../lib/provider'
+import { PROVIDER_KIND_LABEL, PROVIDER_KINDS, type ProviderKind } from '@shared/providerKinds'
+import { draftWithBaseUrl, draftWithKind, parseHeaders, type ProviderDraft } from '../lib/provider'
 import { cn } from '../lib/format'
 import { Button, Label } from './ui/controls'
+import { Select } from './ui/Select'
 import { ApiInfo, C } from './ui/Tooltip'
+
+const KIND_DESCRIPTION: Record<ProviderKind, string> = {
+  openai: 'Qualquer API compatível com /chat/completions da OpenAI',
+  openrouter: 'OpenAI-compatible + extras (custo, reasoning, cache, PDF em qualquer modelo)',
+  anthropic: 'POST /messages nativo: PDF, prompt caching, x-api-key'
+}
+
+function BaseUrlHelp({ kind }: { kind: ProviderKind }): React.JSX.Element {
+  if (kind === 'anthropic')
+    return (
+      <p>
+        API nativa da Anthropic: as requests vão para <C>POST {'{baseUrl}'}/messages</C> (streaming
+        SSE, headers <C>x-api-key</C> e <C>anthropic-version</C>), com suporte a PDF (bloco{' '}
+        <C>document</C>) e prompt caching (<C>cache_control</C>). A lista de modelos vem de{' '}
+        <C>GET {'{baseUrl}'}/models</C>.
+      </p>
+    )
+  if (kind === 'openrouter')
+    return (
+      <p>
+        As requests vão para <C>POST {'{baseUrl}'}/chat/completions</C> (streaming SSE) com os
+        extras do OpenRouter (<C>usage.include</C>, <C>reasoning</C>, <C>cache_control</C>, PDF via
+        file-parser) e a lista de modelos (com modalidades e preços) vem de{' '}
+        <C>GET {'{baseUrl}'}/models</C>.
+      </p>
+    )
+  return (
+    <p>
+      As requests vão para <C>POST {'{baseUrl}'}/chat/completions</C> (streaming SSE) e a lista de
+      modelos vem de <C>GET {'{baseUrl}'}/models</C>.
+    </p>
+  )
+}
 
 export function SecretInput({
   value,
@@ -95,11 +130,31 @@ export function ProviderFields({
       <div>
         <Label
           info={
-            <ApiInfo title="Base URL">
+            <ApiInfo title="Tipo / API">
               <p>
-                As requests vão para <C>POST {'{baseUrl}'}/chat/completions</C> (streaming SSE) e a
-                lista de modelos vem de <C>GET {'{baseUrl}'}/models</C>.
+                Define o adaptador usado para falar com o provedor (formato da request, headers e
+                recursos como PDF e cache).
               </p>
+            </ApiInfo>
+          }
+        >
+          Tipo / API
+        </Label>
+        <Select<ProviderKind>
+          value={draft.kind}
+          options={PROVIDER_KINDS.map((k) => ({
+            value: k,
+            label: PROVIDER_KIND_LABEL[k],
+            description: KIND_DESCRIPTION[k]
+          }))}
+          onChange={(k) => onChange(draftWithKind(draft, k))}
+        />
+      </div>
+      <div>
+        <Label
+          info={
+            <ApiInfo title="Base URL">
+              <BaseUrlHelp kind={draft.kind} />
             </ApiInfo>
           }
         >
@@ -109,7 +164,7 @@ export function ProviderFields({
           className="field font-mono text-[12.5px]"
           spellCheck={false}
           value={draft.baseUrl}
-          onChange={(e) => onChange({ ...draft, baseUrl: e.target.value })}
+          onChange={(e) => onChange(draftWithBaseUrl(draft, e.target.value))}
         />
       </div>
       <div>
@@ -117,8 +172,14 @@ export function ProviderFields({
           info={
             <ApiInfo title="API key">
               <p>
-                Enviada no header <C>Authorization: Bearer {'<chave>'}</C> de cada request. Fica
-                salva apenas no banco local; nos previews de request aparece mascarada.
+                Enviada no header{' '}
+                {draft.kind === 'anthropic' ? (
+                  <C>x-api-key: {'<chave>'}</C>
+                ) : (
+                  <C>Authorization: Bearer {'<chave>'}</C>
+                )}{' '}
+                de cada request. Fica salva apenas no banco local; nos previews de request aparece
+                mascarada.
               </p>
             </ApiInfo>
           }
@@ -128,7 +189,7 @@ export function ProviderFields({
         <SecretInput
           value={draft.apiKey}
           autoFocus={autoFocusKey}
-          placeholder="sk-…"
+          placeholder={draft.kind === 'anthropic' ? 'sk-ant-…' : 'sk-…'}
           onChange={(apiKey) => onChange({ ...draft, apiKey })}
         />
       </div>
@@ -139,7 +200,7 @@ export function ProviderFields({
               <ApiInfo title="Headers extras">
                 <p>
                   Objeto JSON de strings mesclado aos headers HTTP de todas as requests deste
-                  provedor (depois de <C>Authorization</C> e <C>Content-Type</C>).
+                  provedor (depois dos headers de autenticação e <C>Content-Type</C>).
                 </p>
               </ApiInfo>
             }

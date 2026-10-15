@@ -1,6 +1,7 @@
 // Personas no renderer: config base de um chat novo (padrões de "Novos chats") e resolução de
 // uma persona sobre ela.
-import { DEFAULT_CHAT_CONFIG, isOpenRouter } from '@shared/defaults'
+import { DEFAULT_CHAT_CONFIG, supportsCacheControl } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import { defaultModelRef, resolvePresetModel } from '@shared/models'
 import { DEFAULT_PRESET_NAME, applyPreset } from '@shared/presets'
 import type { ChatConfig, Preset, Provider } from '@shared/types'
@@ -24,14 +25,15 @@ export function newChatBase(
     providerId: ref.providerId,
     model: ref.model,
     systemPrompt: settings.defaultSystemPrompt ?? undefined,
-    baseUrl: provider?.baseUrl
+    baseUrl: provider?.baseUrl,
+    kind: provider ? providerKind(provider) : undefined
   })
 }
 
 /**
  * Config completa de uma persona: persona sobre a base. Provedor + modelo andam juntos
  * (`resolvePresetModel`): sem modelo ou com o provedor apagado → o par padrão. Sem
- * `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
+ * `cacheEnabled` na persona → segue o provedor (OpenRouter e Anthropic ligam).
  */
 export function resolvePreset(
   base: ChatConfig,
@@ -48,7 +50,7 @@ export function resolvePreset(
   cfg.model = ref.model
   if (preset?.config.cacheEnabled === undefined) {
     const prov = providers.find((p) => p.id === cfg.providerId)
-    if (prov) cfg.cacheEnabled = isOpenRouter(prov.baseUrl)
+    if (prov) cfg.cacheEnabled = supportsCacheControl(providerKind(prov))
   }
   return cfg
 }

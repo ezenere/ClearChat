@@ -27,6 +27,10 @@ import {
   MessagesSquare,
   Send,
   ShieldCheck,
+  Play,
+  ScrollText,
+  Activity,
+  MessageCircleQuestion,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
@@ -42,6 +46,9 @@ import { CopyButton } from './Markdown'
 import { StatusDot } from './SessionSwitcher'
 import { ModelLabel } from '../ui/ModelLabel'
 import { SmartApproveLine } from './SmartApprove'
+import { AskUserAnswers, AskUserQuestionsList } from './AskUser'
+import { ToolResultMedia } from './Attachments'
+import { toolContentText } from '@shared/attachments'
 
 const ICONS: Record<ToolName, LucideIcon> = {
   list_dir: FolderTree,
@@ -50,7 +57,11 @@ const ICONS: Record<ToolName, LucideIcon> = {
   find_files: FolderSearch,
   write_file: FilePlus,
   edit_file: FilePen,
-  bash: Terminal,
+  shell: Terminal,
+  process_start: Play,
+  process_logs: ScrollText,
+  process_list: Activity,
+  process_stop: CircleStop,
   web_search: Search,
   browse_url: Globe,
   list_models: Cpu,
@@ -62,7 +73,8 @@ const ICONS: Record<ToolName, LucideIcon> = {
   check_subagents: ListChecks,
   wait_subagents: Hourglass,
   cancel_subagent: CircleStop,
-  message_subagent: MessageSquareText
+  message_subagent: MessageSquareText,
+  ask_user: MessageCircleQuestion
 }
 
 const shortId = (id: string): string => (id.length > 12 ? `${id.slice(0, 8)}…` : id)
@@ -86,8 +98,25 @@ function summary(name: string, args: Record<string, unknown> | null): string {
   if (!args) return ''
   const pick = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '')
   switch (name) {
+    case 'shell':
     case 'bash':
       return pick('command')
+    case 'process_start':
+      return [pick('name') && `[${pick('name')}]`, pick('command')].filter(Boolean).join(' ')
+    case 'process_logs':
+      return [
+        pick('id'),
+        pick('pattern') && `/${pick('pattern')}/${args.case_insensitive === true ? 'i' : ''}`,
+        args.since_line != null && `desde a linha ${String(args.since_line)}`,
+        args.offset != null && `a partir da linha ${String(args.offset)}`,
+        args.tail != null && `últimas ${String(args.tail)}`
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    case 'process_list':
+      return ''
+    case 'process_stop':
+      return [pick('id'), pick('signal')].filter(Boolean).join(' · ')
     case 'web_search':
       return pick('query')
     case 'browse_url':
@@ -151,6 +180,12 @@ function summary(name: string, args: Record<string, unknown> | null): string {
     }
     case 'cancel_subagent':
       return shortId(pick('id'))
+    case 'ask_user': {
+      const qs = Array.isArray(args.questions) ? args.questions : []
+      const first = qs[0] as { title?: unknown } | undefined
+      const t = typeof first?.title === 'string' ? first.title : ''
+      return qs.length > 1 ? `${qs.length} perguntas · ${t}` : t
+    }
     case 'message_subagent':
       return [
         `→ ${shortId(pick('id'))}`,
@@ -180,6 +215,7 @@ type Status =
   | 'judging'
   | 'running'
   | 'approval'
+  | 'input'
   | 'ok'
   | 'error'
   | 'denied'
@@ -203,6 +239,11 @@ function StatusChip({ status }: { status: Status }): React.JSX.Element | null {
       label: 'aguardando aprovação',
       cls: 'text-warning',
       icon: <Hand className="size-3" />
+    },
+    input: {
+      label: 'aguardando sua resposta',
+      cls: 'text-warning',
+      icon: <MessageCircleQuestion className="size-3" />
     },
     ok: { label: 'ok', cls: 'text-success/90', icon: <Check className="size-3" /> },
     error: { label: 'erro', cls: 'text-danger', icon: <CircleX className="size-3" /> },
@@ -316,9 +357,18 @@ export function ToolCard({
   const openChat = useStore((s) => s.openChat)
   const args = parseArgs(call.arguments)
   const name = call.name as ToolName
+  const question = useStore((s) =>
+    name === 'ask_user' ? s.questions.find((q) => q.toolCallId === call.id) : undefined
+  )
   const Icon = ICONS[name] ?? Wrench
   const isDelegate = name === 'delegate_task'
-  const resultText = result && result.message.role === 'tool' ? result.message.content : ''
+  const resultText =
+    result && result.message.role === 'tool' ? toolContentText(result.message.content) : ''
+  // read_file de imagem/PDF: parts por referência (miniatura no card)
+  const resultMedia =
+    result && result.message.role === 'tool' && Array.isArray(result.message.content)
+      ? result.message.content.filter((p) => p._attachment)
+      : []
   const background = isDelegate && (result?.meta.background === true || args?.background === true)
   const sessions = useStore((s) => s.sessions)
   const chats = useStore((s) => s.chats)
@@ -340,13 +390,15 @@ export function ToolCard({
     ? 'streaming'
     : approval || subApproval
       ? 'approval'
-      : run?.judging
-        ? 'judging'
-        : run?.running
-          ? 'running'
-          : result
-            ? (result.meta.toolStatus ?? 'ok')
-            : 'pending'
+      : question && !result
+        ? 'input'
+        : run?.judging
+          ? 'judging'
+          : run?.running
+            ? 'running'
+            : result
+              ? (result.meta.toolStatus ?? 'ok')
+              : 'pending'
 
   const expanded = open || !!approval
   const subId = result?.meta.subSessionId ?? subSession?.id
@@ -422,13 +474,14 @@ export function ToolCard({
         )}
         {result && (
           <Tip
-            label={`Enviado ao modelo: ${resultText.length.toLocaleString('pt-BR')} caracteres ≈ ${approxTokens(resultText.length).toLocaleString('pt-BR')} tokens (caracteres ÷ 4)`}
+            label={`Enviado ao modelo: ${resultText.length.toLocaleString('pt-BR')} caracteres ≈ ${approxTokens(resultText.length).toLocaleString('pt-BR')} tokens (caracteres ÷ 4)${resultMedia.length ? ` + ${resultMedia.length} ${resultMedia.every((p) => p._attachment?.kind === 'image') ? 'imagem(ns)' : 'arquivo(s)'} (tokens de imagem/PDF contados pelo provider no uso da resposta)` : ''}`}
           >
             <span
               data-testid="tool-size"
               className="shrink-0 text-[10.5px] tabular-nums text-faint"
             >
               ~{formatTokens(approxTokens(resultText.length))} tok
+              {resultMedia.length ? ' + mídia' : ''}
             </span>
           </Tip>
         )}
@@ -513,6 +566,20 @@ export function ToolCard({
         </div>
       )}
 
+      {resultMedia.length > 0 && !streaming && (
+        <div className="border-t border-border/70 px-3.5 py-2.5">
+          <ToolResultMedia parts={resultMedia} />
+        </div>
+      )}
+
+      {name === 'ask_user' && !streaming && (
+        <AskUserCardBody args={args} result={result} pending={!!question && !result} />
+      )}
+
+      {name === 'process_start' && !streaming && (
+        <ProcessStartInfo chatId={chatId} args={args} result={resultText} />
+      )}
+
       {targetSub && !streaming && (
         <div className="flex items-center gap-3 border-t border-border/70 px-3.5 py-2.5">
           <StatusDot status={targetSub.status} />
@@ -561,6 +628,120 @@ export function ToolCard({
       )}
       {approval && <ApprovalPrompt request={approval} />}
       {!approval && subApproval && <ApprovalPrompt request={subApproval} fromSubagent />}
+    </div>
+  )
+}
+
+/** ask_user: pendente → "Aguardando sua resposta…"; respondido → pergunta → resposta(s); cancelado → "Não respondido". */
+function AskUserCardBody({
+  args,
+  result,
+  pending
+}: {
+  args: Record<string, unknown> | null
+  result?: StoredMessage
+  pending: boolean
+}): React.JSX.Element | null {
+  const rec = result?.meta.askUser
+  const rawQs = (Array.isArray(args?.questions) ? args.questions : []) as { title?: unknown }[]
+  const titles = rec
+    ? rec.questions
+    : rawQs.map((q, i) => ({ title: typeof q?.title === 'string' ? q.title : `Pergunta ${i + 1}` }))
+  if (pending)
+    return (
+      <div data-testid="ask-card-pending" className="border-t border-border/70 px-3.5 py-2.5">
+        <p className="mb-1.5 text-[12px] text-warning/90">
+          Aguardando sua resposta… o questionário está no lugar do campo de mensagem.
+        </p>
+        <AskUserQuestionsList questions={titles} />
+      </div>
+    )
+  if (!result) return null
+  if (rec?.outcome === 'answered' && rec.answers)
+    return (
+      <div data-testid="ask-card-answered" className="border-t border-border/70 px-3.5 py-2.5">
+        <AskUserAnswers questions={rec.questions} answers={rec.answers} />
+        {rec.notes?.length ? (
+          <p className="mt-2 text-[11px] text-faint">{rec.notes.join(' ')}</p>
+        ) : null}
+      </div>
+    )
+  if (result.meta.toolStatus === 'cancelled')
+    return (
+      <div data-testid="ask-card-cancelled" className="border-t border-border/70 px-3.5 py-2.5">
+        <p className="mb-1.5 text-[12px] text-subtle">
+          Não respondido
+          {rec?.outcome === 'app-closed' || /app foi fechado/.test(resultText(result))
+            ? ' — o app foi fechado com o questionário aberto.'
+            : '.'}
+        </p>
+        {titles.length > 0 && <AskUserQuestionsList questions={titles} />}
+      </div>
+    )
+  return null
+}
+
+const resultText = (m: StoredMessage): string =>
+  m.message.role === 'tool' ? toolContentText(m.message.content) : ''
+
+/** process_start: comando, cwd, id e estado ao vivo do processo (do store). */
+function ProcessStartInfo({
+  chatId,
+  args,
+  result
+}: {
+  chatId: string
+  args: Record<string, unknown> | null
+  result: string
+}): React.JSX.Element {
+  const id = /\[processo (p\d+)/.exec(result)?.[1] ?? /processo (p\d+)/.exec(result)?.[1]
+  const proc = useStore((s) => (id ? s.processes[chatId]?.find((p) => p.id === id) : undefined))
+  const stopProcess = useStore((s) => s.stopProcess)
+  const command = typeof args?.command === 'string' ? args.command : ''
+  const waitFor = typeof args?.wait_for === 'string' ? args.wait_for : ''
+  return (
+    <div className="border-t border-border/70 px-3.5 py-2.5">
+      <pre className="max-h-24 overflow-auto rounded-lg bg-bg/70 px-3 py-1.5 font-mono text-[11.5px] whitespace-pre-wrap text-fg/85">
+        $ {command}
+      </pre>
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] text-subtle">
+        {id && <span className="font-mono text-faint">{id}</span>}
+        {waitFor && (
+          <span>
+            aguarda <span className="font-mono text-muted">/{waitFor}/</span>
+          </span>
+        )}
+        {proc && (
+          <span
+            data-testid="process-state"
+            className={cn(
+              'flex items-center gap-1',
+              proc.status === 'running' ? 'text-success/90' : 'text-faint'
+            )}
+          >
+            <span
+              className={cn(
+                'size-1.5 rounded-full',
+                proc.status === 'running' ? 'animate-pulse-soft bg-success' : 'bg-faint'
+              )}
+            />
+            {proc.status === 'running'
+              ? 'rodando'
+              : proc.exitCode !== null
+                ? `saiu (código ${proc.exitCode})`
+                : `encerrado${proc.signal ? ` (${proc.signal})` : ''}`}
+          </span>
+        )}
+        {proc?.status === 'running' && (
+          <button
+            type="button"
+            onClick={() => void stopProcess(chatId, proc.id)}
+            className="ml-auto flex items-center gap-1 rounded-md px-1.5 py-0.5 text-danger/85 hover:bg-danger/10 hover:text-danger"
+          >
+            <CircleStop className="size-3" /> Parar
+          </button>
+        )}
+      </div>
     </div>
   )
 }

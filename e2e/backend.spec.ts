@@ -342,7 +342,7 @@ async function main(): Promise<void> {
     const sysText = b.messages[0].content[0].text as string
     assert(sysText.includes(`<environment>\nroot: ${CWD}`), 'env block')
     assert(/caminhos dentro do diretório raiz/.test(sysText), 'confinação no env block')
-    assert(b.tools.length === 19, `tools (${b.tools.length})`)
+    assert(b.tools.length === 24, `tools (${b.tools.length})`) // 19 + 4 de processo + ask_user
     assert(
       b.tools.some((t: any) => t.function.name === 'list_models'),
       'list_models nas tools'
@@ -465,11 +465,11 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the bash tool to run exactly this command: echo hello-e2e > bash.txt && cat bash.txt'
+      'Use the shell tool to run exactly this command: echo hello-e2e > bash.txt && cat bash.txt'
     )
     const ap = await waitApproval(sid)
     assert(
-      ap.toolName === 'bash' && ap.args.command.includes('hello-e2e'),
+      ap.toolName === 'shell' && ap.args.command.includes('hello-e2e'),
       `approval ${JSON.stringify(ap)}`
     )
     const s1 = await session(sid, chatId)
@@ -480,7 +480,7 @@ async function main(): Promise<void> {
     const msgs = await messages(sid)
     addCost(msgs)
     assertPairing(msgs)
-    const t = toolMsgs(msgs, 'bash').at(-1)
+    const t = toolMsgs(msgs, 'shell').at(-1)
     assert(
       t.message.content.includes('hello-e2e') && t.message.content.includes('[exit code: 0]'),
       `bash out ${t.message.content}`
@@ -497,7 +497,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the bash tool to run: ls -la. If it is denied, just say "ok, denied" and do not retry.'
+      'Use the shell tool to run: ls -la. If it is denied, just say "ok, denied" and do not retry.'
     )
     const ap = await waitApproval(sid)
     await api('agent.approve', ap.id, 'deny')
@@ -506,7 +506,7 @@ async function main(): Promise<void> {
     const msgs = await messages(sid)
     addCost(msgs)
     assertPairing(msgs)
-    const t = toolMsgs(msgs, 'bash').find((m) => m.message.tool_call_id === ap.toolCallId)
+    const t = toolMsgs(msgs, 'shell').find((m) => m.message.tool_call_id === ap.toolCallId)
     assert(t && t.message.content === DENIED_TEXT && t.meta.toolStatus === 'denied', 'tool negada')
   })
 
@@ -514,12 +514,12 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the bash tool to run: sleep 4; echo slept-ok. Then report the output.'
+      'Use the shell tool to run: sleep 4; echo slept-ok. Then report the output.'
     )
     const ap = await waitApproval(sid)
     await api('agent.approve', ap.id, 'always')
     const chat = await api('chats.get', chatId)
-    assert(chat.config.autoApprove.includes('bash'), 'autoApprove atualizado')
+    assert(chat.config.autoApprove.includes('shell'), 'autoApprove atualizado')
     await sleep(500)
     const q = await api('agent.send', sid, 'Also: what is 2+2? Answer with just the number.')
     assert(q.queued === true, 'deveria enfileirar')
@@ -532,7 +532,7 @@ async function main(): Promise<void> {
     assertPairing(msgs)
     const qi = msgs.findIndex((m) => m.meta.kind === 'queued')
     assert(qi > 0, 'msg queued persistida')
-    const bashTool = toolMsgs(msgs, 'bash').find((m) => m.message.tool_call_id === ap.toolCallId)
+    const bashTool = toolMsgs(msgs, 'shell').find((m) => m.message.tool_call_id === ap.toolCallId)
     assert(
       bashTool && bashTool.seq < msgs[qi].seq && bashTool.message.content.includes('slept-ok'),
       'queued após resultado da tool'
@@ -550,13 +550,13 @@ async function main(): Promise<void> {
   })
 
   await test('forceSend durante tool (bash longo)', async () => {
-    await api('chats.update', chatId, { config: { autoApprove: ['bash'] } })
+    await api('chats.update', chatId, { config: { autoApprove: ['shell'] } })
     await clearEvents()
     const marker = `sleep 31.${Math.floor(Math.random() * 1000)}`
     await api(
       'agent.send',
       sid,
-      `Use the bash tool to run exactly: ${marker}; echo late > late.txt`
+      `Use the shell tool to run exactly: ${marker}; echo late > late.txt`
     )
     await waitFor(
       async () => (await events()).find((e) => e.type === 'tool-running' && e.running),
@@ -667,7 +667,7 @@ async function main(): Promise<void> {
   })
 
   await test('delegate_task (subsessão)', async () => {
-    await api('chats.update', chatId, { config: { autoApprove: ['bash'] } })
+    await api('chats.update', chatId, { config: { autoApprove: ['shell'] } })
     await clearEvents()
     await api(
       'agent.send',
@@ -784,7 +784,7 @@ async function main(): Promise<void> {
 
   await test('web_search + browse_url', async () => {
     await api('chats.update', chatId, {
-      config: { autoApprove: ['bash', 'web_search', 'browse_url'] }
+      config: { autoApprove: ['shell', 'web_search', 'browse_url'] }
     })
     await api(
       'agent.send',
@@ -977,11 +977,11 @@ async function main(): Promise<void> {
   })
 
   await test('reinício: sessão rodando → interrupted (pareamento reparado)', async () => {
-    const { chat: rc, sid: rs } = await newChat({ enabledTools: ['bash'], autoApprove: ['bash'] })
+    const { chat: rc, sid: rs } = await newChat({ enabledTools: ['shell'], autoApprove: ['shell'] })
     const chatId = rc.id
     const sid = rs
     await clearEvents()
-    await api('agent.send', sid, 'Use the bash tool to run exactly: sleep 20.123; echo z')
+    await api('agent.send', sid, 'Use the shell tool to run exactly: sleep 20.123; echo z')
     await waitFor(
       async () =>
         (await events()).find((e) => e.type === 'tool-running' && e.running && e.sessionId === sid),
@@ -1002,7 +1002,7 @@ async function main(): Promise<void> {
     assert(msgs.at(-1).message.content === CANCELLED_TEXT, 'tool sintética cancelada')
     // crash (SIGKILL): na próxima inicialização a sessão vira 'interrupted' e o pareamento é reparado
     await clearEvents()
-    await api('agent.send', sid, 'Use the bash tool to run exactly: sleep 5.321; echo y')
+    await api('agent.send', sid, 'Use the shell tool to run exactly: sleep 5.321; echo y')
     await waitFor(
       async () =>
         (await events()).find((e) => e.type === 'tool-running' && e.running && e.sessionId === sid),
@@ -1265,19 +1265,19 @@ async function main(): Promise<void> {
 
   await test('bash: cd persiste entre chamadas; confinação rejeita caminho fora da raiz', async () => {
     const { chat, sid: sb } = await newChat({
-      enabledTools: ['bash', 'read_file'],
-      autoApprove: ['bash']
+      enabledTools: ['shell', 'read_file'],
+      autoApprove: ['shell']
     })
     await api(
       'agent.send',
       sb,
-      'Make two SEPARATE bash tool calls, one per response: first run exactly `mkdir -p deep/dir && cd deep/dir`, then (after it finishes) run exactly `pwd`. Then reply with the pwd output only.'
+      'Make two SEPARATE shell tool calls, one per response: first run exactly `mkdir -p deep/dir && cd deep/dir`, then (after it finishes) run exactly `pwd`. Then reply with the pwd output only.'
     )
     await waitIdle(chat.id, sb)
     const msgs = await messages(sb)
     addCost(msgs)
     assertPairing(msgs)
-    const bashes = toolMsgs(msgs, 'bash')
+    const bashes = toolMsgs(msgs, 'shell')
     assert(bashes.length >= 1, 'bash chamado')
     const last = bashes.at(-1)
     assert(last.meta.shellCwd === join(CWD, 'deep/dir'), `shellCwd ${last.meta.shellCwd}`)
@@ -1525,8 +1525,8 @@ async function main(): Promise<void> {
   await test('anexo na fila (drenado) e com ⚡ (forceSend)', async () => {
     const { chat, sid: sq } = await newChat({
       model: VISION_MODEL,
-      enabledTools: ['bash'],
-      autoApprove: ['bash']
+      enabledTools: ['shell'],
+      autoApprove: ['shell']
     })
     const t1 = await api('attachments.add', {
       name: 'a.txt',
@@ -1550,7 +1550,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sq,
-      'Use the bash tool to run exactly: sleep 3; echo done-1. Then say ok.'
+      'Use the shell tool to run exactly: sleep 3; echo done-1. Then say ok.'
     )
     await bashRunning()
     const q = await api(
@@ -1583,7 +1583,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sq,
-      'Use the bash tool to run exactly: sleep 30; echo late. Then say ok.'
+      'Use the shell tool to run exactly: sleep 30; echo late. Then say ok.'
     )
     await bashRunning()
     await api(
@@ -1943,13 +1943,13 @@ async function main(): Promise<void> {
 
   await test('subagentes: cancel_subagent para um subagente em segundo plano', async () => {
     const { chat, sid: sx } = await newChat({
-      enabledTools: [...SUB_TOOLS, 'bash'],
-      autoApprove: ['bash']
+      enabledTools: [...SUB_TOOLS, 'shell'],
+      autoApprove: ['shell']
     })
     await api(
       'agent.send',
       sx,
-      'Step 1: call delegate_task with background=true, title "dorminhoco" and task "Run the bash command `sleep 120` and then reply DONE.". Step 2: call cancel_subagent with the id returned in step 1. Step 3: reply "cancelled".'
+      'Step 1: call delegate_task with background=true, title "dorminhoco" and task "Run the shell command `sleep 120` and then reply DONE.". Step 2: call cancel_subagent with the id returned in step 1. Step 3: reply "cancelled".'
     )
     await waitChatQuiet(chat.id, 240_000)
     const msgs = await messages(sx)
@@ -2040,14 +2040,14 @@ async function main(): Promise<void> {
 
   await test('subagentes: nível 1 dorme até o filho em segundo plano terminar', async () => {
     const { chat, sid: sd } = await newChat({
-      enabledTools: [...SUB_TOOLS, 'bash'],
-      autoApprove: ['bash']
+      enabledTools: [...SUB_TOOLS, 'shell'],
+      autoApprove: ['shell']
     })
     await clearEvents()
     await api(
       'agent.send',
       sd,
-      'Call delegate_task (blocking, NOT background) with title "coordenador" and this task: "Call delegate_task with background=true and task \'Run the bash command `sleep 8`, then reply with exactly the text HOTEL-8 and nothing else.\'. Then end your turn replying just \'waiting\'. When the result of the sub-agent arrives as a message, reply with exactly that code." Then reply with the result you got.'
+      'Call delegate_task (blocking, NOT background) with title "coordenador" and this task: "Call delegate_task with background=true and task \'Run the shell command `sleep 8`, then reply with exactly the text HOTEL-8 and nothing else.\'. Then end your turn replying just \'waiting\'. When the result of the sub-agent arrives as a message, reply with exactly that code." Then reply with the result you got.'
     )
     await waitChatQuiet(chat.id, 300_000)
     const msgs = await messages(sd)

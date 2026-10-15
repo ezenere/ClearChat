@@ -8,7 +8,8 @@ import {
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
-import { isOpenRouter } from '@shared/defaults'
+import { supportsCacheControl } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import { sameValue, sanitizePresetConfig, withoutCwd, type PresetConfig } from '@shared/presets'
 import type { ChatConfig, Preset } from '@shared/types'
 import { AppSignatureField, AppSignatureInfo } from './AppSignatureField'
@@ -123,7 +124,7 @@ export function NewChat(): React.JSX.Element {
     const cacheEnabled =
       preset?.config.cacheEnabled !== undefined && form.providerId === resolved.providerId
         ? preset.config.cacheEnabled
-        : isOpenRouter(provider.baseUrl)
+        : supportsCacheControl(providerKind(provider))
     await createChat({
       config: {
         ...withoutCwd(preset?.config),
@@ -305,7 +306,7 @@ export function NewChat(): React.JSX.Element {
                 </div>
               )}
               <p className="mt-1.5 text-[11px] leading-snug text-subtle">
-                Workspace da sessão: o agente cria e edita arquivos e roda o bash aqui.
+                Workspace da sessão: o agente cria e edita arquivos e roda o shell aqui.
               </p>
             </div>
             <div>

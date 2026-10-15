@@ -1,6 +1,7 @@
 // Personas (presets de chat): quais campos de ChatConfig um preset guarda e como é aplicado.
 // Funções puras — usadas pelo main (sanitizar ao salvar) e pelo renderer (snapshot/aplicar).
 import type { ChatConfig, ChatParams, Preset } from './types'
+import { migrateConfigTools } from './toolRename'
 
 export type PresetConfig = Partial<ChatConfig>
 
@@ -67,7 +68,8 @@ export function sanitizePresetConfig(cfg: unknown): PresetConfig {
     out[k] = k === 'params' ? cleanParams(src[k] as ChatParams) : clone(src[k])
   }
   if (typeof src.cwd === 'string' && src.cwd.trim()) out.cwd = src.cwd
-  return out as PresetConfig
+  // alias de leitura: nomes antigos de tools ('bash' → 'shell')
+  return migrateConfigTools(out as PresetConfig)
 }
 
 /** Cópia sanitizada sem `cwd`. */

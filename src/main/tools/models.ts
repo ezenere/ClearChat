@@ -446,13 +446,31 @@ const shortError = (e: string): string => {
 }
 
 /**
+ * Erro de conectividade (não do modelo): conexão cortada no meio do stream (undici "terminated" /
+ * "other side closed"), DNS/rede indisponível, reset, suspensão do computador, timeout sem resposta.
+ */
+export function isNetworkError(error: string): boolean {
+  return /\bterminated\b|fetch failed|Falha de rede|other side closed|socket hang up|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|ENETDOWN|EHOSTUNREACH|EPIPE|UND_ERR_|network (?:error|changed)|Sem resposta do provider/i.test(
+    error
+  )
+}
+
+/**
  * Resultado de delegate_task quando a chamada ao modelo do subagente falha: erro acionável para o
- * agente pai tentar de novo com outro modelo.
+ * agente pai. Falha de rede → retomar a subsessão (o trabalho até ali está salvo), não trocar de modelo.
  */
 export function delegateFailureText(model: string, error: string): string {
+  const msg = shortError(error) || 'erro desconhecido'
+  if (isNetworkError(error))
+    return (
+      `[falha de conexão com o provedor (modelo ${model}): ${msg}] A conexão caiu no meio da execução ` +
+      '(rede instável, Wi-Fi desconectado ou o computador entrou em suspensão) — não é um problema do modelo. ' +
+      'O que o subagente fez até aqui está salvo na subsessão: retome-o com message_subagent pedindo para continuar ' +
+      '(ou repita a tarefa); não é preciso trocar de modelo.'
+    )
   const free = model.endsWith(':free')
   return (
-    `[falha do modelo ${model}: ${shortError(error) || 'erro desconhecido'}] O subagente não concluiu a tarefa. ` +
+    `[falha do modelo ${model}: ${msg}] O subagente não concluiu a tarefa. ` +
     (free
       ? 'Modelos grátis falham com frequência: tente outro modelo grátis ou um pago (delegate_task com "model"; veja list_models).'
       : 'Tente outro modelo (delegate_task com "model"; veja list_models) ou repita a tarefa.')

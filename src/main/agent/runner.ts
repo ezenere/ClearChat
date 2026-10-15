@@ -3,6 +3,7 @@
 import type {
   ApiMessage,
   Chat,
+  ContentPart,
   MessageMeta,
   QueuedMessage,
   Session,
@@ -12,6 +13,7 @@ import type {
   ToolCall,
   ToolName
 } from '@shared/types'
+import { TOOL_ALIASES } from '@shared/types'
 import {
   approvalRoute,
   normalizeSmartApprove,
@@ -71,6 +73,8 @@ import {
   type SubagentRow
 } from './subagents'
 import { listModels } from '../providers'
+import { contentText } from '@shared/attachments'
+import { providerKind } from '@shared/providerKinds'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
 import { availableTools, buildRequest, maskRequest, setProviderNamesSource } from './request'
 import {
@@ -94,7 +98,15 @@ import {
 } from './queue'
 import { formatTextToolResult, parseTextToolCalls } from './textTools'
 import { buildUserContent, truncateBodyForPreview, validateAttachments } from '../attachments'
-import type { AttachmentInfo } from '@shared/types'
+import type { AskUserRecord, AttachmentInfo } from '@shared/types'
+import {
+  ASK_USER_APP_CLOSED,
+  ASK_USER_NOT_ANSWERED,
+  formatAskUserResult,
+  parseAskUserArgs
+} from '@shared/askUser'
+import { cancelQuestion, getQuestion, listQuestions, requestQuestion } from './questions'
+import { resolveAskUserQuestions } from '../askUserImages'
 
 export const CANCELLED_TEXT = '[Interrompido pelo usuário antes de concluir]'
 export const DENIED_TEXT = 'O usuário negou a execução desta ferramenta.'
@@ -140,6 +152,8 @@ interface RunState {
 
 interface ToolOutcome {
   content: string
+  /** read_file de imagem/PDF: conteúdo multimodal por referência (vira o content da mensagem tool). */
+  parts?: ContentPart[]
   status: 'ok' | 'error' | 'denied' | 'cancelled'
   subSessionId?: string
   shellCwd?: string
@@ -151,6 +165,8 @@ interface ToolOutcome {
   smartApprove?: SmartApproveRecord
   /** Rodou por "Executar mesmo assim" (liberação de uma vez só). */
   smartOverride?: boolean
+  /** ask_user: perguntas mostradas + respostas (card do questionário). */
+  askUser?: AskUserRecord
   durationMs: number
 }
 
@@ -275,7 +291,10 @@ export async function deleteMessage(id: string): Promise<void> {
  * Garante pareamento válido no fim do histórico: para cada tool_call do último assistant
  * sem resposta, adiciona msg `tool` sintética cancelada.
  */
-export function repairTail(sessionId: string): void {
+export function repairTail(
+  sessionId: string,
+  reason: 'cancelled' | 'app-closed' = 'cancelled'
+): void {
   const msgs = messagesRepo.list(sessionId)
   let idx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
@@ -296,13 +315,26 @@ export function repairTail(sessionId: string): void {
       .filter(Boolean)
   )
   for (const tc of a.tool_calls) {
-    if (!answered.has(tc.id)) {
+    if (answered.has(tc.id)) continue
+    // questionário que ficou sem resposta (app fechado): texto próprio; o card usa os argumentos
+    if (tc.function.name === 'ask_user') {
+      const appClosed = reason === 'app-closed'
       append(
         sessionId,
-        { role: 'tool', tool_call_id: tc.id, content: CANCELLED_TEXT },
+        {
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: appClosed ? ASK_USER_APP_CLOSED : ASK_USER_NOT_ANSWERED
+        },
         { synthetic: true, kind: 'tool-cancelled', toolStatus: 'cancelled' }
       )
+      continue
     }
+    append(
+      sessionId,
+      { role: 'tool', tool_call_id: tc.id, content: CANCELLED_TEXT },
+      { synthetic: true, kind: 'tool-cancelled', toolStatus: 'cancelled' }
+    )
   }
 }
 
@@ -530,6 +562,8 @@ function onAborted(st: RunState, partial: string): 'continue' | LoopOutcome {
   if (!st.stopRequested && st.forced.length && sessionsRepo.get(st.sessionId)) {
     st.controller = new AbortController()
     st.compactOnly = false
+    // ⚡ durante aprovação/questionário: a sessão volta a 'running'
+    setStatus(st.sessionId, 'running')
     for (const f of st.forced.splice(0)) {
       const s = sessionsRepo.get(st.sessionId)
       if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
@@ -758,11 +792,16 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       if (r.background) tmeta.background = true
       if (r.smartApprove) tmeta.smartApprove = r.smartApprove
       if (r.smartOverride) tmeta.smartOverride = true
+      if (r.askUser) tmeta.askUser = r.askUser
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
         tmeta.kind = 'tool-cancelled'
       }
-      append(session.id, { role: 'tool', tool_call_id: call.id, content: r.content }, tmeta)
+      append(
+        session.id,
+        { role: 'tool', tool_call_id: call.id, content: r.parts?.length ? r.parts : r.content },
+        tmeta
+      )
       if (r.status === 'cancelled' && signal.aborted) break
     }
     if (signal.aborted) return { kind: 'aborted', partial: '' }
@@ -774,6 +813,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     const parsed = parseTextToolCalls(acc.content, availableTools(chat, session, history))
     if (parsed.length) {
       const parts: string[] = []
+      // read_file de imagem/PDF no modo texto: os parts vão na própria mensagem user sintética
+      const media: ContentPart[] = []
       let subSessionId: string | undefined
       for (let i = 0; i < parsed.length; i++) {
         const p = parsed[i]
@@ -789,10 +830,16 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
         const r = await executeTool(st, session, id, p.name, p.args, signal)
         if (r.subSessionId) subSessionId = r.subSessionId
         parts.push(formatTextToolResult(p.name, r.content))
+        if (r.parts) media.push(...r.parts.filter((x) => x._attachment))
       }
       const umeta: MessageMeta = { synthetic: true }
       if (subSessionId) umeta.subSessionId = subSessionId
-      append(session.id, { role: 'user', content: parts.join('\n\n') }, umeta)
+      const text = parts.join('\n\n')
+      append(
+        session.id,
+        { role: 'user', content: media.length ? [{ type: 'text', text }, ...media] : text },
+        umeta
+      )
       if (signal.aborted) return { kind: 'aborted', partial: '' }
       return { kind: 'continue' }
     }
@@ -820,7 +867,7 @@ async function executeTool(
   })
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return done({ content: 'Erro: chat não encontrado.', status: 'error' })
-  const name = rawName as ToolName
+  const name = (TOOL_ALIASES[rawName] ?? rawName) as ToolName // 'bash' (antigo) → 'shell'
   if (!availableTools(chat, session).includes(name)) {
     return done({
       content: `Erro: a ferramenta "${rawName}" não está disponível nesta sessão.`,
@@ -835,7 +882,8 @@ async function executeTool(
   }
 
   // Ordem: autoApprove → Smart-Approve (juiz) → usuário. Ver @shared/smartApprove.
-  let route = approvalRoute(chat.config, name)
+  // ask_user nunca pede confirmação (é o próprio usuário quem responde)
+  let route = name === 'ask_user' ? 'run' : approvalRoute(chat.config, name)
   if (route !== 'run' && takeOverride(session.id, name, args)) {
     // "Executar mesmo assim": o usuário já liberou exatamente esta chamada (uma vez)
     smartOverride = true
@@ -912,8 +960,10 @@ async function executeTool(
     if (name === 'cancel_subagent') return done(await runCancelSubagent(session, chat, args))
     if (name === 'message_subagent')
       return done(await runMessageSubagent(session, chat, args, signal))
+    if (name === 'ask_user') return done(await runAskUser(session, chat, toolCallId, args, signal))
     const root = chat.config.cwd
     const provider = name === 'list_models' ? providerFor(chat, session) : null
+    const sessionProvider = name === 'read_file' ? providerFor(chat, session) : null
     const allProviders = name === 'list_models' ? modelSources(chat, session) : []
     const r = await runLocalTool(name, args, {
       cwd: root,
@@ -921,10 +971,12 @@ async function executeTool(
       maxOutput: clampToolOutput(chat.config.maxToolOutputChars),
       sandbox: !!chat.config.sandboxBash,
       shell:
-        name === 'bash'
+        name === 'shell' || name === 'process_start'
           ? shellStateFor(session.id, root, () => lastShellCwd(session.id))
           : undefined,
       cacheKey: session.id,
+      chatId: chat.id,
+      sessionId: session.id,
       models:
         provider || allProviders.length
           ? {
@@ -938,13 +990,26 @@ async function executeTool(
       chats:
         name === 'get_chat_info' || name === 'list_chats' ? chatToolsCtx(chat, session) : undefined,
       history: name === 'read_history' ? () => messagesRepo.list(session.id) : undefined,
+      // read_file: imagens/PDF só se o modelo da sessão os lê (mesma regra dos anexos)
+      media: sessionProvider
+        ? {
+            providerKind: providerKind(sessionProvider),
+            model: async () =>
+              (await listModels(sessionProvider)).find((m) => m.id === session.model) ?? null
+          }
+        : undefined,
       signal,
       onOutput: (partial) => {
         latest = partial
         out.call()
       }
     })
-    return done({ content: r.content, status: r.status, shellCwd: r.meta?.shellCwd })
+    return done({
+      content: r.content,
+      status: r.status,
+      shellCwd: r.meta?.shellCwd,
+      ...(r.parts?.length ? { parts: r.parts } : {})
+    })
   } catch (e) {
     if (signal.aborted || (e as Error).name === 'AbortError') {
       return done({ content: CANCELLED_TEXT, status: 'cancelled' })
@@ -1065,11 +1130,85 @@ async function runDelegate(
   }
 }
 
+// ---------------- questionário (ask_user) ----------------
+
+/**
+ * ask_user: valida, resolve as imagens (store de anexos), mostra o questionário (sessão
+ * 'awaiting_input') e espera. Respondeu → texto compacto + respostas estruturadas no meta.
+ * Cancelou (Esc / Parar / ⚡ → abort do signal) → `[O usuário não respondeu ao questionário]`; o
+ * abort faz o loop parar (Parar/Esc: turno termina, sem nova chamada; ⚡: entra a mensagem forçada).
+ */
+async function runAskUser(
+  session: Session,
+  chat: Chat,
+  toolCallId: string,
+  args: Record<string, unknown>,
+  signal: AbortSignal
+): Promise<Omit<ToolOutcome, 'durationMs'>> {
+  if (session.depth !== 0)
+    return {
+      content:
+        'Erro: subagentes não podem perguntar ao usuário. Decida sozinho ou devolva a dúvida no resultado final.',
+      status: 'error'
+    }
+  const parsed = parseAskUserArgs(args)
+  if ('error' in parsed) return { content: parsed.error, status: 'error' }
+  let resolved
+  try {
+    resolved = await resolveAskUserQuestions(parsed.questions, {
+      root: chat.config.cwd,
+      confine: chat.config.confineToRoot !== false,
+      signal
+    })
+  } catch (e) {
+    if (signal.aborted) return { content: ASK_USER_NOT_ANSWERED, status: 'cancelled' }
+    return { content: `Erro: ${errMsg(e)}`, status: 'error' }
+  }
+  const { questions, notes } = resolved
+  const tail = notes.length ? `\n\n${notes.join('\n')}` : ''
+  const rec = (r: Omit<AskUserRecord, 'questions' | 'notes'>): AskUserRecord => ({
+    questions,
+    ...r,
+    ...(notes.length ? { notes } : {})
+  })
+  if (signal.aborted)
+    return {
+      content: ASK_USER_NOT_ANSWERED + tail,
+      status: 'cancelled',
+      askUser: rec({ outcome: 'cancelled' })
+    }
+  setStatus(session.id, 'awaiting_input')
+  const outcome = await requestQuestion(
+    {
+      chatId: chat.id,
+      sessionId: session.id,
+      toolCallId,
+      questions,
+      ...(notes.length ? { notes } : {})
+    },
+    signal
+  )
+  if (outcome.kind === 'cancel' || signal.aborted)
+    return {
+      content: ASK_USER_NOT_ANSWERED + tail,
+      status: 'cancelled',
+      askUser: rec({ outcome: 'cancelled' })
+    }
+  setStatus(session.id, 'running')
+  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  return {
+    content: truncateHeadTail(formatAskUserResult(questions, outcome.answers, notes), max, 0.5),
+    status: 'ok',
+    askUser: rec({ outcome: 'answered', answers: outcome.answers })
+  }
+}
+
 // ---------------- chats: get_chat_info / list_chats / send_to_chat ----------------
 
 /** Estado de um chat para list_chats: aprovação pendente > alguma sessão rodando > ocioso. */
 function chatStatus(chatId: string): ChatListEntry['status'] {
   if (listApprovals().some((a) => a.chatId === chatId)) return 'awaiting_approval'
+  if (listQuestions().some((q) => q.chatId === chatId)) return 'awaiting_input'
   for (const st of runs.values()) if (st.chatId === chatId) return 'running'
   return 'idle'
 }
@@ -1466,7 +1605,7 @@ function sessionTail(sessionId: string): string {
       if (m.tool_calls?.length)
         return `chamando ${m.tool_calls.map((t) => t.function.name).join(', ')}`
     }
-    if (m.role === 'tool') return `resultado de tool (${m.content.length} caracteres)`
+    if (m.role === 'tool') return `resultado de tool (${contentText(m.content).length} caracteres)`
   }
   return ''
 }
@@ -1910,6 +2049,21 @@ export function pendingApprovals(): ReturnType<typeof listApprovals> {
   return listApprovals()
 }
 
+export function pendingQuestions(): ReturnType<typeof listQuestions> {
+  return listQuestions()
+}
+
+/**
+ * Cancelar o questionário (Esc / "Cancelar"): o mesmo que Parar — o resultado vira
+ * `[O usuário não respondeu ao questionário]` e o agente para (sem nova chamada ao modelo).
+ */
+export async function cancelQuestionRequest(id: string): Promise<void> {
+  const q = getQuestion(id)
+  if (!q) return
+  if (runs.has(q.sessionId)) await stop(q.sessionId)
+  cancelQuestion(id) // sem loop (não deveria acontecer): só resolve
+}
+
 export function previewRequest(sessionId: string): RequestPreview {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
@@ -1953,12 +2107,12 @@ export async function stopChat(chatId: string): Promise<void> {
   for (const s of sessionsRepo.list(chatId)) clearQueue(s.id)
 }
 
-/** Inicialização: sessões que ficaram 'running'/'awaiting_approval' → 'interrupted' (+ repara pareamento). */
+/** Inicialização: sessões que ficaram rodando/aguardando → 'interrupted' (+ repara pareamento). */
 export function initRunner(): void {
   const stale = sessionsRepo.markStaleInterrupted()
   for (const id of stale) {
     try {
-      repairTail(id)
+      repairTail(id, 'app-closed')
     } catch (e) {
       console.error('[clearchat] repairTail', id, e)
     }
@@ -1989,9 +2143,33 @@ export function initRunner(): void {
  */
 export function shutdownRunner(): void {
   const ids = [...runs.keys()]
+  // questionários pendentes: resultado "não respondido: o app foi fechado" (com o card respondível
+  // como "Não respondido": perguntas resolvidas no meta)
+  for (const q of listQuestions()) {
+    try {
+      if (!sessionsRepo.get(q.sessionId)) continue
+      const m = messagesRepo.append(
+        q.sessionId,
+        { role: 'tool', tool_call_id: q.toolCallId, content: ASK_USER_APP_CLOSED },
+        {
+          synthetic: true,
+          kind: 'tool-cancelled',
+          toolStatus: 'cancelled',
+          askUser: {
+            questions: q.questions,
+            outcome: 'app-closed',
+            ...(q.notes?.length ? { notes: q.notes } : {})
+          }
+        }
+      )
+      emit({ type: 'message-added', message: m })
+    } catch (e) {
+      console.error('[clearchat] shutdown questionário', q.sessionId, e)
+    }
+  }
   for (const id of ids) {
     try {
-      repairTail(id)
+      repairTail(id, 'app-closed')
       const s = sessionsRepo.setStatus(id, 'interrupted')
       if (s) emit({ type: 'session-updated', session: s })
     } catch (e) {

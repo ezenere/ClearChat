@@ -3,6 +3,7 @@ import type { ChatConfig } from './types'
 import { TOOL_NAMES, type ToolDefinition } from './tools'
 import { DEFAULT_APP_SIGNATURE } from './appSignatures'
 import { LIMITS } from './limits'
+import { providerKind, type ProviderKind } from './providerKinds'
 
 export const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1'
 export const DEFAULT_PROVIDER_NAME = 'OpenRouter'
@@ -23,10 +24,23 @@ export const DEFAULT_COMPACT_THRESHOLD = 0.9
 
 export const isOpenRouter = (baseUrl: string): boolean => baseUrl.includes('openrouter.ai')
 
-/** Config padrão de um chat novo. `baseUrl` define o padrão de `cacheEnabled`. */
+/** O adaptador suporta prompt caching explícito (`cache_control`)? (OpenRouter e Anthropic nativa.) */
+export const supportsCacheControl = (kind: ProviderKind): boolean =>
+  kind === 'openrouter' || kind === 'anthropic'
+
+/**
+ * Config padrão de um chat novo. O tipo do provider (`kind`, ou inferido de `baseUrl`) define o
+ * padrão de `cacheEnabled`.
+ */
 export function DEFAULT_CHAT_CONFIG(
   cwd: string,
-  opts: { providerId?: string; model?: string; systemPrompt?: string; baseUrl?: string } = {}
+  opts: {
+    providerId?: string
+    model?: string
+    systemPrompt?: string
+    baseUrl?: string
+    kind?: ProviderKind
+  } = {}
 ): ChatConfig {
   return {
     providerId: opts.providerId ?? '',
@@ -38,7 +52,9 @@ export function DEFAULT_CHAT_CONFIG(
     toolsInPrompt: false,
     toolsPromptText: null,
     envInPrompt: true,
-    cacheEnabled: isOpenRouter(opts.baseUrl ?? DEFAULT_BASE_URL),
+    cacheEnabled: supportsCacheControl(
+      providerKind({ baseUrl: opts.baseUrl ?? DEFAULT_BASE_URL, kind: opts.kind })
+    ),
     subagentSystemPrompt: DEFAULT_SUBAGENT_SYSTEM_PROMPT,
     cwd,
     confineToRoot: true,
@@ -130,11 +146,15 @@ export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean
       '- Para escolher o modelo de um subagente, consulte list_models antes de delegate_task. Modelos grátis: só tarefas fáceis e sem dados pessoais; são instáveis — se falharem, use outro modelo.',
     has('delegate_task') &&
       has('wait_subagents') &&
-      '- Subagentes em segundo plano (delegate_task com background=true) rodam em paralelo e o resultado chega sozinho como mensagem; não consulte em loop — use wait_subagents ou encerre o turno. Use message_subagent para atualizar um subagente.',
+      '- Subagentes em segundo plano (delegate_task com background=true) rodam em paralelo e o resultado chega sozinho como mensagem; sem mais nada a fazer, encerre o turno — você é acordado quando eles terminarem (wait_subagents só se o próximo passo do mesmo turno depende do resultado). Use message_subagent para atualizar um subagente.',
     has('read_history') &&
       '- Depois de uma compactação, use read_history para recuperar detalhes do histórico original que não estejam no resumo.',
+    has('process_start') &&
+      '- Processos que precisam continuar rodando (dev server, emulador, watcher, logcat): process_start (com wait_for para esperar ficar pronto), process_logs (pattern/since_line) e process_stop — nunca `&`/nohup no shell.',
     has('send_to_chat') &&
       '- send_to_chat entrega uma mensagem a outro chat como se fosse o usuário (ids via list_chats). Mensagens vindas de outros chats começam com [Mensagem do chat "…" (id …)].',
+    has('ask_user') &&
+      '- ask_user mostra um questionário de múltipla escolha ao usuário: use para decisões com opções claras ou para coletar várias preferências de uma vez; para uma pergunta aberta simples, apenas escreva no chat e encerre o turno.',
     '- Algumas ferramentas exigem aprovação do usuário; se ele negar, não insista — siga sem ela ou pergunte.',
     '- Quando terminar, responda normalmente, sem chamar ferramentas.'
   ]
@@ -198,7 +218,7 @@ arguments:
 
 Project root (cwd): {{cwd}}
 File tools confined to the root: {{confine}}
-Bash sandboxed (only the root is writable): {{sandbox}}
+Shell sandboxed (only the root is writable): {{sandbox}}
 
 Latest user message:
 """

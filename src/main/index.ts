@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, nativeTheme, protocol } from 'electron'
+import { app, shell, BrowserWindow, nativeImage, nativeTheme, protocol } from 'electron'
 import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -6,7 +6,17 @@ import { closeDb, getDb, getDbPath } from './db'
 import { registerIpc } from './ipc'
 import { registerEventWindow } from './events'
 import { initRunner, shutdownRunner } from './agent/runner'
+import { emit } from './events'
+import { initShell } from './tools/shellEnv'
+import {
+  gcProcessLogs,
+  killAllProcesses,
+  setProcessListener,
+  setProcessLogDir
+} from './tools/processes'
 import { migrateLegacyData } from './migrate'
+import { setImageProcessor } from './tools/media'
+import { nativeImageProcessor } from './imageResize'
 import { ATTACHMENT_SCHEME, parseAttachmentUrl } from '@shared/attachments'
 import {
   attachmentsDir,
@@ -99,6 +109,8 @@ app.whenReady().then(() => {
 
   // Anexos: store content-addressed + GC de arquivos que nenhuma mensagem referencia.
   setAttachmentsDir(join(app.getPath('userData'), 'attachments'))
+  // read_file: imagens grandes são reduzidas antes de ir ao modelo
+  setImageProcessor(nativeImageProcessor(nativeImage))
   try {
     const gc = gcAttachments(attachmentsDir(), referencedFilesInDb(getDb()))
     if (gc.deleted.length) console.log(`[clearchat] anexos órfãos apagados: ${gc.deleted.length}`)
@@ -117,6 +129,18 @@ app.whenReady().then(() => {
     }
   })
 
+  // Shell do usuário (descrição da tool `shell`) + ambiente do -ilc em segundo plano.
+  initShell()
+  // Processos em segundo plano: logs em userData/processes (antigos apagados) + evento por chat.
+  setProcessLogDir(join(app.getPath('userData'), 'processes'))
+  try {
+    const old = gcProcessLogs()
+    if (old.length) console.log(`[clearchat] logs de processos antigos apagados: ${old.length}`)
+  } catch (e) {
+    console.error('[clearchat] gc de logs de processos', e)
+  }
+  setProcessListener((chatId, processes) => emit({ type: 'processes-updated', chatId, processes }))
+
   initRunner()
   registerIpc()
   createWindow()
@@ -130,5 +154,10 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => shutdownRunner())
+app.on('before-quit', () => {
+  shutdownRunner()
+  killAllProcesses()
+})
+// garantia: nenhum process group de process_start fica órfão
+process.on('exit', () => killAllProcesses(0))
 app.on('will-quit', () => closeDb())

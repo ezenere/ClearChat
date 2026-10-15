@@ -47,7 +47,14 @@ function shorten(text: string, max: number): string {
 function shrinkMessage(m: StoredMessage): StoredMessage {
   const msg = m.message
   let next: ApiMessage = msg
-  if (msg.role === 'tool') next = { ...msg, content: shorten(msg.content, TOOL_MAX) }
+  if (msg.role === 'tool')
+    next = {
+      ...msg,
+      content:
+        typeof msg.content === 'string'
+          ? shorten(msg.content, TOOL_MAX)
+          : msg.content.map(shrinkPart) // read_file de imagem/PDF → placeholder de texto
+    }
   else if (msg.role === 'assistant' && typeof msg.content === 'string') {
     const tool_calls = msg.tool_calls?.map((t): ToolCall => ({
       ...t,
@@ -143,7 +150,8 @@ export function buildCompactionRequest(
   }
   const req = buildRequest(chat, session, [...hist, promptMsg], provider, env)
   // Só se o modelo insistir em chamar tools em vez de resumir (muda o cache de mensagens).
-  if (opts.toolChoiceNone && req.body.tools) req.body.tool_choice = 'none'
+  if (opts.toolChoiceNone && req.body.tools)
+    req.body.tool_choice = req.kind === 'anthropic' ? { type: 'none' } : 'none'
   return req
 }
 

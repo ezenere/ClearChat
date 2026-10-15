@@ -2,11 +2,8 @@
 // tools avaliadas, rótulos, contexto/tempo, prompt + template editáveis e "Testar".
 import { FlaskConical, RotateCcw, X } from 'lucide-react'
 import { useState } from 'react'
-import {
-  DEFAULT_SMART_APPROVE_PROMPT,
-  DEFAULT_SMART_APPROVE_TEMPLATE,
-  isOpenRouter
-} from '@shared/defaults'
+import { DEFAULT_SMART_APPROVE_PROMPT, DEFAULT_SMART_APPROVE_TEMPLATE } from '@shared/defaults'
+import { providerKind } from '@shared/providerKinds'
 import {
   buildJudgeBody,
   buildJudgeMessages,
@@ -65,10 +62,12 @@ function SmartRequestInfo({
   const body = buildJudgeBody(
     sa.model ?? '<modelo>',
     messages,
-    provider ? isOpenRouter(provider.baseUrl) : false
+    provider ? providerKind(provider) === 'openrouter' : false
   )
+  const endpoint =
+    provider && providerKind(provider) === 'anthropic' ? 'messages' : 'chat/completions'
   const url = provider
-    ? `${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`
+    ? `${provider.baseUrl.replace(/\/+$/, '')}/${endpoint}`
     : '<provedor>/chat/completions'
   return (
     <ApiInfo

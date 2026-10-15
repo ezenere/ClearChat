@@ -241,6 +241,7 @@ const STATUS_LABEL: Record<SessionStatus, string> = {
   idle: 'ocioso',
   running: 'rodando',
   awaiting_approval: 'aguardando aprovação',
+  awaiting_input: 'aguardando resposta do usuário',
   waiting: 'aguardando subagentes',
   done: 'concluído',
   error: 'erro',

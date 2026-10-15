@@ -129,13 +129,13 @@ test('validateLabels / normalizeSmartApprove', () => {
     labels: { approve: ' SIM ', reject: 'NAO', ask: 'TALVEZ' },
     contextMessages: 999,
     timeoutS: 1,
-    tools: ['bash', 'bash', 'write_file']
+    tools: ['shell', 'shell', 'write_file']
   })
   assert.equal(n.model, 'm')
   assert.deepEqual(n.labels, { approve: 'SIM', reject: 'NAO', ask: 'TALVEZ' })
   assert.equal(n.contextMessages, 50)
   assert.equal(n.timeoutS, 3)
-  assert.deepEqual(n.tools, ['bash', 'write_file'])
+  assert.deepEqual(n.tools, ['shell', 'write_file'])
   assert.equal(smartApproveActive(n), true)
   assert.equal(smartApproveActive({ ...n, model: null }), false)
   assert.equal(smartApproveActive({ ...n, enabled: false }), false)
@@ -188,13 +188,13 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
         {
           id: 'c2',
           type: 'function',
-          function: { name: 'bash', arguments: '{"command":"ls -la"}' }
+          function: { name: 'shell', arguments: '{"command":"ls -la"}' }
         }
       ]
     })
   ]
   const msgs = buildJudgeMessages(sa, {
-    tool: 'bash',
+    tool: 'shell',
     args: { command: 'ls -la' },
     cwd: '/work',
     confine: true,
@@ -207,17 +207,17 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
   assert.ok(!msgs[0].content.includes('{{'), 'system sem placeholders')
   const u = msgs[1].content
   assert.ok(!u.includes('{{'), 'user sem placeholders')
-  assert.ok(u.includes('tool: bash'))
+  assert.ok(u.includes('tool: shell'))
   assert.ok(u.includes('{\n  "command": "ls -la"\n}'), 'args em JSON formatado')
   assert.ok(u.includes('Project root (cwd): /work'))
   assert.ok(u.includes('File tools confined to the root: yes'))
-  assert.ok(u.includes('Bash sandboxed (only the root is writable): no'))
+  assert.ok(u.includes('Shell sandboxed (only the root is writable): no'))
   assert.ok(u.includes('"""\nListe os arquivos, por favor.\n"""'))
-  // últimas 3 (sem a de erro): assistant(read_file), tool (cortado), assistant(bash)
+  // últimas 3 (sem a de erro): assistant(read_file), tool (cortado), assistant(shell)
   assert.ok(!u.includes('mensagem antiga'))
   assert.ok(u.includes('→ read_file({"path":"a"})'))
   assert.ok(u.includes('[tool read_file] ' + 'x'.repeat(300) + '… [+1700 chars]'))
-  assert.ok(u.includes('[assistant] Vou listar.\n  → bash({"command":"ls -la"})'))
+  assert.ok(u.includes('[assistant] Vou listar.\n  → shell({"command":"ls -la"})'))
   assert.ok(!u.includes('erro'))
 })
 
@@ -257,16 +257,16 @@ test('body do juiz: temperatura 0, poucos tokens, sem tools; usage só no OpenRo
 test('ordem: autoApprove → juiz → usuário; tools extras só com o juiz ativo', () => {
   const sa = { enabled: true, providerId: 'p', model: 'j' }
   const r = (cfg: any, t: any): string => approvalRoute(cfg, t)
-  assert.equal(r({ autoApprove: [] }, 'bash'), 'user')
+  assert.equal(r({ autoApprove: [] }, 'shell'), 'user')
   assert.equal(r({ autoApprove: [] }, 'read_file'), 'run')
-  assert.equal(r({ autoApprove: ['bash'] }, 'bash'), 'run')
-  assert.equal(r({ autoApprove: [], smartApprove: sa }, 'bash'), 'judge')
-  assert.equal(r({ autoApprove: ['bash'], smartApprove: sa }, 'bash'), 'run')
-  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, enabled: false } }, 'bash'), 'user')
-  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, model: null } }, 'bash'), 'user')
+  assert.equal(r({ autoApprove: ['shell'] }, 'shell'), 'run')
+  assert.equal(r({ autoApprove: [], smartApprove: sa }, 'shell'), 'judge')
+  assert.equal(r({ autoApprove: ['shell'], smartApprove: sa }, 'shell'), 'run')
+  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, enabled: false } }, 'shell'), 'user')
+  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, model: null } }, 'shell'), 'user')
   // fora da lista do juiz → usuário (CONFIRM) ou roda (não-CONFIRM)
   const only = { ...sa, tools: ['web_search', 'write_file'] }
-  assert.equal(r({ autoApprove: [], smartApprove: only }, 'bash'), 'user')
+  assert.equal(r({ autoApprove: [], smartApprove: only }, 'shell'), 'user')
   assert.equal(r({ autoApprove: [], smartApprove: only }, 'web_search'), 'judge')
   assert.equal(r({ autoApprove: [], smartApprove: only }, 'write_file'), 'judge')
   assert.equal(
@@ -281,18 +281,18 @@ test('textos: rejeição e "Executar mesmo assim"', () => {
   assert.equal(smartRejectText('m/j', ' perigoso '), 'Rejeitado pelo Smart-Approve (m/j): perigoso')
   assert.equal(smartRejectText('m', ''), 'Rejeitado pelo Smart-Approve (m): sem motivo informado.')
   assert.equal(
-    overrideMessageText('bash', { command: 'rm -rf build' }),
-    'Pode executar bash `rm -rf build`; eu aprovo.'
+    overrideMessageText('shell', { command: 'rm -rf build' }),
+    'Pode executar shell `rm -rf build`; eu aprovo.'
   )
   assert.match(overrideMessageText('write_file', { path: 'a.txt', content: 'x' }), /`a\.txt`/)
 })
 
 test('liberação de uma vez só: mesma tool + mesmos args (ordem das chaves não importa), expira', () => {
   clearOverrides()
-  addOverride('s1', 'bash', { command: 'ls', timeout_ms: 5 })
-  assert.equal(takeOverride('s2', 'bash', { command: 'ls', timeout_ms: 5 }), false, 'outra sessão')
+  addOverride('s1', 'shell', { command: 'ls', timeout_ms: 5 })
+  assert.equal(takeOverride('s2', 'shell', { command: 'ls', timeout_ms: 5 }), false, 'outra sessão')
   assert.equal(
-    takeOverride('s1', 'bash', { command: 'ls -a', timeout_ms: 5 }),
+    takeOverride('s1', 'shell', { command: 'ls -a', timeout_ms: 5 }),
     false,
     'outros args'
   )
@@ -301,11 +301,11 @@ test('liberação de uma vez só: mesma tool + mesmos args (ordem das chaves nã
     false,
     'outra tool'
   )
-  assert.equal(takeOverride('s1', 'bash', { timeout_ms: 5, command: 'ls' }), true)
-  assert.equal(takeOverride('s1', 'bash', { timeout_ms: 5, command: 'ls' }), false, 'só uma vez')
-  addOverride('s1', 'bash', { command: 'x' }, 1000)
+  assert.equal(takeOverride('s1', 'shell', { timeout_ms: 5, command: 'ls' }), true)
+  assert.equal(takeOverride('s1', 'shell', { timeout_ms: 5, command: 'ls' }), false, 'só uma vez')
+  addOverride('s1', 'shell', { command: 'x' }, 1000)
   assert.equal(
-    takeOverride('s1', 'bash', { command: 'x' }, 1000 + OVERRIDE_TTL_MS + 1),
+    takeOverride('s1', 'shell', { command: 'x' }, 1000 + OVERRIDE_TTL_MS + 1),
     false,
     'expirou'
   )
@@ -318,7 +318,7 @@ test('personas: smartApprove está em PRESET_FIELDS e sobrevive a snapshot/aplic
   assert.ok((PRESET_FIELDS as readonly string[]).includes('smartApprove'))
   const sa: SmartApproveConfig = {
     ...normalizeSmartApprove({ enabled: true, providerId: 'p', model: 'j' }),
-    tools: ['bash', 'write_file']
+    tools: ['shell', 'write_file']
   }
   const base = DEFAULT_CHAT_CONFIG('/w', { providerId: 'p', model: 'm' })
   const snap = snapshotPreset({ ...base, smartApprove: sa })
@@ -400,7 +400,7 @@ const judge = (
     provider: p,
     chatConfig: { appSignature: 'none' },
     ctx: {
-      tool: 'bash',
+      tool: 'shell',
       args: { command: 'ls' },
       cwd: '/w',
       confine: true,
@@ -500,6 +500,7 @@ test('juiz: falhas nunca liberam (ambíguo, vazio, HTTP, rede, timeout, abort, s
     r = await judge({ model: null })
     assert.equal(r.decision, 'ask')
   } finally {
+    server.closeAllConnections() // keep-alive do fetch reaproveitaria a conexão
     server.close()
   }
   // servidor fechado → erro de rede
