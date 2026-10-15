@@ -54,8 +54,9 @@ export function ModelFieldInfo({ side }: { side?: Side }): React.JSX.Element {
       <p>
         <C>HTTP-Referer</C>/<C>X-Title</C> vêm da &quot;Assinatura do app&quot;; em OpenRouter
         também vai <C>{'usage: { include: true }'}</C>. Trocar no meio do chat vale a partir da
-        próxima request; subagentes ficam no provedor da sessão que os criou e podem usar outro
-        modelo se o <C>delegate_task</C> informar <C>model</C>.
+        próxima request; subagentes ficam no provedor da sessão que os criou, salvo se o{' '}
+        <C>delegate_task</C> informar <C>provider</C> (e/ou <C>model</C>) — aí o subagente fica fixo
+        nesse par.
       </p>
     </ApiInfo>
   )

@@ -1048,6 +1048,75 @@ async function main(): Promise<void> {
   )
 
   await step(
+    'subagente em outro provedor: list_models de todos + delegate_task provider → request no outro',
+    async () => {
+      // principal no OpenRouter (passo anterior voltou para lá); o subagente vai para o Local Fake
+      const { chat, sid } = await currentState()
+      assert(chat.config.providerId === orId, 'principal no OpenRouter')
+      const enabled: string[] = chat.config.enabledTools
+      if (!enabled.includes('list_models') || !enabled.includes('delegate_task'))
+        await read('chats.update', chat.id, {
+          config: { enabledTools: [...new Set([...enabled, 'list_models', 'delegate_task'])] }
+        })
+      const before = fakeHits.length
+      const nMsgs = (await read<any[]>('sessions.messages', sid)).length
+      await sendMessage(
+        'Do exactly these two tool calls in order. 1) Call list_models with query "nano". ' +
+          '2) Call delegate_task with provider "Local Fake", model "' +
+          MODEL +
+          '", title "via fake" and task "Reply with the word PONG.". ' +
+          'Then reply with the subagent result only.'
+      )
+      await waitIdle(180_000)
+      const msgs = (await read<any[]>('sessions.messages', sid)).slice(nMsgs)
+      const toolRes = (name: string): any => {
+        const call = msgs
+          .flatMap((m) => m.message.tool_calls ?? [])
+          .filter((t: any) => t.function.name === name)
+          .at(-1)
+        return call && msgs.find((m) => m.message.tool_call_id === call.id)
+      }
+      // list_models: seções por provedor, o quebrado inline
+      const lm = toolRes('list_models')
+      assert(lm && lm.meta.toolStatus === 'ok', `list_models: ${lm?.message.content}`)
+      const lmText: string = lm.message.content
+      assert(
+        /^\[modelos de 3 provedores — OpenRouter/.test(lmText),
+        `cabeçalho: ${lmText.slice(0, 200)}`
+      )
+      assert(lmText.includes('[Local Fake]') && lmText.includes(MODEL), 'seção Local Fake')
+      assert(/\[Quebrado\] erro ao listar/.test(lmText), 'quebrado inline')
+      // delegate_task: subsessão no Local Fake, request chegou lá
+      const del = toolRes('delegate_task')
+      assert(del && del.meta.toolStatus === 'ok', `delegate: ${del?.message.content}`)
+      assert(/FAKE-OK/.test(del.message.content), `resultado: ${del.message.content}`)
+      const sub = (await read<any[]>('sessions.list', chat.id)).find(
+        (x) => x.id === del.meta.subSessionId
+      )
+      assert(sub && sub.providerId === fakeId && sub.model === MODEL, `sub: ${JSON.stringify(sub)}`)
+      const hits = fakeHits.slice(before)
+      assert(hits.length === 1, `requests no falso: ${hits.length}`)
+      assert(hits[0].auth === `Bearer ${FAKE_KEY}` && hits[0].body.model === MODEL, 'key/model')
+      assert(
+        JSON.stringify(hits[0].body.messages).includes('PONG'),
+        'a tarefa do subagente foi para o falso'
+      )
+      // o card e o seletor mostram "<Provedor> · <modelo>"
+      const card = toolCards('Delegar a subagente').last()
+      await card.getByText('Local Fake').waitFor({ timeout: 5000 })
+      await page.getByRole('button', { name: /\d+ sub/ }).click()
+      await page
+        .locator('button', { hasText: 'via fake' })
+        .last()
+        .getByText('Local Fake')
+        .waitFor({ timeout: 5000 })
+      await shot('cross-provider-subagent')
+      await page.keyboard.press('Escape')
+      return `sub ${sub.id.slice(0, 8)} → ${hits[0].url}`
+    }
+  )
+
+  await step(
     'Novos chats: modelo padrão (par) · persona com provedor apagado → aviso · provedor apagado = não definido',
     async () => {
       await page.getByRole('button', { name: 'Configurações' }).first().click()

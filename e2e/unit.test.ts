@@ -1194,12 +1194,235 @@ test('list_models: filtro, ordenação, formato, grátis e truncamento', async (
   assert.deepEqual(Object.keys(d.parameters.properties).sort(), [
     'free_only',
     'limit',
+    'provider',
     'query',
     'sort',
     'tools_only'
   ])
+  assert.ok('provider' in TOOL_DEFINITIONS.delegate_task.function.parameters.properties)
   assert.match(d.description, /grátis/)
   assert.match(TOOL_DEFINITIONS.delegate_task.function.description, /list_models/)
+})
+
+// ---- provedores múltiplos: list_models e delegate_task ----
+
+import {
+  formatMultiProviderModels,
+  type ModelSource,
+  matchProvider,
+  resolveSubagentTarget
+} from '../src/main/tools/models.ts'
+
+const PROVS = [
+  { id: 'p-or', name: 'OpenRouter' },
+  { id: 'p-an', name: 'Anthropic' },
+  { id: 'p-or2', name: 'OpenRouter Pessoal' }
+]
+const PROV_MODELS: Record<string, string[]> = {
+  'p-or': ['anthropic/claude-opus-4', 'openai/gpt-4.1', 'shared/x'],
+  'p-an': ['claude-opus-4', 'claude-haiku-4.5'],
+  'p-or2': ['anthropic/claude-opus-4', 'shared/x', 'only/or2']
+}
+const listFor = async (pid: string): Promise<ModelInfo[]> => {
+  if (pid === 'p-down') throw new Error('Erro HTTP 503')
+  return (PROV_MODELS[pid] ?? []).map((id) => ({ id }))
+}
+const resolve = (over: Record<string, unknown>): ReturnType<typeof resolveSubagentTarget> =>
+  resolveSubagentTarget({
+    providers: PROVS,
+    callerProviderId: 'p-or',
+    callerModel: 'openai/gpt-4.1',
+    listModels: listFor,
+    ...over
+  })
+
+test('matchProvider: id exato, nome sem caixa, ambíguo, desconhecido', () => {
+  assert.equal(matchProvider(PROVS, 'p-an'), PROVS[1])
+  assert.equal(matchProvider(PROVS, '  anthropic '), PROVS[1])
+  assert.equal(matchProvider(PROVS, 'openrouter pessoal'), PROVS[2])
+  assert.equal(matchProvider(PROVS, 'Nope'), null)
+  assert.equal(matchProvider(PROVS, ''), null)
+  assert.equal(
+    matchProvider([...PROVS, { id: 'dup', name: 'anthropic' }], 'Anthropic'),
+    'ambiguous'
+  )
+})
+
+test('delegate_task: resolução de provedor + modelo do subagente', async () => {
+  // padrão: provedor e modelo da sessão chamadora
+  assert.deepEqual(await resolve({}), { providerId: 'p-or', model: 'openai/gpt-4.1' })
+  // modelo do próprio provedor
+  assert.deepEqual(await resolve({ model: 'anthropic/claude-opus-4' }), {
+    providerId: 'p-or',
+    model: 'anthropic/claude-opus-4'
+  })
+  // provider por nome (sem caixa) e por id
+  assert.deepEqual(await resolve({ provider: 'anthropic', model: 'claude-opus-4' }), {
+    providerId: 'p-an',
+    model: 'claude-opus-4'
+  })
+  assert.deepEqual(await resolve({ provider: 'p-or2', model: 'anthropic/claude-opus-4' }), {
+    providerId: 'p-or2',
+    model: 'anthropic/claude-opus-4'
+  })
+  // provider sem model: o modelo da sessão, se existir lá; senão erro pedindo model
+  const noModel = await resolve({ provider: 'Anthropic' })
+  assert.ok('error' in noModel && /informe "model"/.test(noModel.error), JSON.stringify(noModel))
+  // provider desconhecido → nomes disponíveis
+  const unk = await resolve({ provider: 'Groq', model: 'x' })
+  assert.ok('error' in unk)
+  assert.match(unk.error, /provedor "Groq" não encontrado/)
+  assert.match(unk.error, /"OpenRouter", "Anthropic", "OpenRouter Pessoal"/)
+  // model inexistente no provider pedido → erro com dica de list_models
+  const miss = await resolve({ provider: 'Anthropic', model: 'openai/gpt-4.1' })
+  assert.ok('error' in miss && /não existe no provedor Anthropic/.test(miss.error))
+  // sem provider: modelo só em outro provedor (exatamente um) → esse, com nota
+  const other = await resolve({ model: 'claude-haiku-4.5' })
+  assert.ok(!('error' in other))
+  assert.equal(other.providerId, 'p-an')
+  assert.equal(other.model, 'claude-haiku-4.5')
+  assert.match(other.note ?? '', /não existe no provedor OpenRouter; usando o provedor Anthropic/)
+  // ... mas o do próprio provedor tem prioridade mesmo existindo em outro
+  assert.deepEqual(await resolve({ model: 'shared/x' }), { providerId: 'p-or', model: 'shared/x' })
+  // em vários outros → erro pedindo provider
+  const amb = await resolve({
+    callerProviderId: 'p-an',
+    callerModel: 'claude-opus-4',
+    model: 'shared/x'
+  })
+  assert.ok('error' in amb)
+  assert.match(
+    amb.error,
+    /existe em vários provedores \("OpenRouter", "OpenRouter Pessoal"\); informe "provider"/
+  )
+  // em nenhum → modelo da sessão, com nota
+  const none = await resolve({ model: 'zzz/nada' })
+  assert.ok(!('error' in none))
+  assert.equal(none.providerId, 'p-or')
+  assert.equal(none.model, 'openai/gpt-4.1')
+  assert.match(none.note ?? '', /não foi encontrado em nenhum provedor/)
+  // /models do provedor da sessão falhou → confia no pedido
+  assert.deepEqual(
+    await resolve({
+      callerProviderId: 'p-down',
+      providers: [...PROVS, { id: 'p-down', name: 'Down' }],
+      model: 'x/y'
+    }),
+    { providerId: 'p-down', model: 'x/y' }
+  )
+})
+
+test('list_models: vários provedores — seções, contagens, erro inline, filtro e teto', async () => {
+  const info = { current: 'openai/gpt-4.1' }
+  const out = formatMultiProviderModels(
+    [
+      {
+        id: 'p-an',
+        name: 'Anthropic',
+        models: [{ id: 'claude-opus-4' }, { id: 'claude-haiku-4.5' }]
+      },
+      { id: 'p-or', name: 'OpenRouter', isSession: true, models: MODELS },
+      { id: 'p-x', name: 'Local', error: 'fetch failed: ECONNREFUSED\n  at x' }
+    ],
+    {},
+    info
+  )
+  const lines = out.split('\n')
+  assert.match(
+    lines[0],
+    /^\[modelos de 3 provedores — OpenRouter \(desta sessão\): 5 de 5, mostrando 5 · Anthropic: 2 de 2, mostrando 2 · Local: falhou\]$/
+  )
+  // o da sessão primeiro, com (atual) só nele
+  assert.equal(lines[1], '[OpenRouter] (provedor desta sessão)')
+  assert.ok(lines.includes('openai/gpt-4.1 (atual) · ctx 1.047k · $2.00/$8.00 por 1M · tools'))
+  const an = lines.indexOf('[Anthropic]')
+  assert.ok(an > 1 && lines[an + 1] === 'claude-haiku-4.5' && lines[an + 2] === 'claude-opus-4')
+  assert.ok(lines.includes('[Local] erro ao listar (GET /models): fetch failed: ECONNREFUSED at x'))
+  assert.match(out, /delegate_task com "provider" e "model"/)
+
+  // filtro sem resultado num provedor
+  const q = formatMultiProviderModels(
+    [
+      { id: 'p-or', name: 'OpenRouter', isSession: true, models: MODELS },
+      { id: 'p-an', name: 'Anthropic', models: [{ id: 'claude-opus-4' }] }
+    ],
+    { query: 'opus' },
+    info
+  )
+  assert.match(q, /OpenRouter \(desta sessão\): 0 de 5/)
+  assert.match(q, /\[OpenRouter\] nenhum modelo casa com os filtros \(de 5\)/)
+  assert.match(q, /\[Anthropic\]\nclaude-opus-4/)
+
+  // limit por provedor + teto de caracteres dividido entre provedores
+  const many = (p: string): ModelInfo[] =>
+    Array.from({ length: 300 }, (_, i) => ({ id: `${p}/model-${String(i).padStart(3, '0')}` }))
+  const capped = formatMultiProviderModels(
+    [
+      { id: 'a', name: 'A', isSession: true, models: many('a') },
+      { id: 'b', name: 'B', models: many('b') }
+    ],
+    { limit: 200 },
+    { maxChars: 4000 }
+  )
+  assert.ok(capped.length <= 4000, `tamanho ${capped.length}`)
+  const aN = capped.split('\n').filter((l) => l.startsWith('a/')).length
+  const bN = capped.split('\n').filter((l) => l.startsWith('b/')).length
+  assert.ok(aN > 10 && bN > 10, `divisão justa: ${aN}/${bN}`)
+  assert.match(capped, /\[… mais \d+ em A\]/)
+  assert.match(capped, /aumente limit \(por provedor/)
+  const lim = formatMultiProviderModels(
+    [
+      { id: 'a', name: 'A', models: many('a') },
+      { id: 'b', name: 'B', models: many('b') }
+    ],
+    { limit: 3 },
+    {}
+  )
+  assert.equal(lim.split('\n').filter((l) => /^[ab]\//.test(l)).length, 6)
+})
+
+test('list_models (tool): todos os provedores, provider filtra, falha parcial não derruba', async () => {
+  const ac = new AbortController()
+  const src = (id: string, name: string, isSession = false): ModelSource => ({
+    id,
+    name,
+    isSession,
+    list: () => listFor(id)
+  })
+  const ctx: any = {
+    cwd: '/',
+    signal: ac.signal,
+    models: {
+      providerName: 'OpenRouter',
+      current: 'openai/gpt-4.1',
+      list: () => listFor('p-or'),
+      providers: [
+        src('p-or', 'OpenRouter', true),
+        src('p-an', 'Anthropic'),
+        src('p-down', 'Fora do ar')
+      ]
+    }
+  }
+  const all = await listModelsTool({}, ctx)
+  assert.equal(all.status, 'ok')
+  assert.match(all.content, /^\[modelos de 3 provedores — OpenRouter \(desta sessão\): 3 de 3/)
+  assert.match(all.content, /\[Fora do ar\] erro ao listar \(GET \/models\): Erro HTTP 503/)
+  assert.match(all.content, /\[Anthropic\]\nclaude-haiku-4\.5\nclaude-opus-4/)
+  // provider por nome (sem caixa) → formato de um provedor só
+  const one = await listModelsTool({ provider: 'anthropic' }, ctx)
+  assert.equal(one.status, 'ok')
+  assert.match(one.content, /^\[2 modelos de 2 no provedor Anthropic; mostrando 2\]/)
+  assert.ok(!one.content.includes('(atual)'))
+  const byId = await listModelsTool({ provider: 'p-or' }, ctx)
+  assert.match(byId.content, /openai\/gpt-4\.1 \(atual\)/)
+  // desconhecido → erro com os nomes
+  const unk = await listModelsTool({ provider: 'Groq' }, ctx)
+  assert.equal(unk.status, 'error')
+  assert.match(unk.content, /"OpenRouter", "Anthropic", "Fora do ar"/)
+  // só o que falhou → erro
+  const down = await listModelsTool({ provider: 'fora do ar' }, ctx)
+  assert.equal(down.status, 'error')
+  assert.match(down.content, /provedor Fora do ar .*503/)
 })
 
 test('delegate_task: falha do modelo do subagente vira erro acionável', () => {

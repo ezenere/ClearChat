@@ -193,18 +193,22 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   list_models: def(
     'list_models',
-    `Lista os modelos do provedor deste chat, um por linha: id · contexto · preço por 1M tokens (entrada/saída) · grátis · tools. Use para escolher o modelo de um subagente (delegate_task; ele precisa de "tools"). Modelos grátis (id ":free" ou preço 0) só para tarefas fáceis e SEM dados pessoais/sensíveis (o provedor pode registrar os prompts); são instáveis (429, erros, respostas vazias, sem tools): se falharem, tente outro grátis ou um pago. Tarefas difíceis ou com dados pessoais: modelo pago. Padrão ${L.modelsDefaultResults} resultados (máx. ${L.modelsMaxResults}).`,
+    `Lista os modelos de todos os provedores configurados (seções [Provedor]; o desta sessão primeiro), um por linha: id · contexto · preço por 1M tokens (entrada/saída) · grátis · tools. Use para escolher o modelo de um subagente (delegate_task com model e provider; ele precisa de "tools"). Modelos grátis (id ":free" ou preço 0) só para tarefas fáceis e SEM dados pessoais/sensíveis (o provedor pode registrar os prompts); são instáveis (429, erros, respostas vazias, sem tools): se falharem, tente outro grátis ou um pago. Tarefas difíceis ou com dados pessoais: modelo pago. Padrão ${L.modelsDefaultResults} por provedor (máx. ${L.modelsMaxResults}).`,
     {
       query: {
         type: 'string',
         description:
           'Filtra por parte do id ou do nome (sem diferenciar maiúsculas; ex.: "gpt-4.1", "claude").'
       },
+      provider: {
+        type: 'string',
+        description: 'Só este provedor (nome ou id). Padrão: todos.'
+      },
       tools_only: { type: 'boolean', description: 'Só modelos com suporte a tools.' },
       free_only: { type: 'boolean', description: 'Só modelos grátis.' },
       limit: {
         type: 'number',
-        description: `Máximo de modelos listados (padrão ${L.modelsDefaultResults}, máx. ${L.modelsMaxResults}).`
+        description: `Máximo de modelos listados por provedor (padrão ${L.modelsDefaultResults}, máx. ${L.modelsMaxResults}).`
       },
       sort: {
         type: 'string',
@@ -216,12 +220,17 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   delegate_task: def(
     'delegate_task',
-    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Com background=true retorna na hora e o resultado chega depois sozinho, como mensagem (você é acordado se tiver encerrado o turno): use para tarefas independentes ou longas e para rodar várias em paralelo; não fique consultando em loop — use wait_subagents ou apenas encerre o turno. Para outro modelo, consulte list_models; se o modelo falhar, tente outro.',
+    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Com background=true retorna na hora e o resultado chega depois sozinho, como mensagem (você é acordado se tiver encerrado o turno): use para tarefas independentes ou longas e para rodar várias em paralelo; não fique consultando em loop — use wait_subagents ou apenas encerre o turno. Para outro modelo (ou o mesmo modelo por outro provedor), consulte list_models e passe model/provider; se o modelo falhar, tente outro.',
     {
       task: { type: 'string', description: 'Descrição completa e autocontida da tarefa.' },
       model: {
         type: 'string',
         description: 'Modelo do subagente (padrão: o mesmo desta sessão; veja list_models).'
+      },
+      provider: {
+        type: 'string',
+        description:
+          'Provedor do subagente (nome, como em list_models, ou id). Padrão: o desta sessão.'
       },
       title: { type: 'string', description: 'Título curto para a subsessão.' },
       background: {

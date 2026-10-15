@@ -1225,8 +1225,13 @@ async function main(): Promise<void> {
     const t = calls.at(-1)
     assert(t.meta.toolStatus === 'ok', `status: ${t.meta.toolStatus} — ${t.message.content}`)
     const c = t.message.content as string
+    // um provedor: formato simples; vários (o "Bad" criado antes): seções, o da sessão primeiro
     assert(
-      /^\[\d+ modelos de [\d.]+ no provedor OpenRouter; mostrando \d+\]/.test(c),
+      /^\[\d+ modelos de [\d.]+ no provedor OpenRouter; mostrando \d+\]/.test(c) ||
+        (/^\[modelos de \d+ provedores — OpenRouter \(desta sessão\): \d+ de [\d.]+, mostrando \d+/.test(
+          c
+        ) &&
+          c.split('\n')[1] === '[OpenRouter] (provedor desta sessão)'),
       `cabeçalho: ${c.slice(0, 200)}`
     )
     const lines = c
@@ -2065,6 +2070,51 @@ async function main(): Promise<void> {
       `resultado subiu só depois do neto: ${del.message.content}`
     )
     return del.message.content.slice(0, 60)
+  })
+
+  await test('delegate_task com provider: subagente em outro provedor (mesma key, outro nome)', async () => {
+    const pB = await api('providers.create', {
+      name: 'OpenRouter B',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: KEY,
+      headers: {}
+    })
+    try {
+      const { chat, sid } = await newChat({ enabledTools: ['delegate_task'] })
+      await api(
+        'agent.send',
+        sid,
+        'Call delegate_task twice, one after the other (blocking). First: provider "nope-provider", title "x", task "Reply OK.". ' +
+          'Second: provider "openrouter b", title "via B", task "Reply with exactly the text INDIA-9 and nothing else.". Then reply with the result of the second call.'
+      )
+      await waitIdle(chat.id, sid, 240_000)
+      const msgs = await messages(sid)
+      addCost(msgs)
+      assertPairing(msgs)
+      const dels = toolMsgs(msgs, 'delegate_task')
+      const bad = dels.find((d) => d.meta.toolStatus === 'error')
+      assert(
+        bad && /provedor "nope-provider" não encontrado/.test(bad.message.content),
+        `erro de provedor: ${dels.map((d) => d.message.content).join(' | ')}`
+      )
+      assert(/"OpenRouter B"/.test(bad.message.content), 'lista os provedores disponíveis')
+      const good = dels.find((d) => d.meta.subSessionId)
+      assert(good && /INDIA-9/.test(good.message.content), `resultado: ${good?.message.content}`)
+      const sub = (await api<any[]>('sessions.list', chat.id)).find(
+        (x) => x.id === good.meta.subSessionId
+      )
+      assert(sub && sub.providerId === pB.id && sub.model === model, `sub: ${JSON.stringify(sub)}`)
+      const sm = await messages(sub.id)
+      addCost(sm)
+      assert(
+        sm.some((m) => m.meta.usage),
+        'subagente respondeu pelo provedor B'
+      )
+      await api('chats.delete', chat.id)
+      return `sub no provedor B (${pB.id.slice(0, 8)})`
+    } finally {
+      await api('providers.delete', pB.id)
+    }
   })
 
   await test('fs.*', async () => {

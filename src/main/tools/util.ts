@@ -28,8 +28,21 @@ export interface ToolContext {
   sandbox?: boolean
   /** Chave de cache por sessão (browse_url). */
   cacheKey?: string
-  /** list_models: modelos do provedor do chat (providers.listModels, com cache). */
-  models?: { providerName: string; current?: string; list: () => Promise<ModelInfo[]> }
+  /**
+   * list_models: modelos do provedor da sessão (providers.listModels, com cache) e, em `providers`,
+   * de todos os provedores configurados (o da sessão incluso, com isSession).
+   */
+  models?: {
+    providerName: string
+    current?: string
+    list: () => Promise<ModelInfo[]>
+    providers?: {
+      id: string
+      name: string
+      isSession?: boolean
+      list: () => Promise<ModelInfo[]>
+    }[]
+  }
   /** get_chat_info / list_chats: dados do chat chamador e dos outros chats (fornecidos pelo runner). */
   chats?: { self: () => ChatInfoData; list: () => ChatListEntry[] }
   /** read_history: mensagens persistidas da sessão chamadora (inclui as anteriores às fronteiras). */

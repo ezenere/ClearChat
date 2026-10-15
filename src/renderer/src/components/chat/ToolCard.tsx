@@ -39,6 +39,7 @@ import { ApiInfo, C, Tip } from '../ui/Tooltip'
 import { Button, Spinner } from '../ui/controls'
 import { CopyButton } from './Markdown'
 import { StatusDot } from './SessionSwitcher'
+import { ModelLabel } from '../ui/ModelLabel'
 
 const ICONS: Record<ToolName, LucideIcon> = {
   list_dir: FolderTree,
@@ -97,6 +98,7 @@ function summary(name: string, args: Record<string, unknown> | null): string {
     }
     case 'list_models':
       return [
+        pick('provider') && `@${pick('provider')}`,
         pick('query') && `"${pick('query')}"`,
         args.tools_only === true && 'tools',
         args.free_only === true && 'grátis',
@@ -344,6 +346,7 @@ export function ToolCard({
       .join(' · ')
   const liveSub = subId ? sessions[subId] : undefined
   const root = useStore((s) => s.chats.find((c) => c.id === chatId)?.config.cwd)
+  const chatProviderId = useStore((s) => s.chats.find((c) => c.id === chatId)?.config.providerId)
   const shellCwd = result?.meta.shellCwd
   const shellRel =
     shellCwd && root
@@ -424,6 +427,15 @@ export function ToolCard({
           <p className="line-clamp-2 min-w-0 flex-1 text-[12.5px] leading-relaxed text-muted">
             {typeof args?.task === 'string' ? args.task : ''}
           </p>
+          {liveSub && (
+            <ModelLabel
+              providerId={liveSub.providerId ?? chatProviderId}
+              model={liveSub.model}
+              short
+              className="max-w-[200px] shrink-0 text-[11px] text-faint"
+              modelClassName="font-mono"
+            />
+          )}
           <TaskInfo task={typeof args?.task === 'string' ? args.task : null} side="left" />
           {subId && (
             <Button

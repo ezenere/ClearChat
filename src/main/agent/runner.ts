@@ -42,7 +42,12 @@ import {
   type ChatListEntry,
   type ToolContext
 } from '../tools/util'
-import { delegateEmptyText, delegateFailureText } from '../tools/models'
+import {
+  delegateEmptyText,
+  delegateFailureText,
+  resolveSubagentTarget,
+  type ModelSource
+} from '../tools/models'
 import {
   callbackText,
   formatSubagentList,
@@ -841,6 +846,7 @@ async function executeTool(
       return done(await runMessageSubagent(session, chat, args, signal))
     const root = chat.config.cwd
     const provider = name === 'list_models' ? providerFor(chat, session) : null
+    const allProviders = name === 'list_models' ? modelSources(chat, session) : []
     const r = await runLocalTool(name, args, {
       cwd: root,
       confine: chat.config.confineToRoot !== false,
@@ -851,9 +857,16 @@ async function executeTool(
           ? shellStateFor(session.id, root, () => lastShellCwd(session.id))
           : undefined,
       cacheKey: session.id,
-      models: provider
-        ? { providerName: provider.name, current: session.model, list: () => listModels(provider) }
-        : undefined,
+      models:
+        provider || allProviders.length
+          ? {
+              providerName: provider?.name ?? '',
+              current: session.model,
+              list: () =>
+                provider ? listModels(provider) : Promise.reject(new Error('sem provedor')),
+              providers: allProviders
+            }
+          : undefined,
       chats:
         name === 'get_chat_info' || name === 'list_chats' ? chatToolsCtx(chat, session) : undefined,
       history: name === 'read_history' ? () => messagesRepo.list(session.id) : undefined,
@@ -875,22 +888,35 @@ async function executeTool(
   }
 }
 
-/** Modelo do subagente: o pedido pelo modelo chamador, se existir no provider; senão o da sessão. */
-async function resolveSubagentModel(
+/** Todos os provedores configurados como fontes de modelos (o da sessão primeiro, marcado). */
+function modelSources(chat: Chat, session: Session): ModelSource[] {
+  const own = sessionProviderId(chat.config, session)
+  const list = providersRepo.list().map((p): ModelSource => ({
+    id: p.id,
+    name: p.name,
+    isSession: p.id === own,
+    list: () => listModels(p)
+  }))
+  return [...list.filter((p) => p.isSession), ...list.filter((p) => !p.isSession)]
+}
+
+/** Provedor + modelo do subagente (args provider/model; padrão: os da sessão chamadora). */
+function resolveSubagent(
   chat: Chat,
   session: Session,
-  requested: unknown
-): Promise<string> {
-  const req = typeof requested === 'string' ? requested.trim() : ''
-  if (!req || req === session.model) return session.model
-  const provider = providerFor(chat, session)
-  if (!provider) return session.model
-  try {
-    const models = await listModels(provider)
-    return models.some((m) => m.id === req) ? req : session.model
-  } catch {
-    return req // sem lista de modelos: confia no pedido
-  }
+  args: Record<string, unknown>
+): ReturnType<typeof resolveSubagentTarget> {
+  return resolveSubagentTarget({
+    providers: providersRepo.list().map((p) => ({ id: p.id, name: p.name })),
+    callerProviderId: sessionProviderId(chat.config, session),
+    callerModel: session.model,
+    provider: args.provider,
+    model: args.model,
+    listModels: (pid) => {
+      const p = providersRepo.get(pid)
+      return p ? listModels(p) : Promise.reject(new Error('provedor não encontrado'))
+    }
+  })
 }
 
 async function runDelegate(
@@ -907,7 +933,12 @@ async function runDelegate(
   const task = typeof args.task === 'string' ? args.task.trim() : ''
   if (!task) return { content: 'Erro: argumento obrigatório "task" ausente.', status: 'error' }
   const background = args.background === true || args.background === 'true'
-  const model = await resolveSubagentModel(chat, session, args.model)
+  const target = await resolveSubagent(chat, session, args)
+  if ('error' in target) return { content: target.error, status: 'error' }
+  const { model, providerId } = target
+  const providerName = providersRepo.get(providerId)?.name ?? providerId
+  // nota de resolução (ex.: modelo achado em outro provedor) — vai no início do resultado
+  const note = target.note ? `[nota: ${target.note}]\n\n` : ''
   const rawTitle =
     (typeof args.title === 'string' && args.title.trim()) || task.replace(/\s+/g, ' ')
   const title = rawTitle.length > 60 ? rawTitle.slice(0, 60).trimEnd() + '…' : rawTitle
@@ -918,8 +949,8 @@ async function runDelegate(
     parentToolCallId: toolCallId,
     depth: (session.depth + 1) as 1 | 2,
     model,
-    // o subagente fica no provedor da sessão que o criou (trocar o do chat depois não o muda)
-    providerId: sessionProviderId(chat.config, session),
+    // provedor escolhido (padrão: o da sessão que o criou); trocar o do chat depois não o muda
+    providerId,
     title,
     task,
     status: 'running'
@@ -932,7 +963,7 @@ async function runDelegate(
     const bst = startLoop(child)
     attachReport(bst, child, false)
     return {
-      content: `Subagente iniciado em segundo plano (id ${child.id}, modelo ${model}). Você receberá o resultado automaticamente quando ele terminar.`,
+      content: `${note}Subagente iniciado em segundo plano (id ${child.id}, ${providerName} · ${model}). Você receberá o resultado automaticamente quando ele terminar.`,
       status: 'ok',
       subSessionId: child.id,
       background: true
@@ -944,7 +975,7 @@ async function runDelegate(
   const max = clampToolOutput(chat.config.maxToolOutputChars)
   if (outcome.kind === 'final') {
     return {
-      content: truncateHeadTail(outcome.text.trim() || delegateEmptyText(model), max, 0.5),
+      content: note + truncateHeadTail(outcome.text.trim() || delegateEmptyText(model), max, 0.5),
       status: 'ok',
       subSessionId: child.id
     }
@@ -960,7 +991,7 @@ async function runDelegate(
     }
   }
   return {
-    content: delegateFailureText(model, outcome.error),
+    content: note + delegateFailureText(model, outcome.error),
     status: 'error',
     subSessionId: child.id
   }

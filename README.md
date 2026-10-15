@@ -105,9 +105,14 @@ npm run install:local -- --uninstall
   saída, `browse_url` pagina com `offset`, `list_dir`/`web_search`/`search_files`/`list_models` têm teto; o teto
   geral por resultado é configurável no chat ("Saída máx. por ferramenta"). `search_files` e
   `find_files` usam ripgrep quando disponível.
-- **`list_models`** ("Listar modelos"): o modelo lista os modelos do provedor da sessão (`/models`,
-  com cache) filtrando por `query`, `tools_only`, `free_only`, ordenando por id/preço/contexto — útil
-  para escolher o modelo de um `delegate_task`. Uma linha por modelo (`ctx`, preço por 1M, `grátis`,
+- **`list_models`** ("Listar modelos"): o modelo lista os modelos de todos os provedores
+  configurados (`/models`, com cache; seções `[Provedor]`, o da sessão primeiro; um provedor fora do ar
+  aparece como erro na seção dele; `provider` filtra um só) filtrando por `query`, `tools_only`,
+  `free_only`, ordenando por id/preço/contexto — útil para escolher o modelo de um `delegate_task`.
+- **Subagentes em outro provedor**: `delegate_task` aceita `provider` (nome ou id) — o mesmo modelo
+  pode ir pelo OpenRouter ou direto pelo provedor. Sem `provider`, usa o da sessão; um `model` que só
+  existe em um outro provedor vai para ele (o resultado avisa); se existir em vários, pede `provider`.
+  O card do delegate e o seletor de sessão mostram "<Provedor> · <modelo>". Uma linha por modelo (`ctx`, preço por 1M, `grátis`,
   `tools`, `(atual)`). Habilitada por padrão em chats novos; chats antigos podem ligá-la na Config.
   A descrição orienta a usar modelos grátis só em tarefas fáceis e sem dados pessoais, e a trocar de
   modelo quando falham; se o modelo do subagente falhar, o `delegate_task` devolve

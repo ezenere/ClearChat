@@ -1,5 +1,6 @@
-// list_models: lista os modelos do provedor do chat (providers.listModels, com cache por provider).
-// A formatação é pura (formatModelList) — testada em e2e/unit.test.ts sem rede.
+// list_models: lista os modelos de todos os provedores configurados (providers.listModels, com cache
+// por provider). Formatação e resolução de provedor do delegate_task são puras — testadas em
+// e2e/unit.test.ts sem rede.
 import { LIMITS } from '@shared/limits'
 import type { ModelInfo } from '@shared/types'
 import {
@@ -78,14 +79,10 @@ export function clampModelLimit(v: unknown): number {
   return Math.min(LIMITS.modelsMaxResults, Math.max(1, Math.floor(n)))
 }
 
-/** Filtra, ordena e formata a lista (uma linha por modelo), respeitando `maxChars`. */
-export function formatModelList(
-  models: ModelInfo[],
-  opts: ModelListOptions,
-  info: { providerName: string; current?: string; maxChars?: number }
-): string {
+/** Aplica query/tools_only/free_only e a ordenação pedida (sem limite). */
+export function filterSortModels(models: ModelInfo[], opts: ModelListOptions): ModelInfo[] {
   const query = (opts.query ?? '').trim()
-  let list = models.filter(
+  const list = models.filter(
     (m) =>
       (!query || matchesModelQuery(m, query)) &&
       (!opts.toolsOnly || m.supportsTools === true) &&
@@ -93,7 +90,7 @@ export function formatModelList(
   )
   const byId = (a: ModelInfo, b: ModelInfo): number => a.id.localeCompare(b.id)
   const sort = opts.sort ?? 'id'
-  list = [...list].sort((a, b) => {
+  return [...list].sort((a, b) => {
     if (sort === 'price') {
       const pa = totalPrice(a)
       const pb = totalPrice(b)
@@ -105,7 +102,16 @@ export function formatModelList(
     }
     return byId(a, b)
   })
+}
 
+/** Filtra, ordena e formata a lista (uma linha por modelo), respeitando `maxChars`. */
+export function formatModelList(
+  models: ModelInfo[],
+  opts: ModelListOptions,
+  info: { providerName: string; current?: string; maxChars?: number }
+): string {
+  const query = (opts.query ?? '').trim()
+  const list = filterSortModels(models, opts)
   const filters = [
     query && `query "${query}"`,
     opts.toolsOnly && 'tools_only',
@@ -136,6 +142,123 @@ export function formatModelList(
   return out.join('\n')
 }
 
+/** Um provedor configurado como fonte de modelos (list_models / delegate_task). */
+export interface ModelSource {
+  id: string
+  name: string
+  /** Provedor da sessão chamadora (marca "(atual)" e vem primeiro). */
+  isSession?: boolean
+  list: () => Promise<ModelInfo[]>
+}
+
+/** Resultado de um provedor: modelos ou o erro do /models. */
+export interface ProviderModels {
+  id: string
+  name: string
+  isSession?: boolean
+  models?: ModelInfo[]
+  error?: string
+}
+
+export interface ProviderRef {
+  id: string
+  name: string
+}
+
+/** Provedor por id exato ou nome (sem diferenciar caixa nem espaços nas pontas). */
+export function matchProvider<T extends ProviderRef>(
+  providers: T[],
+  ref: string
+): T | 'ambiguous' | null {
+  const r = ref.trim()
+  if (!r) return null
+  const byId = providers.find((p) => p.id === r)
+  if (byId) return byId
+  const lc = r.toLowerCase()
+  const byName = providers.filter((p) => p.name.trim().toLowerCase() === lc)
+  return byName.length === 1 ? byName[0] : byName.length > 1 ? 'ambiguous' : null
+}
+
+const providerNames = (ps: ProviderRef[]): string =>
+  ps.length ? ps.map((p) => `"${p.name}"`).join(', ') : '(nenhum provedor configurado)'
+
+const oneLine = (e: string, max = 200): string => {
+  const t = e.replace(/\s+/g, ' ').trim()
+  return t.length > max ? t.slice(0, max) + '…' : t
+}
+
+/**
+ * Lista de vários provedores: cabeçalho com contagem por provedor, uma seção `[Provedor]` por
+ * provedor (o da sessão primeiro) e erros inline. `limit` vale por provedor; o teto de caracteres é
+ * dividido entre os provedores com resultados (sobra de um passa ao próximo).
+ */
+export function formatMultiProviderModels(
+  groups: ProviderModels[],
+  opts: ModelListOptions,
+  info: { current?: string; maxChars?: number }
+): string {
+  const ordered = [...groups.filter((g) => g.isSession), ...groups.filter((g) => !g.isSession)]
+  const limit = clampModelLimit(opts.limit)
+  const max = info.maxChars && info.maxChars > 0 ? info.maxChars : LIMITS.maxToolOutputChars
+  const rows = ordered.map((g) => ({ g, list: g.models ? filterSortModels(g.models, opts) : [] }))
+  const tag = (g: ProviderModels): string => (g.isSession ? `${g.name} (desta sessão)` : g.name)
+  // orçamento: tira cabeçalho, títulos e erros; divide o resto entre os que têm resultados
+  const fixed = 600 + ordered.reduce((n, g) => n + g.name.length * 2 + 80, 0)
+  let budget = Math.max(400, max - fixed)
+  let pending = rows.filter((r) => r.list.length).length
+  const sections: string[] = []
+  const counts: string[] = []
+  let hidden = 0
+  for (const { g, list } of rows) {
+    if (g.error !== undefined) {
+      counts.push(`${tag(g)}: falhou`)
+      sections.push(`[${g.name}] erro ao listar (GET /models): ${oneLine(g.error)}`)
+      continue
+    }
+    const total = g.models?.length ?? 0
+    if (!list.length) {
+      counts.push(`${tag(g)}: 0 de ${fmtNum(total)}`)
+      sections.push(`[${g.name}] nenhum modelo casa com os filtros (de ${fmtNum(total)})`)
+      continue
+    }
+    const share = Math.floor(budget / Math.max(1, pending))
+    pending--
+    const lines: string[] = []
+    let used = 0
+    for (const m of list.slice(0, limit)) {
+      const line = formatModelLine(m, g.isSession ? info.current : undefined)
+      if (used + line.length + 1 > share) break
+      lines.push(line)
+      used += line.length + 1
+    }
+    budget -= used
+    counts.push(
+      `${tag(g)}: ${fmtNum(list.length)} de ${fmtNum(total)}, mostrando ${fmtNum(lines.length)}`
+    )
+    const more = list.length - lines.length
+    hidden += more
+    sections.push(
+      [
+        `[${g.name}]${g.isSession ? ' (provedor desta sessão)' : ''}`,
+        ...lines,
+        ...(more > 0 ? [`[… mais ${fmtNum(more)} em ${g.name}]`] : [])
+      ].join('\n')
+    )
+  }
+  const out = [
+    `[modelos de ${fmtNum(ordered.length)} provedores — ${counts.join(' · ')}]`,
+    ...sections
+  ]
+  if (hidden > 0)
+    out.push(
+      `[Refine com query (ex.: "claude", "gpt-4.1"), provider, tools_only/free_only, ou aumente limit (por provedor, máx. ${LIMITS.modelsMaxResults}).]`
+    )
+  out.push(
+    '[Para usar um modelo de outro provedor num subagente: delegate_task com "provider" e "model".]'
+  )
+  return out.join('\n')
+}
+
 function parseOptions(args: Record<string, unknown>): ModelListOptions {
   const { query, tools_only, free_only, limit, sort } = args
   if (query !== undefined && query !== null && typeof query !== 'string')
@@ -151,32 +274,153 @@ function parseOptions(args: Record<string, unknown>): ModelListOptions {
   }
 }
 
+const listFailText = (name: string, e: unknown): string =>
+  `Erro: não foi possível listar os modelos do provedor ${name} (GET /models): ${(e as Error).message}. O endpoint pode não suportar /models; use o id do modelo diretamente se o conhecer.`
+
 export async function listModelsTool(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
   const opts = parseOptions(args)
   const src = ctx.models
-  if (!src) return fail('Erro: nenhum provedor configurado para este chat.')
-  let models: ModelInfo[]
-  try {
-    models = await src.list()
-  } catch (e) {
-    if (ctx.signal.aborted) throw abortError()
-    return fail(
-      `Erro: não foi possível listar os modelos do provedor ${src.providerName} (GET /models): ${(e as Error).message}. O endpoint pode não suportar /models; use o id do modelo diretamente se o conhecer.`
+  const all: ModelSource[] = src?.providers?.length
+    ? src.providers
+    : src
+      ? [{ id: '', name: src.providerName, isSession: true, list: src.list }]
+      : []
+  if (!all.length) return fail('Erro: nenhum provedor configurado.')
+  let sources = all
+  const pref = args.provider
+  if (pref !== undefined && pref !== null && pref !== '') {
+    if (typeof pref !== 'string') throw new ToolError('O argumento "provider" deve ser uma string.')
+    const m = matchProvider(all, pref)
+    if (m === 'ambiguous')
+      return fail(
+        `Erro: há mais de um provedor chamado "${pref}"; use o id (${all.map((p) => `${p.name}: ${p.id}`).join(', ')}).`
+      )
+    if (!m)
+      return fail(
+        `Erro: provedor "${pref}" não encontrado. Provedores disponíveis: ${providerNames(all)}.`
+      )
+    sources = [m]
+  }
+  const results = await Promise.allSettled(sources.map((p) => p.list()))
+  if (ctx.signal.aborted) throw abortError()
+  // um só provedor: formato simples (como antes)
+  if (sources.length === 1) {
+    const one = sources[0]
+    const r = results[0]
+    if (r.status === 'rejected') return fail(listFailText(one.name, r.reason))
+    if (r.value.length === 0)
+      return ok(`O provedor ${one.name} não informou nenhum modelo em /models.`)
+    return ok(
+      formatModelList(r.value, opts, {
+        providerName: one.name,
+        current: one.isSession ? src?.current : undefined,
+        maxChars: maxOutputOf(ctx)
+      })
     )
   }
-  if (ctx.signal.aborted) throw abortError()
-  if (models.length === 0)
-    return ok(`O provedor ${src.providerName} não informou nenhum modelo em /models.`)
+  if (results.every((r) => r.status === 'rejected')) {
+    return fail(
+      `Erro: não foi possível listar os modelos de nenhum provedor (GET /models): ${sources
+        .map(
+          (p, i) =>
+            `${p.name}: ${oneLine(((results[i] as PromiseRejectedResult).reason as Error)?.message ?? '?', 160)}`
+        )
+        .join(' · ')}`
+    )
+  }
+  const groups: ProviderModels[] = sources.map((p, i) => {
+    const r = results[i]
+    return r.status === 'fulfilled'
+      ? { id: p.id, name: p.name, isSession: p.isSession, models: r.value }
+      : {
+          id: p.id,
+          name: p.name,
+          isSession: p.isSession,
+          error: (r.reason as Error)?.message ?? String(r.reason)
+        }
+  })
   return ok(
-    formatModelList(models, opts, {
-      providerName: src.providerName,
-      current: src.current,
-      maxChars: maxOutputOf(ctx)
-    })
+    formatMultiProviderModels(groups, opts, { current: src?.current, maxChars: maxOutputOf(ctx) })
   )
+}
+
+/** Provedor + modelo do subagente (delegate_task), ou um erro legível para o modelo chamador. */
+export type SubagentTarget =
+  { providerId: string; model: string; note?: string } | { error: string }
+
+/**
+ * Regras (testadas em e2e/unit.test.ts):
+ * - `provider` (nome sem caixa ou id): esse provedor; desconhecido → erro com os nomes disponíveis.
+ *   Sem `model`: o modelo da sessão (se existir lá). `model` que o /models dele não lista → erro.
+ * - sem `provider`: o da sessão chamadora. `model` que não existe nele mas existe em exatamente um
+ *   outro provedor → esse outro (com nota); em vários → erro pedindo `provider`; em nenhum → o modelo
+ *   da sessão (com nota). /models com falha → confia no pedido.
+ */
+export async function resolveSubagentTarget(p: {
+  providers: ProviderRef[]
+  callerProviderId: string
+  callerModel: string
+  provider?: unknown
+  model?: unknown
+  listModels: (providerId: string) => Promise<ModelInfo[]>
+}): Promise<SubagentTarget> {
+  const reqProv = typeof p.provider === 'string' ? p.provider.trim() : ''
+  const reqModel = typeof p.model === 'string' ? p.model.trim() : ''
+  /** true/false = o /models lista (ou não) o modelo; null = sem lista (falhou). */
+  const has = async (pid: string, model: string): Promise<boolean | null> => {
+    try {
+      return (await p.listModels(pid)).some((m) => m.id === model)
+    } catch {
+      return null
+    }
+  }
+  if (reqProv) {
+    const m = matchProvider(p.providers, reqProv)
+    if (m === 'ambiguous')
+      return {
+        error: `Erro: há mais de um provedor chamado "${reqProv}"; use o id (${p.providers.map((x) => `${x.name}: ${x.id}`).join(', ')}).`
+      }
+    if (!m)
+      return {
+        error: `Erro: provedor "${reqProv}" não encontrado. Provedores disponíveis: ${providerNames(p.providers)}.`
+      }
+    const model = reqModel || p.callerModel
+    if (m.id === p.callerProviderId && (!reqModel || reqModel === p.callerModel))
+      return { providerId: m.id, model }
+    if ((await has(m.id, model)) === false)
+      return {
+        error: reqModel
+          ? `Erro: o modelo "${model}" não existe no provedor ${m.name}. Veja list_models com provider "${m.name}".`
+          : `Erro: o modelo desta sessão (${model}) não existe no provedor ${m.name}; informe "model" (veja list_models com provider "${m.name}").`
+      }
+    return { providerId: m.id, model }
+  }
+  const callerName = p.providers.find((x) => x.id === p.callerProviderId)?.name ?? 'desta sessão'
+  if (!reqModel || reqModel === p.callerModel)
+    return { providerId: p.callerProviderId, model: p.callerModel }
+  if ((await has(p.callerProviderId, reqModel)) !== false)
+    return { providerId: p.callerProviderId, model: reqModel }
+  const others = p.providers.filter((x) => x.id !== p.callerProviderId)
+  const hits = await Promise.all(others.map((o) => has(o.id, reqModel)))
+  const found = others.filter((_, i) => hits[i] === true)
+  if (found.length === 1)
+    return {
+      providerId: found[0].id,
+      model: reqModel,
+      note: `o modelo ${reqModel} não existe no provedor ${callerName}; usando o provedor ${found[0].name}, onde ele existe.`
+    }
+  if (found.length > 1)
+    return {
+      error: `Erro: o modelo "${reqModel}" não existe no provedor ${callerName}, mas existe em vários provedores (${providerNames(found)}); informe "provider".`
+    }
+  return {
+    providerId: p.callerProviderId,
+    model: p.callerModel,
+    note: `o modelo ${reqModel} não foi encontrado em nenhum provedor; usando ${p.callerModel} (${callerName}).`
+  }
 }
 
 /** Primeira linha (curta) de um erro. */
