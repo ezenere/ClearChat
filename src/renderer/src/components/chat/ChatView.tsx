@@ -30,7 +30,7 @@ function ModelPill({ model }: { model: string }): React.JSX.Element {
     <Tip label="Modelo · abrir configurações do chat" side="bottom">
       <button
         type="button"
-        onClick={() => setPanel(true, 'config')}
+        onClick={() => setPanel(true, 'model')}
         className="no-drag flex h-7 max-w-[260px] min-w-0 shrink items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 text-xs transition-colors hover:border-border-strong hover:bg-hover max-[1179px]:max-w-[180px]"
       >
         <Sparkles className="size-3 shrink-0 text-accent-strong" />
@@ -54,7 +54,7 @@ function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
       <div className="mt-5 flex flex-wrap items-center justify-center gap-2 text-[11.5px]">
         <button
           type="button"
-          onClick={() => setPanel(true, 'config')}
+          onClick={() => setPanel(true, 'model')}
           className="rounded-full border border-border px-2.5 py-1 font-mono text-muted hover:border-border-strong hover:text-fg"
         >
           {chat.config.model || 'sem modelo'}
@@ -85,7 +85,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
     >
       <button
         type="button"
-        onClick={() => setPanel(true, 'config')}
+        onClick={() => setPanel(true, 'tools')}
         aria-label="Auto-aprovação"
         className="no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-warning/25 bg-warning/[0.06] px-2 text-xs text-warning/90 transition-colors hover:bg-warning/[0.12]"
       >

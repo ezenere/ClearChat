@@ -215,11 +215,20 @@ async function closeModal(): Promise<void> {
   await page.getByRole('dialog').waitFor({ state: 'detached', timeout: 5000 })
 }
 
-async function ensurePanel(tab: 'Config' | 'Arquivos'): Promise<void> {
-  const tabBtn = page.getByRole('button', { name: tab, exact: true })
-  if (!(await tabBtn.count())) await page.getByRole('button', { name: 'Abrir painel' }).click()
-  await tabBtn.click()
+type PanelTab = 'Modelo' | 'Chat' | 'Tools' | 'Arquivos'
+
+const panelTab = (tab: PanelTab): Locator =>
+  page.getByTestId('right-panel').getByRole('tab', { name: tab, exact: true })
+
+async function ensurePanel(tab: PanelTab): Promise<void> {
+  if (!(await panelTab(tab).count()))
+    await page.getByRole('button', { name: 'Abrir painel' }).click()
+  await panelTab(tab).click()
 }
+
+/** Linha de uma persona na aba Personas das Configurações. */
+const presetRow = (name: string): Locator =>
+  page.getByTestId('preset-row').filter({ has: page.locator(`span:text-is("${name}")`) })
 
 async function tooltipText(trigger: Locator): Promise<string> {
   await trigger.hover()
@@ -284,6 +293,57 @@ async function main(): Promise<void> {
     assert(chat.config.cwd === CWD, `cwd ${chat.config.cwd}`)
     assert(chat.config.systemPrompt.startsWith('Você é um assistente de testes'), 'system prompt')
   })
+
+  await step(
+    'painel: abas Modelo · Chat · Tools · Arquivos, Ver request de qualquer aba',
+    async () => {
+      const aside = page.getByTestId('right-panel')
+      await ensurePanel('Modelo')
+      await aside.getByRole('combobox').waitFor({ timeout: 5000 })
+      await aside.getByLabel('System prompt', { exact: true }).waitFor()
+      await aside.getByRole('switch', { name: 'Enviar temperature' }).waitFor()
+      await aside.getByRole('switch', { name: 'Token caching' }).waitFor()
+      await aside.getByTestId('model-info').getByText(/ctx/).waitFor({ timeout: 15_000 })
+      assert(
+        (await aside.getByRole('switch', { name: 'Enviar tools nativas' }).count()) === 0,
+        'Modelo sem tools'
+      )
+      await shot('tab-modelo')
+      await ensurePanel('Chat')
+      await aside.getByLabel('Título do chat').waitFor()
+      for (const t of ['Diretório raiz', 'Assinatura do app', 'Contexto'])
+        await aside.locator('h3', { hasText: t }).waitFor({ timeout: 3000 })
+      await aside.getByRole('switch', { name: 'Bloco de ambiente' }).waitFor()
+      await aside.getByRole('button', { name: 'Salvar como persona' }).waitFor()
+      await shot('tab-chat')
+      await ensurePanel('Tools')
+      for (const n of [
+        'Enviar tools nativas',
+        'Texto das tools no system prompt',
+        'Auto-aprovar tudo'
+      ])
+        await aside.getByRole('switch', { name: n }).waitFor({ timeout: 3000 })
+      await aside.getByLabel('System prompt dos subagentes').waitFor()
+      await aside
+        .getByRole('spinbutton', { name: 'Saída máxima por ferramenta (caracteres)' })
+        .waitFor()
+      await shot('tab-tools')
+      // "Ver request" no cabeçalho do painel: funciona de qualquer aba
+      const { body } = await openPreview()
+      assert(body.model === MODEL && Array.isArray(body.tools), 'preview pela aba Tools')
+      await closeModal()
+      await ensurePanel('Arquivos')
+      await aside.getByText('readme.txt').waitFor({ timeout: 5000 })
+      // a aba é lembrada (localStorage) ao fechar/reabrir o painel
+      await ensurePanel('Tools')
+      await page.getByRole('button', { name: 'Fechar painel' }).first().click()
+      await page.getByRole('button', { name: 'Abrir painel' }).click()
+      assert((await panelTab('Tools').getAttribute('aria-selected')) === 'true', 'aba lembrada')
+      const stored = await page.evaluate(() => localStorage.getItem('clearchat.panelTab'))
+      assert(stored === 'tools', `localStorage ${stored}`)
+      await ensurePanel('Modelo')
+    }
+  )
 
   await step('write_file + read_file', async () => {
     await sendMessage(
@@ -440,7 +500,7 @@ async function main(): Promise<void> {
   })
 
   await step('editar modelo/system prompt/params no meio do chat → Ver request', async () => {
-    await ensurePanel('Config')
+    await ensurePanel('Modelo')
     const aside = page.locator('aside')
     await pickModel(aside.getByRole('combobox'), ALT_MODEL)
     const sp = aside.locator('textarea').first()
@@ -467,6 +527,7 @@ async function main(): Promise<void> {
   })
 
   await step('modo texto (tools nativas off + texto no prompt) roda tool', async () => {
+    await ensurePanel('Tools')
     const aside = page.locator('aside')
     await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
     await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
@@ -490,6 +551,7 @@ async function main(): Promise<void> {
   })
 
   await step('assinatura do app none/cline nos headers do Ver request', async () => {
+    await ensurePanel('Chat')
     const aside = page.locator('aside')
     const sel = aside.locator('section', { hasText: 'Assinatura do app' }).locator('button.field')
     await sel.click()
@@ -574,7 +636,7 @@ async function main(): Promise<void> {
   })
 
   await step('editar / apagar mensagem, regenerar', async () => {
-    await ensurePanel('Config')
+    await ensurePanel('Modelo')
     // editar a primeira mensagem do usuário
     const firstUser = page.locator('div.group\\/msg').filter({ hasText: 'Use write_file' }).first()
     await firstUser.hover()
@@ -614,9 +676,10 @@ async function main(): Promise<void> {
   await step(
     'contexto: banner (janela pequena) → Compactar → divisor + resumo → Ver request',
     async () => {
-      await ensurePanel('Config')
+      await ensurePanel('Modelo')
       const aside = page.locator('aside')
-      await page.getByTestId('context-meter').click() // rola até a seção Contexto
+      await page.getByTestId('context-meter').click() // abre a aba Chat e rola até Contexto
+      assert((await panelTab('Chat').getAttribute('aria-selected')) === 'true', 'aba Chat')
       await aside.getByRole('switch', { name: 'Definir janela manualmente' }).click()
       const win = aside.getByRole('spinbutton', { name: 'Janela de contexto (tokens)' })
       await win.fill('1000')
@@ -672,6 +735,7 @@ async function main(): Promise<void> {
   )
 
   await step('erro HTTP persistido ((i) "não é enviado à API")', async () => {
+    await ensurePanel('Modelo')
     const aside = page.locator('aside')
     await pickModel(aside.getByRole('combobox'), 'invalid-vendor/modelo-que-nao-existe')
     await sendMessage('isto deve falhar')
@@ -692,6 +756,7 @@ async function main(): Promise<void> {
   })
 
   await step('reinício: chats e mensagens persistem', async () => {
+    await ensurePanel('Chat') // a aba do painel sobrevive ao reinício
     const before = await currentState()
     await app.close()
     await launch()
@@ -704,6 +769,7 @@ async function main(): Promise<void> {
       after.msgs.length === before.msgs.length,
       `msgs ${before.msgs.length} → ${after.msgs.length}`
     )
+    assert((await panelTab('Chat').getAttribute('aria-selected')) === 'true', 'aba lembrada')
     await shot('after-restart')
   })
 
@@ -737,6 +803,174 @@ async function main(): Promise<void> {
       .getByText('projeto-ui')
       .waitFor({ timeout: 5000 })
     await shot('new-folder-chat')
+  })
+
+  let revisorId = ''
+
+  await step('persona: Novo chat → editar campos → Salvar como persona', async () => {
+    await page.getByRole('button', { name: 'Novo chat' }).first().click()
+    await page.getByRole('heading', { name: 'Novo chat' }).waitFor({ timeout: 10_000 })
+    const picker = page.getByTestId('preset-picker')
+    await picker.getByText('Padrão', { exact: true }).waitFor({ timeout: 5000 })
+    // a lista mostra a persona "Padrão" criada na primeira execução
+    await picker.click()
+    await page.getByRole('option', { name: /Padrão/ }).waitFor()
+    await page.keyboard.press('Escape')
+    assert(
+      (await page.getByRole('button', { name: /Salvar como persona/ }).count()) === 0,
+      'sem botão antes de editar'
+    )
+    // trocar a pasta não personaliza (a "Padrão" não define diretório raiz)
+    await page.getByRole('button', { name: /Alterar/ }).click() // diálogo → pasta do e2e
+    await page.getByTestId('new-chat-root').getByText('cwd').waitFor({ timeout: 5000 })
+    assert((await picker.getByText('Personalizado').count()) === 0, 'pasta não personaliza')
+    await pickModel(page.getByRole('combobox'), MODEL)
+    await page
+      .getByPlaceholder('Instruções para o modelo (opcional)')
+      .fill('Você é o revisor do e2e. Responda em uma linha.')
+    await picker.getByText('Personalizado').waitFor({ timeout: 3000 })
+    await picker.getByText('a partir de Padrão').waitFor()
+    await shot('preset-customized')
+    await page.getByRole('button', { name: /Salvar como persona/ }).click()
+    const dlg = page.getByRole('dialog')
+    assert(
+      (await dlg.getByRole('radio', { name: 'Nova persona' }).getAttribute('aria-checked')) ===
+        'true',
+      'modo nova persona'
+    )
+    await dlg.getByLabel('Nome da persona').fill('Revisor E2E')
+    await dlg.getByRole('button', { name: 'Escolher ícone' }).click()
+    await dlg.getByRole('button', { name: 'Ícone code' }).click()
+    await dlg.getByLabel('Descrição da persona').fill('Persona criada pelo e2e')
+    const cwdSwitch = dlg.getByRole('switch', { name: 'Incluir diretório raiz' })
+    assert((await cwdSwitch.getAttribute('aria-checked')) === 'false', 'cwd desligado por padrão')
+    await shot('preset-save-dialog')
+    await dlg.getByRole('button', { name: 'Salvar persona' }).click()
+    await dlg.waitFor({ state: 'detached', timeout: 5000 })
+    await picker.getByText('Revisor E2E', { exact: true }).waitFor({ timeout: 5000 })
+    assert((await picker.getByText('Personalizado').count()) === 0, 'não é mais personalizado')
+    const presets = await read<any[]>('presets.list')
+    const p = presets.find((x) => x.name === 'Revisor E2E')
+    assert(p, 'persona salva')
+    revisorId = p.id
+    assert(p.icon === 'code' && p.description === 'Persona criada pelo e2e', 'ícone/descrição')
+    assert(p.config.model === MODEL, `modelo ${p.config.model}`)
+    assert(p.config.systemPrompt.startsWith('Você é o revisor do e2e'), 'system prompt')
+    assert(!('cwd' in p.config), 'sem cwd')
+    await shot('preset-saved')
+  })
+
+  await step('persona: começar chat a partir dela + salvar do painel (aba Chat)', async () => {
+    await page.getByRole('button', { name: 'Começar' }).click()
+    await composer().waitFor({ timeout: 10_000 })
+    const chats = await read<any[]>('chats.list')
+    const chat = chats.find((c) => c.config.presetId === revisorId)
+    assert(chat, 'chat lembra a persona de origem')
+    assert(chat.config.systemPrompt.startsWith('Você é o revisor do e2e'), 'system do chat')
+    assert(chat.config.model === MODEL, 'modelo do chat')
+    await ensurePanel('Chat')
+    const aside = page.getByTestId('right-panel')
+    await aside.getByTestId('chat-preset').getByText('Revisor E2E').waitFor({ timeout: 5000 })
+    // título editável na aba Chat
+    await aside.getByLabel('Título do chat').fill('Chat da persona E2E')
+    await aside.getByLabel('Título do chat').press('Enter')
+    await page.locator('nav').getByText('Chat da persona E2E').waitFor({ timeout: 5000 })
+    // ajusta um parâmetro e salva o chat como outra persona, com o diretório raiz
+    await ensurePanel('Modelo')
+    await aside.getByRole('switch', { name: 'Enviar temperature' }).click()
+    await aside.getByRole('spinbutton', { name: 'temperature', exact: true }).fill('0.4')
+    await ensurePanel('Chat')
+    await aside.getByRole('button', { name: 'Salvar como persona' }).click()
+    const dlg = page.getByRole('dialog')
+    await dlg.getByRole('radio', { name: 'Atualizar “Revisor E2E”' }).waitFor()
+    await dlg.getByLabel('Nome da persona').fill('Do painel E2E')
+    await dlg.getByRole('switch', { name: 'Incluir diretório raiz' }).click()
+    await dlg.getByRole('button', { name: 'Salvar persona' }).click()
+    await dlg.waitFor({ state: 'detached', timeout: 5000 })
+    await aside.getByTestId('chat-preset').getByText('Do painel E2E').waitFor({ timeout: 5000 })
+    const p = (await read<any[]>('presets.list')).find((x) => x.name === 'Do painel E2E')
+    assert(p, 'persona do painel salva')
+    assert(p.config.params.temperature === 0.4, `params ${JSON.stringify(p.config.params)}`)
+    assert(p.config.cwd === CWD, `cwd ${p.config.cwd}`)
+    assert(
+      Array.isArray(p.config.enabledTools) && p.config.enabledTools.length > 0,
+      'snapshot completo'
+    )
+    assert(!('presetId' in p.config), 'presetId não vai na persona')
+    await sleep(600)
+    const c2 = (await read<any[]>('chats.list')).find((c) => c.id === chat.id)
+    assert(c2.config.presetId === p.id, 'chat passa a apontar para a nova persona')
+  })
+
+  await step('persona: editar nas Configurações (Modelo + Tools)', async () => {
+    await page.getByRole('button', { name: 'Configurações' }).first().click()
+    const dlg = page.getByRole('dialog')
+    await dlg.getByRole('button', { name: 'Personas', exact: true }).click()
+    await presetRow('Padrão').waitFor({ timeout: 5000 })
+    await presetRow('Revisor E2E').getByRole('button', { name: 'Editar' }).click()
+    const ed = dlg.getByTestId('preset-editor')
+    await ed.getByLabel('Nome da persona').fill('Revisor E2E 2')
+    await ed.getByLabel('System prompt', { exact: true }).fill('System editado nas configurações.')
+    await shot('preset-editor')
+    await ed.getByRole('tab', { name: 'Tools' }).click()
+    await ed.getByRole('switch', { name: 'Terminal (bash)' }).first().click()
+    await shot('preset-editor-tools')
+    await ed.getByRole('button', { name: 'Salvar persona' }).click()
+    await presetRow('Revisor E2E 2').waitFor({ timeout: 5000 })
+    const p = (await read<any[]>('presets.list')).find((x) => x.id === revisorId)
+    assert(p.name === 'Revisor E2E 2', `nome ${p.name}`)
+    assert(p.config.systemPrompt === 'System editado nas configurações.', 'system editado')
+    assert(
+      Array.isArray(p.config.enabledTools) && !p.config.enabledTools.includes('bash'),
+      `tools ${JSON.stringify(p.config.enabledTools)}`
+    )
+    assert(p.config.model === MODEL, 'modelo mantido')
+    await shot('preset-list')
+  })
+
+  await step('persona: duplicar, definir padrão → Novo chat já vem com ela', async () => {
+    await presetRow('Revisor E2E 2').getByRole('button', { name: 'Duplicar' }).click()
+    await presetRow('Revisor E2E 2 (cópia)').waitFor({ timeout: 5000 })
+    await presetRow('Revisor E2E 2').getByRole('button', { name: 'Definir como padrão' }).click()
+    await presetRow('Revisor E2E 2').getByText('padrão', { exact: true }).waitFor({ timeout: 3000 })
+    const def = await read<string>('settings.get', 'defaultPresetId')
+    assert(def === revisorId, `defaultPresetId ${def}`)
+    await closeModal()
+    await page.getByRole('button', { name: 'Novo chat' }).first().click()
+    const picker = page.getByTestId('preset-picker')
+    await picker.getByText('Revisor E2E 2', { exact: true }).waitFor({ timeout: 5000 })
+    const sp = await page.getByPlaceholder('Instruções para o modelo (opcional)').inputValue()
+    assert(sp === 'System editado nas configurações.', `system no Novo chat: ${sp}`)
+    await shot('preset-default-new-chat')
+  })
+
+  await step('persona: apagar (padrão volta para "Padrão")', async () => {
+    await page.getByRole('button', { name: 'Configurações' }).first().click()
+    const dlg = page.getByRole('dialog')
+    await dlg.getByRole('button', { name: 'Personas', exact: true }).click()
+    for (const name of ['Revisor E2E 2', 'Revisor E2E 2 (cópia)', 'Do painel E2E']) {
+      const row = presetRow(name)
+      await row.hover()
+      await row.getByRole('button', { name: 'Apagar' }).click()
+      await row.getByRole('button', { name: 'Apagar?' }).click()
+      await row.waitFor({ state: 'detached', timeout: 5000 })
+    }
+    const presets = await read<any[]>('presets.list')
+    assert(
+      presets.length === 1 && presets[0].name === 'Padrão',
+      `restou ${presets.map((p) => p.name)}`
+    )
+    assert((await read('settings.get', 'defaultPresetId')) === null, 'padrão limpo')
+    await closeModal()
+    await page
+      .getByTestId('preset-picker')
+      .getByText('Padrão', { exact: true })
+      .waitFor({ timeout: 5000 })
+    // o chat criado da persona apagada continua funcionando (presetId só informativo)
+    await page.getByText('Chat da persona E2E').first().click()
+    await composer().waitFor({ timeout: 10_000 })
+    await ensurePanel('Chat')
+    await page.getByTestId('chat-preset').getByText('(persona apagada)').waitFor({ timeout: 5000 })
   })
 
   await step('indicador global de aprovação pendente (subagente pede bash)', async () => {
@@ -806,19 +1040,27 @@ async function main(): Promise<void> {
     assert(!overflow, 'sem scroll horizontal')
     const comp = await composer().boundingBox()
     assert(comp && comp.width >= 300, `composer largo o bastante: ${comp?.width}`)
-    assert(
-      (await page.getByRole('button', { name: 'Config', exact: true }).count()) === 0,
-      'painel recolhido'
-    )
-    // reabre como gaveta sobreposta; clicar fora fecha
+    assert((await panelTab('Modelo').count()) === 0, 'painel recolhido')
+    // reabre como gaveta sobreposta (todas as abas cabem no cabeçalho); clicar fora fecha
     await page.getByRole('button', { name: 'Abrir painel' }).click()
-    await page.getByRole('button', { name: 'Config', exact: true }).waitFor()
+    await panelTab('Modelo').waitFor()
+    for (const t of ['Modelo', 'Chat', 'Tools', 'Arquivos'] as const) {
+      const box = await panelTab(t).boundingBox()
+      assert(box && box.x + box.width <= 900, `aba ${t} visível`)
+    }
+    await ensurePanel('Modelo')
     await sleep(300)
     await shot('min-size-drawer')
     await page.mouse.click(300, 300)
-    await page
-      .getByRole('button', { name: 'Config', exact: true })
-      .waitFor({ state: 'detached', timeout: 3000 })
+    await panelTab('Modelo').waitFor({ state: 'detached', timeout: 3000 })
+    // Novo chat em 900x600 (persona + campos sem scroll horizontal)
+    await page.getByRole('button', { name: 'Novo chat' }).first().click()
+    await page.getByTestId('preset-picker').waitFor()
+    assert(
+      !(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)),
+      'novo chat sem scroll horizontal'
+    )
+    await shot('min-size-new-chat')
     await setSize(1280, 820)
   })
 

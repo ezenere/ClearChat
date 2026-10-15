@@ -8,6 +8,7 @@ import type {
   ChatConfig,
   DirEntry,
   ModelInfo,
+  Preset,
   Provider,
   QueuedMessage,
   Session,
@@ -64,6 +65,13 @@ export const IPC = {
   },
   app: {
     capabilities: 'app:capabilities'
+  },
+  presets: {
+    list: 'presets:list',
+    create: 'presets:create',
+    update: 'presets:update',
+    delete: 'presets:delete',
+    duplicate: 'presets:duplicate'
   }
 } as const
 
@@ -129,6 +137,16 @@ export interface AppCapabilities {
   ripgrep: boolean
 }
 
+/** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
+export interface PresetInput {
+  name: string
+  description?: string
+  icon?: string
+  config: Partial<ChatConfig>
+}
+/** `config`, se presente, SUBSTITUI a config inteira da persona (não é merge). */
+export type PresetPatch = Partial<PresetInput>
+
 export interface ClearApi {
   providers: {
     list(): Promise<Provider[]>
@@ -190,6 +208,15 @@ export interface ClearApi {
   }
   app: {
     capabilities(): Promise<AppCapabilities>
+  }
+  /** Personas (presets de chat). Apagar a persona padrão limpa `defaultPresetId`. */
+  presets: {
+    list(): Promise<Preset[]>
+    create(input: PresetInput): Promise<Preset>
+    update(id: string, patch: PresetPatch): Promise<Preset>
+    delete(id: string): Promise<void>
+    /** Cópia com nome "X (cópia)". */
+    duplicate(id: string): Promise<Preset>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

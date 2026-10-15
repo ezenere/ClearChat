@@ -203,13 +203,14 @@ function EnvBlock({
   cwd,
   deps
 }: {
-  sessionId: string
+  sessionId?: string
   cwd: string
   deps?: string
 }): React.JSX.Element {
   const fallback = `<environment>\nroot: ${cwd}\nos: (sistema operacional detectado pelo app)\nshell: bash\n…\n</environment>`
   const [text, setText] = useState<string | null>(null)
   useEffect(() => {
+    if (!sessionId) return
     let alive = true
     api.agent
       .previewRequest(sessionId)
@@ -234,7 +235,8 @@ export function EnvInfo({
   cwd,
   deps
 }: {
-  sessionId: string
+  /** Sem sessão (ex.: editor de persona): mostra um modelo do bloco. */
+  sessionId?: string
   cwd: string
   /** Muda quando opções que alteram o bloco mudam (confinação, sandbox). */
   deps?: string

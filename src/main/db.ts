@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at   INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
+
+CREATE TABLE IF NOT EXISTS presets (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  icon        TEXT NOT NULL DEFAULT '',
+  config_json TEXT NOT NULL DEFAULT '{}',
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
 `
 
 let db: Database.Database | null = null

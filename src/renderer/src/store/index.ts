@@ -5,13 +5,14 @@ import type {
   Chat,
   ChatConfig,
   ModelInfo,
+  Preset,
   Provider,
   QueuedMessage,
   Session,
   StoredMessage,
   StreamDraft
 } from '@shared/types'
-import type { AppCapabilities, ApprovalDecision } from '@shared/ipc'
+import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
 import { api, errorMessage } from '../lib/api'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
@@ -21,6 +22,8 @@ export interface AppSettings {
   defaultModel: string | null
   defaultSystemPrompt: string | null
   defaultCwd: string | null
+  /** Persona selecionada por padrão no Novo chat. */
+  defaultPresetId: string | null
 }
 
 export interface ToolRun {
@@ -40,7 +43,32 @@ export interface Toast {
   text: string
 }
 
-export type PanelTab = 'config' | 'files'
+export type SettingsTab = 'providers' | 'presets' | 'defaults'
+
+export type PanelTab = 'model' | 'chat' | 'tools' | 'files'
+
+const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'files']
+const PANEL_TAB_KEY = 'clearchat.panelTab'
+
+/** Seção do painel → aba onde ela mora (focusConfig). */
+const SECTION_TAB: Record<string, PanelTab> = { contexto: 'chat' }
+
+function loadPanelTab(): PanelTab {
+  try {
+    const v = localStorage.getItem(PANEL_TAB_KEY) as PanelTab | null
+    return v && PANEL_TABS.includes(v) ? v : 'model'
+  } catch {
+    return 'model'
+  }
+}
+
+function savePanelTab(tab: PanelTab): void {
+  try {
+    localStorage.setItem(PANEL_TAB_KEY, tab)
+  } catch {
+    /* armazenamento indisponível: só não lembra */
+  }
+}
 
 /** Compactação em andamento/agendada por sessão (evento `compaction`). */
 export interface CompactionState {
@@ -52,6 +80,8 @@ interface State {
   booted: boolean
   providers: Provider[]
   chats: Chat[]
+  /** Personas (presets de chat). */
+  presets: Preset[]
   settings: AppSettings
   homeDir: string | null
   view: View
@@ -68,6 +98,7 @@ interface State {
   panelOpen: boolean
   panelTab: PanelTab
   settingsOpen: boolean
+  settingsTab: SettingsTab
   previewSessionId: string | null
   toasts: Toast[]
   compactions: Record<string, CompactionState | undefined>
@@ -81,6 +112,11 @@ interface State {
 interface Actions {
   boot(): Promise<void>
   refreshProviders(): Promise<void>
+  refreshPresets(): Promise<void>
+  /** Cria (sem id) ou atualiza uma persona; retorna a persona salva (ou null em erro). */
+  savePreset(input: PresetInput, id?: string): Promise<Preset | null>
+  deletePreset(id: string): Promise<void>
+  duplicatePreset(id: string): Promise<Preset | null>
   setSetting<K extends keyof AppSettings>(key: K, value: AppSettings[K]): Promise<void>
   goNew(): void
   openChat(chatId: string, sessionId?: string): Promise<void>
@@ -95,7 +131,7 @@ interface Actions {
   approve(id: string, decision: ApprovalDecision): Promise<void>
   loadModels(providerId: string, force?: boolean): Promise<void>
   setPanel(open: boolean, tab?: PanelTab): void
-  setSettingsOpen(open: boolean): void
+  setSettingsOpen(open: boolean, tab?: SettingsTab): void
   setPreview(sessionId: string | null): void
   toast(text: string, kind?: Toast['kind']): void
   dismissToast(id: number): void
@@ -121,7 +157,8 @@ const SETTINGS_KEYS: (keyof AppSettings)[] = [
   'defaultProviderId',
   'defaultModel',
   'defaultSystemPrompt',
-  'defaultCwd'
+  'defaultCwd',
+  'defaultPresetId'
 ]
 
 function sortChats(chats: Chat[]): Chat[] {
@@ -150,11 +187,13 @@ export const useStore = create<Store>()((set, get) => ({
   booted: false,
   providers: [],
   chats: [],
+  presets: [],
   settings: {
     defaultProviderId: null,
     defaultModel: null,
     defaultSystemPrompt: null,
-    defaultCwd: null
+    defaultCwd: null,
+    defaultPresetId: null
   },
   homeDir: null,
   view: { kind: 'new' },
@@ -167,8 +206,9 @@ export const useStore = create<Store>()((set, get) => ({
   errors: {},
   models: {},
   panelOpen: true,
-  panelTab: 'config',
+  panelTab: loadPanelTab(),
   settingsOpen: false,
+  settingsTab: 'providers',
   previewSessionId: null,
   toasts: [],
   compactions: {},
@@ -195,20 +235,23 @@ export const useStore = create<Store>()((set, get) => ({
         return fallback
       }
     }
-    const [providers, chats, homeDir, approvals, capabilities, ...values] = await Promise.all([
-      safe(() => api.providers.list(), [] as Provider[]),
-      safe(() => api.chats.list(), [] as Chat[]),
-      safe(() => api.fs.homeDir(), null as string | null),
-      safe(() => api.agent.pendingApprovals(), [] as ApprovalRequest[]),
-      safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
-      ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
-    ])
+    const [providers, chats, presets, homeDir, approvals, capabilities, ...values] =
+      await Promise.all([
+        safe(() => api.providers.list(), [] as Provider[]),
+        safe(() => api.chats.list(), [] as Chat[]),
+        safe(() => api.presets.list(), [] as Preset[]),
+        safe(() => api.fs.homeDir(), null as string | null),
+        safe(() => api.agent.pendingApprovals(), [] as ApprovalRequest[]),
+        safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
+        ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
+      ])
     const settings = Object.fromEntries(
       SETTINGS_KEYS.map((k, i) => [k, values[i] ?? null])
     ) as unknown as AppSettings
     set({
       providers,
       chats: sortChats(chats),
+      presets,
       homeDir,
       approvals,
       capabilities,
@@ -220,6 +263,44 @@ export const useStore = create<Store>()((set, get) => ({
   async refreshProviders() {
     const providers = await get().run(() => api.providers.list(), 'Erro ao carregar provedores')
     if (providers) set({ providers })
+  },
+
+  async refreshPresets() {
+    const presets = await get().run(() => api.presets.list(), 'Erro ao carregar personas')
+    if (presets) set({ presets })
+  },
+
+  async savePreset(input, id) {
+    const preset = await get().run(
+      () => (id ? api.presets.update(id, input) : api.presets.create(input)),
+      'Erro ao salvar persona'
+    )
+    if (!preset) return null
+    set((s) => ({
+      presets: s.presets.some((p) => p.id === preset.id)
+        ? s.presets.map((p) => (p.id === preset.id ? preset : p))
+        : [...s.presets, preset]
+    }))
+    return preset
+  },
+
+  async deletePreset(id) {
+    const ok = await get().run(async () => {
+      await api.presets.delete(id)
+      return true
+    }, 'Erro ao apagar persona')
+    if (!ok) return
+    set((s) => ({
+      presets: s.presets.filter((p) => p.id !== id),
+      settings:
+        s.settings.defaultPresetId === id ? { ...s.settings, defaultPresetId: null } : s.settings
+    }))
+  },
+
+  async duplicatePreset(id) {
+    const preset = await get().run(() => api.presets.duplicate(id), 'Erro ao duplicar persona')
+    if (preset) set((s) => ({ presets: [...s.presets, preset] }))
+    return preset ?? null
   },
 
   async setSetting(key, value) {
@@ -358,10 +439,11 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   setPanel(open, tab) {
+    if (tab) savePanelTab(tab)
     set((s) => ({ panelOpen: open, panelTab: tab ?? s.panelTab }))
   },
-  setSettingsOpen(open) {
-    set({ settingsOpen: open })
+  setSettingsOpen(open, tab) {
+    set((s) => ({ settingsOpen: open, settingsTab: tab ?? s.settingsTab }))
   },
   setPreview(sessionId) {
     set({ previewSessionId: sessionId })
@@ -391,11 +473,10 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   focusConfig(section) {
-    set(
-      section
-        ? { configFocus: section, panelOpen: true, panelTab: 'config' }
-        : { configFocus: null }
-    )
+    if (!section) return set({ configFocus: null })
+    const panelTab = SECTION_TAB[section] ?? 'model'
+    savePanelTab(panelTab)
+    set({ configFocus: section, panelOpen: true, panelTab })
   }
 }))
 

@@ -9,13 +9,22 @@ import {
   type CompactOptions,
   type ChatCreateInput,
   type ChatUpdateInput,
+  type PresetInput,
+  type PresetPatch,
   type ProviderInput,
   type ProviderPatch,
   type ProviderTestInput
 } from '@shared/ipc'
 import type { ApiMessage, Chat } from '@shared/types'
 import { emit } from './events'
-import { chatsRepo, messagesRepo, providersRepo, sessionsRepo, settingsRepo } from './repo'
+import {
+  chatsRepo,
+  messagesRepo,
+  presetsRepo,
+  providersRepo,
+  sessionsRepo,
+  settingsRepo
+} from './repo'
 import { invalidateModels, listModels, testProvider } from './providers'
 import * as fsapi from './fsapi'
 import * as runner from './agent/runner'
@@ -34,6 +43,7 @@ function validateMessage(m: unknown): ApiMessage {
 }
 
 export function registerIpc(): void {
+  presetsRepo.seed()
   const handlers: Record<string, Handler> = {
     // ---- providers ----
     [IPC.providers.list]: () => providersRepo.list(),
@@ -126,7 +136,14 @@ export function registerIpc(): void {
     [IPC.app.capabilities]: (): AppCapabilities => ({
       bwrap: bwrapAvailable(),
       ripgrep: ripgrepAvailable()
-    })
+    }),
+
+    // ---- presets (personas) ----
+    [IPC.presets.list]: () => presetsRepo.list(),
+    [IPC.presets.create]: (input: PresetInput) => presetsRepo.create(input),
+    [IPC.presets.update]: (id: string, patch: PresetPatch) => presetsRepo.update(id, patch ?? {}),
+    [IPC.presets.delete]: (id: string) => presetsRepo.delete(id),
+    [IPC.presets.duplicate]: (id: string) => presetsRepo.duplicate(id)
   }
 
   const missing = ALL_CHANNELS.filter((c) => !handlers[c])
