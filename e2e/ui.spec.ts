@@ -540,7 +540,7 @@ async function main(): Promise<void> {
       await page.keyboard.press('Escape')
       await lb.waitFor({ state: 'detached', timeout: 3000 })
       // Ver request: base64 encurtado + nota
-      await ensurePanel('Config')
+      await ensurePanel('Chat')
       const { body, dlg } = await openPreview()
       const sent = body.messages.findLast((m: any) => m.role === 'user').content
       assert(
