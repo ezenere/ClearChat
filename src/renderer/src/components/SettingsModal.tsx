@@ -1,0 +1,314 @@
+import { FolderOpen, Pencil, Plus, RotateCcw, Server, Trash2 } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { DEFAULT_BASE_URL, DEFAULT_SYSTEM_PROMPT } from '@shared/defaults'
+import type { Provider } from '@shared/types'
+import { api, errorMessage } from '../lib/api'
+import { cn, shortPath } from '../lib/format'
+import { useStore } from '../store'
+import { ModelFieldInfo, SystemPromptInfo } from './apiDocs'
+import { ProviderFields, TestButton, TestResult } from './ProviderForm'
+import { draftToInput, useProviderTest, type ProviderDraft } from '../lib/provider'
+import { AutoTextarea, Button, Label } from './ui/controls'
+import { Modal } from './ui/layers'
+import { ModelCombobox } from './ui/ModelCombobox'
+import { Select } from './ui/Select'
+
+function toDraft(p?: Provider): ProviderDraft {
+  return p
+    ? {
+        name: p.name,
+        baseUrl: p.baseUrl,
+        apiKey: p.apiKey,
+        headersText: Object.keys(p.headers ?? {}).length ? JSON.stringify(p.headers, null, 2) : ''
+      }
+    : { name: '', baseUrl: DEFAULT_BASE_URL, apiKey: '', headersText: '' }
+}
+
+function ProviderEditor({
+  provider,
+  onDone
+}: {
+  provider?: Provider
+  onDone: () => void
+}): React.JSX.Element {
+  const [draft, setDraft] = useState(() => toDraft(provider))
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const { testing, result, test, reset } = useProviderTest()
+  const refreshProviders = useStore((s) => s.refreshProviders)
+  const loadModels = useStore((s) => s.loadModels)
+
+  const save = async (): Promise<void> => {
+    const input = draftToInput(draft)
+    if (typeof input === 'string') return setError(input)
+    setSaving(true)
+    try {
+      if (provider) {
+        await api.providers.update(provider.id, input)
+        void loadModels(provider.id, true)
+      } else await api.providers.create(input)
+      await refreshProviders()
+      onDone()
+    } catch (err) {
+      setError(errorMessage(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="animate-fade-in rounded-xl border border-border-strong/70 bg-bg/40 p-4">
+      <ProviderFields
+        draft={draft}
+        onChange={(d) => {
+          setDraft(d)
+          reset()
+          setError(null)
+        }}
+      />
+      <div className="mt-3 space-y-2 empty:hidden">
+        <TestResult result={result} />
+        {error && <TestResult result={{ ok: false, error }} />}
+      </div>
+      <div className="mt-4 flex items-center gap-2">
+        <TestButton testing={testing} onClick={() => void test(draft)} />
+        <div className="ml-auto flex gap-2">
+          <Button variant="ghost" onClick={onDone}>
+            Cancelar
+          </Button>
+          <Button variant="primary" loading={saving} onClick={() => void save()}>
+            {provider ? 'Salvar' : 'Adicionar'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ProviderRow({
+  provider,
+  onEdit
+}: {
+  provider: Provider
+  onEdit: () => void
+}): React.JSX.Element {
+  const [confirm, setConfirm] = useState(false)
+  const run = useStore((s) => s.run)
+  const refreshProviders = useStore((s) => s.refreshProviders)
+  const isDefault = useStore((s) => s.settings.defaultProviderId === provider.id)
+  return (
+    <div
+      className="group flex items-center gap-3 rounded-xl border border-border bg-bg/30 px-3.5 py-2.5"
+      onMouseLeave={() => setConfirm(false)}
+    >
+      <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-border bg-elevated">
+        <Server className="size-3.5 text-muted" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-[13px] font-medium">
+          {provider.name}
+          {isDefault && (
+            <span className="rounded bg-accent-soft px-1.5 py-px text-[10px] font-medium text-accent-strong">
+              padrão
+            </span>
+          )}
+        </div>
+        <div className="truncate font-mono text-[11px] text-subtle">
+          {provider.baseUrl}
+          {provider.apiKey && (
+            <span className="ml-2 text-faint">•••• {provider.apiKey.slice(-4)}</span>
+          )}
+        </div>
+      </div>
+      <div className="flex items-center gap-1 opacity-60 transition-opacity group-hover:opacity-100">
+        <Button size="sm" variant="ghost" icon={<Pencil className="size-3.5" />} onClick={onEdit}>
+          Editar
+        </Button>
+        {confirm ? (
+          <Button
+            size="sm"
+            variant="danger"
+            onClick={() =>
+              void run(async () => {
+                await api.providers.delete(provider.id)
+                await refreshProviders()
+              }, 'Erro ao remover provedor')
+            }
+          >
+            Remover?
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="hover:text-danger"
+            icon={<Trash2 className="size-3.5" />}
+            onClick={() => setConfirm(true)}
+            aria-label="Remover"
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+function DefaultsSection(): React.JSX.Element {
+  const providers = useStore((s) => s.providers)
+  const settings = useStore((s) => s.settings)
+  const homeDir = useStore((s) => s.homeDir)
+  const setSetting = useStore((s) => s.setSetting)
+  const run = useStore((s) => s.run)
+  const [prompt, setPrompt] = useState(settings.defaultSystemPrompt ?? DEFAULT_SYSTEM_PROMPT)
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const providerId =
+    providers.find((p) => p.id === settings.defaultProviderId)?.id ?? providers[0]?.id ?? null
+
+  useEffect(
+    () => () => {
+      if (timer.current) clearTimeout(timer.current)
+    },
+    []
+  )
+
+  const onPrompt = (v: string): void => {
+    setPrompt(v)
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = setTimeout(() => void setSetting('defaultSystemPrompt', v), 500)
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3">
+        <div>
+          <Label>Provedor padrão</Label>
+          <Select
+            value={providerId}
+            onChange={(v) => void setSetting('defaultProviderId', v)}
+            options={providers.map((p) => ({ value: p.id, label: p.name }))}
+          />
+        </div>
+        <div>
+          <Label info={<ModelFieldInfo />}>Modelo padrão</Label>
+          <ModelCombobox
+            providerId={providerId}
+            value={settings.defaultModel ?? ''}
+            onChange={(m) => void setSetting('defaultModel', m)}
+          />
+        </div>
+      </div>
+      <div>
+        <Label
+          info={<SystemPromptInfo />}
+          hint={
+            prompt !== DEFAULT_SYSTEM_PROMPT && (
+              <button
+                type="button"
+                onClick={() => onPrompt(DEFAULT_SYSTEM_PROMPT)}
+                className="inline-flex items-center gap-1 hover:text-fg"
+              >
+                <RotateCcw className="size-3" /> Restaurar padrão
+              </button>
+            )
+          }
+        >
+          System prompt padrão
+        </Label>
+        <AutoTextarea
+          value={prompt}
+          onChange={(e) => onPrompt(e.target.value)}
+          minRows={5}
+          maxRows={12}
+          className="field text-[12.5px] leading-relaxed"
+        />
+      </div>
+      <div>
+        <Label>Pasta de trabalho padrão</Label>
+        <button
+          type="button"
+          onClick={() =>
+            void run(async () => {
+              const d = await api.fs.pickDirectory()
+              if (d) await setSetting('defaultCwd', d)
+            })
+          }
+          className="field group flex items-center gap-2.5 text-left"
+        >
+          <FolderOpen className="size-4 shrink-0 text-subtle group-hover:text-accent-strong" />
+          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">
+            {shortPath(settings.defaultCwd ?? homeDir ?? '~', homeDir)}
+          </span>
+          <span className="text-xs text-subtle group-hover:text-fg">Alterar</span>
+        </button>
+      </div>
+    </div>
+  )
+}
+
+export function SettingsModal(): React.JSX.Element {
+  const open = useStore((s) => s.settingsOpen)
+  const setOpen = useStore((s) => s.setSettingsOpen)
+  const providers = useStore((s) => s.providers)
+  const [editing, setEditing] = useState<string | 'new' | null>(null)
+  const [tab, setTab] = useState<'providers' | 'defaults'>('providers')
+
+  return (
+    <Modal
+      open={open}
+      onClose={() => {
+        setOpen(false)
+        setEditing(null)
+      }}
+      title="Configurações"
+      width={640}
+    >
+      <div className="mb-5 flex gap-1 border-b border-border">
+        {(
+          [
+            ['providers', 'Provedores'],
+            ['defaults', 'Novos chats']
+          ] as const
+        ).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setTab(id)}
+            className={cn(
+              '-mb-px border-b-2 px-2.5 pb-2 text-[13px] transition-colors',
+              tab === id ? 'border-accent text-fg' : 'border-transparent text-subtle hover:text-fg'
+            )}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'providers' ? (
+        <div className="space-y-2.5">
+          <p className="mb-3 text-xs text-subtle">
+            Endpoints compatíveis com a API da OpenAI (chat/completions).
+          </p>
+          {providers.map((p) =>
+            editing === p.id ? (
+              <ProviderEditor key={p.id} provider={p} onDone={() => setEditing(null)} />
+            ) : (
+              <ProviderRow key={p.id} provider={p} onEdit={() => setEditing(p.id)} />
+            )
+          )}
+          {editing === 'new' ? (
+            <ProviderEditor onDone={() => setEditing(null)} />
+          ) : (
+            <button
+              type="button"
+              onClick={() => setEditing('new')}
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-dashed border-border-strong text-[13px] text-subtle transition-colors hover:border-accent/50 hover:bg-accent-soft/30 hover:text-fg"
+            >
+              <Plus className="size-4" /> Adicionar provedor
+            </button>
+          )}
+        </div>
+      ) : (
+        <DefaultsSection />
+      )}
+    </Modal>
+  )
+}

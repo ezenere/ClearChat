@@ -1,0 +1,11 @@
+node_modules
+out
+dist
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.eslintcache
+*.log*
+test-results
+playwright-report

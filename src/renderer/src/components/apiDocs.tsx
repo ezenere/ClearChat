@@ -1,0 +1,552 @@
+// Conteúdo dos ícones (i): o que exatamente vai para a API e como. Fonte única para toda a UI.
+import { useEffect, useState } from 'react'
+import { TOOL_DEFINITIONS } from '@shared/tools'
+import { COMPACTION_NOTE, compactionMessageText } from '@shared/defaults'
+import { LIMITS } from '@shared/limits'
+import type { ApiMessage, ChatParams, StoredMessage, ToolName } from '@shared/types'
+import { api } from '../lib/api'
+import { ApiInfo, C } from './ui/Tooltip'
+
+type Side = 'top' | 'right' | 'bottom' | 'left'
+
+export function SystemPromptInfo({
+  subagent,
+  side
+}: {
+  subagent?: boolean
+  side?: Side
+}): React.JSX.Element {
+  return (
+    <ApiInfo title={subagent ? 'System prompt dos subagentes' : 'System prompt'} side={side}>
+      {subagent ? (
+        <p>
+          Nas subsessões criadas por <C>delegate_task</C>, este texto substitui o system prompt
+          principal: vira a mensagem <C>{'role: "system"'}</C> no início de <C>messages</C> de cada
+          request do subagente.
+        </p>
+      ) : (
+        <p>
+          Enviado como a primeira mensagem do array <C>messages</C>, com <C>{'role: "system"'}</C>.
+          Usado só na sessão principal.
+        </p>
+      )}
+      <p>
+        Ordem do conteúdo: este texto → <C>\n\n</C> + bloco <C>{'<environment>'}</C> (se ativo) →{' '}
+        <C>\n\n</C> + texto das tools (se ativo). Com token caching, o conteúdo vai como{' '}
+        <C>{'[{ type: "text", text, cache_control: { type: "ephemeral" } }]'}</C>. Se tudo ficar
+        vazio, nenhuma mensagem system é enviada.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ModelFieldInfo({ side }: { side?: Side }): React.JSX.Element {
+  return (
+    <ApiInfo title="Modelo" side={side}>
+      <p>
+        Enviado no campo <C>model</C> do body de <C>POST /chat/completions</C>. Subagentes podem
+        usar outro modelo se a chamada de <C>delegate_task</C> informar <C>model</C>.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ProviderFieldInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Provedor">
+      <p>
+        Define a URL (<C>{'{baseUrl}'}/chat/completions</C>), o header{' '}
+        <C>Authorization: Bearer …</C> e os headers extras do provedor. Os headers{' '}
+        <C>HTTP-Referer</C>/<C>X-Title</C> vêm da &quot;Assinatura do app&quot;. Em OpenRouter
+        também vai <C>{'usage: { include: true }'}</C> no body.
+      </p>
+    </ApiInfo>
+  )
+}
+
+const PARAM_DOCS: Record<Exclude<keyof ChatParams, 'extraBody'>, string> = {
+  temperature: 'Aleatoriedade da amostragem. Maior = mais criativo.',
+  top_p: 'Nucleus sampling: considera só os tokens que somam esta probabilidade.',
+  top_k: 'Considera só os K tokens mais prováveis (nem todo provedor aceita).',
+  max_tokens: 'Limite de tokens gerados na resposta.',
+  frequency_penalty: 'Penaliza tokens proporcionalmente à frequência em que já apareceram.',
+  presence_penalty: 'Penaliza tokens que já apareceram ao menos uma vez.',
+  repetition_penalty: 'Penalidade de repetição (OpenRouter e alguns provedores).',
+  seed: 'Semente para amostragem determinística (quando suportado).',
+  reasoning_effort: 'Esforço de raciocínio em modelos que suportam.'
+}
+
+export function ParamInfo({
+  name,
+  openRouter
+}: {
+  name: keyof typeof PARAM_DOCS
+  openRouter: boolean
+}): React.JSX.Element {
+  return (
+    <ApiInfo title={<span className="font-mono text-[12px]">{name}</span>} side="left">
+      <p>{PARAM_DOCS[name]}</p>
+      {name === 'reasoning_effort' ? (
+        <p>
+          {openRouter ? (
+            <>
+              Este provedor é OpenRouter: enviado como <C>{'reasoning: { effort: "<valor>" }'}</C>{' '}
+              no body.
+            </>
+          ) : (
+            <>
+              Enviado como campo <C>reasoning_effort</C> no body (no OpenRouter seria{' '}
+              <C>{'reasoning: { effort }'}</C>).
+            </>
+          )}
+        </p>
+      ) : (
+        <p>
+          Enviado como <C>{`"${name}": <número>`}</C> na raiz do body.
+        </p>
+      )}
+      <p className="text-subtle">
+        Só vai na request com o toggle ligado; desligado, o campo é omitido.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ExtraBodyInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Body extra (JSON)" side="left">
+      <p>
+        Objeto JSON mesclado de forma rasa (<C>{'{ ...body, ...extra }'}</C>) na raiz do body,{' '}
+        <strong className="text-fg">por último</strong> — sobrescreve qualquer campo, inclusive{' '}
+        <C>model</C>, <C>messages</C> e <C>tools</C>. Vazio = nada é mesclado.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ToolDefInfo({
+  name,
+  nativeTools
+}: {
+  name: ToolName
+  nativeTools: boolean
+}): React.JSX.Element {
+  return (
+    <ApiInfo
+      title={<span className="font-mono text-[12px]">{name}</span>}
+      code={JSON.stringify(TOOL_DEFINITIONS[name], null, 2)}
+      codeLabel="Definição exata (um item do array tools):"
+      side="left"
+    >
+      <p>
+        {nativeTools ? (
+          <>
+            Habilitada: enviada como um item do array <C>tools</C> da request.
+          </>
+        ) : (
+          <>
+            &quot;Tools nativas&quot; está desligado: o campo <C>tools</C> não é enviado. A tool só
+            chega ao modelo se o texto das tools no system prompt estiver ligado.
+          </>
+        )}{' '}
+        <C>delegate_task</C> é omitida em subsessões de nível 2.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function NativeToolsInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Tools nativas" side="left">
+      <p>
+        Ligado: as definições JSON das tools habilitadas vão no campo <C>tools</C> da request (antes
+        do system, no prefixo cacheável) e o modelo responde com <C>tool_calls</C>.
+      </p>
+      <p>
+        Desligado: o campo <C>tools</C> é omitido. Se o texto das tools no prompt estiver ligado, o
+        modelo é instruído a chamar ferramentas escrevendo <C>{'<tool_call>{…}</tool_call>'}</C>, e
+        os resultados voltam como mensagens <C>{'role: "user"'}</C> com{' '}
+        <C>{'<tool_result name="…">…</tool_result>'}</C>.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ToolsInPromptInfo({ text }: { text: string }): React.JSX.Element {
+  return (
+    <ApiInfo
+      title="Texto das tools no system prompt"
+      code={text}
+      codeLabel="Texto exato anexado:"
+      side="left"
+    >
+      <p>
+        Anexado ao <strong className="text-fg">final</strong> do conteúdo da mensagem{' '}
+        <C>{'role: "system"'}</C>, precedido de <C>\n\n</C>, depois do bloco de ambiente.
+      </p>
+    </ApiInfo>
+  )
+}
+
+const ENV_RE = /<environment>[\s\S]*?<\/environment>/
+
+function systemText(body: unknown): string | null {
+  const msgs = (body as { messages?: ApiMessage[] } | null)?.messages
+  const sys = msgs?.find((m) => m.role === 'system')
+  if (!sys) return null
+  return typeof sys.content === 'string' ? sys.content : sys.content.map((p) => p.text).join('')
+}
+
+/** Busca o bloco <environment> exato via previewRequest; cai num modelo se o main não responder. */
+function EnvBlock({
+  sessionId,
+  cwd,
+  deps
+}: {
+  sessionId: string
+  cwd: string
+  deps?: string
+}): React.JSX.Element {
+  const fallback = `<environment>\nroot: ${cwd}\nos: (sistema operacional detectado pelo app)\nshell: bash\n…\n</environment>`
+  const [text, setText] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    api.agent
+      .previewRequest(sessionId)
+      .then((p) => {
+        const m = systemText(p.body)?.match(ENV_RE)
+        if (alive && m) setText(m[0])
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [sessionId, cwd, deps])
+  return (
+    <pre className="max-h-60 overflow-auto rounded-lg border border-border bg-bg/80 p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-fg/90">
+      {text ?? fallback}
+    </pre>
+  )
+}
+
+export function EnvInfo({
+  sessionId,
+  cwd,
+  deps
+}: {
+  sessionId: string
+  cwd: string
+  /** Muda quando opções que alteram o bloco mudam (confinação, sandbox). */
+  deps?: string
+}): React.JSX.Element {
+  return (
+    <ApiInfo title="Bloco de ambiente" side="left" wide>
+      <p>
+        Anexado ao conteúdo da mensagem <C>{'role: "system"'}</C>, precedido de <C>\n\n</C>, logo
+        após o seu system prompt. Diz ao modelo o diretório raiz, o SO e as regras do workspace. Sem
+        data/hora nem diretório atual do shell, para manter o prefixo estável para o cache. Texto
+        exato:
+      </p>
+      <EnvBlock sessionId={sessionId} cwd={cwd} deps={deps} />
+    </ApiInfo>
+  )
+}
+
+export function RootInfo({ side }: { side?: Side }): React.JSX.Element {
+  return (
+    <ApiInfo title="Diretório raiz" side={side}>
+      <p>
+        O workspace da sessão (e de todos os subagentes). Com o bloco de ambiente ativo, aparece no
+        system prompt como <C>root: …</C> dentro de <C>{'<environment>'}</C>, junto com a regra de
+        que caminhos relativos resolvem a partir dele.
+      </p>
+      <p>
+        Localmente: base dos caminhos relativos das ferramentas e diretório onde o <C>bash</C>{' '}
+        começa (o <C>cd</C> persiste entre chamadas da mesma sessão).
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ConfineInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Confinar ao diretório raiz" side="left">
+      <p>
+        Localmente, <C>list_dir</C>, <C>read_file</C>, <C>write_file</C>, <C>edit_file</C>,{' '}
+        <C>search_files</C> e <C>find_files</C> recusam caminhos que (após resolver <C>..</C> e
+        links simbólicos) saiam do diretório raiz; o erro volta ao modelo como{' '}
+        <C>{'role: "tool"'}</C>. O bash sempre começa no raiz e volta a ele se terminar fora.
+      </p>
+      <p>
+        Com o bloco de ambiente ativo, adiciona ao system prompt a linha:{' '}
+        <C>As ferramentas de arquivo só acessam caminhos dentro do diretório raiz.</C>
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function SandboxInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Bash em sandbox (bubblewrap)" side="left">
+      <p>
+        Localmente, o bash roda via <C>bwrap</C>: o diretório raiz é montado com leitura e escrita,
+        o resto do sistema de arquivos fica somente leitura, <C>/tmp</C> é privado e a rede continua
+        liberada.
+      </p>
+      <p>
+        Com o bloco de ambiente ativo, adiciona ao system prompt a linha:{' '}
+        <C>O bash roda em sandbox: só o diretório raiz (e um /tmp privado) é gravável.</C>
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ContextWindowInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Janela de contexto e limite" side="left">
+      <p>
+        <strong className="text-fg">Não é enviado à API.</strong> Usado só pelo medidor de contexto
+        (tokens da última resposta: <C>prompt_tokens + completion_tokens</C>) e para decidir quando
+        sugerir — ou fazer, se automático — a compactação. Sem override, vem do{' '}
+        <C>context_length</C> que o provedor informa em <C>/models</C>.
+      </p>
+      <p className="text-subtle">
+        Subagentes usam a janela do próprio modelo e compactam sempre ao atingir o limite.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function CompactPromptInfo({ prompt }: { prompt: string }): React.JSX.Element {
+  return (
+    <ApiInfo
+      title="Prompt de compactação"
+      side="left"
+      code={compactionMessageText('…resumo gerado pelo modelo…')}
+      codeLabel="O histórico anterior é substituído por esta mensagem role: user:"
+    >
+      <p>
+        Usado só na request de compactação: a request normal da sessão (mesmas tools, system,
+        parâmetros e histórico ativo — o prefixo vem do cache) com este texto como última mensagem{' '}
+        <C>{'{ role: "user", content: "<prompt>" }'}</C>.
+      </p>
+      <p>
+        Essa request e a resposta <strong className="text-fg">não entram no histórico</strong>. O
+        resumo é salvo numa mensagem de fronteira; dali em diante cada request envia só{' '}
+        <C>system</C> → fronteira → mensagens novas.
+      </p>
+      <p className="text-subtle">{prompt.length.toLocaleString('pt-BR')} caracteres.</p>
+    </ApiInfo>
+  )
+}
+
+export function MaxOutputInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Limite de saída das ferramentas" side="left">
+      <p>
+        Teto de caracteres do <C>content</C> de cada resultado enviado ao modelo como{' '}
+        <C>{'role: "tool"'}</C> (≈ 4 caracteres por token). Saídas maiores são cortadas com um
+        marcador explicando o corte e como ler o resto.
+      </p>
+      <p>
+        Fixos: <C>read_file</C> lê no máximo {LIMITS.readDefaultLines.toLocaleString('pt-BR')}{' '}
+        linhas sem offset/limit e corta linhas acima de{' '}
+        {LIMITS.readMaxLineChars.toLocaleString('pt-BR')} caracteres; <C>list_dir</C> até{' '}
+        {LIMITS.listMaxEntries} entradas; <C>search_files</C> até {LIMITS.searchMaxResults}{' '}
+        resultados; <C>list_models</C> até {LIMITS.modelsMaxResults} modelos; <C>bash</C> mantém
+        início e fim; <C>browse_url</C> pagina o texto com <C>offset</C>.
+      </p>
+      <p className="text-subtle">Não é um campo da request.</p>
+    </ApiInfo>
+  )
+}
+
+export function CompactionMessageInfo({
+  msg,
+  side = 'top'
+}: {
+  msg: StoredMessage
+  side?: Side
+}): React.JSX.Element {
+  return (
+    <ApiInfo
+      title="Resumo da conversa (fronteira de compactação)"
+      code={JSON.stringify(msg.message, null, 2)}
+      codeLabel="Objeto exato no array messages:"
+      side={side}
+    >
+      <p>
+        Enviado como mensagem <C>{'role: "user"'}</C> no início do histórico — logo depois do
+        system. As mensagens anteriores a ela continuam salvas e visíveis, mas{' '}
+        <strong className="text-fg">não são mais enviadas à API</strong>.
+      </p>
+      <p className="text-subtle">
+        Criada pelo app: conteúdo = <C>{'<conversation_summary>…</conversation_summary>'}</C> + a
+        nota “{COMPACTION_NOTE}” Apague-a para voltar a enviar o histórico completo.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function CacheInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Token caching" side="left">
+      <p>
+        Adiciona <C>{'cache_control: { type: "ephemeral" }'}</C> em até três pontos da request (máx.
+        4 no Anthropic):
+      </p>
+      <p>
+        1. No system prompt, cujo <C>content</C> vira{' '}
+        <C>{'[{ type: "text", text, cache_control }]'}</C>.
+        <br />
+        2. Na <strong className="text-fg">última</strong> mensagem do array, de qualquer role
+        (inclusive <C>{'role: "tool"'}</C>) — assim cada passo de um loop de tools lê do cache tudo
+        o que o passo anterior enviou.
+        <br />
+        3. Na última mensagem <C>{'role: "user"'}</C>, se não for a mesma.
+      </p>
+      <p>
+        O <C>content</C> string vira <C>{'[{ type: "text", text, cache_control }]'}</C> só na cópia
+        enviada; o histórico salvo não muda.
+      </p>
+      <p className="text-subtle">
+        O histórico é reenviado byte a byte como foi salvo, para maximizar acertos de cache.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function AutoApproveInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Aprovação automática">
+      <p>
+        <strong className="text-fg">Não é enviado à API.</strong> Só controla se o app pede sua
+        confirmação antes de executar a tool localmente. Se você negar, o resultado enviado ao
+        modelo como <C>{'role: "tool"'}</C> é: <C>O usuário negou a execução desta ferramenta.</C>
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ComposerInfo({ running }: { running: boolean }): React.JSX.Element {
+  return (
+    <ApiInfo title="Sua mensagem" side="top">
+      <p>
+        Enviada como uma nova mensagem <C>{'{ role: "user", content: "<texto>" }'}</C> (string) no
+        fim do array <C>messages</C>, depois de todo o histórico.
+      </p>
+      {running && (
+        <p>
+          O agente está trabalhando: a mensagem entra na <strong className="text-fg">fila</strong> e
+          é anexada como <C>{'role: "user"'}</C> no próximo limite de passo (após os resultados das
+          tools, antes da próxima chamada).
+        </p>
+      )}
+    </ApiInfo>
+  )
+}
+
+export function QueueInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Mensagens na fila">
+      <p>
+        Cada item vira uma mensagem <C>{'role: "user"'}</C> anexada no próximo limite de passo do
+        agente, na ordem da fila.
+      </p>
+      <p>
+        ⚡ envia agora: interrompe a geração/tools em andamento, salva a resposta parcial, fecha
+        cada tool call pendente com uma mensagem <C>{'role: "tool"'}</C> com o texto{' '}
+        <C>[Interrompido pelo usuário antes de concluir]</C> e então anexa sua mensagem.
+      </p>
+    </ApiInfo>
+  )
+}
+
+/** (i) de uma mensagem do histórico: mostra o objeto exato reenviado em toda request. */
+export function MessageInfo({
+  msg,
+  side = 'top'
+}: {
+  msg: StoredMessage
+  side?: Side
+}): React.JSX.Element {
+  const m = msg.message
+  if (msg.meta.kind === 'compaction') return <CompactionMessageInfo msg={msg} side={side} />
+  if (msg.meta.kind === 'error') {
+    return (
+      <ApiInfo title="Erro (só exibição)" side={side}>
+        <p>
+          <strong className="text-fg">Não é enviado à API.</strong> O app salvou este erro no
+          histórico apenas para exibição (sobrevive ao reinício); ele é excluído do array{' '}
+          <C>messages</C> de todas as requests.
+        </p>
+      </ApiInfo>
+    )
+  }
+  const desc: Record<ApiMessage['role'], React.ReactNode> = {
+    user: (
+      <>
+        Mensagem <C>{'role: "user"'}</C> do histórico, reenviada em toda request exatamente como
+        salva.
+      </>
+    ),
+    assistant: (
+      <>
+        Mensagem <C>{'role: "assistant"'}</C> reenviada em toda request como salva: <C>content</C>
+        {m.role === 'assistant' && m.tool_calls?.length ? (
+          <>
+            {' '}
+            + <C>tool_calls</C>
+          </>
+        ) : null}
+        {m.role === 'assistant' && m.reasoning ? (
+          <>
+            {' '}
+            + <C>reasoning</C>
+          </>
+        ) : null}
+        .
+      </>
+    ),
+    tool: (
+      <>
+        Resultado enviado ao modelo como <C>{'role: "tool"'}</C>, pareado pelo <C>tool_call_id</C>.
+      </>
+    ),
+    system: (
+      <>
+        Mensagem <C>{'role: "system"'}</C> do histórico.
+      </>
+    )
+  }
+  return (
+    <ApiInfo
+      title={msg.meta.synthetic ? 'Mensagem sintética (criada pelo app)' : undefined}
+      code={JSON.stringify(m, null, 2)}
+      codeLabel="Objeto exato no array messages:"
+      side={side}
+    >
+      <p>{desc[m.role]}</p>
+      {msg.meta.synthetic && (
+        <p>
+          Não foi escrita por você nem pelo modelo: o app a inseriu para manter a conversa
+          consistente.
+        </p>
+      )}
+    </ApiInfo>
+  )
+}
+
+export function TaskInfo({ task, side }: { task: string | null; side?: Side }): React.JSX.Element {
+  return (
+    <ApiInfo title="Tarefa do subagente" code={task ?? ''} codeLabel="Argumento task:" side={side}>
+      <p>
+        O subagente não vê esta conversa. A request dele começa do zero com:{' '}
+        <C>{'role: "system"'}</C> = system prompt de subagentes (+ ambiente/tools, se ativos) e,
+        como primeira mensagem <C>{'role: "user"'}</C>, exatamente o argumento <C>task</C> da
+        chamada <C>delegate_task</C>. O texto final dele volta para esta sessão como o resultado{' '}
+        <C>{'role: "tool"'}</C>.
+      </p>
+    </ApiInfo>
+  )
+}

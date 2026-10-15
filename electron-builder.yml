@@ -1,0 +1,99 @@
+appId: com.clearchat.app
+productName: ClearChat
+copyright: Copyright © 2026 Eduardo Zenere
+directories:
+  buildResources: build
+  output: dist
+artifactName: ClearChat-${version}-${arch}.${ext}
+compression: maximum
+files:
+  # Só o necessário em runtime: out/ (main/preload/renderer), resources/ e node_modules de produção.
+  - '!**/.vscode/*'
+  - '!{src,e2e,scripts,docs,build,dist,test-results,playwright-report}{,/**}'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!electron-builder.yml'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,.editorconfig,.gitignore,dev-app-update.yml,CHANGELOG.md,README.md,SPEC.md}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,package-lock.json}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!**/*.{map,ts,tsx,md,markdown}'
+  - '!**/{test,tests,__tests__,example,examples,docs,.github}{,/**}'
+  - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
+  # headers de compilação (o better-sqlite3 usa os binários de prebuilds/)
+  - '!node_modules/node-addon-api{,/**}'
+asarUnpack:
+  - resources/**
+  - node_modules/better-sqlite3/**
+npmRebuild: false
+# Só os idiomas da UI do Chromium que importam (pt-BR + fallback en-US): ~40 MB a menos.
+electronLanguages:
+  - pt-BR
+  - en-US
+
+linux:
+  executableName: clearchat
+  files:
+    - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
+  # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
+  # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
+  syncDesktopName: true
+  icon: build/icons
+  category: Development;
+  synopsis: Chat desktop minimalista para endpoints OpenAI-compatible
+  # Também vira o Comment do .desktop (o electron-builder usa a description para ele).
+  description: Chat minimalista com IA para qualquer endpoint OpenAI-compatible (OpenRouter, OpenAI, servidores locais)
+  maintainer: Eduardo Zenere
+  vendor: Eduardo Zenere
+  target:
+    - AppImage
+    - deb
+    - pacman
+    - tar.gz
+  desktop:
+    entry:
+      Name: ClearChat
+      GenericName: Chat com IA
+      Keywords: ai;ia;chat;llm;openai;openrouter;assistente;
+      StartupWMClass: clearchat
+      StartupNotify: 'true'
+appImage:
+  # AppImage de uma arquitetura só (x64): o nome já inclui ${arch}.
+  artifactName: ClearChat-${version}-${arch}.${ext}
+deb:
+  packageCategory: devel
+  priority: optional
+pacman:
+  packageCategory: devel
+  # A lista padrão do electron-builder inclui pacotes que não existem mais nos repositórios do
+  # Arch (http-parser, libappindicator-gtk3) e quebraria o `pacman -U`. O Electron já traz o resto.
+  depends:
+    - gtk3
+    - nss
+    - alsa-lib
+    - libxss
+    - libxtst
+    - libnotify
+    - xdg-utils
+
+win:
+  executableName: clearchat
+  files:
+    - '!node_modules/better-sqlite3/prebuilds/{darwin,linux,linuxmusl}-*'
+  icon: build/icon.ico
+  target:
+    - nsis
+nsis:
+  artifactName: ClearChat-${version}-setup-${arch}.${ext}
+  shortcutName: ClearChat
+  uninstallDisplayName: ClearChat
+
+mac:
+  icon: build/icon.icns
+  files:
+    - '!node_modules/better-sqlite3/prebuilds/{win32,linux,linuxmusl}-*'
+  category: public.app-category.developer-tools
+  entitlementsInherit: build/entitlements.mac.plist
+  notarize: false
+  target:
+    - dmg
+dmg:
+  artifactName: ClearChat-${version}-${arch}.${ext}
