@@ -4,7 +4,9 @@ import { DEFAULT_BASE_URL, DEFAULT_SYSTEM_PROMPT } from '@shared/defaults'
 import type { Provider } from '@shared/types'
 import { api, errorMessage } from '../lib/api'
 import { cn, shortPath } from '../lib/format'
-import { useStore } from '../store'
+import { useStore, type SettingsTab } from '../store'
+import { PresetEditor, PresetsList } from './presets/PresetsSettings'
+import { PresetIcon } from './presets/PresetIcon'
 import { ModelFieldInfo, SystemPromptInfo } from './apiDocs'
 import { ProviderFields, TestButton, TestResult } from './ProviderForm'
 import { draftToInput, useProviderTest, type ProviderDraft } from '../lib/provider'
@@ -178,6 +180,11 @@ function DefaultsSection(): React.JSX.Element {
 
   return (
     <div className="space-y-4">
+      <DefaultPresetField />
+      <p className="text-xs leading-relaxed text-subtle">
+        Padrões de chats novos — valem para os campos que a persona não define (a persona “Padrão”
+        não define nenhum) e quando não há persona.
+      </p>
       <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3">
         <div>
           <Label>Provedor padrão</Label>
@@ -244,12 +251,47 @@ function DefaultsSection(): React.JSX.Element {
   )
 }
 
+function DefaultPresetField(): React.JSX.Element {
+  const presets = useStore((s) => s.presets)
+  const defaultPresetId = useStore((s) => s.settings.defaultPresetId)
+  const setSetting = useStore((s) => s.setSetting)
+  const NONE = '__none__'
+  return (
+    <div>
+      <Label>Persona padrão do Novo chat</Label>
+      <Select
+        value={presets.some((p) => p.id === defaultPresetId) ? defaultPresetId : NONE}
+        onChange={(v) => void setSetting('defaultPresetId', v === NONE ? null : v)}
+        options={[
+          ...presets.map((p) => ({
+            value: p.id,
+            label: (
+              <span className="flex items-center gap-2">
+                <PresetIcon icon={p.icon} size="sm" className="size-5 border-0 bg-transparent" />
+                {p.name}
+              </span>
+            ),
+            description: p.description || undefined
+          })),
+          { value: NONE, label: 'Nenhuma (só os padrões abaixo)' }
+        ]}
+      />
+    </div>
+  )
+}
+
 export function SettingsModal(): React.JSX.Element {
   const open = useStore((s) => s.settingsOpen)
   const setOpen = useStore((s) => s.setSettingsOpen)
+  const tab = useStore((s) => s.settingsTab)
   const providers = useStore((s) => s.providers)
+  const presets = useStore((s) => s.presets)
   const [editing, setEditing] = useState<string | 'new' | null>(null)
-  const [tab, setTab] = useState<'providers' | 'defaults'>('providers')
+  const [editingPreset, setEditingPreset] = useState<string | 'new' | null>(null)
+  const setTab = (t: SettingsTab): void => {
+    setOpen(true, t)
+    setEditingPreset(null)
+  }
 
   return (
     <Modal
@@ -257,14 +299,16 @@ export function SettingsModal(): React.JSX.Element {
       onClose={() => {
         setOpen(false)
         setEditing(null)
+        setEditingPreset(null)
       }}
       title="Configurações"
-      width={640}
+      width={tab === 'presets' && editingPreset ? 720 : 640}
     >
       <div className="mb-5 flex gap-1 border-b border-border">
         {(
           [
             ['providers', 'Provedores'],
+            ['presets', 'Personas'],
             ['defaults', 'Novos chats']
           ] as const
         ).map(([id, label]) => (
@@ -306,6 +350,16 @@ export function SettingsModal(): React.JSX.Element {
             </button>
           )}
         </div>
+      ) : tab === 'presets' ? (
+        editingPreset ? (
+          <PresetEditor
+            key={editingPreset}
+            preset={presets.find((p) => p.id === editingPreset) ?? null}
+            onDone={() => setEditingPreset(null)}
+          />
+        ) : (
+          <PresetsList onEdit={setEditingPreset} />
+        )
       ) : (
         <DefaultsSection />
       )}

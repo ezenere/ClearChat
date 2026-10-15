@@ -10,12 +10,28 @@ import type {
   ChatConfig,
   ChatParams,
   MessageMeta,
+  Preset,
   Provider,
   Session,
   SessionStatus,
   StoredMessage
 } from '@shared/types'
-import type { ChatCreateInput, ChatUpdateInput, ProviderInput, ProviderPatch } from '@shared/ipc'
+import type {
+  ChatCreateInput,
+  ChatUpdateInput,
+  PresetInput,
+  PresetPatch,
+  ProviderInput,
+  ProviderPatch
+} from '@shared/ipc'
+import {
+  DEFAULT_PRESET_ICON,
+  DEFAULT_PRESET_NAME,
+  DEFAULT_PRESET_SETTING,
+  PRESETS_SEEDED_SETTING,
+  copyName,
+  sanitizePresetConfig
+} from '@shared/presets'
 
 const parse = <T>(s: string | null | undefined, fallback: T): T => {
   if (s == null) return fallback
@@ -464,5 +480,112 @@ export const chatsRepo = {
   },
   delete(id: string): void {
     getDb().prepare('DELETE FROM chats WHERE id = ?').run(id)
+  }
+}
+
+// ---------------- presets (personas) ----------------
+
+interface PresetRow {
+  id: string
+  name: string
+  description: string
+  icon: string
+  config_json: string
+  created_at: number
+  updated_at: number
+}
+
+const toPreset = (r: PresetRow): Preset => ({
+  id: r.id,
+  name: r.name,
+  description: r.description,
+  icon: r.icon,
+  config: sanitizePresetConfig(parse<unknown>(r.config_json, {})),
+  createdAt: r.created_at,
+  updatedAt: r.updated_at
+})
+
+export const presetsRepo = {
+  list(): Preset[] {
+    const rows = getDb()
+      .prepare('SELECT * FROM presets ORDER BY created_at, rowid')
+      .all() as PresetRow[]
+    return rows.map(toPreset)
+  },
+  get(id: string): Preset | null {
+    const r = getDb().prepare('SELECT * FROM presets WHERE id = ?').get(id) as PresetRow | undefined
+    return r ? toPreset(r) : null
+  },
+  create(input: PresetInput): Preset {
+    const now = Date.now()
+    const p: Preset = {
+      id: randomUUID(),
+      name: input?.name?.trim() || 'Persona',
+      description: input?.description?.trim() ?? '',
+      icon: input?.icon?.trim() ?? '',
+      config: sanitizePresetConfig(input?.config),
+      createdAt: now,
+      updatedAt: now
+    }
+    getDb()
+      .prepare(
+        'INSERT INTO presets (id, name, description, icon, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      )
+      .run(p.id, p.name, p.description, p.icon, JSON.stringify(p.config), now, now)
+    return p
+  },
+  /** `patch.config` substitui a config inteira. */
+  update(id: string, patch: PresetPatch): Preset {
+    const cur = presetsRepo.get(id)
+    if (!cur) throw new Error(`Persona não encontrada: ${id}`)
+    const next: Preset = {
+      ...cur,
+      ...(patch?.name !== undefined ? { name: patch.name.trim() || cur.name } : {}),
+      ...(patch?.description !== undefined ? { description: patch.description.trim() } : {}),
+      ...(patch?.icon !== undefined ? { icon: patch.icon.trim() } : {}),
+      ...(patch?.config !== undefined ? { config: sanitizePresetConfig(patch.config) } : {}),
+      updatedAt: Date.now()
+    }
+    getDb()
+      .prepare(
+        'UPDATE presets SET name = ?, description = ?, icon = ?, config_json = ?, updated_at = ? WHERE id = ?'
+      )
+      .run(next.name, next.description, next.icon, JSON.stringify(next.config), next.updatedAt, id)
+    return next
+  },
+  delete(id: string): void {
+    getDb().prepare('DELETE FROM presets WHERE id = ?').run(id)
+    if (settingsRepo.get(DEFAULT_PRESET_SETTING) === id)
+      settingsRepo.set(DEFAULT_PRESET_SETTING, null)
+  },
+  duplicate(id: string): Preset {
+    const cur = presetsRepo.get(id)
+    if (!cur) throw new Error(`Persona não encontrada: ${id}`)
+    return presetsRepo.create({
+      name: copyName(cur.name, presetsRepo.list()),
+      description: cur.description,
+      icon: cur.icon,
+      config: cur.config
+    })
+  },
+  /**
+   * Primeira execução: cria a persona "Padrão" com config vazia (= segue os padrões de
+   * "Novos chats" nas Configurações) e a marca como padrão. Roda uma vez só (apagá-la não a recria).
+   */
+  seed(): void {
+    if (settingsRepo.get(PRESETS_SEEDED_SETTING)) return
+    const db = getDb()
+    db.transaction(() => {
+      if ((db.prepare('SELECT COUNT(*) AS n FROM presets').get() as { n: number }).n === 0) {
+        const p = presetsRepo.create({
+          name: DEFAULT_PRESET_NAME,
+          description: 'Configuração padrão do app (Configurações → Novos chats).',
+          icon: DEFAULT_PRESET_ICON,
+          config: {}
+        })
+        settingsRepo.set(DEFAULT_PRESET_SETTING, p.id)
+      }
+      settingsRepo.set(PRESETS_SEEDED_SETTING, true)
+    })()
   }
 }

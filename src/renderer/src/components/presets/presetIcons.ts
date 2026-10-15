@@ -1,0 +1,71 @@
+// Ícones de persona: nomes lucide curados (o campo `icon` guarda o nome) e emojis sugeridos.
+import {
+  BookOpen,
+  Bot,
+  Brain,
+  Briefcase,
+  ChartLine,
+  CodeXml,
+  Database,
+  Feather,
+  FlaskConical,
+  Globe,
+  GraduationCap,
+  Languages,
+  Lightbulb,
+  MessageSquare,
+  Palette,
+  PenLine,
+  Rocket,
+  Scale,
+  Search,
+  ShieldCheck,
+  Sparkles,
+  SquareTerminal,
+  Wrench,
+  Zap,
+  type LucideIcon
+} from 'lucide-react'
+
+export const PRESET_LUCIDE: Record<string, LucideIcon> = {
+  sparkles: Sparkles,
+  bot: Bot,
+  brain: Brain,
+  code: CodeXml,
+  terminal: SquareTerminal,
+  pen: PenLine,
+  feather: Feather,
+  search: Search,
+  book: BookOpen,
+  graduation: GraduationCap,
+  flask: FlaskConical,
+  chart: ChartLine,
+  database: Database,
+  globe: Globe,
+  languages: Languages,
+  briefcase: Briefcase,
+  scale: Scale,
+  shield: ShieldCheck,
+  wrench: Wrench,
+  palette: Palette,
+  lightbulb: Lightbulb,
+  message: MessageSquare,
+  rocket: Rocket,
+  zap: Zap
+}
+
+export const PRESET_ICON_NAMES = Object.keys(PRESET_LUCIDE)
+export const PRESET_EMOJIS = [
+  '🤖',
+  '🧠',
+  '🧐',
+  '✍️',
+  '💻',
+  '🔬',
+  '📚',
+  '🌐',
+  '⚖️',
+  '🎨',
+  '🛡️',
+  '⚡'
+]

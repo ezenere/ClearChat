@@ -63,6 +63,8 @@ function Main(): React.JSX.Element {
   const panelOpen = useStore((s) => s.panelOpen)
   const setPanel = useStore((s) => s.setPanel)
   const narrow = useNarrow()
+  // trocar a persona padrão (Configurações) reinicia o Novo chat com ela
+  const defaultPresetId = useStore((s) => s.settings.defaultPresetId)
 
   // Ao ficar estreita, recolhe o painel (o usuário pode reabrir como gaveta).
   useEffect(() => {
@@ -92,7 +94,7 @@ function Main(): React.JSX.Element {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <TopBar />
-      <NewChat key="new" />
+      <NewChat key={`new:${defaultPresetId ?? ''}`} />
     </div>
   )
 }

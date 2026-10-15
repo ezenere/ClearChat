@@ -1,13 +1,17 @@
-import { FolderTree, SlidersHorizontal, X } from 'lucide-react'
+import { Braces, FolderTree, MessageSquareText, Sparkles, Wrench, X } from 'lucide-react'
+import { useEffect, useRef } from 'react'
 import type { Chat } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore, type PanelTab } from '../../store'
 import { IconButton } from '../ui/controls'
-import { ConfigTab } from './ConfigTab'
+import { ChatTab, ModelTab, ToolsTab } from './ConfigTabs'
+import { Note } from './fields'
 import { FilesTab } from './FilesTab'
 
-const TABS: { id: PanelTab; label: string; icon: typeof SlidersHorizontal }[] = [
-  { id: 'config', label: 'Config', icon: SlidersHorizontal },
+const TABS: { id: PanelTab; label: string; icon: typeof Sparkles }[] = [
+  { id: 'model', label: 'Modelo', icon: Sparkles },
+  { id: 'chat', label: 'Chat', icon: MessageSquareText },
+  { id: 'tools', label: 'Tools', icon: Wrench },
   { id: 'files', label: 'Arquivos', icon: FolderTree }
 ]
 
@@ -21,44 +25,87 @@ export function RightPanel({
 }): React.JSX.Element {
   const tab = useStore((s) => s.panelTab)
   const setPanel = useStore((s) => s.setPanel)
+  const setPreview = useStore((s) => s.setPreview)
+  const viewSessionId = useStore((s) => (s.view.kind === 'chat' ? s.view.sessionId : null))
+  const viewSession = useStore((s) => (viewSessionId ? s.sessions[viewSessionId] : undefined))
+  const isSub = !!viewSession && viewSession.depth > 0
+
+  // focusConfig('contexto') → a aba já foi trocada no store; rola até a seção e destaca.
+  const configFocus = useStore((s) => s.configFocus)
+  const focusConfig = useStore((s) => s.focusConfig)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!configFocus) return
+    const el = bodyRef.current?.querySelector<HTMLElement>(`[data-section="${configFocus}"]`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      el.classList.add('animate-flash')
+      setTimeout(() => el.classList.remove('animate-flash'), 1200)
+    }
+    focusConfig(null)
+  }, [configFocus, focusConfig, tab])
+
   return (
     <aside
       data-testid="right-panel"
       className={cn(
-        'flex w-[360px] max-w-[85%] shrink-0 animate-fade-in flex-col border-l border-border bg-surface',
+        'flex w-[384px] max-w-[85%] shrink-0 animate-fade-in flex-col border-l border-border bg-surface',
         overlay && 'absolute inset-y-0 right-0 z-30 shadow-popover'
       )}
     >
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border/70 px-3">
-        <div className="flex rounded-lg bg-bg/70 p-0.5">
+      <div className="flex h-11 shrink-0 items-center gap-1.5 border-b border-border/70 px-2.5">
+        <div role="tablist" className="flex min-w-0 flex-1 rounded-lg bg-bg/70 p-0.5">
           {TABS.map((t) => (
             <button
               key={t.id}
               type="button"
+              role="tab"
+              aria-selected={tab === t.id}
               onClick={() => setPanel(true, t.id)}
               className={cn(
-                'flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium transition-colors',
+                'flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-1.5 text-xs font-medium transition-colors',
                 tab === t.id ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
               )}
             >
-              <t.icon className="size-3.5" />
-              {t.label}
+              <t.icon className="size-3.5 shrink-0" />
+              <span className="truncate">{t.label}</span>
             </button>
           ))}
         </div>
         <IconButton
-          label="Fechar painel"
+          label="Ver request"
           size="sm"
-          className="ml-auto"
-          onClick={() => setPanel(false)}
+          side="bottom"
+          onClick={() => setPreview(viewSessionId ?? chat.mainSessionId)}
         >
+          <Braces />
+        </IconButton>
+        <IconButton label="Fechar painel" size="sm" side="bottom" onClick={() => setPanel(false)}>
           <X />
         </IconButton>
       </div>
       <div
-        className={cn('min-h-0 flex-1', tab === 'config' ? 'overflow-y-auto' : 'overflow-hidden')}
+        ref={bodyRef}
+        className={cn('min-h-0 flex-1', tab === 'files' ? 'overflow-hidden' : 'overflow-y-auto')}
       >
-        {tab === 'config' ? <ConfigTab chat={chat} /> : <FilesTab key={chat.id} chat={chat} />}
+        {tab !== 'files' && isSub && (
+          <div className="px-4 pt-4">
+            <Note>
+              Configuração do chat (compartilhada). Esta subsessão usa o modelo{' '}
+              <span className="font-mono text-fg/90">{viewSession.model}</span> e o system prompt de
+              subagentes (aba Tools); &quot;Ver request&quot; mostra a request dela.
+            </Note>
+          </div>
+        )}
+        {tab === 'model' ? (
+          <ModelTab chat={chat} />
+        ) : tab === 'chat' ? (
+          <ChatTab chat={chat} />
+        ) : tab === 'tools' ? (
+          <ToolsTab chat={chat} />
+        ) : (
+          <FilesTab key={chat.id} chat={chat} />
+        )}
       </div>
     </aside>
   )

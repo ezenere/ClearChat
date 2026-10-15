@@ -1,62 +1,145 @@
-import { ArrowRight, FolderOpen, FolderPlus, RotateCcw } from 'lucide-react'
-import { useState } from 'react'
-import { DEFAULT_APP_SIGNATURE } from '@shared/appSignatures'
-import { DEFAULT_SYSTEM_PROMPT, isOpenRouter } from '@shared/defaults'
+import { ArrowRight, BookmarkPlus, FolderOpen, FolderPlus, RotateCcw } from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { normalizeAppSignatureId } from '@shared/appSignatures'
+import { isOpenRouter } from '@shared/defaults'
+import { sameValue, sanitizePresetConfig, withoutCwd, type PresetConfig } from '@shared/presets'
+import type { ChatConfig, Preset } from '@shared/types'
 import { AppSignatureField, AppSignatureInfo } from './AppSignatureField'
 import { api } from '../lib/api'
 import { compactPath } from '../lib/format'
+import { initialPresetId, newChatBase, resolvePreset } from '../lib/presets'
 import { useStore } from '../store'
 import { ModelFieldInfo, ProviderFieldInfo, RootInfo, SystemPromptInfo } from './apiDocs'
 import { NewFolderForm } from './panel/FilesTab'
+import { ModelInfoLine } from './panel/editors'
+import { PresetPicker } from './presets/PresetPicker'
+import { SavePresetDialog } from './presets/SavePresetDialog'
 import { Tip } from './ui/Tooltip'
 import { AutoTextarea, Button, Kbd, Label } from './ui/controls'
 import { ModelCombobox } from './ui/ModelCombobox'
 import { Select } from './ui/Select'
 
+type Custom = { referer: string; title: string }
+
+/** Campos visíveis no Novo chat (o resto vem da persona). */
+interface Form {
+  providerId: string
+  model: string
+  systemPrompt: string
+  cwd: string
+  appSignature: string
+  appSignatureCustom: Custom
+}
+
+const EMPTY_CUSTOM: Custom = { referer: '', title: '' }
+
+function formFrom(cfg: ChatConfig, cwd: string): Form {
+  return {
+    providerId: cfg.providerId,
+    model: cfg.model,
+    systemPrompt: cfg.systemPrompt,
+    cwd,
+    appSignature: normalizeAppSignatureId(cfg.appSignature),
+    appSignatureCustom: cfg.appSignatureCustom ?? EMPTY_CUSTOM
+  }
+}
+
+/** Campos do formulário que diferem da persona resolvida (cwd só conta se a persona o define). */
+function changedFields(form: Form, resolved: ChatConfig, preset: Preset | null): (keyof Form)[] {
+  const out: (keyof Form)[] = []
+  if (form.providerId !== resolved.providerId) out.push('providerId')
+  if (form.model.trim() !== resolved.model.trim()) out.push('model')
+  if (form.systemPrompt !== resolved.systemPrompt) out.push('systemPrompt')
+  if (form.appSignature !== normalizeAppSignatureId(resolved.appSignature)) out.push('appSignature')
+  else if (
+    form.appSignature === 'custom' &&
+    !sameValue(form.appSignatureCustom, resolved.appSignatureCustom ?? EMPTY_CUSTOM)
+  )
+    out.push('appSignatureCustom')
+  if (preset?.config.cwd && form.cwd !== preset.config.cwd) out.push('cwd')
+  return out
+}
+
 export function NewChat(): React.JSX.Element {
   const providers = useStore((s) => s.providers)
   const settings = useStore((s) => s.settings)
   const homeDir = useStore((s) => s.homeDir)
+  const presets = useStore((s) => s.presets)
   const createChat = useStore((s) => s.createChat)
   const run = useStore((s) => s.run)
 
-  const initialProvider =
-    providers.find((p) => p.id === settings.defaultProviderId)?.id ?? providers[0]?.id ?? null
-  const [providerId, setProviderId] = useState<string | null>(initialProvider)
-  const [model, setModel] = useState(settings.defaultModel ?? '')
-  const [systemPrompt, setSystemPrompt] = useState(
-    settings.defaultSystemPrompt ?? DEFAULT_SYSTEM_PROMPT
+  const base = useMemo(
+    () => newChatBase(settings, providers, homeDir),
+    [settings, providers, homeDir]
   )
-  const [cwd, setCwd] = useState<string | null>(settings.defaultCwd ?? homeDir)
+  const resolve = (p: Preset | null): ChatConfig => resolvePreset(base, p, providers)
+
+  const [presetId, setPresetId] = useState<string | null>(() =>
+    initialPresetId(presets, settings.defaultPresetId)
+  )
+  const preset = presets.find((p) => p.id === presetId) ?? null
+  const resolved = resolve(preset)
+  const [form, setForm] = useState<Form>(() =>
+    formFrom(resolved, preset?.config.cwd ?? settings.defaultCwd ?? homeDir ?? '')
+  )
+  const set = (p: Partial<Form>): void => setForm((f) => ({ ...f, ...p }))
+
   const [creating, setCreating] = useState(false)
   const [newFolder, setNewFolder] = useState(false)
-  const [appSignature, setAppSignature] = useState(DEFAULT_APP_SIGNATURE)
-  const [appSignatureCustom, setAppSignatureCustom] = useState({ referer: '', title: '' })
+  const [saveOpen, setSaveOpen] = useState(false)
 
-  const defaultPrompt = settings.defaultSystemPrompt ?? DEFAULT_SYSTEM_PROMPT
-  const provider = providers.find((p) => p.id === providerId)
-  const canStart = !!provider && model.trim().length > 0 && !!cwd
+  const changed = changedFields(form, resolved, preset)
+  const customized = !!preset && changed.length > 0
+  const provider = providers.find((p) => p.id === form.providerId)
+  const canStart = !!provider && form.model.trim().length > 0 && !!form.cwd
+
+  const pickPreset = (id: string): void => {
+    const p = presets.find((x) => x.id === id) ?? null
+    setPresetId(id)
+    // a pasta escolhida continua, a menos que a persona defina a sua
+    setForm(formFrom(resolve(p), p?.config.cwd ?? form.cwd))
+  }
+
+  /** Campos visíveis como patch de ChatConfig. */
+  const visibleConfig = (): Partial<ChatConfig> => ({
+    providerId: form.providerId,
+    model: form.model.trim(),
+    systemPrompt: form.systemPrompt,
+    appSignature: form.appSignature,
+    ...(form.appSignature === 'custom' ? { appSignatureCustom: form.appSignatureCustom } : {})
+  })
 
   const start = async (): Promise<void> => {
-    if (!canStart || !provider || !cwd) return
+    if (!canStart || !provider) return
     setCreating(true)
+    // cache: o da persona, se ela define e o provedor não mudou; senão segue o provedor
+    const cacheEnabled =
+      preset?.config.cacheEnabled !== undefined && form.providerId === resolved.providerId
+        ? preset.config.cacheEnabled
+        : isOpenRouter(provider.baseUrl)
     await createChat({
       config: {
-        providerId: provider.id,
-        model: model.trim(),
-        systemPrompt,
-        cwd,
-        cacheEnabled: isOpenRouter(provider.baseUrl),
-        appSignature,
-        ...(appSignature === 'custom' ? { appSignatureCustom } : {})
+        ...withoutCwd(preset?.config),
+        ...visibleConfig(),
+        cwd: form.cwd,
+        cacheEnabled,
+        ...(preset ? { presetId: preset.id } : {})
       }
     })
     setCreating(false)
   }
 
+  /** Nova persona = config da persona de origem + o que está na tela; atualizar = idem por cima dela. */
+  const buildConfig = (_mode: 'new' | 'update', includeCwd: boolean): PresetConfig =>
+    sanitizePresetConfig({
+      ...withoutCwd(preset?.config),
+      ...visibleConfig(),
+      ...(includeCwd ? { cwd: form.cwd } : {})
+    })
+
   const pickDir = async (): Promise<void> => {
     const dir = await run(() => api.fs.pickDirectory(), 'Erro ao escolher pasta')
-    if (dir) setCwd(dir)
+    if (dir) set({ cwd: dir })
   }
 
   return (
@@ -72,16 +155,57 @@ export function NewChat(): React.JSX.Element {
       <div className="w-full max-w-[600px] animate-slide-up py-[9vh]">
         <h1 className="text-[24px] font-semibold tracking-tight">Novo chat</h1>
         <p className="mt-1.5 text-[13px] text-muted">
-          Escolha o modelo, ajuste o system prompt e comece.
+          Escolha uma persona ou o modelo, ajuste o system prompt e comece.
         </p>
 
         <div className="mt-8 space-y-5">
+          <div>
+            <Label
+              className="min-h-[18px]"
+              hint={
+                customized && (
+                  <button
+                    type="button"
+                    onClick={() => pickPreset(preset.id)}
+                    className="inline-flex items-center gap-1 text-subtle hover:text-fg"
+                  >
+                    <RotateCcw className="size-3" /> Desfazer alterações
+                  </button>
+                )
+              }
+            >
+              Persona
+            </Label>
+            <div className="flex items-stretch gap-2">
+              <div className="min-w-0 flex-1">
+                <PresetPicker
+                  presets={presets}
+                  value={presetId}
+                  customized={customized}
+                  resolve={resolve}
+                  onChange={pickPreset}
+                />
+              </div>
+              {(customized || presets.length === 0) && (
+                <Button
+                  variant="secondary"
+                  className="h-auto animate-fade-in px-3"
+                  icon={<BookmarkPlus className="size-4 text-accent-strong" />}
+                  onClick={() => setSaveOpen(true)}
+                >
+                  <span className="max-[1179px]:hidden">Salvar como persona</span>
+                  <span className="hidden max-[1179px]:inline">Salvar</span>
+                </Button>
+              )}
+            </div>
+          </div>
+
           <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3">
             <div>
               <Label info={<ProviderFieldInfo />}>Provedor</Label>
               <Select
-                value={providerId}
-                onChange={setProviderId}
+                value={form.providerId || null}
+                onChange={(providerId) => set({ providerId })}
                 options={providers.map((p) => ({
                   value: p.id,
                   label: p.name,
@@ -91,7 +215,14 @@ export function NewChat(): React.JSX.Element {
             </div>
             <div>
               <Label info={<ModelFieldInfo />}>Modelo</Label>
-              <ModelCombobox providerId={providerId} value={model} onChange={setModel} />
+              <ModelCombobox
+                providerId={form.providerId || null}
+                value={form.model}
+                onChange={(model) => set({ model })}
+              />
+              <div className="mt-1.5 empty:hidden">
+                <ModelInfoLine providerId={form.providerId} model={form.model} />
+              </div>
             </div>
           </div>
 
@@ -99,13 +230,14 @@ export function NewChat(): React.JSX.Element {
             <Label
               info={<SystemPromptInfo />}
               hint={
-                systemPrompt !== defaultPrompt && (
+                form.systemPrompt !== resolved.systemPrompt && (
                   <button
                     type="button"
-                    onClick={() => setSystemPrompt(defaultPrompt)}
+                    onClick={() => set({ systemPrompt: resolved.systemPrompt })}
                     className="inline-flex items-center gap-1 text-subtle hover:text-fg"
                   >
-                    <RotateCcw className="size-3" /> Restaurar padrão
+                    <RotateCcw className="size-3" />{' '}
+                    {preset ? 'Restaurar da persona' : 'Restaurar padrão'}
                   </button>
                 )
               }
@@ -113,8 +245,8 @@ export function NewChat(): React.JSX.Element {
               System prompt
             </Label>
             <AutoTextarea
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
+              value={form.systemPrompt}
+              onChange={(e) => set({ systemPrompt: e.target.value })}
               minRows={6}
               maxRows={16}
               placeholder="Instruções para o modelo (opcional)"
@@ -135,10 +267,10 @@ export function NewChat(): React.JSX.Element {
                   <span
                     data-testid="new-chat-root"
                     className="min-w-0 flex-1 truncate font-mono text-[12.5px]"
-                    title={cwd ?? undefined}
+                    title={form.cwd || undefined}
                   >
-                    {cwd ? (
-                      compactPath(cwd, homeDir, 40)
+                    {form.cwd ? (
+                      compactPath(form.cwd, homeDir, 40)
                     ) : (
                       <span className="font-sans text-subtle">Escolher pasta…</span>
                     )}
@@ -157,14 +289,14 @@ export function NewChat(): React.JSX.Element {
                   </button>
                 </Tip>
               </div>
-              {newFolder && (cwd ?? homeDir) && (
+              {newFolder && (form.cwd || homeDir) && (
                 <div className="mt-2">
                   <NewFolderForm
-                    parent={(cwd ?? homeDir)!}
+                    parent={(form.cwd || homeDir)!}
                     onCancel={() => setNewFolder(false)}
                     onCreated={(p) => {
                       setNewFolder(false)
-                      setCwd(p)
+                      set({ cwd: p })
                     }}
                   />
                 </div>
@@ -175,16 +307,22 @@ export function NewChat(): React.JSX.Element {
             </div>
             <div>
               <Label
-                info={<AppSignatureInfo id={appSignature} custom={appSignatureCustom} side="top" />}
+                info={
+                  <AppSignatureInfo
+                    id={form.appSignature}
+                    custom={form.appSignatureCustom}
+                    side="top"
+                  />
+                }
               >
                 Assinatura do app
               </Label>
               <AppSignatureField
-                value={appSignature}
-                custom={appSignatureCustom}
+                value={form.appSignature}
+                custom={form.appSignatureCustom}
                 onChange={(p) => {
-                  if (p.appSignature !== undefined) setAppSignature(p.appSignature)
-                  if (p.appSignatureCustom) setAppSignatureCustom(p.appSignatureCustom)
+                  if (p.appSignature !== undefined) set({ appSignature: p.appSignature })
+                  if (p.appSignatureCustom) set({ appSignatureCustom: p.appSignatureCustom })
                 }}
               />
             </div>
@@ -207,6 +345,19 @@ export function NewChat(): React.JSX.Element {
           </Button>
         </div>
       </div>
+
+      <SavePresetDialog
+        open={saveOpen}
+        onClose={() => setSaveOpen(false)}
+        cwd={form.cwd || null}
+        base={preset}
+        buildConfig={buildConfig}
+        onSaved={(p) => {
+          // a persona salva passa a ser a selecionada (sem alterações pendentes)
+          setPresetId(p.id)
+          if (p.config.cwd) set({ cwd: p.config.cwd })
+        }}
+      />
     </div>
   )
 }

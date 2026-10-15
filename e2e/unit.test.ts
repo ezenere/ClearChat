@@ -1197,3 +1197,109 @@ test('delegate_task: falha do modelo do subagente vira erro acionável', () => {
   assert.match(f, /tente outro modelo grátis ou um pago/)
   assert.match(delegateEmptyText('x/y:free'), /possível falha do modelo x\/y:free/)
 })
+
+// ---------------- personas (presets) ----------------
+import {
+  PRESET_FIELDS,
+  applyPreset,
+  copyName,
+  patchPresetConfig,
+  sanitizePresetConfig,
+  snapshotPreset,
+  withoutCwd
+} from '../src/shared/presets.ts'
+
+test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional), sem presetId', () => {
+  const cfg = {
+    ...DEFAULT_CHAT_CONFIG('/proj', { providerId: 'p1', model: 'm1', systemPrompt: 'SYS' }),
+    params: { temperature: 0.2, top_p: null, extraBody: '{"a":1}' },
+    enabledTools: ['read_file', 'bash'],
+    autoApprove: ['bash'],
+    nativeTools: false,
+    toolsInPrompt: true,
+    toolsPromptText: 'TXT',
+    envInPrompt: false,
+    cacheEnabled: false,
+    subagentSystemPrompt: 'SUB',
+    appSignature: 'custom',
+    appSignatureCustom: { referer: 'https://x.dev', title: 'X' },
+    contextWindow: 64000,
+    compactThreshold: 0.8,
+    autoCompact: true,
+    compactPrompt: 'RESUMA',
+    maxToolOutputChars: 12000,
+    confineToRoot: false,
+    sandboxBash: true,
+    presetId: 'old'
+  } as any
+  const snap = snapshotPreset(cfg)
+  // todos os campos de persona, nada além deles
+  assert.deepEqual(Object.keys(snap).sort(), [...PRESET_FIELDS].sort())
+  assert.equal(snap.model, 'm1')
+  assert.equal(snap.systemPrompt, 'SYS')
+  assert.deepEqual(snap.params, { temperature: 0.2, extraBody: '{"a":1}' }) // null removido
+  assert.deepEqual(snap.enabledTools, ['read_file', 'bash'])
+  assert.deepEqual(snap.autoApprove, ['bash'])
+  assert.equal(snap.toolsPromptText, 'TXT')
+  assert.deepEqual(snap.appSignatureCustom, { referer: 'https://x.dev', title: 'X' })
+  assert.equal(snap.contextWindow, 64000)
+  assert.equal(snap.compactPrompt, 'RESUMA')
+  assert.equal(snap.sandboxBash, true)
+  assert.ok(!('cwd' in snap) && !('presetId' in snap))
+  // cópia profunda: mexer no snapshot não altera o chat
+  ;(snap.enabledTools as string[]).push('write_file')
+  assert.deepEqual(cfg.enabledTools, ['read_file', 'bash'])
+  // cwd só com includeCwd
+  assert.equal(snapshotPreset(cfg, { includeCwd: true }).cwd, '/proj')
+  assert.ok(!('cwd' in withoutCwd(snapshotPreset(cfg, { includeCwd: true }))))
+})
+
+test('persona: sanitize descarta chaves desconhecidas, undefined e cwd vazio', () => {
+  assert.deepEqual(sanitizePresetConfig(null), {})
+  assert.deepEqual(sanitizePresetConfig([1, 2]), {})
+  assert.deepEqual(
+    sanitizePresetConfig({ model: 'x', hack: 1, title: 't', cwd: '  ', systemPrompt: undefined }),
+    { model: 'x' }
+  )
+})
+
+test('persona: aplicar sobre os padrões (campos ausentes seguem a base; params mesclados)', () => {
+  const base = {
+    ...DEFAULT_CHAT_CONFIG('/home/u', { providerId: 'p1', model: 'base-m', systemPrompt: 'BASE' }),
+    params: { max_tokens: 100 }
+  }
+  // persona vazia (ex.: "Padrão") = base
+  const same = applyPreset(base, {})
+  assert.deepEqual(same, base)
+  assert.notEqual(same.params, base.params)
+  const cfg = applyPreset(base, {
+    model: 'm2',
+    params: { temperature: 0.5 },
+    enabledTools: ['read_file'],
+    cwd: '/proj',
+    presetId: 'x'
+  } as any)
+  assert.equal(cfg.model, 'm2')
+  assert.equal(cfg.systemPrompt, 'BASE')
+  assert.deepEqual(cfg.params, { max_tokens: 100, temperature: 0.5 })
+  assert.deepEqual(cfg.enabledTools, ['read_file'])
+  assert.equal(cfg.cwd, '/proj')
+  assert.equal(cfg.presetId, undefined)
+  assert.equal(base.model, 'base-m') // base intacta
+  // sem cwd na persona → cwd da base
+  assert.equal(applyPreset(base, { model: 'z' }).cwd, '/home/u')
+})
+
+test('persona: patch de rascunho (params nulos removem) e nome de cópia', () => {
+  let d = patchPresetConfig({}, { model: 'a', params: { temperature: 0.3 } })
+  assert.deepEqual(d, { model: 'a', params: { temperature: 0.3 } })
+  d = patchPresetConfig(d, { params: { temperature: null as any, seed: 7 } })
+  assert.deepEqual(d.params, { seed: 7 })
+  d = patchPresetConfig(d, { systemPrompt: undefined })
+  assert.ok(!('systemPrompt' in d))
+  assert.equal(copyName('Revisor', [{ name: 'Revisor' }]), 'Revisor (cópia)')
+  assert.equal(
+    copyName('Revisor (cópia)', [{ name: 'Revisor' }, { name: 'Revisor (cópia)' }]),
+    'Revisor (cópia 2)'
+  )
+})

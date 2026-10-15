@@ -89,6 +89,23 @@ export interface ChatConfig {
   appSignature: string
   /** Usada quando appSignature === 'custom'. */
   appSignatureCustom?: { referer: string; title: string }
+  /** Persona (preset) de onde o chat veio — só informativo (ver Preset). */
+  presetId?: string
+}
+
+/**
+ * Persona: preset reutilizável de configuração de chat. `config` é um snapshot parcial de
+ * ChatConfig (ver PRESET_FIELDS em presets.ts); campos ausentes seguem os padrões do app.
+ */
+export interface Preset {
+  id: string
+  name: string
+  description: string
+  /** Emoji ou nome de ícone lucide (ver PRESET_ICONS no renderer). */
+  icon: string
+  config: Partial<ChatConfig>
+  createdAt: number
+  updatedAt: number
 }
 
 export interface Chat {

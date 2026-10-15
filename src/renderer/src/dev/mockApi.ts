@@ -2,11 +2,13 @@
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import type { ClearApi } from '@shared/ipc'
+import { copyName, sanitizePresetConfig } from '@shared/presets'
 import type {
   AgentEvent,
   ApprovalRequest,
   Chat,
   ModelInfo,
+  Preset,
   Provider,
   QueuedMessage,
   Session,
@@ -360,9 +362,34 @@ export function createMockApi(scenario: string): ClearApi {
       }
     ]
   }
+  const presets: Preset[] = [
+    {
+      id: 'pr1',
+      name: 'Padrão',
+      description: 'Configuração padrão do app (Configurações → Novos chats).',
+      icon: 'sparkles',
+      config: {},
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: 'pr2',
+      name: 'Revisor de código',
+      description: 'Lê o projeto e aponta bugs, sem editar arquivos.',
+      icon: '🧐',
+      config: {
+        model: 'openai/gpt-4.1',
+        systemPrompt: 'Você é um revisor de código rigoroso. Aponte bugs e riscos.',
+        enabledTools: ['list_dir', 'read_file', 'search_files', 'find_files']
+      },
+      createdAt: now,
+      updatedAt: now
+    }
+  ]
   const settings: Record<string, unknown> = {
     defaultProviderId: 'p1',
-    defaultModel: 'anthropic/claude-sonnet-4.5'
+    defaultModel: 'anthropic/claude-sonnet-4.5',
+    defaultPresetId: 'pr1'
   }
 
   const files: Record<string, { name: string; isDir: boolean; size: number }[]> = {
@@ -550,6 +577,41 @@ export function createMockApi(scenario: string): ClearApi {
     },
     app: {
       capabilities: () => delay({ bwrap: true, ripgrep: true })
+    },
+    presets: {
+      list: () => delay(presets),
+      create: async (input) => {
+        const p: Preset = {
+          id: id('pr'),
+          name: input.name || 'Persona',
+          description: input.description ?? '',
+          icon: input.icon ?? '',
+          config: sanitizePresetConfig(input.config),
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        }
+        presets.push(p)
+        return delay(p)
+      },
+      update: async (pid, patch) => {
+        const p = presets.find((x) => x.id === pid)!
+        Object.assign(p, patch, patch.config ? { config: sanitizePresetConfig(patch.config) } : {})
+        p.updatedAt = Date.now()
+        return delay(p)
+      },
+      delete: async (pid) => {
+        presets.splice(
+          presets.findIndex((x) => x.id === pid),
+          1
+        )
+        if (settings.defaultPresetId === pid) delete settings.defaultPresetId
+      },
+      duplicate: async (pid) => {
+        const src = presets.find((x) => x.id === pid)!
+        const p = { ...structuredClone(src), id: id('pr'), name: copyName(src.name, presets) }
+        presets.push(p)
+        return delay(p)
+      }
     },
     onEvent: (cb) => {
       listeners.add(cb)

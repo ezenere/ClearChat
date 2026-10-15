@@ -21,11 +21,12 @@ Segurança Electron: `contextIsolation: true`, `nodeIntegration: false`, `sandbo
 
 ```sql
 providers(id TEXT PK, name TEXT, base_url TEXT, api_key TEXT, headers_json TEXT DEFAULT '{}', created_at INTEGER)
-settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId, defaultModel, defaultSystemPrompt, defaultCwd
+settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId, defaultModel, defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded
 chats(id TEXT PK, title TEXT, config_json TEXT, main_session_id TEXT, created_at INTEGER, updated_at INTEGER)
 sessions(id TEXT PK, chat_id TEXT, parent_session_id TEXT NULL, parent_tool_call_id TEXT NULL, depth INTEGER,
          model TEXT, title TEXT, task TEXT NULL, status TEXT, created_at INTEGER)
 messages(id TEXT PK, session_id TEXT, seq INTEGER, message_json TEXT, meta_json TEXT, created_at INTEGER)
+presets(id TEXT PK, name TEXT, description TEXT, icon TEXT, config_json TEXT, created_at INTEGER, updated_at INTEGER)  -- personas (ver "Personas")
 ```
 IDs: `crypto.randomUUID()`. Timestamps: `Date.now()`. Deletar chat apaga sessions/messages (cascade manual ou FK ON DELETE CASCADE).
 
@@ -67,7 +68,9 @@ export interface ChatConfig {
   compactPrompt: string | null  // prompt de compactação; null = DEFAULT_COMPACT_PROMPT (defaults.ts)
   maxToolOutputChars: number    // teto de caracteres de cada resultado de tool — padrão 30000 (LIMITS em shared/limits.ts)
   autoApprove: ToolName[]       // tools de CONFIRM_TOOLS que o usuário marcou "permitir sempre neste chat"
+  presetId?: string             // persona de onde o chat veio — só informativo
 }
+export interface Preset { id: string; name: string; description: string; icon: string /* emoji ou nome lucide */; config: Partial<ChatConfig>; createdAt: number; updatedAt: number }
 export interface Chat { id: string; title: string; config: ChatConfig; mainSessionId: string; createdAt: number; updatedAt: number }
 
 export type SessionStatus = 'idle' | 'running' | 'awaiting_approval' | 'done' | 'error' | 'interrupted'
@@ -149,6 +152,8 @@ interface ClearApi {
   fs: { listDir(path): DirEntry[]; readFile(path): { content: string; truncated: boolean; binary: boolean }; pickDirectory(): string | null; homeDir(): string
         mkdir(path): string }                    // "Nova pasta…" (pai precisa existir; erro "Já existe")
   app: { capabilities(): { bwrap: boolean; ripgrep: boolean } }
+  presets: { list(): Preset[]; create(input: PresetInput): Preset; update(id, patch: Partial<PresetInput>): Preset   // patch.config SUBSTITUI a config
+             delete(id): void; duplicate(id): Preset }   // PresetInput = { name; description?; icon?; config: Partial<ChatConfig> }
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
@@ -187,6 +192,16 @@ Por chat, o usuário escolhe quais headers de atribuição (`HTTP-Referer` / `X-
 - `APP_SIGNATURES: AppSignature[]` (`{ id, label, referer?, title? }`): `none` (Nenhuma — não envia headers de atribuição), `clearchat` (padrão), `cline`, `roo-code`, `kilo-code`, `aider`, `opencode`, `sillytavern`, `open-webui`, `librechat` (valores conferidos no código-fonte de cada app) e `custom` (Personalizada).
 - `resolveAppSignatureHeaders(id, custom?)` → `{ 'HTTP-Referer'?, 'X-Title'? }` (campos vazios são omitidos; id desconhecido → ClearChat). `buildRequest` aplica depois de `Authorization` e antes de `provider.headers`; o `previewRequest` mostra os headers; subsessões usam a assinatura do chat.
 - "Auto-aprovar tudo" na UI = `autoApprove = CONFIRM_TOOLS` (sem mudança no backend).
+
+### Personas (presets de chat) — `src/shared/presets.ts`
+
+Registro de configurações de chat reutilizáveis (tabela `presets`, `presetsRepo` em `repo.ts`, canais `presets:*`).
+- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `autoApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash` — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
+- **Campos ausentes seguem os padrões** de "Novos chats" (provedor/modelo/system prompt/pasta padrão + `DEFAULT_CHAT_CONFIG`): `applyPreset(base, config)` = base ← persona (params mesclados). Provedor apagado → o padrão; sem `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
+- `snapshotPreset(chatConfig, { includeCwd })` = persona a partir de um chat (snapshot completo dos campos acima). `patchPresetConfig` mescla edições num rascunho (params nulos removem).
+- **Primeira execução** (`presetsRepo.seed()`, chamado em `registerIpc`): cria "Padrão" com config **vazia** (= segue "Novos chats", então mudar o modelo/system prompt padrão continua valendo) e a define em `defaultPresetId`; a flag `presetsSeeded` impede recriá-la depois de apagada. Sem nenhuma persona o app funciona igual (só os padrões).
+- Apagar a persona padrão limpa `defaultPresetId`. `duplicate` cria "Nome (cópia)". Chats guardam `config.presetId` (informativo: apagar/editar a persona não muda chats existentes).
+- Tudo o que uma persona define são os mesmos campos do chat, com os mesmos (i) (system prompt, params, tools…), nos mesmos editores.
 
 ## Tools (`src/main/tools/`)
 
@@ -238,14 +253,17 @@ Estética: escura, elegante, minimalista (referência: Linear / Claude desktop /
 
 - **Onboarding** (sem providers): tela cheia — nome (padrão "OpenRouter"), base URL (padrão `https://openrouter.ai/api/v1`), API key, botão Testar conexão, Continuar.
 - **Sidebar esquerda**: "Novo chat", lista de chats (renomear/apagar no hover), engrenagem → Configurações.
-- **Novo chat**: tela central — provider, modelo (combobox pesquisável de `listModels`, aceita texto livre), system prompt (textarea, (i)), **Diretório raiz** (seletor de pasta + "Nova pasta…" que cria uma pasta dentro da selecionada e a usa como raiz, (i)), botão "Começar". Só isso.
+- **Novo chat**: tela central — **Persona** (seletor compacto: ícone + nome + modelo; padrão = `defaultPresetId` → "Padrão" → a primeira; "Gerenciar personas…" abre as Configurações), provider, modelo (combobox pesquisável de `listModels`, aceita texto livre; contexto/preço/tools do modelo abaixo), system prompt (textarea, (i)), **Diretório raiz** (seletor de pasta + "Nova pasta…" que cria uma pasta dentro da selecionada e a usa como raiz, (i)), assinatura do app, botão "Começar". Escolher uma persona preenche os campos (a pasta só muda se a persona definir uma); os campos que a tela não mostra (params, tools, aprovação, contexto…) vêm da persona. Ao alterar qualquer campo o seletor vira "Personalizado · a partir de <persona>" com "Desfazer alterações" e aparece **"Salvar como persona"** (nome, ícone — lucide ou emoji —, descrição, "Incluir diretório raiz", e "Atualizar “<persona>”" em vez de criar outra; a persona salva = config da origem + campos da tela). O chat criado guarda `presetId`.
 - **Chat**: header com título, pílula do modelo (clicável → painel config), **seletor de sessão** (principal + subagentes em árvore com indicador de status; subsessão = **somente leitura**, banner "Subagente · somente leitura · voltar à principal"). Mensagens: usuário, assistente em markdown (react-markdown + remark-gfm + highlight), raciocínio em três estados — fechado (só o cabeçalho "Raciocínio"/"Pensando…"), caixa compacta com rolagem própria (abre sozinha enquanto o modelo pensa) e "Expandir tudo" (botão no cabeçalho: texto inteiro na altura natural, sem rolagem interna; "Voltar para a caixa" desfaz); o estado fica guardado por mensagem enquanto o app está aberto — cards de tool call (nome, args, status, resultado colapsável com (i) "enviado ao modelo como `role: tool`"), card de delegate com "Abrir subsessão", aprovação inline (Permitir / Negar / Sempre neste chat), rodapé de uso (in/out/cached/custo). Mensagens sintéticas mostram (i) com o texto exato enviado. Hover: editar / apagar mensagem; regenerar última resposta.
 - **Contexto**: medidor compacto no rodapé do composer (e no banner de subsessão) — anel + "38k / 200k · 19%", cor muda em 70% / limite; tooltip com entrada/resposta/cache/janela; janela desconhecida → "N tokens · definir janela"; clique → seção Contexto da Config. Banner acima do composer no limite com "Compactar conversa" (dispensável). Mensagens antes da fronteira ficam visíveis porém esmaecidas, com divisor "Conversa compactada · N mensagens resumidas · não são mais enviadas à API" (Ocultar/Mostrar); a fronteira é um card "Resumo da conversa" (markdown recolhível, (i) "Enviado como mensagem role:user no início do histórico", N mensagens, tokens antes → depois, custo). Compactação em andamento: card com o resumo ao vivo. Erro de contexto excedido → botão "Compactar e tentar de novo".
 - **Composer**: textarea auto-grow, Enter envia / Shift+Enter quebra linha, botão Parar quando rodando. Mensagens **enfileiradas** aparecem acima do composer como chips com botão ⚡ (forçar) no canto e X (remover).
 - **Painel direito** (colapsável), abas:
-  - **Config**: provider, modelo, system prompt (i), parâmetros (cada um com toggle "enviar" — só os ativados vão; (i)), extraBody JSON (i), tools habilitadas (cada uma com (i) mostrando a definição JSON enviada), toggle "Enviar tools nativas (campo tools)" (i), toggle "Inserir texto das tools no system prompt" (i) + textarea editável com reset, toggle "Bloco de ambiente no system prompt" (i, mostra o texto), toggle "Token caching (cache_control)" (i), system prompt de subagentes (i), autoApprove, **Diretório raiz** (caminho, "Alterar…", "Confinar ferramentas à raiz" (i), "Bash em sandbox" (i) — só se bwrap existir), **Contexto** (uso/janela, "Definir janela manualmente", "Sugerir compactação em N%", "Compactar automaticamente", prompt de compactação editável com reset e (i), "Compactar agora"), **Limites** ("Saída máx. por ferramenta" (i)), botão **"Ver request"** → modal com JSON exato da próxima request (`previewRequest`). Tudo editável a qualquer momento; salva automaticamente.
+  Cabeçalho: abas **Modelo · Chat · Tools · Arquivos** (ícone + rótulo; `role="tab"`), botão **"Ver request"** ({ }, de qualquer aba → modal com o JSON exato da próxima request, `previewRequest`) e fechar. A última aba fica em `localStorage` (`clearchat.panelTab`, com try/catch). Em subsessão, as abas de config mostram a nota "Configuração do chat (compartilhada) · esta subsessão usa o modelo X e o system prompt de subagentes". Tudo editável a qualquer momento; salva automaticamente. Os editores (`panel/editors.tsx`) recebem `{cfg, patch}` e são os mesmos no editor de personas.
+  - **Modelo**: provider, modelo (+ contexto/preço/tools), system prompt (i), parâmetros (cada um com toggle "enviar" — só os ativados vão; (i)), reasoning_effort, **Request**: "Token caching (cache_control)" (i; depende do modelo/provedor) e body extra JSON (i).
+  - **Chat**: título, persona de origem + **"Salvar como persona"** (snapshot da config do chat; opção de incluir a raiz ou atualizar a persona de origem), **Diretório raiz** (caminho, "Alterar…", "Confinar ferramentas à raiz" (i), "Bash em sandbox" (i) — só se bwrap existir —, "Bloco de ambiente" no system prompt (i, mostra o texto)), **Assinatura do app** (i), **Contexto** (uso/janela, "Definir janela manualmente", "Sugerir compactação em N%", "Compactar automaticamente", prompt de compactação editável com reset e (i), "Compactar agora"; o medidor do composer abre esta aba).
+  - **Tools**: tools habilitadas (cada uma com (i) mostrando a definição JSON enviada), "Enviar tools nativas (campo tools)" (i), "Texto das tools no system prompt" (i) + textarea editável com reset, aprovação automática (tudo + por tool), system prompt de subagentes (i), **Limites** ("Saída máx. por ferramenta" (i)).
   - **Arquivos**: navegador da raiz — com `confineToRoot` o breadcrumb começa na raiz e nunca sobe acima dela; recarregar (e recarrega sozinho a cada resultado de tool do chat); "Usar como raiz", "Escolher pasta…", "Nova pasta…" (cria na pasta atual e entra nela); clicar arquivo → preview (somente leitura).
-- **Configurações** (modal): CRUD de providers (nome, base URL, API key mascarada, headers extras JSON, testar), provider/modelo padrão, system prompt padrão para novos chats.
+- **Configurações** (modal), abas: **Provedores** (CRUD: nome, base URL, API key mascarada, headers extras JSON, testar); **Personas** (lista com ícone, nome, modelo e descrição/resumo; Editar — nome/ícone/descrição + sub-abas Modelo · Chat · Tools com os mesmos editores do painel, incluindo "Definir diretório raiz"; Duplicar; estrela = definir como padrão; Apagar com confirmação; "Nova persona"); **Novos chats** (persona padrão, provedor/modelo/system prompt/pasta padrão — usados nos campos que a persona não define).
 - Componente `<ApiInfo>`: ícone (i) com tooltip (Radix Tooltip ou próprio) — usar em TODO lugar que vira parte do prompt/request.
 
 ## Notas do scaffold (fase 1)

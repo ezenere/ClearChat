@@ -64,6 +64,16 @@ npm run install:local -- --uninstall
   `clearchat.db` etc.) — aplicado com `app.setPath` antes do `ready`. Use para testes isolados sem
   tocar no seu banco real.
 
+## Personas e painel
+
+- **Personas** (presets de chat, `src/shared/presets.ts`): modelo, system prompt, parâmetros, tools,
+  aprovação, contexto, assinatura etc. (opcionalmente o diretório raiz). No Novo chat escolha uma no
+  topo; ao editar qualquer campo aparece "Salvar como persona" (nova ou atualizando a de origem). A aba
+  Chat do painel salva a config do chat atual; Configurações → Personas lista, edita, duplica, apaga e
+  define a padrão. Campos que a persona não define seguem "Novos chats"; a "Padrão" (criada na 1ª
+  execução, apagável) não define nenhum.
+- **Painel direito**: abas Modelo · Chat · Tools · Arquivos; "Ver request" ({ }) no cabeçalho.
+
 ## Workspace, contexto e limites
 
 - **Diretório raiz**: cada chat tem uma pasta-raiz (workspace) compartilhada pela sessão principal e
@@ -104,6 +114,7 @@ Rode `npm run build` depois para voltar ao bundle normal.
 
 ```bash
 npm run test:unit   # buildRequest (+ fronteira de compactação), parser SSE/usage, <tool_call>, DuckDuckGo, assinatura de app,
+                    # personas (snapshot/aplicar: campos copiados, cwd opcional, params, sanitização),
                     # confinação de caminhos, janelas do read_file, bash (corte início/fim + cd persistente),
                     # search/find_files, list_models (filtro/ordem/formato/corte) e erro de delegate,
                     # detecção de contexto excedido (Node puro, sem Electron)
@@ -129,7 +140,10 @@ OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
   persistido, reinício do app, indicador global de aprovação de subagente e layout em 900x600 — e
   também o medidor de contexto, o banner de compactação (forçado com uma janela minúscula), o botão
   Compactar (divisor + card do resumo + "Ver request" compactado), a aba Arquivos confinada à raiz
-  ("Usar como raiz", "Nova pasta…") e "Nova pasta…" no Novo chat.
+  ("Usar como raiz", "Nova pasta…") e "Nova pasta…" no Novo chat — e ainda as abas do painel (Modelo ·
+  Chat · Tools · Arquivos, "Ver request" de qualquer aba, aba lembrada entre reinícios) e as personas:
+  criar no Novo chat depois de editar (Personalizado → Salvar como persona), começar um chat dela,
+  salvar do painel (com a raiz), editar/duplicar/definir padrão/apagar nas Configurações.
 - O E2E do backend cobre ainda: compactação ponta a ponta (resumo persistido, request a partir da
   fronteira, conversa coerente depois, Parar cancela sem salvar), compactação automática e
   "tentar de novo", compactação reaproveitando o cache (Haiku), aviso de arquivo grande,

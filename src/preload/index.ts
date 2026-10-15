@@ -55,6 +55,13 @@ const api: ClearApi = {
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
   },
+  presets: {
+    list: () => invoke(IPC.presets.list),
+    create: (input) => invoke(IPC.presets.create, input),
+    update: (id, patch) => invoke(IPC.presets.update, id, patch),
+    delete: (id) => invoke(IPC.presets.delete, id),
+    duplicate: (id) => invoke(IPC.presets.duplicate, id)
+  },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)
     ipcRenderer.on(EVENT_CHANNEL, listener)
