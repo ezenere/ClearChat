@@ -354,8 +354,8 @@ export type SubagentTarget =
 /**
  * Regras (testadas em e2e/unit.test.ts):
  * - `provider` (nome sem caixa ou id): esse provedor; desconhecido → erro com os nomes disponíveis.
- *   Sem `model`: o modelo da sessão (se existir lá). `model` que o /models dele não lista → erro
- *   (no próprio provedor da sessão: o modelo da sessão, com nota).
+ *   Sem `model`: o modelo da sessão (se existir lá). `model` que o /models dele não lista → o modelo
+ *   da sessão, se existir lá (com nota); senão erro.
  * - sem `provider`: o da sessão chamadora. `model` que não existe nele mas existe em exatamente um
  *   outro provedor → esse outro (com nota); em vários → erro pedindo `provider`; em nenhum → o modelo
  *   da sessão (com nota). /models com falha → confia no pedido.
@@ -398,6 +398,13 @@ export async function resolveSubagentTarget(p: {
           providerId: m.id,
           model: p.callerModel,
           note: `o modelo ${model} não existe no provedor ${m.name}; usando ${p.callerModel}.`
+        }
+      // modelo pedido inexistente lá, mas o desta sessão existe → usa o da sessão (com nota)
+      if (reqModel && reqModel !== p.callerModel && (await has(m.id, p.callerModel)) === true)
+        return {
+          providerId: m.id,
+          model: p.callerModel,
+          note: `o modelo ${reqModel} não existe no provedor ${m.name}; usando ${p.callerModel}, que existe nele.`
         }
       return {
         error: reqModel

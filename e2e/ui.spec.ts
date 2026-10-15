@@ -1053,15 +1053,19 @@ async function main(): Promise<void> {
       // principal no OpenRouter (passo anterior voltou para lá); o subagente vai para o Local Fake
       const { chat, sid } = await currentState()
       assert(chat.config.providerId === orId, 'principal no OpenRouter')
+      // tools nativas (independe de um passo anterior ter falhado no meio do modo texto)
       const enabled: string[] = chat.config.enabledTools
-      if (!enabled.includes('list_models') || !enabled.includes('delegate_task'))
-        await read('chats.update', chat.id, {
-          config: { enabledTools: [...new Set([...enabled, 'list_models', 'delegate_task'])] }
-        })
+      await read('chats.update', chat.id, {
+        config: {
+          nativeTools: true,
+          toolsInPrompt: false,
+          enabledTools: [...new Set([...enabled, 'list_models', 'delegate_task'])]
+        }
+      })
       const before = fakeHits.length
       const nMsgs = (await read<any[]>('sessions.messages', sid)).length
       await sendMessage(
-        'Do exactly these two tool calls in order. 1) Call list_models with query "nano". ' +
+        'Do exactly these two tool calls in order. 1) Call list_models with only query "nano" (no provider argument, so it lists every provider). ' +
           '2) Call delegate_task with provider "Local Fake", model "' +
           MODEL +
           '", title "via fake" and task "Reply with the word PONG.". ' +
@@ -1080,12 +1084,25 @@ async function main(): Promise<void> {
       const lm = toolRes('list_models')
       assert(lm && lm.meta.toolStatus === 'ok', `list_models: ${lm?.message.content}`)
       const lmText: string = lm.message.content
-      assert(
-        /^\[modelos de 3 provedores — OpenRouter/.test(lmText),
-        `cabeçalho: ${lmText.slice(0, 200)}`
+      const lmArgs = JSON.parse(
+        msgs
+          .flatMap((m) => m.message.tool_calls ?? [])
+          .find((t: any) => t.id === lm.message.tool_call_id).function.arguments || '{}'
       )
-      assert(lmText.includes('[Local Fake]') && lmText.includes(MODEL), 'seção Local Fake')
-      assert(/\[Quebrado\] erro ao listar/.test(lmText), 'quebrado inline')
+      if (lmArgs.provider) {
+        // o modelo filtrou por conta própria (há enum de provedores): formato de um provedor só
+        assert(
+          new RegExp(`no provedor ${lmArgs.provider}`, 'i').test(lmText.split('\n')[0]),
+          `cabeçalho filtrado: ${lmText.slice(0, 200)}`
+        )
+      } else {
+        assert(
+          /^\[modelos de 3 provedores — OpenRouter/.test(lmText),
+          `cabeçalho: ${lmText.slice(0, 200)}`
+        )
+        assert(lmText.includes('[Local Fake]') && lmText.includes(MODEL), 'seção Local Fake')
+        assert(/\[Quebrado\] erro ao listar/.test(lmText), 'quebrado inline')
+      }
       // delegate_task: subsessão no Local Fake, request chegou lá
       const del = toolRes('delegate_task')
       assert(del && del.meta.toolStatus === 'ok', `delegate: ${del?.message.content}`)

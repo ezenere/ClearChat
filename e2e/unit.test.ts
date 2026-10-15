@@ -1279,9 +1279,22 @@ test('delegate_task: resolução de provedor + modelo do subagente', async () =>
   assert.ok('error' in unk)
   assert.match(unk.error, /provedor "Groq" não encontrado/)
   assert.match(unk.error, /"OpenRouter", "Anthropic", "OpenRouter Pessoal"/)
-  // model inexistente no provider pedido → erro com dica de list_models
-  const miss = await resolve({ provider: 'Anthropic', model: 'openai/gpt-4.1' })
+  // model inexistente no provider pedido (e o da sessão também não existe lá) → erro
+  const miss = await resolve({ provider: 'Anthropic', model: 'openai/gpt-4.1-mini' })
   assert.ok('error' in miss && /não existe no provedor Anthropic/.test(miss.error))
+  // ... mas se o modelo da sessão existe lá, usa ele (com nota) — modelos fracos inventam "model"
+  const fb = await resolve({
+    provider: 'OpenRouter Pessoal',
+    model: 'default',
+    callerModel: 'shared/x'
+  })
+  assert.ok(!('error' in fb))
+  assert.equal(fb.providerId, 'p-or2')
+  assert.equal(fb.model, 'shared/x')
+  assert.match(
+    fb.note ?? '',
+    /o modelo default não existe no provedor OpenRouter Pessoal; usando shared\/x/
+  )
   // sem provider: modelo só em outro provedor (exatamente um) → esse, com nota
   const other = await resolve({ model: 'claude-haiku-4.5' })
   assert.ok(!('error' in other))

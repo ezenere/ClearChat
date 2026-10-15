@@ -700,8 +700,10 @@ async function main(): Promise<void> {
     assertPairing(cm)
     // o resultado do delegate é exatamente o texto final do subagente (o conteúdo depende do modelo)
     const finalSub = cm.filter((m) => m.message.role === 'assistant').at(-1)
+    // (salvo uma `[nota: …]` inicial do delegate_task, ex.: "model" inventado → o da sessão)
     assert(
-      t.message.content.trim() === String(finalSub?.message.content ?? '').trim(),
+      t.message.content.replace(/^\[nota: [^\n]*\]\n\n/, '').trim() ===
+        String(finalSub?.message.content ?? '').trim(),
       `resultado do subagente: ${t.message.content.slice(0, 200)}`
     )
     assert(
@@ -2081,24 +2083,22 @@ async function main(): Promise<void> {
     })
     try {
       const { chat, sid } = await newChat({ enabledTools: ['delegate_task'] })
+      // com 2+ provedores a definição enviada tem `provider` com enum dos nomes
+      const def = (await api('agent.previewRequest', sid)).body.tools.find(
+        (x: any) => x.function.name === 'delegate_task'
+      )
+      const en: string[] = def.function.parameters.properties.provider?.enum ?? []
+      assert(en.includes('OpenRouter') && en.includes('OpenRouter B'), `enum: ${en}`)
       await api(
         'agent.send',
         sid,
-        'Call delegate_task twice, one after the other (blocking). First: provider "nope-provider", title "x", task "Reply OK.". ' +
-          'Second: provider "openrouter b", title "via B", task "Reply with exactly the text INDIA-9 and nothing else.". Then reply with the result of the second call.'
+        `Call delegate_task once (blocking) with provider "OpenRouter B", model "${model}", title "via B" and task "Reply with exactly the text INDIA-9 and nothing else.". Then reply with its result.`
       )
       await waitIdle(chat.id, sid, 240_000)
       const msgs = await messages(sid)
       addCost(msgs)
       assertPairing(msgs)
-      const dels = toolMsgs(msgs, 'delegate_task')
-      const bad = dels.find((d) => d.meta.toolStatus === 'error')
-      assert(
-        bad && /provedor "nope-provider" não encontrado/.test(bad.message.content),
-        `erro de provedor: ${dels.map((d) => d.message.content).join(' | ')}`
-      )
-      assert(/"OpenRouter B"/.test(bad.message.content), 'lista os provedores disponíveis')
-      const good = dels.find((d) => d.meta.subSessionId)
+      const good = toolMsgs(msgs, 'delegate_task').find((d) => d.meta.subSessionId)
       assert(good && /INDIA-9/.test(good.message.content), `resultado: ${good?.message.content}`)
       const sub = (await api<any[]>('sessions.list', chat.id)).find(
         (x) => x.id === good.meta.subSessionId
