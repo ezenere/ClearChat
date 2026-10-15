@@ -71,9 +71,18 @@ export interface ChatConfig {
   autoCompact: boolean          // compacta a sessão principal sozinho ao atingir o limite — padrão false (subsessões: sempre)
   compactPrompt: string | null  // prompt de compactação; null = DEFAULT_COMPACT_PROMPT (defaults.ts)
   maxToolOutputChars: number    // teto de caracteres de cada resultado de tool — padrão 30000 (LIMITS em shared/limits.ts)
-  autoApprove: ToolName[]       // tools de CONFIRM_TOOLS que o usuário marcou "permitir sempre neste chat"
+  autoApprove: ToolName[]       // tools que o usuário marcou "permitir sempre neste chat" (CONFIRM_TOOLS + extras do Smart-Approve)
+  smartApprove?: SmartApproveConfig // juiz automático das confirmações (ver "Smart-Approve"); ausente = desligado
   presetId?: string             // persona de onde o chat veio — só informativo
 }
+export interface SmartApproveConfig { enabled: boolean; providerId: string | null; model: string | null   // par do juiz (qualquer provedor)
+  prompt: string | null; template: string | null      // system e template da msg user; null = DEFAULT_SMART_APPROVE_PROMPT / _TEMPLATE
+  labels: { approve: string; reject: string; ask: string }   // padrão 'APPROVED' | 'REJECTED' | 'ASK-USER' (não vazios, distintos sem caixa)
+  contextMessages: number /* 6 */; timeoutS: number /* 30, 3–300 */; tools?: ToolName[] /* padrão CONFIRM_TOOLS */ }
+export interface SmartApproveRecord { decision: 'approve' | 'reject' | 'ask'; reason: string; fallback?: 'error' | 'timeout' | 'ambiguous'; error?: string
+  providerId: string; model: string; usage?: Usage; durationMs: number
+  request?: { url; headers; body }   // request exata ao juiz (key mascarada) — (i)
+  response?: string; overridden?: boolean }
 export interface Preset { id: string; name: string; description: string; icon: string /* emoji ou nome lucide */; config: Partial<ChatConfig>; createdAt: number; updatedAt: number }
 export interface Chat { id: string; title: string; config: ChatConfig; mainSessionId: string; createdAt: number; updatedAt: number }
 
@@ -116,12 +125,15 @@ export interface MessageMeta {
   // send_to_chat (mensagem tool no remetente): targetChatId
   // subagentes: background (tool do delegate_task em segundo plano), callbackUpdate (callback de retomada)
   // kind 'parent-message' (no subagente): fromSessionId
+  smartApprove?: SmartApproveRecord // mensagem tool: avaliação do juiz (custo no rodapé da resposta)
+  smartOverride?: boolean        // mensagem tool: rodou por "Executar mesmo assim"
 }
 export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number }
 
 export interface QueuedMessage { id: string; sessionId: string; text: string; createdAt: number; attachments?: AttachmentInfo[]
   meta?: MessageMeta }           // meta extra aplicada ao persistir (inter-chat, callback de subagente, mensagem do pai)
-export interface ApprovalRequest { id: string; chatId: string; sessionId: string; toolCallId: string; toolName: ToolName; args: unknown; createdAt: number }
+export interface ApprovalRequest { id: string; chatId: string; sessionId: string; toolCallId: string; toolName: ToolName; args: unknown; createdAt: number
+  smartApprove?: SmartApproveRecord }  // o juiz pediu a decisão (ou falhou) — o card mostra o motivo
 export interface StreamDraft { content: string; reasoning: string; toolCalls: { id: string; name: string; arguments: string }[] }
 export interface DirEntry { name: string; path: string; isDir: boolean; size: number; mtime: number }
 
@@ -133,7 +145,7 @@ export type AgentEvent =
   | { type: 'message-updated'; message: StoredMessage }
   | { type: 'message-deleted'; sessionId: string; messageId: string }
   | { type: 'draft'; sessionId: string; draft: StreamDraft | null }      // throttled ~30–60ms; null = fim do stream
-  | { type: 'tool-running'; sessionId: string; toolCallId: string; running: boolean; output?: string } // output parcial (bash) opcional
+  | { type: 'tool-running'; sessionId: string; toolCallId: string; running: boolean; output?: string; judging?: boolean } // output parcial (bash) opcional; judging = Smart-Approve avaliando
   | { type: 'queue-updated'; sessionId: string; queue: QueuedMessage[] }
   | { type: 'approval-requested'; request: ApprovalRequest }
   | { type: 'approval-resolved'; id: string }
@@ -166,6 +178,8 @@ interface ClearApi {
     previewRequest(sessionId): { url: string; headers: Record<string,string>; body: unknown; notes?: string[] }  // request EXATA da próxima chamada (apiKey mascarada; base64 de anexos encurtado + nota)
     runningSessions(): string[]
     compact(sessionId, opts?: { retry?: boolean }): { scheduled: boolean }  // só depth 0; ociosa → já; rodando → próximo limite de passo
+    smartOverride(messageId): void               // "Executar mesmo assim" numa rejeição do Smart-Approve (ver "Smart-Approve")
+    smartApproveTest(input: { config; tool; args; history? }): SmartApproveRecord  // "Testar" do editor (nada é salvo)
   }
   fs: { listDir(path): DirEntry[]; readFile(path): { content: string; truncated: boolean; binary: boolean }; pickDirectory(): string | null; homeDir(): string
         mkdir(path): string }                    // "Nova pasta…" (pai precisa existir; erro "Já existe")
@@ -216,7 +230,7 @@ Por chat, o usuário escolhe quais headers de atribuição (`HTTP-Referer` / `X-
 ### Personas (presets de chat) — `src/shared/presets.ts`
 
 Registro de configurações de chat reutilizáveis (tabela `presets`, `presetsRepo` em `repo.ts`, canais `presets:*`).
-- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `autoApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash` — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
+- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `autoApprove`, `smartApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash`, `smartApprove` — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
 - **Campos ausentes seguem os padrões** de "Novos chats" (modelo/system prompt/pasta padrão + `DEFAULT_CHAT_CONFIG`): `applyPreset(base, config)` = base ← persona (params mesclados). `providerId` + `model` são **um par** (`resolvePresetModel` em `src/shared/models.ts`): persona sem modelo → o par padrão (o `providerId` sozinho é ignorado); com modelo e sem `providerId` (antigas) → o modelo no provedor padrão; provedor apagado → o par padrão + aviso no Novo chat e no editor ("O provedor … não existe mais"). Sem `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
 - `snapshotPreset(chatConfig, { includeCwd })` = persona a partir de um chat (snapshot completo dos campos acima). `patchPresetConfig` mescla edições num rascunho (params nulos removem).
 - **Primeira execução** (`presetsRepo.seed()`, chamado em `registerIpc`): cria "Padrão" com config **vazia** (= segue "Novos chats", então mudar o modelo/system prompt padrão continua valendo) e a define em `defaultPresetId`; a flag `presetsSeeded` impede recriá-la depois de apagada. Sem nenhuma persona o app funciona igual (só os padrões).
@@ -259,7 +273,20 @@ Registro de configurações de chat reutilizáveis (tabela `presets`, `presetsRe
 
 As 4 tools de subagentes só são oferecidas quando `delegate_task` está disponível (habilitada e depth < 2); num **subagente** (depth 1), só depois que ele mesmo chamou `delegate_task` (`hasDelegated(history)` em `availableTools(chat, session, history)`) — modelos fracos não as usam para "responder" a quem delegou; o prefixo de cache muda uma vez, no primeiro delegate. A principal as vê sempre (para planejar). A execução de tool é permissiva (sem histórico). Todas as novas tools vêm habilitadas em chats novos e não pedem confirmação.
 
-Confirmação: tool em `CONFIRM_TOOLS` e não em `autoApprove` → cria `ApprovalRequest`, emite `approval-requested`, sessão `awaiting_approval`, aguarda `agent.approve`. `deny` → resultado de tool `"O usuário negou a execução desta ferramenta."` (toolStatus `denied`). Subsessões também pedem confirmação (a UI mostra a solicitação mesmo se o usuário estiver em outra sessão).
+Confirmação (`approvalRoute` em `src/shared/smartApprove.ts`): (1) tool em `autoApprove` → roda; (2) Smart-Approve ativo para a tool → juiz (abaixo); (3) senão, tool em `CONFIRM_TOOLS` → cria `ApprovalRequest`, emite `approval-requested`, sessão `awaiting_approval`, aguarda `agent.approve`. `deny` → resultado de tool `"O usuário negou a execução desta ferramenta."` (toolStatus `denied`). Subsessões também pedem confirmação (a UI mostra a solicitação mesmo se o usuário estiver em outra sessão).
+
+## Smart-Approve (`src/shared/smartApprove.ts`, `src/main/agent/smartApprove.ts`, runner)
+
+Um modelo "juiz" (qualquer par provedor + modelo) decide as confirmações antes de perguntar ao usuário. Config por chat em `ChatConfig.smartApprove` (também nas personas, via `PRESET_FIELDS`). Ativo = `enabled` **e** modelo escolhido (sem modelo a UI não deixa ligar).
+- **Tools avaliadas**: `smartApprove.tools` (padrão `CONFIRM_TOOLS`). Desmarcar uma de `CONFIRM_TOOLS` → ela volta a ir direto para o usuário. Extras opcionais (`SMART_APPROVE_EXTRA_TOOLS`: `write_file`, `edit_file`, `send_to_chat`, `delegate_task`) passam a exigir confirmação enquanto o Smart-Approve estiver ativo (juiz → usuário). "Sempre neste chat" funciona para elas também (vão para `autoApprove`).
+- **Ordem**: `autoApprove` → juiz → usuário. Resultados do juiz: `approve` → roda; `reject` → não roda, resultado de tool `Rejeitado pelo Smart-Approve (<modelo>): <motivo>` (toolStatus `denied`) para o agente se adaptar; `ask` → card de aprovação normal com o motivo do juiz. **Fail-closed**: erro HTTP/rede, tempo esgotado (`timeoutS`), resposta vazia, sem rótulo ou com mais de um rótulo distinto → card de aprovação (`fallback` `error`/`timeout`/`ambiguous`). Nunca libera por falha. Parar/⚡ durante a avaliação cancela a chamada.
+- **Chamada ao juiz** (fora do histórico, nunca persistida como mensagem; o agente não a vê): `POST {baseUrl}/chat/completions` do provedor do juiz, headers = `buildHeaders(provedor, assinatura do chat)`, body `{ model, messages: [system, user], temperature: 0, max_tokens: 300, stream: true, stream_options, usage? (OpenRouter) }` — stream acumulado (aceita JSON se o provedor ignorar `stream`). System = `prompt ?? DEFAULT_SMART_APPROVE_PROMPT` (inglês de propósito: formato estrito mais confiável; o motivo vem no idioma do usuário); user = `template ?? DEFAULT_SMART_APPROVE_TEMPLATE`. Placeholders (system e template, uma passada, desconhecidos ficam): `{{tool}}`, `{{args}}` (JSON formatado), `{{cwd}}`, `{{confine}}` / `{{sandbox}}` (yes/no), `{{last_user_message}}` (última `role: user` da sessão — na subsessão, a tarefa —, sem fronteiras/callbacks/`<tool_result>`, ≤ 2.000 chars), `{{recent_context}}` (últimas `contextMessages` mensagens ativas: `[user] …`, `[assistant] …` + `→ tool(args ≤ 300)`, `[tool nome] resultado ≤ 300`, cada texto ≤ 600; 0 = `(omitted)`), `{{labels}}` (`A | R | P`), `{{approve}}`, `{{reject}}`, `{{ask}}`.
+- **Parse** (`parseJudgeOutput`): ignora `<think>…</think>`, `*`, crases, `~~`, `#`/`>`/marcadores; a 1ª linha não vazia precisa **começar** com um rótulo (sem caixa; tolera `Decision:`/`Veredito —`/aspas/colchetes; fronteira: nem letra/dígito/`_`/`-` colados — `ASK` ≠ `ASK-USER`); outro rótulo distinto na mesma linha (sem caixa) ou nas linhas seguintes (caixa exata) → ambíguo. Resto = motivo (uma linha, ≤ 500).
+- **Registro**: `SmartApproveRecord` na meta da mensagem tool (`meta.smartApprove`) e na `ApprovalRequest` (decisão `ask`). Inclui a request mascarada e a resposta crua (para o (i)), usage/custo e duração. Subagentes usam a mesma config com o próprio histórico.
+- **"Executar mesmo assim"** (`agent.smartOverride(messageId)`): a rejeição continua sendo o resultado daquela chamada (o histórico não é reescrito, o pareamento tool_call/tool não muda). Ao clicar, (1) o app registra uma **liberação de uma vez só** em memória para a mesma sessão + mesma tool + mesmos argumentos (`argsKey`: JSON com chaves ordenadas; expira em 15 min ou ao reiniciar) e (2) entrega à sessão a mensagem do usuário ``Pode executar <tool> `<args resumidos>`; eu aprovo.`` (fila se estiver rodando; senão inicia um turno). Quando o agente repete a chamada idêntica, ela roda sem juiz nem card (`meta.smartOverride`); qualquer variação passa pelo juiz de novo (que agora vê a autorização explícita no contexto). A rejeição fica marcada `overridden` (o botão vira "Liberado · …").
+- **UI**: card da tool com status "Smart-Approve avaliando" (evento `tool-running` com `judging`), linha compacta "Aprovado pelo Smart-Approve · <Provedor · modelo> · custo · duração" (verde) / "Rejeitado…" (vermelho, com "Executar mesmo assim") / "Smart-Approve pediu sua decisão" ou "não decidiu (tempo esgotado | erro na chamada | resposta ambígua)" (âmbar, dentro do card de aprovação), motivo abaixo e (i) com a request exata + resposta. Rodapé da resposta do assistente: "juiz $x" (tooltip: chamadas, tokens, custo — fora do histórico).
+- **Aba Tools → Smart-Approve**: seletor de modelo (placeholder "Nenhum" + × para remover), "Habilitar" (desabilitado sem modelo: "Escolha um modelo para habilitar"), tools avaliadas (checkboxes), rótulos (validados: não vazios, distintos, uma linha — inválido não salva), mensagens de contexto, tempo máximo, prompt + template com "Restaurar padrão" e cola de placeholders, (i) com a request exata para a chamada de exemplo e "Testar" (`agent.smartApproveTest`: tool + args editáveis, contexto de exemplo, mostra a decisão).
+- **Header**: o selo "Auto-aprovação" (ou "Smart-Approve" quando só ele está ligado; "· Smart" quando os dois) abre um popover: tools que rodam sem confirmação (`autoApprove`) com "Revogar" e "Revogar tudo" (salva na hora), "Smart-Approve: <Provedor · modelo>" com liga/desliga e "Abrir aba Tools".
 
 ## Contexto e compactação (`src/shared/context.ts`, `src/main/agent/compaction.ts`, runner)
 
@@ -315,7 +342,7 @@ Estética: escura, elegante, minimalista (referência: Linear / Claude desktop /
   Cabeçalho: abas **Modelo · Chat · Tools · Arquivos** (ícone + rótulo; `role="tab"`), botão **"Ver request"** ({ }, de qualquer aba → modal com o JSON exato da próxima request, `previewRequest`) e fechar. A última aba fica em `localStorage` (`clearchat.panelTab`, com try/catch). Em subsessão, as abas de config mostram a nota "Configuração do chat (compartilhada) · esta subsessão usa o modelo X e o system prompt de subagentes". Tudo editável a qualquer momento; salva automaticamente. Os editores (`panel/editors.tsx`) recebem `{cfg, patch}` e são os mesmos no editor de personas.
   - **Modelo**: o seletor único de modelo (par provedor + modelo; (i) explica que o id vai como `model` para o endpoint daquele provedor) (+ contexto/preço/tools), system prompt (i), parâmetros (cada um com toggle "enviar" — só os ativados vão; (i)), reasoning_effort, **Request**: "Token caching (cache_control)" (i; depende do modelo/provedor) e body extra JSON (i).
   - **Chat**: título, persona de origem + **"Salvar como persona"** (snapshot da config do chat; opção de incluir a raiz ou atualizar a persona de origem), **Diretório raiz** (caminho, "Alterar…", "Confinar ferramentas à raiz" (i), "Bash em sandbox" (i) — só se bwrap existir —, "Bloco de ambiente" no system prompt (i, mostra o texto)), **Assinatura do app** (i), **Contexto** (uso/janela, "Definir janela manualmente", "Sugerir compactação em N%", "Compactar automaticamente", prompt de compactação editável com reset e (i), "Compactar agora"; o medidor do composer abre esta aba).
-  - **Tools**: tools habilitadas (cada uma com (i) mostrando a definição JSON enviada), "Enviar tools nativas (campo tools)" (i), "Texto das tools no system prompt" (i) + textarea editável com reset, aprovação automática (tudo + por tool), system prompt de subagentes (i), **Limites** ("Saída máx. por ferramenta" (i)).
+  - **Tools**: tools habilitadas (cada uma com (i) mostrando a definição JSON enviada), "Enviar tools nativas (campo tools)" (i), "Texto das tools no system prompt" (i) + textarea editável com reset, aprovação automática (tudo + por tool), **Smart-Approve** (ver acima; (i) com a request exata do juiz), system prompt de subagentes (i), **Limites** ("Saída máx. por ferramenta" (i)).
   - **Arquivos**: navegador da raiz — com `confineToRoot` o breadcrumb começa na raiz e nunca sobe acima dela; recarregar (e recarrega sozinho a cada resultado de tool do chat); "Usar como raiz", "Escolher pasta…", "Nova pasta…" (cria na pasta atual e entra nela); clicar arquivo → preview (somente leitura).
 - **Configurações** (modal), abas: **Provedores** (CRUD: nome, base URL, API key mascarada, headers extras JSON, testar — nenhum é "padrão"); **Personas** (lista com ícone, nome, "<Provedor> · <modelo>" e descrição/resumo; Editar — nome/ícone/descrição + sub-abas Modelo · Chat · Tools com os mesmos editores do painel, incluindo "Definir diretório raiz"; na aba Modelo, nota "Definido nesta persona" / "Segue o modelo padrão" + "Usar o padrão" (remove o par da persona); Duplicar; estrela = definir como padrão; Apagar com confirmação; "Nova persona"); **Novos chats** (persona padrão, **Modelo padrão** — um seletor só que grava `defaultProviderId` + `defaultModel` juntos; provedor apagado → "Não definido" —, system prompt e pasta padrão — usados nos campos que a persona não define).
 - Componente `<ApiInfo>`: ícone (i) com tooltip (Radix Tooltip ou próprio) — usar em TODO lugar que vira parte do prompt/request.

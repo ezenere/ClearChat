@@ -528,6 +528,15 @@ export function createMockApi(scenario: string): ClearApi {
         emit({ type: 'approval-resolved', id: rid })
       },
       pendingApprovals: () => delay(approvals),
+      smartOverride: async () => {},
+      smartApproveTest: async () =>
+        delay({
+          decision: 'approve' as const,
+          reason: 'Exemplo (mock).',
+          providerId: '',
+          model: 'mock/judge',
+          durationMs: 120
+        }),
       previewRequest: async (sid) => {
         const s = sessions.find((x) => x.id === sid)!
         const c = chats.find((x) => x.id === s.chatId)!

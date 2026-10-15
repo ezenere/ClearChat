@@ -26,6 +26,7 @@ import {
   MessageSquareText,
   MessagesSquare,
   Send,
+  ShieldCheck,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
@@ -40,6 +41,7 @@ import { Button, Spinner } from '../ui/controls'
 import { CopyButton } from './Markdown'
 import { StatusDot } from './SessionSwitcher'
 import { ModelLabel } from '../ui/ModelLabel'
+import { SmartApproveLine } from './SmartApprove'
 
 const ICONS: Record<ToolName, LucideIcon> = {
   list_dir: FolderTree,
@@ -174,11 +176,24 @@ function summary(name: string, args: Record<string, unknown> | null): string {
 }
 
 type Status =
-  'streaming' | 'running' | 'approval' | 'ok' | 'error' | 'denied' | 'cancelled' | 'pending'
+  | 'streaming'
+  | 'judging'
+  | 'running'
+  | 'approval'
+  | 'ok'
+  | 'error'
+  | 'denied'
+  | 'cancelled'
+  | 'pending'
 
 function StatusChip({ status }: { status: Status }): React.JSX.Element | null {
   const map: Record<Status, { label: string; cls: string; icon: ReactNode }> = {
     streaming: { label: 'gerando', cls: 'text-subtle', icon: <Spinner className="size-3" /> },
+    judging: {
+      label: 'Smart-Approve avaliando',
+      cls: 'text-accent-strong',
+      icon: <Spinner className="size-3 text-accent-strong" />
+    },
     running: {
       label: 'executando',
       cls: 'text-accent-strong',
@@ -228,6 +243,11 @@ function ApprovalPrompt({
         <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-bg/70 px-3 py-2 font-mono text-[11.5px] whitespace-pre-wrap text-fg/85">
           {detail}
         </pre>
+      )}
+      {request.smartApprove && (
+        <div className="-mx-3.5 mt-2 border-y border-warning/15 bg-bg/30">
+          <SmartApproveLine rec={request.smartApprove} pending />
+        </div>
       )}
       <div className="mt-2.5 flex flex-wrap items-center gap-2">
         <Button variant="primary" size="sm" onClick={() => void approve(request.id, 'allow')}>
@@ -320,11 +340,13 @@ export function ToolCard({
     ? 'streaming'
     : approval || subApproval
       ? 'approval'
-      : run?.running
-        ? 'running'
-        : result
-          ? (result.meta.toolStatus ?? 'ok')
-          : 'pending'
+      : run?.judging
+        ? 'judging'
+        : run?.running
+          ? 'running'
+          : result
+            ? (result.meta.toolStatus ?? 'ok')
+            : 'pending'
 
   const expanded = open || !!approval
   const subId = result?.meta.subSessionId ?? subSession?.id
@@ -412,6 +434,19 @@ export function ToolCard({
         )}
         <StatusChip status={status} />
       </div>
+
+      {result?.meta.smartApprove && (
+        <SmartApproveLine rec={result.meta.smartApprove} messageId={result.id} />
+      )}
+      {result?.meta.smartOverride && (
+        <div
+          data-testid="smart-override-run"
+          className="flex items-center gap-1.5 border-t border-border/70 px-3.5 py-2 text-[12px] text-subtle"
+        >
+          <ShieldCheck className="size-3.5 shrink-0 text-success/80" />
+          Executada com a sua liberação (Executar mesmo assim), sem passar pelo Smart-Approve.
+        </div>
+      )}
 
       {isDelegate && !streaming && (
         <div className="flex items-center gap-3 border-t border-border/70 px-3.5 py-2.5">

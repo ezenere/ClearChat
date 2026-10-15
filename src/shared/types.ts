@@ -99,8 +99,59 @@ export interface ChatConfig {
   appSignature: string
   /** Usada quando appSignature === 'custom'. */
   appSignatureCustom?: { referer: string; title: string }
+  /**
+   * Smart-Approve: um modelo "juiz" decide se uma chamada de tool que pediria confirmação pode
+   * rodar (aprovar / rejeitar / perguntar ao usuário). Ausente = desligado. Ver smartApprove.ts.
+   */
+  smartApprove?: SmartApproveConfig
   /** Persona (preset) de onde o chat veio — só informativo (ver Preset). */
   presetId?: string
+}
+
+/** Rótulos que o juiz do Smart-Approve deve responder na 1ª linha. */
+export interface SmartApproveLabels {
+  approve: string
+  reject: string
+  ask: string
+}
+
+export interface SmartApproveConfig {
+  enabled: boolean
+  /** Par provedor + modelo do juiz (qualquer provedor). Sem modelo → não pode ser habilitado. */
+  providerId: string | null
+  model: string | null
+  /** System prompt do juiz; null = DEFAULT_SMART_APPROVE_PROMPT. */
+  prompt: string | null
+  /** Template da mensagem `user` do juiz (placeholders {{tool}} etc.); null = o padrão. */
+  template: string | null
+  labels: SmartApproveLabels
+  /** Quantas mensagens recentes da sessão entram em {{recent_context}} (padrão 6). */
+  contextMessages: number
+  /** Tempo máximo da chamada ao juiz, em segundos (padrão 30). Estourou → pergunta ao usuário. */
+  timeoutS: number
+  /** Tools avaliadas pelo juiz (padrão CONFIRM_TOOLS). Outras incluídas aqui passam a pedir confirmação. */
+  tools?: ToolName[]
+}
+
+export type SmartApproveDecision = 'approve' | 'reject' | 'ask'
+
+/** Uma avaliação do juiz (meta da mensagem tool e da ApprovalRequest). Nunca entra no histórico enviado. */
+export interface SmartApproveRecord {
+  decision: SmartApproveDecision
+  reason: string
+  /** Por que caiu em 'ask' sem o juiz pedir: erro HTTP/rede, tempo esgotado ou resposta ambígua. */
+  fallback?: 'error' | 'timeout' | 'ambiguous'
+  error?: string
+  providerId: string
+  model: string
+  usage?: Usage
+  durationMs: number
+  /** Request exata enviada ao juiz (key mascarada) — para o (i). */
+  request?: { url: string; headers: Record<string, string>; body: unknown }
+  /** Texto bruto da resposta do juiz (cortado). */
+  response?: string
+  /** O usuário clicou "Executar mesmo assim" depois de uma rejeição. */
+  overridden?: boolean
 }
 
 /**
@@ -278,6 +329,11 @@ export interface MessageMeta {
   background?: boolean
   /** kind 'subagent-callback': resultado de uma retomada (atualização após nova mensagem). */
   callbackUpdate?: boolean
+  // ---- Smart-Approve (mensagem tool) ----
+  /** Avaliação do juiz para esta chamada (custo aparece no rodapé da resposta). */
+  smartApprove?: SmartApproveRecord
+  /** Executada por liberação explícita do usuário ("Executar mesmo assim") após uma rejeição. */
+  smartOverride?: boolean
 }
 
 export interface StoredMessage {
@@ -308,6 +364,8 @@ export interface ApprovalRequest {
   toolName: ToolName
   args: unknown
   createdAt: number
+  /** O Smart-Approve avaliou e pediu sua decisão (ou falhou) — o card mostra o motivo. */
+  smartApprove?: SmartApproveRecord
 }
 
 export interface StreamDraft {
@@ -341,6 +399,8 @@ export type AgentEvent =
       toolCallId: string
       running: boolean
       output?: string
+      /** Smart-Approve avaliando a chamada (antes de executar ou pedir aprovação). */
+      judging?: boolean
     }
   | { type: 'queue-updated'; sessionId: string; queue: QueuedMessage[] }
   | { type: 'approval-requested'; request: ApprovalRequest }

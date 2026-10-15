@@ -15,7 +15,8 @@ import {
   type PresetPatch,
   type ProviderInput,
   type ProviderPatch,
-  type ProviderTestInput
+  type ProviderTestInput,
+  type SmartApproveTestInput
 } from '@shared/ipc'
 import type { ApiMessage, AttachmentInfo, Chat } from '@shared/types'
 import { emit } from './events'
@@ -125,6 +126,8 @@ export function registerIpc(): void {
     [IPC.agent.compact]: (sessionId: string, opts?: CompactOptions) =>
       runner.compact(sessionId, opts ?? {}),
     [IPC.agent.stopSubagents]: (chatId: string) => runner.stopSubagents(chatId),
+    [IPC.agent.smartOverride]: (messageId: string) => runner.smartOverride(messageId),
+    [IPC.agent.smartApproveTest]: (input: SmartApproveTestInput) => runner.smartApproveTest(input),
 
     // ---- fs ----
     [IPC.fs.listDir]: (path: string) => fsapi.listDir(path),

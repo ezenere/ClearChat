@@ -5,6 +5,8 @@ import {
   FolderOpen,
   PanelRight,
   Paperclip,
+  Settings2,
+  ShieldCheck,
   ShieldOff,
   Sparkles,
   Square
@@ -13,14 +15,16 @@ import { useRef, useState } from 'react'
 import { TOOL_LABELS } from '@shared/tools'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { CONFIRM_TOOLS } from '@shared/types'
-import type { Chat, Session } from '@shared/types'
+import type { Chat, ChatConfig, Session, ToolName } from '@shared/types'
+import { normalizeSmartApprove, smartApproveActive, smartApproveTools } from '@shared/smartApprove'
 import { sessionProviderId } from '@shared/models'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
 import { isBusy, useStore } from '../../store'
 import { api } from '../../lib/api'
 import { TaskInfo } from '../apiDocs'
 import { TopBar } from '../TopBar'
-import { IconButton } from '../ui/controls'
+import { IconButton, Switch } from '../ui/controls'
+import { Popover } from '../ui/layers'
 import { ModelLabel } from '../ui/ModelLabel'
 import { Tip } from '../ui/Tooltip'
 import { Composer } from './Composer'
@@ -117,29 +121,157 @@ function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
 
 function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
   const setPanel = useStore((s) => s.setPanel)
-  const tools = CONFIRM_TOOLS.filter((t) => chat.config.autoApprove.includes(t))
-  if (tools.length === 0) return null
+  const patchConfig = useStore((s) => s.patchConfig)
+  const flushConfig = useStore((s) => s.flushConfig)
+  const [open, setOpen] = useState(false)
+  const anchor = useRef<HTMLButtonElement>(null)
+  const tools = chat.config.autoApprove
+  const sa = normalizeSmartApprove(chat.config.smartApprove)
+  const smartOn = smartApproveActive(sa)
+  if (tools.length === 0 && !smartOn && !open) return null
+  // revogar salva na hora (sem o debounce da config)
+  const save = (p: Partial<ChatConfig>): void => {
+    patchConfig(chat.id, p)
+    void flushConfig(chat.id)
+  }
+  const revoke = (t: ToolName): void => save({ autoApprove: tools.filter((x) => x !== t) })
+  const allConfirm = CONFIRM_TOOLS.every((t) => tools.includes(t))
+  const label =
+    tools.length === 0
+      ? 'Smart-Approve'
+      : `${allConfirm && tools.length === CONFIRM_TOOLS.length ? 'Auto-aprovação' : `Auto-aprovação · ${tools.length}`}${smartOn ? ' · Smart' : ''}`
   return (
-    <Tip
-      side="bottom"
-      label={
-        <span>Executam sem pedir confirmação: {tools.map((t) => TOOL_LABELS[t]).join(', ')}</span>
-      }
-    >
-      <button
-        type="button"
-        onClick={() => setPanel(true, 'tools')}
-        aria-label="Auto-aprovação"
-        className="no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-warning/25 bg-warning/[0.06] px-2 text-xs text-warning/90 transition-colors hover:bg-warning/[0.12]"
+    <>
+      <Tip
+        side="bottom"
+        label={
+          <span>
+            {tools.length
+              ? `Executam sem pedir confirmação: ${tools.map((t) => TOOL_LABELS[t] ?? t).join(', ')}`
+              : 'Smart-Approve decide as confirmações'}
+            {tools.length > 0 && smartOn ? ' · Smart-Approve ligado' : ''} · clique para revogar
+          </span>
+        }
       >
-        <ShieldOff className="size-3.5" />
-        <span className="max-[1179px]:hidden">
-          {tools.length === CONFIRM_TOOLS.length
-            ? 'Auto-aprovação'
-            : `Auto-aprovação · ${tools.length}`}
-        </span>
-      </button>
-    </Tip>
+        <button
+          ref={anchor}
+          type="button"
+          data-testid="auto-approve-badge"
+          onClick={() => setOpen((o) => !o)}
+          aria-label="Auto-aprovação"
+          aria-expanded={open}
+          className={cn(
+            'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
+            tools.length
+              ? 'border-warning/25 bg-warning/[0.06] text-warning/90 hover:bg-warning/[0.12]'
+              : 'border-accent/25 bg-accent-soft/50 text-accent-strong hover:bg-accent-soft'
+          )}
+        >
+          {tools.length ? <ShieldOff className="size-3.5" /> : <ShieldCheck className="size-3.5" />}
+          <span className="max-[1179px]:hidden">{label}</span>
+        </button>
+      </Tip>
+      <Popover
+        open={open}
+        onClose={() => setOpen(false)}
+        anchor={anchor}
+        width={320}
+        align="end"
+        maxHeight={420}
+      >
+        <div data-testid="auto-approve-popover" className="flex flex-col py-1.5">
+          <div className="flex items-center gap-2 px-3 pt-1 pb-1.5">
+            <span className="text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
+              Sem confirmação
+            </span>
+            {tools.length > 1 && (
+              <button
+                type="button"
+                onClick={() => save({ autoApprove: [] })}
+                className="ml-auto text-[11.5px] text-danger/85 hover:text-danger"
+              >
+                Revogar tudo
+              </button>
+            )}
+          </div>
+          {tools.length === 0 ? (
+            <p className="px-3 pb-1.5 text-[12px] text-subtle">
+              Nenhuma tool roda sem confirmação.
+            </p>
+          ) : (
+            tools.map((t) => (
+              <div
+                key={t}
+                data-testid="auto-approve-item"
+                className="group flex h-8 items-center gap-2 px-3 hover:bg-hover/60"
+              >
+                <ShieldOff className="size-3.5 shrink-0 text-warning/80" />
+                <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
+                  {TOOL_LABELS[t] ?? t}
+                </span>
+                <span className="font-mono text-[10.5px] text-faint">{t}</span>
+                <button
+                  type="button"
+                  onClick={() => revoke(t)}
+                  aria-label={`Revogar ${TOOL_LABELS[t] ?? t}`}
+                  className="rounded-md px-1.5 py-0.5 text-[11.5px] text-danger/85 hover:bg-danger/10 hover:text-danger"
+                >
+                  Revogar
+                </button>
+              </div>
+            ))
+          )}
+          {(smartOn || sa.model) && (
+            <div className="mt-1.5 border-t border-border/70 px-3 pt-2.5 pb-1.5">
+              <div className="flex items-center gap-2">
+                <ShieldCheck
+                  className={cn('size-3.5 shrink-0', smartOn ? 'text-accent-strong' : 'text-faint')}
+                />
+                <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
+                  Smart-Approve
+                  {sa.model && (
+                    <>
+                      <span className="text-faint">: </span>
+                      <ModelLabel
+                        providerId={sa.providerId}
+                        model={sa.model}
+                        short
+                        className="text-[12px]"
+                        modelClassName="font-mono text-muted"
+                      />
+                    </>
+                  )}
+                </span>
+                <Switch
+                  size="sm"
+                  checked={smartOn}
+                  disabled={!sa.model}
+                  label="Smart-Approve"
+                  onChange={(enabled) => save({ smartApprove: { ...sa, enabled } })}
+                />
+              </div>
+              <p className="mt-1 pl-5.5 text-[11.5px] leading-snug text-subtle">
+                {smartOn
+                  ? `Avalia ${smartApproveTools(sa).length} ferramenta${smartApproveTools(sa).length === 1 ? '' : 's'} antes de pedir sua confirmação.`
+                  : 'Desligado: as confirmações voltam a ser suas.'}
+              </p>
+            </div>
+          )}
+          <div className="mt-1.5 border-t border-border/70 px-1.5 pt-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false)
+                setPanel(true, 'tools')
+              }}
+              className="flex h-7 w-full items-center gap-1.5 rounded-md px-1.5 text-[12px] text-accent-strong hover:bg-accent-soft"
+            >
+              <Settings2 className="size-3.5" /> Abrir aba Tools
+            </button>
+          </div>
+        </div>
+      </Popover>
+    </>
   )
 }
 

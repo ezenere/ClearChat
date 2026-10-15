@@ -13,7 +13,9 @@ import type {
   Provider,
   QueuedMessage,
   Session,
-  StoredMessage
+  SmartApproveRecord,
+  StoredMessage,
+  ToolName
 } from './types'
 
 export const IPC = {
@@ -56,7 +58,9 @@ export const IPC = {
     previewRequest: 'agent:previewRequest',
     runningSessions: 'agent:runningSessions',
     compact: 'agent:compact',
-    stopSubagents: 'agent:stopSubagents'
+    stopSubagents: 'agent:stopSubagents',
+    smartOverride: 'agent:smartOverride',
+    smartApproveTest: 'agent:smartApproveTest'
   },
   fs: {
     listDir: 'fs:listDir',
@@ -117,6 +121,18 @@ export interface ChatUpdateInput {
 }
 
 export type ApprovalDecision = 'allow' | 'deny' | 'always'
+
+/** "Testar" do Smart-Approve: a config (chat ou persona) + uma chamada de exemplo. */
+export interface SmartApproveTestInput {
+  config: Pick<
+    ChatConfig,
+    'smartApprove' | 'cwd' | 'confineToRoot' | 'sandboxBash' | 'appSignature' | 'appSignatureCustom'
+  >
+  tool: ToolName
+  args: unknown
+  /** Histórico de exemplo para {{recent_context}} / {{last_user_message}}. */
+  history?: StoredMessage[]
+}
 
 /** Request EXATA da próxima chamada (apiKey mascarada). */
 export interface RequestPreview {
@@ -227,6 +243,13 @@ export interface ClearApi {
     compact(sessionId: string, opts?: CompactOptions): Promise<{ scheduled: boolean }>
     /** Para todos os subagentes do chat (inclusive em segundo plano); a sessão principal continua. */
     stopSubagents(chatId: string): Promise<void>
+    /**
+     * "Executar mesmo assim" num resultado rejeitado pelo Smart-Approve (id da mensagem tool):
+     * libera a próxima chamada idêntica uma vez e envia "Pode executar …; eu aprovo." à sessão.
+     */
+    smartOverride(messageId: string): Promise<void>
+    /** Roda o juiz numa chamada de exemplo (nada é salvo). */
+    smartApproveTest(input: SmartApproveTestInput): Promise<SmartApproveRecord>
   }
   fs: {
     listDir(path: string): Promise<DirEntry[]>

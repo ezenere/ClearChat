@@ -34,6 +34,7 @@ import { AppSignatureField, AppSignatureInfo } from '../AppSignatureField'
 import { AutoTextarea, Switch } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { ExtraBodyEditor, NumberInput, Section, ToggleRow } from './fields'
+import { SmartApproveSection } from './SmartApproveSection'
 
 export interface CfgProps {
   cfg: ChatConfig
@@ -588,7 +589,7 @@ export function AutoApproveSection({ cfg, patch }: CfgProps): React.JSX.Element 
           />
         </div>
       </div>
-      {CONFIRM_TOOLS.map((t) => (
+      {[...CONFIRM_TOOLS, ...cfg.autoApprove.filter((t) => !CONFIRM_TOOLS.includes(t))].map((t) => (
         <ToggleRow
           key={t}
           label={TOOL_LABELS[t]}
@@ -657,6 +658,7 @@ export function ToolsEditor(props: CfgProps): React.JSX.Element {
       <ToolsListSection {...props} />
       <ToolsPromptSection {...props} />
       <AutoApproveSection {...props} />
+      <SmartApproveSection {...props} />
       <SubagentSection {...props} />
       <LimitsSection {...props} />
     </>

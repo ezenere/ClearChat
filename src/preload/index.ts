@@ -44,7 +44,9 @@ const api: ClearApi = {
     previewRequest: (sessionId) => invoke(IPC.agent.previewRequest, sessionId),
     runningSessions: () => invoke(IPC.agent.runningSessions),
     compact: (sessionId, opts) => invoke(IPC.agent.compact, sessionId, opts),
-    stopSubagents: (chatId) => invoke(IPC.agent.stopSubagents, chatId)
+    stopSubagents: (chatId) => invoke(IPC.agent.stopSubagents, chatId),
+    smartOverride: (messageId) => invoke(IPC.agent.smartOverride, messageId),
+    smartApproveTest: (input) => invoke(IPC.agent.smartApproveTest, input)
   },
   fs: {
     listDir: (path) => invoke(IPC.fs.listDir, path),

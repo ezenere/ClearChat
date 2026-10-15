@@ -1,6 +1,5 @@
 // Loop do agente por sessão: build → stream → persistir assistant → tools → [fila] → repetir.
 // Ver SPEC.md → "Runner / fila / interrupção".
-import { CONFIRM_TOOLS } from '@shared/types'
 import type {
   ApiMessage,
   Chat,
@@ -8,11 +7,23 @@ import type {
   QueuedMessage,
   Session,
   SessionStatus,
+  SmartApproveRecord,
   StoredMessage,
   ToolCall,
   ToolName
 } from '@shared/types'
-import type { ApprovalDecision, CompactOptions, RequestPreview } from '@shared/ipc'
+import {
+  approvalRoute,
+  normalizeSmartApprove,
+  overrideMessageText,
+  smartRejectText
+} from '@shared/smartApprove'
+import type {
+  ApprovalDecision,
+  CompactOptions,
+  RequestPreview,
+  SmartApproveTestInput
+} from '@shared/ipc'
 import type { ModelInfo, Provider } from '@shared/types'
 import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
@@ -69,6 +80,8 @@ import {
   compactionMeta
 } from './compaction'
 import { getApproval, listApprovals, requestApproval, resolveApproval } from './approvals'
+import { addOverride, runJudge, takeOverride } from './smartApprove'
+import { bwrapAvailable } from '../tools/bash'
 import {
   drainQueue,
   enqueue,
@@ -134,6 +147,10 @@ interface ToolOutcome {
   targetChatId?: string
   /** delegate_task em segundo plano. */
   background?: boolean
+  /** Avaliação do Smart-Approve desta chamada. */
+  smartApprove?: SmartApproveRecord
+  /** Rodou por "Executar mesmo assim" (liberação de uma vez só). */
+  smartOverride?: boolean
   durationMs: number
 }
 
@@ -739,6 +756,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       if (r.shellCwd) tmeta.shellCwd = r.shellCwd
       if (r.targetChatId) tmeta.targetChatId = r.targetChatId
       if (r.background) tmeta.background = true
+      if (r.smartApprove) tmeta.smartApprove = r.smartApprove
+      if (r.smartOverride) tmeta.smartOverride = true
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
         tmeta.kind = 'tool-cancelled'
@@ -791,8 +810,12 @@ async function executeTool(
   signal: AbortSignal
 ): Promise<ToolOutcome> {
   const t0 = Date.now()
+  let smart: SmartApproveRecord | undefined
+  let smartOverride = false
   const done = (o: Omit<ToolOutcome, 'durationMs'>): ToolOutcome => ({
     ...o,
+    ...(smart ? { smartApprove: smart } : {}),
+    ...(smartOverride ? { smartOverride: true } : {}),
     durationMs: Date.now() - t0
   })
   const chat = chatsRepo.get(session.chatId)
@@ -811,10 +834,52 @@ async function executeTool(
     return done({ content: `Erro: ${errMsg(e)}`, status: 'error' })
   }
 
-  if (CONFIRM_TOOLS.includes(name) && !chat.config.autoApprove.includes(name)) {
+  // Ordem: autoApprove → Smart-Approve (juiz) → usuário. Ver @shared/smartApprove.
+  let route = approvalRoute(chat.config, name)
+  if (route !== 'run' && takeOverride(session.id, name, args)) {
+    // "Executar mesmo assim": o usuário já liberou exatamente esta chamada (uma vez)
+    smartOverride = true
+    route = 'run'
+  }
+  if (route === 'judge') {
+    const sa = normalizeSmartApprove(chat.config.smartApprove)
+    emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: true, judging: true })
+    try {
+      smart = await runJudge({
+        sa,
+        provider: sa.providerId ? providersRepo.get(sa.providerId) : null,
+        chatConfig: chat.config,
+        ctx: {
+          tool: name,
+          args,
+          cwd: chat.config.cwd,
+          confine: chat.config.confineToRoot !== false,
+          sandbox: !!chat.config.sandboxBash && bwrapAvailable(),
+          history: messagesRepo.list(session.id)
+        },
+        signal
+      })
+    } finally {
+      emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: false })
+    }
+    dbg('smart-approve', name, smart.decision, smart.fallback ?? '', smart.durationMs, 'ms')
+    if (signal.aborted) return done({ content: CANCELLED_TEXT, status: 'cancelled' })
+    if (smart.decision === 'reject') {
+      return done({ content: smartRejectText(smart.model, smart.reason), status: 'denied' })
+    }
+    route = smart.decision === 'approve' ? 'run' : 'user'
+  }
+  if (route === 'user') {
     setStatus(session.id, 'awaiting_approval')
     const outcome = await requestApproval(
-      { chatId: chat.id, sessionId: session.id, toolCallId, toolName: name, args },
+      {
+        chatId: chat.id,
+        sessionId: session.id,
+        toolCallId,
+        toolName: name,
+        args,
+        ...(smart ? { smartApprove: smart } : {})
+      },
       signal
     )
     if (!signal.aborted) setStatus(session.id, 'running')
@@ -1779,6 +1844,66 @@ export function approve(requestId: string, decision: ApprovalDecision): void {
     return
   }
   resolveApproval(requestId, decision === 'allow' ? 'allow' : 'deny')
+}
+
+/**
+ * "Executar mesmo assim" num resultado rejeitado pelo Smart-Approve: a rejeição continua sendo o
+ * resultado daquela chamada (o histórico não muda), mas (1) a próxima chamada IDÊNTICA na mesma
+ * sessão roda uma vez sem juiz nem confirmação e (2) uma mensagem do usuário "Pode executar …; eu
+ * aprovo." é entregue à sessão (fila se estiver rodando; senão inicia um turno).
+ */
+export function smartOverride(messageId: string): void {
+  const msg = messagesRepo.get(messageId)
+  if (!msg || msg.message.role !== 'tool') throw new Error('Mensagem não encontrada.')
+  const rec = msg.meta.smartApprove
+  if (!rec || rec.decision !== 'reject')
+    throw new Error('Esta chamada não foi rejeitada pelo Smart-Approve.')
+  if (rec.overridden) return
+  const session = sessionsRepo.get(msg.sessionId)
+  if (!session) throw new Error('Sessão não encontrada.')
+  const toolCallId = msg.message.tool_call_id
+  let call: ToolCall | undefined
+  for (const m of messagesRepo.list(session.id)) {
+    if (m.message.role === 'assistant')
+      call = m.message.tool_calls?.find((t) => t.id === toolCallId) ?? call
+    if (call) break
+  }
+  if (!call) throw new Error('Chamada original não encontrada no histórico.')
+  let args: Record<string, unknown>
+  try {
+    args = parseToolArgs(call.function.arguments)
+  } catch (e) {
+    throw new Error(`Argumentos inválidos: ${errMsg(e)}`, { cause: e })
+  }
+  const tool = call.function.name as ToolName
+  addOverride(session.id, tool, args)
+  const updated = messagesRepo.update(msg.id, msg.message, {
+    ...msg.meta,
+    smartApprove: { ...rec, overridden: true }
+  })
+  emit({ type: 'message-updated', message: updated })
+  deliverToSession(session, overrideMessageText(tool, args), {}, true)
+}
+
+/** "Testar" do editor: roda o juiz numa chamada de exemplo (sem sessão; nada é salvo). */
+export async function smartApproveTest(input: SmartApproveTestInput): Promise<SmartApproveRecord> {
+  const sa = normalizeSmartApprove({ ...input.config.smartApprove, enabled: true })
+  const ctx = {
+    tool: input.tool,
+    args: input.args,
+    cwd: input.config.cwd || '~',
+    confine: input.config.confineToRoot !== false,
+    sandbox: !!input.config.sandboxBash && bwrapAvailable(),
+    history: input.history ?? []
+  }
+  const provider = sa.providerId ? providersRepo.get(sa.providerId) : null
+  return runJudge({
+    sa,
+    provider,
+    chatConfig: input.config,
+    ctx,
+    signal: new AbortController().signal
+  })
 }
 
 export function pendingApprovals(): ReturnType<typeof listApprovals> {

@@ -29,6 +29,7 @@ export const PRESET_FIELDS = [
   'cacheEnabled',
   'subagentSystemPrompt',
   'autoApprove',
+  'smartApprove',
   'appSignature',
   'appSignatureCustom',
   'contextWindow',

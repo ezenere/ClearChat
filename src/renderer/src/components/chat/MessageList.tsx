@@ -122,7 +122,39 @@ function Reasoning({
   )
 }
 
-function UsageFooter({ msg }: { msg: StoredMessage }): React.JSX.Element | null {
+/** Soma das chamadas ao Smart-Approve dos resultados das tools de uma resposta. */
+interface JudgeTotals {
+  calls: number
+  promptTokens: number
+  completionTokens: number
+  cost: number
+  hasCost: boolean
+}
+
+function judgeTotals(msg: StoredMessage, results: Map<string, StoredMessage>): JudgeTotals | null {
+  if (msg.message.role !== 'assistant' || !msg.message.tool_calls?.length) return null
+  const t: JudgeTotals = { calls: 0, promptTokens: 0, completionTokens: 0, cost: 0, hasCost: false }
+  for (const tc of msg.message.tool_calls) {
+    const rec = results.get(tc.id)?.meta.smartApprove
+    if (!rec) continue
+    t.calls++
+    t.promptTokens += rec.usage?.promptTokens ?? 0
+    t.completionTokens += rec.usage?.completionTokens ?? 0
+    if (rec.usage?.cost != null) {
+      t.cost += rec.usage.cost
+      t.hasCost = true
+    }
+  }
+  return t.calls ? t : null
+}
+
+function UsageFooter({
+  msg,
+  judge
+}: {
+  msg: StoredMessage
+  judge?: JudgeTotals | null
+}): React.JSX.Element | null {
   const u = msg.meta.usage
   const parts: ReactNode[] = []
   if (msg.meta.model)
@@ -157,6 +189,24 @@ function UsageFooter({ msg }: { msg: StoredMessage }): React.JSX.Element | null 
       <span key="d" className="tabular-nums">
         {d}
       </span>
+    )
+  if (judge)
+    parts.push(
+      <Tip
+        key="j"
+        label={
+          <span>
+            Smart-Approve: {judge.calls} chamada{judge.calls > 1 ? 's' : ''} ao juiz ·{' '}
+            {formatTokens(judge.promptTokens)} in · {formatTokens(judge.completionTokens)} out
+            {judge.hasCost ? ` · ${formatCost(judge.cost) ?? '$0'}` : ''} — fora do histórico, não
+            somado acima
+          </span>
+        }
+      >
+        <span data-testid="judge-usage" className="tabular-nums">
+          juiz {judge.hasCost ? (formatCost(judge.cost) ?? '$0') : `${judge.calls}×`}
+        </span>
+      </Tip>
     )
   if (parts.length === 0) return null
   return (
@@ -870,7 +920,7 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
       {msg.meta.error && <ErrorRow text={msg.meta.error} />}
       {!editing && (
         <div className="mt-1.5 flex min-h-6 items-center gap-3">
-          <UsageFooter msg={msg} />
+          <UsageFooter msg={msg} judge={judgeTotals(msg, ctx.results)} />
           <MessageActions
             msg={msg}
             canEdit={canEdit}
@@ -1048,7 +1098,7 @@ export function MessageList({
     session.status !== 'waiting' &&
     !draft &&
     compaction?.state !== 'running' &&
-    Object.values(runs).every((r) => !r.running) &&
+    Object.values(runs).every((r) => !r.running && !r.judging) &&
     ctx.approvals.length === 0
   const canEdit = !readOnly && !busy
 

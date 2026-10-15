@@ -134,6 +134,21 @@ npm run install:local -- --uninstall
   na subsessão); se ele já tinha concluído, a nova resposta volta ao pai como atualização. Parar na
   principal não derruba os subagentes em segundo plano ("Parar todos os subagentes" no seletor de sessão).
 
+## Smart-Approve
+
+- Aba Tools → **Smart-Approve**: um modelo "juiz" (qualquer provedor) avalia cada chamada que pediria
+  confirmação (`bash`, `web_search`, `browse_url`; opcionalmente `write_file`/`edit_file`/`send_to_chat`/
+  `delegate_task`) e **aprova** (roda), **rejeita** (o agente recebe `Rejeitado pelo Smart-Approve (<modelo>):
+  <motivo>`) ou **pergunta a você** (card de aprovação com o motivo). Erro, demora (tempo máximo) ou resposta
+  ambígua → pergunta a você; nunca libera por falha. Ordem: Auto-aprovação → juiz → você.
+- A chamada ao juiz é separada (fora do histórico; `temperature: 0`, `max_tokens: 300`), com prompt + template
+  editáveis (placeholders `{{tool}}`, `{{args}}`, `{{cwd}}`, `{{last_user_message}}`, `{{recent_context}}`…),
+  rótulos configuráveis e "Testar". O (i) mostra a request exata; o custo aparece no rodapé ("juiz $…").
+- **Executar mesmo assim** (numa rejeição): manda "Pode executar … ; eu aprovo." e libera **uma vez** a
+  próxima chamada idêntica (mesma tool + mesmos argumentos, 15 min) sem juiz nem confirmação.
+- O selo "Auto-aprovação" no header abre um popover para revogar tools (uma ou todas) e desligar o
+  Smart-Approve. Vale também para personas (campo `smartApprove`).
+
 ## Anexos
 
 - 📎 no composer (diálogo nativo), arrastar arquivos para o chat ou colar imagens. Imagens
@@ -165,6 +180,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # confinação de caminhos, janelas do read_file, bash (corte início/fim + cd persistente),
                     # search/find_files, list_models (filtro/ordem/formato/corte) e erro de delegate,
                     # read_history (faixa/busca/corte), cabeçalho/saltos/ciclo de espera entre chats,
+                    # Smart-Approve (e2e/smartApprove.test.ts: parse dos rótulos, template, ordem de decisão,
+                    # juiz contra servidor local — aprovar/rejeitar/perguntar, falhas → perguntar —, liberação única, personas),
                     # list_chats/get_chat_info, callbacks e posse de subagentes,
                     # detecção de contexto excedido (Node puro, sem Electron)
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
@@ -175,12 +192,22 @@ OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-e2e npm run test:e
 # só alguns testes (filtro por nome, separado por vírgula):
 OPENROUTER_API_KEY=... node e2e/backend.spec.ts 'delegate,fila'
 
+# E2E do Smart-Approve (UI real, 100% local: um provedor OpenAI-compatible falso faz o agente e o juiz — sem key)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-smart-e2e npm run test:e2e:smart
+
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui
 # para depois de um passo (os passos são dependentes):
 OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
 ```
 
+- O E2E do Smart-Approve (`e2e/smart-approve.spec.ts`) percorre: seção na aba Tools (habilitar só com modelo,
+  remover modelo, rótulos inválidos não salvam, tempo máximo, prompt/placeholders), juiz APPROVED (roda, linha
+  verde, custo no rodapé, body com `temperature: 0`/sem tools, agente não vê o juiz), REJECTED (resultado
+  negado ao agente) + "Executar mesmo assim" (mensagem do usuário, chamada idêntica roda sem juiz, liberação
+  única), ASK-USER (card com o motivo), resposta malformada e timeout (card de aprovação), "Testar", popover do
+  header (revogar uma / todas, desligar o Smart-Approve → bash volta a pedir confirmação sem juiz) e a seção no
+  editor de personas.
 - O E2E da UI digita a key no onboarding e percorre: novo chat (seletor de modelo, system prompt,
   PWD), write/read de arquivo, aprovação de bash (Permitir / Negar / Sempre neste chat), fila (chip)
   e ⚡, Parar, delegate_task + subsessão (banner + composer próprio), edição de modelo/system prompt/params com
