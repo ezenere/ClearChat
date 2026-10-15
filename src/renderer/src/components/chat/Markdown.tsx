@@ -1,9 +1,15 @@
 import { Check, Copy } from 'lucide-react'
-import { isValidElement, memo, useState, type ReactNode } from 'react'
+import 'katex/dist/katex.min.css'
+import './markdown-math.css'
+import { isValidElement, memo, useMemo, useState, type ReactNode } from 'react'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import rehypeHighlight from 'rehype-highlight'
+import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import { normalizeFences } from '../../lib/fences'
 import { cn } from '../../lib/format'
+import { normalizeMath } from '../../lib/math'
 
 function textOf(node: ReactNode): string {
   if (node == null || typeof node === 'boolean') return ''
@@ -70,6 +76,18 @@ const components: Components = {
   )
 }
 
+// `$…$` fica ligado: o normalizeMath já escapou os cifrões que não formam fórmula (preços).
+const remarkPlugins: React.ComponentProps<typeof ReactMarkdown>['remarkPlugins'] = [
+  remarkGfm,
+  [remarkMath, { singleDollarTextMath: true }]
+]
+// KaTeX antes do highlight (senão o highlight tentaria colorir `language-math`). Erro de TeX não
+// derruba nada: o rehype-katex cai para throwOnError:false e mostra o TeX cru em vermelho suave.
+const rehypePlugins: React.ComponentProps<typeof ReactMarkdown>['rehypePlugins'] = [
+  [rehypeKatex, { errorColor: '#d98a8a', strict: 'ignore' }],
+  [rehypeHighlight, { detect: false }]
+]
+
 export const Markdown = memo(function Markdown({
   text,
   streaming
@@ -77,14 +95,16 @@ export const Markdown = memo(function Markdown({
   text: string
   streaming?: boolean
 }): React.JSX.Element {
+  // Cercas aninhadas → uma cerca externa mais longa; \[ \] e \( \) → $$ e $; preços escapados.
+  const source = useMemo(() => normalizeMath(normalizeFences(text), streaming), [text, streaming])
   return (
     <div className={cn('md', streaming && 'stream-caret')}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: false }]]}
+        remarkPlugins={remarkPlugins}
+        rehypePlugins={rehypePlugins}
         components={components}
       >
-        {text}
+        {source}
       </ReactMarkdown>
     </div>
   )

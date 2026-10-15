@@ -1,0 +1,30 @@
+/* Fórmulas (KaTeX) no markdown das respostas. O CSS base do KaTeX vem de katex/dist/katex.min.css
+   (fontes empacotadas pelo Vite, sem rede). */
+.md .katex {
+  font-size: 1.1em;
+  color: inherit;
+  overflow-wrap: normal;
+}
+/* Display: centralizada, rola na horizontal se for larga demais (nunca estoura a coluna). */
+.md .katex-display {
+  margin: 0.9em 0;
+  padding: 0.35em 0.1em;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.md .katex-display > .katex {
+  white-space: nowrap;
+}
+.md .katex-display::-webkit-scrollbar {
+  height: 6px;
+}
+/* TeX inválido: o rehype-katex mostra o fonte cru (cor em errorColor); deixa legível. */
+.md .katex-error {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  white-space: pre-wrap;
+}
+/* Durante o streaming a fórmula final quase sempre está incompleta: cinza em vez de vermelho. */
+.stream-caret .katex-error {
+  color: var(--color-subtle) !important;
+}

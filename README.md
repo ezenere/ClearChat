@@ -97,7 +97,8 @@ npm run install:local -- --uninstall
 
 `VITE_CLEAR_MOCK=1 npx electron-vite build` gera um renderer com uma API falsa
 (`src/renderer/src/dev/mockApi.ts`); sirva `out/renderer` e abra `index.html?scenario=<nome>`
-(`chat`, `onboarding`, `stream`, `reasoning` — raciocínio longo salvo + um turno ainda pensando).
+(`chat`, `onboarding`, `stream`, `reasoning` — raciocínio longo salvo + um turno ainda pensando;
+`markdown` — cercas aninhadas, LaTeX e um rascunho com fórmula incompleta, no chat "Ideias de nomes").
 Rode `npm run build` depois para voltar ao bundle normal.
 
 ## Testes
