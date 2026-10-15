@@ -1,6 +1,6 @@
 // Fila de mensagens por sessão (memória). Emite `queue-updated` a cada mudança.
 import { randomUUID } from 'crypto'
-import type { QueuedMessage } from '@shared/types'
+import type { MessageMeta, QueuedMessage } from '@shared/types'
 import { emit } from '../events'
 
 const queues = new Map<string, QueuedMessage[]>()
@@ -16,8 +16,9 @@ export function hasQueued(sessionId: string): boolean {
   return (queues.get(sessionId)?.length ?? 0) > 0
 }
 
-export function enqueue(sessionId: string, text: string): QueuedMessage {
+export function enqueue(sessionId: string, text: string, meta?: MessageMeta): QueuedMessage {
   const item: QueuedMessage = { id: randomUUID(), sessionId, text, createdAt: Date.now() }
+  if (meta) item.meta = meta // ex.: mensagem de outro chat (kind 'inter-chat')
   queues.set(sessionId, [...(queues.get(sessionId) ?? []), item])
   notify(sessionId)
   return item
@@ -51,6 +52,11 @@ export function drainQueue(sessionId: string): QueuedMessage[] {
   queues.delete(sessionId)
   notify(sessionId)
   return q
+}
+
+/** O item ainda está na fila (não foi entregue nem removido)? */
+export function isQueued(sessionId: string, id: string): boolean {
+  return (queues.get(sessionId) ?? []).some((m) => m.id === id)
 }
 
 export function clearQueue(sessionId: string): void {

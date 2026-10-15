@@ -1,5 +1,7 @@
 import {
   ArrowDown,
+  ArrowUpRight,
+  Bot,
   Brain,
   ChevronRight,
   CircleAlert,
@@ -10,10 +12,13 @@ import {
   Minimize2,
   Pencil,
   RotateCcw,
+  MessagesSquare,
   Trash2,
+  User,
   X,
   Zap
 } from 'lucide-react'
+import { splitInterChatText } from '@shared/interChat'
 import { isContextLengthError, latestBoundaryIndex } from '@shared/context'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ApprovalRequest, Session, StoredMessage, StreamDraft } from '@shared/types'
@@ -596,6 +601,200 @@ function LiveCompaction({ state }: { state: CompactionState }): React.JSX.Elemen
   )
 }
 
+// ---------- Mensagens de outras origens (outro chat, agente pai, subagente) ----------
+
+/** Rótulo acima de uma bolha de usuário que não foi digitada aqui (ou "Você" num subagente). */
+function OriginLabel({ children }: { children: ReactNode }): React.JSX.Element {
+  return (
+    <span className="flex items-center gap-1 text-[10.5px] font-medium text-accent-strong/90">
+      {children}
+    </span>
+  )
+}
+
+/** Mensagem entregue por outro chat (send_to_chat): "De: <título>" com link para o chat de origem. */
+function InterChatMessage({
+  msg,
+  canEdit
+}: {
+  msg: StoredMessage
+  canEdit: boolean
+}): React.JSX.Element {
+  const run = useStore((s) => s.run)
+  const openChat = useStore((s) => s.openChat)
+  const source = useStore((s) => s.chats.find((c) => c.id === msg.meta.fromChatId))
+  const [editing, setEditing] = useState(false)
+  const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
+  const { body } = splitInterChatText(text)
+  const title = source?.title || msg.meta.fromChatTitle || 'outro chat'
+  return (
+    <div
+      data-testid="inter-chat-message"
+      className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
+    >
+      {editing ? (
+        <InlineEditor
+          initial={text}
+          onCancel={() => setEditing(false)}
+          onSave={(t) => {
+            setEditing(false)
+            void run(() => api.messages.update(msg.id, withText(msg.message, t)), 'Erro ao editar')
+          }}
+        />
+      ) : (
+        <>
+          <OriginLabel>
+            <MessagesSquare className="size-3" />
+            De:{' '}
+            {source ? (
+              <button
+                type="button"
+                onClick={() => void openChat(source.id)}
+                className="underline decoration-accent-strong/40 underline-offset-2 hover:decoration-accent-strong"
+              >
+                {title}
+              </button>
+            ) : (
+              <span>{title} (chat apagado)</span>
+            )}
+            {msg.meta.interChatHops && msg.meta.interChatHops > 1 ? (
+              <span className="font-normal text-faint">
+                · {msg.meta.interChatHops}º salto entre chats
+              </span>
+            ) : null}
+          </OriginLabel>
+          <div className="max-w-[85%] rounded-2xl rounded-br-md border border-accent-strong/30 bg-accent-soft/40 px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg">
+            {body}
+          </div>
+          <MessageActions msg={msg} canEdit={canEdit} onEdit={() => setEditing(true)} align="end" />
+        </>
+      )}
+    </div>
+  )
+}
+
+/** Mensagem do agente pai (message_subagent) ou do usuário, numa subsessão. */
+function SubsessionUserMessage({
+  msg,
+  canEdit,
+  from
+}: {
+  msg: StoredMessage
+  canEdit: boolean
+  from: 'you' | 'parent'
+}): React.JSX.Element {
+  const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
+  const body = from === 'parent' ? text.replace(/^\[Mensagem do agente pai\]\n/, '') : text
+  return (
+    <div
+      data-testid={from === 'parent' ? 'parent-message' : 'user-in-sub'}
+      className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
+    >
+      <OriginLabel>
+        {from === 'parent' ? (
+          <>
+            <Bot className="size-3" /> Agente pai
+          </>
+        ) : (
+          <>
+            <User className="size-3" /> Você
+          </>
+        )}
+      </OriginLabel>
+      <div
+        className={cn(
+          'max-w-[85%] rounded-2xl rounded-br-md border px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg',
+          from === 'parent'
+            ? 'border-accent-strong/30 bg-accent-soft/40'
+            : 'border-border bg-elevated'
+        )}
+      >
+        {body}
+      </div>
+      <MessageActions msg={msg} canEdit={canEdit} onEdit={() => undefined} align="end" />
+    </div>
+  )
+}
+
+/** Resultado de um subagente em segundo plano (ou atualização) injetado como role:user sintética. */
+function CallbackCard({
+  msg,
+  chatId,
+  canEdit
+}: {
+  msg: StoredMessage
+  chatId: string
+  canEdit: boolean
+}): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const openChat = useStore((s) => s.openChat)
+  const sub = useStore((s) =>
+    msg.meta.subSessionId ? s.sessions[msg.meta.subSessionId] : undefined
+  )
+  const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
+  const nl = text.indexOf('\n')
+  // exibição: sem os colchetes e sem o id (o id completo fica no (i) e no link da subsessão)
+  const header = (nl === -1 ? text : text.slice(0, nl))
+    .replace(/^\[|\]$/g, '')
+    .replace(/ \(id [^)]+\)/, '')
+  const body = nl === -1 ? '' : text.slice(nl + 1)
+  const failed = / (falhou|foi cancelado|não concluiu)$/.test(header)
+  return (
+    <div
+      data-testid="subagent-callback"
+      className="group/msg my-2 overflow-hidden rounded-xl border border-border bg-surface/70"
+    >
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => setOpen((o) => !o)}
+        onKeyDown={(e) => e.key === 'Enter' && setOpen((o) => !o)}
+        className="flex h-9 items-center gap-2.5 px-3 hover:bg-white/[0.015]"
+      >
+        <ChevronRight
+          className={cn(
+            'size-3.5 shrink-0 text-faint transition-transform duration-150',
+            open && 'rotate-90'
+          )}
+        />
+        <Bot className={cn('size-3.5 shrink-0', failed ? 'text-danger' : 'text-accent-strong')} />
+        <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">{header}</span>
+        <span onClick={(e) => e.stopPropagation()} className="flex items-center gap-1">
+          <MessageInfo msg={msg} side="left" />
+          {sub && (
+            <button
+              type="button"
+              onClick={() => void openChat(chatId, sub.id)}
+              className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] text-accent-strong hover:bg-accent-soft"
+            >
+              <ArrowUpRight className="size-3" /> Abrir subsessão
+            </button>
+          )}
+          {canEdit && (
+            <ActionBtn
+              label="Apagar mensagem"
+              onClick={() => void useStore.getState().run(() => api.messages.delete(msg.id))}
+              danger
+            >
+              <Trash2 className="size-3.5" />
+            </ActionBtn>
+          )}
+        </span>
+      </div>
+      {!open && body && (
+        <p className="line-clamp-2 border-t border-border/70 px-3.5 py-2 text-[12.5px] leading-relaxed text-muted">
+          {body}
+        </p>
+      )}
+      {open && body && (
+        <div className="max-h-96 overflow-y-auto border-t border-border/70 px-3.5 py-2.5 text-[13px]">
+          <Markdown text={body} />
+        </div>
+      )}
+    </div>
+  )
+}
+
 interface Ctx {
   chatId: string
   sessionId: string
@@ -832,6 +1031,7 @@ export function MessageList({
 
   const showThinking =
     busy &&
+    session.status !== 'waiting' &&
     !draft &&
     compaction?.state !== 'running' &&
     Object.values(runs).every((r) => !r.running) &&
@@ -843,6 +1043,14 @@ export function MessageList({
     if (m.meta.kind === 'compaction')
       return <CompactionCard key={m.id} msg={m} canEdit={canEdit} stale={old} />
     if (m.meta.kind === 'error') return <ErrorMessage key={m.id} msg={m} ctx={ctx} />
+    if (role === 'user' && m.meta.kind === 'inter-chat')
+      return <InterChatMessage key={m.id} msg={m} canEdit={canEdit} />
+    if (role === 'user' && m.meta.kind === 'subagent-callback')
+      return <CallbackCard key={m.id} msg={m} chatId={chatId} canEdit={canEdit} />
+    if (role === 'user' && m.meta.kind === 'parent-message')
+      return <SubsessionUserMessage key={m.id} msg={m} canEdit={false} from="parent" />
+    if (role === 'user' && session.depth > 0 && !m.meta.synthetic)
+      return <SubsessionUserMessage key={m.id} msg={m} canEdit={false} from="you" />
     if (m.meta.synthetic && role !== 'assistant') {
       if (role === 'tool' && knownCalls.has(m.message.tool_call_id)) return null
       return <SyntheticMessage key={m.id} msg={m} canEdit={canEdit} />

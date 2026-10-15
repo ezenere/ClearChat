@@ -5,13 +5,15 @@ import {
   FolderOpen,
   PanelRight,
   ShieldOff,
-  Sparkles
+  Sparkles,
+  Square
 } from 'lucide-react'
 import { TOOL_LABELS } from '@shared/tools'
 import { CONFIRM_TOOLS } from '@shared/types'
 import type { Chat, Session } from '@shared/types'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
-import { useStore } from '../../store'
+import { isBusy, useStore } from '../../store'
+import { api } from '../../lib/api'
 import { TaskInfo } from '../apiDocs'
 import { TopBar } from '../TopBar'
 import { IconButton } from '../ui/controls'
@@ -151,20 +153,36 @@ export function ChatHeader({
 
 function SubBanner({ chat, session }: { chat: Chat; session: Session }): React.JSX.Element {
   const openSession = useStore((s) => s.openSession)
+  const run = useStore((s) => s.run)
   const parent = useStore((s) =>
     session.parentSessionId ? s.sessions[session.parentSessionId] : undefined
   )
+  const parentLabel = parent ? (parent.depth === 0 ? 'principal' : sessionLabel(parent)) : 'pai'
   return (
     <div className="shrink-0 border-b border-border/70 bg-accent-soft/40 px-8">
       <div className="mx-auto flex h-10 max-w-[780px] items-center gap-2 text-[12.5px]">
-        <Bot className="size-3.5 text-accent-strong" />
-        <span className="font-medium text-fg/90">Subagente</span>
-        <span className="text-faint">·</span>
-        <span className="text-muted">somente leitura</span>
+        <Bot className="size-3.5 shrink-0 text-accent-strong" />
+        <span data-testid="sub-banner" className="min-w-0 truncate text-muted">
+          Conversando com o subagente{' '}
+          <span className="font-medium text-fg/90">{sessionLabel(session)}</span>
+          <span className="text-faint"> · </span>
+          as respostas dele voltam ao agente {parentLabel}
+        </span>
         <StatusDot status={session.status} className="ml-1" />
         <TaskInfo task={session.task} />
-        <div className="ml-auto flex items-center gap-1">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
           <ContextMeter chat={chat} session={session} />
+          {isBusy(session.status) && (
+            <Tip label="Parar este subagente (e os subagentes dele)">
+              <button
+                type="button"
+                onClick={() => void run(() => api.agent.stop(session.id), 'Falha ao parar')}
+                className="no-drag flex items-center gap-1 rounded-md px-2 py-1 text-xs text-danger/90 hover:bg-danger/10"
+              >
+                <Square className="size-3" fill="currentColor" /> Parar
+              </button>
+            </Tip>
+          )}
           {parent && parent.depth > 0 && (
             <button
               type="button"
@@ -208,7 +226,7 @@ export function ChatView({
         readOnly={isSub}
         empty={!isSub && <EmptyChat chat={chat} />}
       />
-      {!isSub && <Composer session={session} autoFocus />}
+      <Composer session={session} autoFocus />
     </div>
   )
 }

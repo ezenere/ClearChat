@@ -1,9 +1,12 @@
 // Registro das tools executadas localmente. delegate_task é tratado pelo runner (precisa do loop).
+// send_to_chat também (precisa do loop do chat de destino).
 import type { ToolName } from '@shared/types'
 import { bash } from './bash'
 import { editFile, listDir, readFile, writeFile } from './files'
 import { findFiles, searchFiles } from './search'
 import { listModelsTool } from './models'
+import { getChatInfoTool, listChatsTool } from './chats'
+import { readHistoryTool } from './history'
 import { browseUrl, webSearch } from './web'
 import {
   abortError,
@@ -53,7 +56,10 @@ const IMPLS: Partial<Record<ToolName, Impl>> = {
   bash,
   web_search: webSearch,
   browse_url: browseUrl,
-  list_models: listModelsTool
+  list_models: listModelsTool,
+  get_chat_info: getChatInfoTool,
+  list_chats: listChatsTool,
+  read_history: readHistoryTool
 }
 
 /** Faz parse dos argumentos (string JSON da tool_call). */

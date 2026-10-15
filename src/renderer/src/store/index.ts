@@ -539,7 +539,7 @@ export const selectRuns =
     s.toolRuns[sessionId] ?? EMPTY_RUNS
 
 export const isBusy = (status: Session['status'] | undefined): boolean =>
-  status === 'running' || status === 'awaiting_approval'
+  status === 'running' || status === 'awaiting_approval' || status === 'waiting'
 
 export const currentChat = (s: Store): Chat | undefined =>
   s.view.kind === 'chat'

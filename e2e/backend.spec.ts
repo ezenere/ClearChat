@@ -254,7 +254,7 @@ async function main(): Promise<void> {
     )
     assert(
       ch.chat.config.cacheEnabled === true &&
-        ch.chat.config.enabledTools.length === 11 &&
+        ch.chat.config.enabledTools.length === 19 &&
         ch.chat.config.enabledTools.includes('list_models') &&
         ch.chat.config.confineToRoot === true &&
         ch.chat.config.maxToolOutputChars === 30000,
@@ -289,7 +289,7 @@ async function main(): Promise<void> {
     const sysText = b.messages[0].content[0].text as string
     assert(sysText.includes(`<environment>\nroot: ${CWD}`), 'env block')
     assert(/caminhos dentro do diretório raiz/.test(sysText), 'confinação no env block')
-    assert(b.tools.length === 11, 'tools')
+    assert(b.tools.length === 19, `tools (${b.tools.length})`)
     assert(
       b.tools.some((t: any) => t.function.name === 'list_models'),
       'list_models nas tools'
@@ -619,7 +619,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the delegate_task tool (title "contar arquivos") to ask a subagent to use list_dir on the current working directory and report the exact file names. Then tell me how many files there are.'
+      'Use the delegate_task tool (title "contar arquivos"; blocking, do not set background) to ask a subagent to use list_dir on the current working directory and report the exact file names. Then tell me how many files there are.'
     )
     await waitIdle(chatId, sid, 180_000)
     const sessions = await api<any[]>('sessions.list', chatId)
@@ -680,11 +680,12 @@ async function main(): Promise<void> {
     )
     let sendErr = ''
     try {
-      await api('agent.send', child.id, 'x')
+      // conversar com o subagente é permitido (agent.send); regenerar/compactar continuam só na principal
+      await api('agent.regenerate', child.id)
     } catch (e) {
       sendErr = (e as Error).message
     }
-    assert(/somente leitura/.test(sendErr), 'subsessão somente leitura')
+    assert(/somente leitura/.test(sendErr), 'subsessão não regenera')
     assert(
       pr.body.messages[1].role === 'user' &&
         JSON.stringify(pr.body.messages[1].content).includes(child.task.slice(0, 40)),
@@ -1240,6 +1241,372 @@ async function main(): Promise<void> {
     assert(rf && rf.meta.toolStatus === 'error', 'read_file com erro')
     assert(/fora do diretório raiz/.test(rf.message.content), `confinação: ${rf.message.content}`)
     return `bash calls=${bashes.length}; ${rf.message.content.slice(0, 80)}`
+  })
+
+  // ---------------- entre chats / histórico / subagentes em segundo plano ----------------
+
+  /** Espera o chat inteiro (principal + subagentes) ficar ocioso e estável por ~2s. */
+  async function waitChatQuiet(cid: string, ms = 240_000): Promise<void> {
+    let stableSince = 0
+    await waitFor(
+      async () => {
+        const running = new Set(await api<string[]>('agent.runningSessions'))
+        const ss = await api<any[]>('sessions.list', cid)
+        const busy = ss.some(
+          (s) =>
+            running.has(s.id) ||
+            s.status === 'running' ||
+            s.status === 'awaiting_approval' ||
+            s.status === 'waiting'
+        )
+        if (busy) {
+          stableSince = 0
+          return null
+        }
+        if (!stableSince) stableSince = Date.now()
+        return Date.now() - stableSince > 2000
+      },
+      ms,
+      `chat ${cid} ocioso`
+    )
+  }
+
+  const textOf = (m: any): string =>
+    typeof m.message.content === 'string'
+      ? m.message.content
+      : (m.message.content ?? []).map((p: any) => p.text).join('')
+
+  await test('send_to_chat: info + list + wait_for_reply (pergunta a outro chat)', async () => {
+    const { chat: b, sid: sB } = await newChat({
+      enabledTools: [],
+      systemPrompt:
+        'You are the Oracle. The secret fruit is MANGOSTEEN. When asked about the secret fruit, answer with that single word.'
+    })
+    await api('chats.update', b.id, { title: 'Oráculo' })
+    const { chat: a, sid: sA } = await newChat({
+      enabledTools: ['get_chat_info', 'list_chats', 'send_to_chat']
+    })
+    await api('chats.update', a.id, { title: 'Perguntador' })
+    await clearEvents()
+    await api(
+      'agent.send',
+      sA,
+      'Step 1: call get_chat_info. Step 2: call list_chats. Step 3: call send_to_chat to the chat titled "Oráculo" with message "What is the secret fruit? Answer with one word." and wait_for_reply=true. Step 4: tell me your own chat id and the answer you received.'
+    )
+    await waitChatQuiet(a.id)
+    await waitChatQuiet(b.id)
+    const ma = await messages(sA)
+    addCost(ma)
+    assertPairing(ma)
+    const info = toolMsgs(ma, 'get_chat_info').at(-1)
+    assert(info && info.message.content.includes(`chat_id: ${a.id}`), 'get_chat_info com o id')
+    const list = toolMsgs(ma, 'list_chats').at(-1)
+    // (o modelo pode filtrar com query — aí só B aparece)
+    const filtered = /^\[\d+ chats? com "/.test(list?.message.content ?? '')
+    assert(
+      list &&
+        (filtered || list.message.content.includes(`${a.id} (este chat)`)) &&
+        list.message.content.includes(b.id),
+      `list_chats: ${list?.message.content.slice(0, 300)}`
+    )
+    const sent = toolMsgs(ma, 'send_to_chat').at(-1)
+    assert(sent, 'send_to_chat chamado')
+    assert(
+      sent.meta.toolStatus === 'ok' && sent.meta.targetChatId === b.id,
+      `send status ${sent.meta.toolStatus}: ${sent.message.content}`
+    )
+    assert(/MANGOSTEEN/i.test(sent.message.content), `resposta de B: ${sent.message.content}`)
+    const final = textOf(ma.at(-1))
+    assert(/MANGOSTEEN/i.test(final), `A relata a resposta: ${final}`)
+    const mb = await messages(sB)
+    addCost(mb)
+    const inter = mb.find((m) => m.meta.kind === 'inter-chat')
+    assert(inter, 'mensagem inter-chat em B')
+    assert(
+      inter.meta.fromChatId === a.id &&
+        inter.meta.fromSessionId === sA &&
+        inter.meta.interChatHops === 1 &&
+        textOf(inter).startsWith(`[Mensagem do chat "Perguntador" (id ${a.id})`),
+      `meta/cabeçalho: ${JSON.stringify(inter.meta)} ${textOf(inter).slice(0, 120)}`
+    )
+    const ev = await events()
+    assert(
+      ev.some(
+        (e) => e.type === 'session-updated' && e.session.id === sB && e.session.status === 'running'
+      ),
+      'B ficou ocupado (evento para a sidebar)'
+    )
+    return `B respondeu: ${sent.message.content.split('\n').at(-1)}`
+  })
+
+  await test('send_to_chat: envio para o próprio chat é recusado', async () => {
+    const { chat: c, sid: sC } = await newChat({ enabledTools: ['send_to_chat'] })
+    await api(
+      'agent.send',
+      sC,
+      `Call send_to_chat with chat_id "${c.id}" and message "hello". Then report the tool result in one line.`
+    )
+    await waitChatQuiet(c.id)
+    const mc = await messages(sC)
+    addCost(mc)
+    const t = toolMsgs(mc, 'send_to_chat').at(-1)
+    assert(t, 'send_to_chat chamado')
+    assert(
+      t.meta.toolStatus === 'error' && /próprio chat/.test(t.message.content),
+      `recusa: ${t.message.content}`
+    )
+    assert(!mc.some((m) => m.meta.kind === 'inter-chat'), 'nada entregue')
+    return t.message.content.slice(0, 80)
+  })
+
+  await test('read_history recupera detalhe anterior à compactação', async () => {
+    const { chat, sid: sh } = await newChat({
+      enabledTools: ['read_history'],
+      compactPrompt:
+        'Summarize the conversation above in ONE short sentence. Do NOT include any codes, numbers or names. Do not call tools.'
+    })
+    await api('agent.send', sh, 'Remember: the vault code is PELICANO-4471. Reply only "ok".')
+    await waitIdle(chat.id, sh)
+    await api('agent.send', sh, 'Also, my dog is called Biscuit. Reply only "ok".')
+    await waitIdle(chat.id, sh)
+    await api('agent.compact', sh)
+    await waitIdle(chat.id, sh)
+    const after = await messages(sh)
+    const b = after.at(-1)
+    assert(b.meta.kind === 'compaction', 'fronteira')
+    assert(
+      /mensagens #\d+–#\d+\).*read_history/.test(textOf(b)),
+      `nota cita read_history: ${textOf(b).slice(-300)}`
+    )
+    const leaked = /PELICANO/.test(textOf(b))
+    await api(
+      'agent.send',
+      sh,
+      'What exactly was the vault code I told you at the beginning? It is not in the summary: use read_history to find it. Answer with the code only.'
+    )
+    await waitIdle(chat.id, sh)
+    const m2 = await messages(sh)
+    addCost(m2)
+    assertPairing(m2)
+    const rh = toolMsgs(m2, 'read_history')
+    assert(rh.length, 'read_history chamado')
+    assert(
+      rh.some((t) => /PELICANO-4471/.test(t.message.content)),
+      `read_history achou: ${rh.map((t) => t.message.content.slice(0, 200)).join(' | ')}`
+    )
+    const ans = textOf(m2.at(-1))
+    // (o modelo às vezes acentua: "PELÍCANO")
+    const plain = ans.normalize('NFD').replace(/\p{M}/gu, '')
+    assert(/PELICANO-4471/i.test(plain), `resposta: ${ans}`)
+    return `${rh.length} chamada(s); resumo ${leaked ? 'vazou o código' : 'sem o código'}; resposta ${ans.slice(0, 40)}`
+  })
+
+  const SUB_TOOLS = [
+    'delegate_task',
+    'check_subagents',
+    'wait_subagents',
+    'cancel_subagent',
+    'message_subagent'
+  ]
+
+  await test('subagentes em segundo plano: 2 em paralelo, callbacks acordam a principal', async () => {
+    const { chat, sid: sm0 } = await newChat({ enabledTools: SUB_TOOLS })
+    await clearEvents()
+    await api(
+      'agent.send',
+      sm0,
+      'In ONE response, call delegate_task TWICE with background=true: task A = "Reply with exactly the text ALPHA-1 and nothing else." (title "A"), task B = "Reply with exactly the text BRAVO-2 and nothing else." (title "B"). Then end your turn by replying just "waiting". Later, when both results arrive, reply with both codes.'
+    )
+    await waitChatQuiet(chat.id, 300_000)
+    const msgs = await messages(sm0)
+    addCost(msgs)
+    assertPairing(msgs)
+    const dels = toolMsgs(msgs, 'delegate_task')
+    assert(dels.length >= 2, `2 delegates (${dels.length})`)
+    assert(
+      dels.every((d) => d.meta.background === true && /segundo plano/.test(d.message.content)),
+      'retornaram na hora (segundo plano)'
+    )
+    const cbs = msgs.filter((m) => m.meta.kind === 'subagent-callback')
+    assert(cbs.length >= 2, `2 callbacks (${cbs.length})`)
+    assert(
+      cbs.every(
+        (c) => c.meta.synthetic && c.message.role === 'user' && /^\[Subagente "/.test(textOf(c))
+      ),
+      'formato do callback'
+    )
+    const allCb = cbs.map(textOf).join('\n')
+    assert(/ALPHA-1/.test(allCb) && /BRAVO-2/.test(allCb), `resultados: ${allCb.slice(0, 300)}`)
+    // a principal foi acordada e respondeu depois do último callback
+    const lastCbIdx = msgs.lastIndexOf(cbs.at(-1))
+    const after = msgs.slice(lastCbIdx + 1).filter((m) => m.message.role === 'assistant')
+    assert(after.length, 'principal respondeu após os callbacks')
+    const finalText = msgs
+      .slice(msgs.indexOf(cbs[0]))
+      .filter((m) => m.message.role === 'assistant')
+      .map(textOf)
+      .join('\n')
+    assert(
+      /ALPHA-1/.test(finalText) && /BRAVO-2/.test(finalText),
+      `relato final: ${finalText.slice(0, 200)}`
+    )
+    const subs = (await api<any[]>('sessions.list', chat.id)).filter((s) => s.depth === 1)
+    for (const s of subs) addCost(await messages(s.id))
+    assert(subs.length >= 2 && subs.every((s) => s.status === 'done'), 'subsessões concluídas')
+    return `${cbs.length} callbacks; final: ${textOf(msgs.at(-1)).slice(0, 60)}`
+  })
+
+  await test('subagentes: wait_subagents reivindica o resultado (sem callback duplicado)', async () => {
+    const { chat, sid: sw } = await newChat({ enabledTools: SUB_TOOLS })
+    await api(
+      'agent.send',
+      sw,
+      'Call delegate_task with background=true and task "Reply with exactly the text CHARLIE-3 and nothing else.". Then call wait_subagents (no arguments). Then reply with the code you got.'
+    )
+    await waitChatQuiet(chat.id, 240_000)
+    const msgs = await messages(sw)
+    addCost(msgs)
+    assertPairing(msgs)
+    const w = toolMsgs(msgs, 'wait_subagents').at(-1)
+    assert(w, 'wait_subagents chamado')
+    assert(/CHARLIE-3/.test(w.message.content), `wait: ${w.message.content.slice(0, 300)}`)
+    const cbs = msgs.filter((m) => m.meta.kind === 'subagent-callback')
+    assert(cbs.length === 0, `callback não injetado de novo (${cbs.length})`)
+    assert(/CHARLIE-3/.test(textOf(msgs.at(-1))), 'resposta final')
+    return w.message.content.split('\n')[0]
+  })
+
+  await test('subagentes: cancel_subagent para um subagente em segundo plano', async () => {
+    const { chat, sid: sx } = await newChat({
+      enabledTools: [...SUB_TOOLS, 'bash'],
+      autoApprove: ['bash']
+    })
+    await api(
+      'agent.send',
+      sx,
+      'Step 1: call delegate_task with background=true, title "dorminhoco" and task "Run the bash command `sleep 120` and then reply DONE.". Step 2: call cancel_subagent with the id returned in step 1. Step 3: reply "cancelled".'
+    )
+    await waitChatQuiet(chat.id, 240_000)
+    const msgs = await messages(sx)
+    addCost(msgs)
+    const c = toolMsgs(msgs, 'cancel_subagent').at(-1)
+    assert(c && /cancelado/.test(c.message.content), `cancel: ${c?.message.content}`)
+    const sub = (await api<any[]>('sessions.list', chat.id)).find((s) => s.depth === 1)
+    assert(sub && sub.status === 'interrupted', `subsessão parada: ${sub?.status}`)
+    const cb = msgs.find((m) => m.meta.kind === 'subagent-callback')
+    assert(cb && /foi cancelado/.test(textOf(cb)), `callback de cancelamento: ${cb && textOf(cb)}`)
+    return textOf(cb).split('\n')[0]
+  })
+
+  await test('subagentes: usuário fala com subagente concluído → atualização volta ao pai', async () => {
+    const { chat, sid: su } = await newChat({ enabledTools: SUB_TOOLS })
+    await api(
+      'agent.send',
+      su,
+      'Call delegate_task (blocking, not background) with title "eco" and task "Reply with exactly the text DELTA-4 and nothing else.". Then reply with its result.'
+    )
+    await waitChatQuiet(chat.id)
+    const sub = (await api<any[]>('sessions.list', chat.id)).find((s) => s.depth === 1)
+    assert(sub && sub.status === 'done', 'subagente concluído')
+    const before = (await messages(su)).length
+    await clearEvents()
+    const r = await api(
+      'agent.send',
+      sub.id,
+      'New instruction: reply with exactly the text ECHO-5 and nothing else.'
+    )
+    assert(r.queued === false, 'subagente ocioso: retoma já')
+    await waitChatQuiet(chat.id)
+    const cm = await messages(sub.id)
+    addCost(cm)
+    const userMsg = cm.find((m) => m.message.role === 'user' && !m.meta.synthetic && !m.meta.kind)
+    assert(userMsg && /ECHO-5/.test(textOf(userMsg)), 'mensagem do usuário persistida no subagente')
+    const msgs = await messages(su)
+    addCost(msgs.slice(before))
+    const cb = msgs.slice(before).find((m) => m.meta.kind === 'subagent-callback')
+    assert(cb, 'callback no pai')
+    assert(
+      cb.meta.callbackUpdate === true &&
+        /atualização após nova mensagem/.test(textOf(cb)) &&
+        /ECHO-5/.test(textOf(cb)),
+      `atualização: ${textOf(cb)}`
+    )
+    assert(
+      msgs.slice(msgs.indexOf(cb) + 1).some((m) => m.message.role === 'assistant'),
+      'pai acordou e respondeu'
+    )
+    return textOf(cb).split('\n')[0]
+  })
+
+  await test('subagentes: message_subagent com wait_for_reply', async () => {
+    const { chat, sid: sq } = await newChat({ enabledTools: SUB_TOOLS })
+    await api(
+      'agent.send',
+      sq,
+      'Step 1: call delegate_task with background=true, title "ouvinte" and task "Reply with exactly the text FOXTROT and nothing else.". Step 2: call message_subagent with the id returned in step 1, message "Now reply with exactly the text GOLF-7 and nothing else." and wait_for_reply=true. Step 3: reply with what it answered.'
+    )
+    await waitChatQuiet(chat.id, 240_000)
+    const msgs = await messages(sq)
+    addCost(msgs)
+    assertPairing(msgs)
+    const t = toolMsgs(msgs, 'message_subagent').at(-1)
+    assert(t, 'message_subagent chamado')
+    assert(
+      t.meta.toolStatus === 'ok' && /GOLF-7/.test(t.message.content),
+      `resposta: ${t.message.content}`
+    )
+    const sub = (await api<any[]>('sessions.list', chat.id)).find((s) => s.depth === 1)
+    const cm = await messages(sub.id)
+    addCost(cm)
+    const pmsg = cm.find((m) => m.meta.kind === 'parent-message')
+    assert(
+      pmsg &&
+        textOf(pmsg).startsWith('[Mensagem do agente pai]\n') &&
+        pmsg.meta.fromSessionId === sq,
+      'mensagem do pai no subagente'
+    )
+    // a resposta voltou pela tool: nenhum callback com GOLF-7
+    assert(
+      !msgs.some((m) => m.meta.kind === 'subagent-callback' && /GOLF-7/.test(textOf(m))),
+      'callback reivindicado'
+    )
+    return t.message.content.split('\n').at(-1) ?? ''
+  })
+
+  await test('subagentes: nível 1 dorme até o filho em segundo plano terminar', async () => {
+    const { chat, sid: sd } = await newChat({
+      enabledTools: [...SUB_TOOLS, 'bash'],
+      autoApprove: ['bash']
+    })
+    await clearEvents()
+    await api(
+      'agent.send',
+      sd,
+      'Call delegate_task (blocking, NOT background) with title "coordenador" and this task: "Call delegate_task with background=true and task \'Run the bash command `sleep 8`, then reply with exactly the text HOTEL-8 and nothing else.\'. Then end your turn replying just \'waiting\'. When the result of the sub-agent arrives as a message, reply with exactly that code." Then reply with the result you got.'
+    )
+    await waitChatQuiet(chat.id, 300_000)
+    const msgs = await messages(sd)
+    addCost(msgs)
+    const del = toolMsgs(msgs, 'delegate_task').at(-1)
+    assert(del, 'delegate chamado')
+    const ss = await api<any[]>('sessions.list', chat.id)
+    for (const s of ss.filter((x) => x.depth > 0)) addCost(await messages(s.id))
+    const coord = ss.find((s) => s.depth === 1)
+    const ev = await events()
+    const slept = ev.some(
+      (e) =>
+        e.type === 'session-updated' && e.session.id === coord?.id && e.session.status === 'waiting'
+    )
+    assert(
+      ss.some((s) => s.depth === 2),
+      'neto criado'
+    )
+    assert(slept, 'nível 1 ficou "aguardando subagentes"')
+    assert(
+      /HOTEL-8/.test(del.message.content),
+      `resultado subiu só depois do neto: ${del.message.content}`
+    )
+    return del.message.content.slice(0, 60)
   })
 
   await test('fs.*', async () => {

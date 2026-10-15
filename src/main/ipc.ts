@@ -106,6 +106,7 @@ export function registerIpc(): void {
     [IPC.agent.runningSessions]: () => runner.runningSessions(),
     [IPC.agent.compact]: (sessionId: string, opts?: CompactOptions) =>
       runner.compact(sessionId, opts ?? {}),
+    [IPC.agent.stopSubagents]: (chatId: string) => runner.stopSubagents(chatId),
 
     // ---- fs ----
     [IPC.fs.listDir]: (path: string) => fsapi.listDir(path),

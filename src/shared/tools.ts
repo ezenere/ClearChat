@@ -5,7 +5,10 @@ import { LIMITS } from './limits'
 
 export interface JsonSchema {
   type: 'object'
-  properties: Record<string, { type: string; description?: string; enum?: string[] }>
+  properties: Record<
+    string,
+    { type: string; description?: string; enum?: string[]; items?: { type: string } }
+  >
   required?: string[]
   additionalProperties?: boolean
 }
@@ -26,7 +29,15 @@ export const TOOL_NAMES: ToolName[] = [
   'web_search',
   'browse_url',
   'list_models',
-  'delegate_task'
+  'delegate_task',
+  'get_chat_info',
+  'list_chats',
+  'send_to_chat',
+  'read_history',
+  'check_subagents',
+  'wait_subagents',
+  'cancel_subagent',
+  'message_subagent'
 ]
 
 /** Rótulos curtos (pt-BR) para a UI. */
@@ -41,7 +52,15 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   web_search: 'Pesquisa na web',
   browse_url: 'Abrir URL',
   list_models: 'Listar modelos',
-  delegate_task: 'Delegar a subagente'
+  delegate_task: 'Delegar a subagente',
+  get_chat_info: 'Info do chat',
+  list_chats: 'Listar chats',
+  send_to_chat: 'Enviar para chat',
+  read_history: 'Ler histórico',
+  check_subagents: 'Ver subagentes',
+  wait_subagents: 'Aguardar subagentes',
+  cancel_subagent: 'Cancelar subagente',
+  message_subagent: 'Mensagem ao subagente'
 }
 
 const def = (
@@ -197,15 +216,110 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   delegate_task: def(
     'delegate_task',
-    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Para outro modelo, consulte list_models; se o modelo falhar, tente outro.',
+    'Delega uma tarefa autocontida a um subagente com as mesmas ferramentas e o mesmo diretório raiz. O subagente não vê esta conversa: descreva a tarefa com todo o contexto necessário. Retorna o relatório final do subagente. Com background=true retorna na hora e o resultado chega depois sozinho, como mensagem (você é acordado se tiver encerrado o turno): use para tarefas independentes ou longas e para rodar várias em paralelo; não fique consultando em loop — use wait_subagents ou apenas encerre o turno. Para outro modelo, consulte list_models; se o modelo falhar, tente outro.',
     {
       task: { type: 'string', description: 'Descrição completa e autocontida da tarefa.' },
       model: {
         type: 'string',
         description: 'Modelo do subagente (padrão: o mesmo desta sessão; veja list_models).'
       },
-      title: { type: 'string', description: 'Título curto para a subsessão.' }
+      title: { type: 'string', description: 'Título curto para a subsessão.' },
+      background: {
+        type: 'boolean',
+        description: 'Rodar em segundo plano e receber o resultado depois (padrão false).'
+      }
     },
     ['task']
+  ),
+  get_chat_info: def(
+    'get_chat_info',
+    'Retorna informações deste chat: id, título, sessão atual (e sessão-pai, se for subagente), modelo, provedor, diretório raiz e data de criação.',
+    {}
+  ),
+  list_chats: def(
+    'list_chats',
+    `Lista os chats do app (id, título, modelo, estado — ocioso, rodando ou aguardando aprovação — e última atualização), mais recentes primeiro; marca este chat. Padrão ${L.chatsDefaultResults} (máx. ${L.chatsMaxResults}).`,
+    {
+      query: { type: 'string', description: 'Filtra por parte do título ou do id.' },
+      limit: {
+        type: 'number',
+        description: `Máximo de chats listados (padrão ${L.chatsDefaultResults}).`
+      }
+    }
+  ),
+  send_to_chat: def(
+    'send_to_chat',
+    `Envia uma mensagem a OUTRO chat (id via list_chats), como se o usuário a digitasse lá: inicia um turno, ou entra na fila se o chat estiver ocupado. O destinatário vê de qual chat ela veio. Com wait_for_reply=true, aguarda o fim do turno e retorna a resposta final dele. Não envia para este próprio chat; cadeias de mensagens entre chats param em ${L.interChatMaxHops} saltos.`,
+    {
+      chat_id: { type: 'string', description: 'Id do chat de destino.' },
+      message: { type: 'string', description: 'Texto a entregar.' },
+      wait_for_reply: {
+        type: 'boolean',
+        description: 'Aguardar e retornar a resposta do chat (padrão false).'
+      },
+      timeout_s: {
+        type: 'number',
+        description: `Espera máxima em segundos com wait_for_reply (padrão ${L.interChatDefaultTimeoutS}).`
+      }
+    },
+    ['chat_id', 'message']
+  ),
+  read_history: def(
+    'read_history',
+    `Lê o histórico salvo desta sessão, inclusive mensagens anteriores a compactações (que não estão mais no seu contexto). Com query: busca o texto (sem diferenciar maiúsculas) em mensagens, argumentos e resultados de tools e retorna trechos com o número #seq. Sem query: retorna as mensagens de from_seq a to_seq (padrão ${L.historyDefaultMessages}). Mensagens longas são cortadas; para ler uma inteira, use from_seq = to_seq.`,
+    {
+      query: { type: 'string', description: 'Texto a buscar.' },
+      from_seq: { type: 'number', description: 'Primeira mensagem (#seq).' },
+      to_seq: { type: 'number', description: 'Última mensagem (#seq).' },
+      limit: {
+        type: 'number',
+        description: `Máximo de mensagens (faixa: padrão ${L.historyDefaultMessages}; busca: padrão ${L.historySearchDefault}).`
+      },
+      include_tool_results: {
+        type: 'boolean',
+        description:
+          'Na faixa, inclui o conteúdo dos resultados de tools (padrão false: só o tamanho).'
+      }
+    }
+  ),
+  check_subagents: def(
+    'check_subagents',
+    'Lista os subagentes desta sessão: id, título, modelo, estado, duração, última atividade e se o resultado já foi entregue. Não use em loop para esperar: use wait_subagents ou encerre o turno.',
+    {}
+  ),
+  wait_subagents: def(
+    'wait_subagents',
+    `Aguarda subagentes em segundo plano terminarem e retorna os resultados (que então não chegam de novo como mensagem). mode "all" (padrão) espera todos; "any", o primeiro. Sem ids: todos os pendentes desta sessão. No tempo limite (padrão ${L.subagentWaitDefaultS}s), retorna os estados.`,
+    {
+      ids: { type: 'array', items: { type: 'string' }, description: 'Ids dos subagentes.' },
+      mode: { type: 'string', enum: ['all', 'any'], description: 'all (padrão) ou any.' },
+      timeout_s: {
+        type: 'number',
+        description: `Espera máxima em segundos (padrão ${L.subagentWaitDefaultS}).`
+      }
+    }
+  ),
+  cancel_subagent: def(
+    'cancel_subagent',
+    'Cancela um subagente em execução (e os subagentes dele). O cancelamento é informado na mensagem de resultado.',
+    { id: { type: 'string', description: 'Id do subagente.' } },
+    ['id']
+  ),
+  message_subagent: def(
+    'message_subagent',
+    'Envia uma mensagem a um subagente que VOCÊ criou com delegate_task (direto ou descendente) — ex.: para avisar de mudanças. Não serve para responder a quem te delegou uma tarefa (para isso, apenas responda). Rodando: entra no próximo passo dele; ocioso ou concluído: ele retoma e a nova resposta final volta como mensagem. Com wait_for_reply=true, aguarda e retorna essa resposta.',
+    {
+      id: { type: 'string', description: 'Id do subagente.' },
+      message: { type: 'string', description: 'Texto a entregar.' },
+      wait_for_reply: {
+        type: 'boolean',
+        description: 'Aguardar e retornar a próxima resposta final dele (padrão false).'
+      },
+      timeout_s: {
+        type: 'number',
+        description: `Espera máxima em segundos com wait_for_reply (padrão ${L.subagentWaitDefaultS}).`
+      }
+    },
+    ['id', 'message']
   )
 }

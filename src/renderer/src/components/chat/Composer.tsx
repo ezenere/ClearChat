@@ -3,17 +3,41 @@ import { useEffect, useRef, useState } from 'react'
 import type { QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
+import { splitInterChatText } from '@shared/interChat'
 import { isBusy, selectQueue, useStore } from '../../store'
 import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
 import { AutoTextarea } from '../ui/controls'
 import { CompactBanner, ContextMeter } from './ContextMeter'
 
+/** Origem de um item da fila que não foi digitado pelo usuário (outro chat, pai, subagente). */
+function queueOrigin(item: QueuedMessage): { label: string; text: string } | null {
+  const kind = item.meta?.kind
+  if (kind === 'inter-chat')
+    return {
+      label: `De: ${item.meta?.fromChatTitle || 'outro chat'}`,
+      text: splitInterChatText(item.text).body
+    }
+  if (kind === 'parent-message')
+    return { label: 'Agente pai', text: item.text.replace(/^\[Mensagem do agente pai\]\n/, '') }
+  if (kind === 'subagent-callback')
+    return { label: 'Resultado de subagente', text: item.text.split('\n')[0] }
+  return null
+}
+
 function QueueChip({ item }: { item: QueuedMessage }): React.JSX.Element {
   const run = useStore((s) => s.run)
+  const origin = queueOrigin(item)
   return (
     <div className="group relative max-w-[280px] min-w-[140px] animate-pop-in rounded-xl border border-border bg-elevated/90 py-2 pr-12 pl-3 shadow-[0_4px_16px_-8px_rgb(0_0_0/0.6)]">
-      <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">{item.text}</p>
+      {origin && (
+        <p className="mb-0.5 truncate text-[10.5px] font-medium text-accent-strong/90">
+          {origin.label}
+        </p>
+      )}
+      <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">
+        {origin ? origin.text : item.text}
+      </p>
       <div className="absolute top-1 right-1 flex items-center">
         <Tip label="Enviar agora (interrompe o agente)">
           <button
@@ -97,7 +121,13 @@ export function Composer({
             value={text}
             minRows={1}
             maxRows={14}
-            placeholder={busy ? 'Enviar para a fila…' : 'Mensagem…'}
+            placeholder={
+              busy
+                ? 'Enviar para a fila…'
+                : session.depth > 0
+                  ? 'Mensagem ao subagente…'
+                  : 'Mensagem…'
+            }
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -115,9 +145,11 @@ export function Composer({
                   <span className="size-1.5 animate-pulse-soft rounded-full bg-accent-strong" />
                   {session.status === 'awaiting_approval'
                     ? 'Aguardando aprovação'
-                    : compaction?.state === 'running'
-                      ? 'Compactando conversa…'
-                      : 'Trabalhando…'}
+                    : session.status === 'waiting'
+                      ? 'Aguardando subagentes'
+                      : compaction?.state === 'running'
+                        ? 'Compactando conversa…'
+                        : 'Trabalhando…'}
                 </span>
               ) : (
                 <span>

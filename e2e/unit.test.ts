@@ -79,7 +79,24 @@ test('system + env + tools + cache_control na cópia', () => {
     { type: 'text', text: 'leia x', cache_control: { type: 'ephemeral' } }
   ])
   assert.equal(JSON.stringify(hist), before, 'histórico não pode ser mutado')
-  assert.equal(body.tools.length, 11)
+  assert.equal(body.tools.length, 19)
+  // num subagente, as tools de gerenciar subagentes só aparecem depois do primeiro delegate_task
+  const sub1 = buildRequest(mkChat(), { depth: 1, model: 'm' }, hist, orProvider, env).body as any
+  assert.equal(sub1.tools.length, 15)
+  assert.ok(!sub1.tools.some((t: any) => t.function.name === 'message_subagent'))
+  const delegated = [
+    ...hist,
+    sm({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        { id: 'd1', type: 'function', function: { name: 'delegate_task', arguments: '{}' } }
+      ]
+    }),
+    sm({ role: 'tool', tool_call_id: 'd1', content: 'ok' })
+  ]
+  const req2 = buildRequest(mkChat(), { depth: 1, model: 'm' }, delegated, orProvider, env)
+  assert.equal((req2.body as any).tools.length, 19)
   assert.equal(body.tools[0].function.name, 'list_dir')
   assert.ok(body.tools.some((t: any) => t.function.name === 'search_files'))
   assert.equal(req.headers['Authorization'], `Bearer ${orProvider.apiKey}`)
@@ -144,7 +161,9 @@ test('sem cache, sem env, system vazio → sem mensagem system; depth 2 sem dele
   assert.equal(body.messages.length, 1)
   assert.equal(body.messages[0].content, 't')
   assert.ok(!body.tools.some((t: any) => t.function.name === 'delegate_task'))
-  assert.equal(body.tools.length, 10)
+  // ferramentas de subagentes só existem com delegate_task disponível
+  assert.ok(!body.tools.some((t: any) => t.function.name === 'check_subagents'))
+  assert.equal(body.tools.length, 14)
 })
 
 test('toolsInPrompt usa só as tools disponíveis; nativeTools=false omite tools', () => {
@@ -1196,4 +1215,444 @@ test('delegate_task: falha do modelo do subagente vira erro acionável', () => {
   const f = delegateFailureText('x/y:free', 'Erro HTTP 502')
   assert.match(f, /tente outro modelo grátis ou um pago/)
   assert.match(delegateEmptyText('x/y:free'), /possível falha do modelo x\/y:free/)
+})
+
+// ---- read_history / mensagens entre chats / subagentes em segundo plano ----
+
+import {
+  cutMessage,
+  formatHistoryRange,
+  historyHeader,
+  readHistoryTool,
+  searchHistory
+} from '../src/main/tools/history.ts'
+import { formatChatInfo, formatChatList } from '../src/main/tools/chats.ts'
+import {
+  currentInterChatHops,
+  interChatHeader,
+  interChatText,
+  nextInterChatHops,
+  splitInterChatText,
+  wouldCreateWaitCycle
+} from '../src/shared/interChat.ts'
+import {
+  callbackText,
+  formatSubagentList,
+  isDescendant,
+  parentMessageText,
+  ReportRegistry,
+  resolveSubagentRef,
+  subtreeIds
+} from '../src/main/agent/subagents.ts'
+import { compactionNoteWithHistory, COMPACTION_NOTE as NOTE } from '../src/shared/defaults.ts'
+
+/** Histórico com uma fronteira de compactação no meio (#1–#6 resumidas em #7). */
+function historyWithBoundary(): StoredMessage[] {
+  let n = 0
+  const mk = (message: ApiMessage, meta: any = {}): StoredMessage => ({
+    id: `h${++n}`,
+    sessionId: 's1',
+    seq: n,
+    message,
+    meta,
+    createdAt: 0
+  })
+  return [
+    mk({ role: 'user', content: 'O código secreto do cofre é PELICANO-4471.' }),
+    mk({ role: 'assistant', content: 'Anotado.' }),
+    mk({ role: 'user', content: 'Leia config.json' }),
+    mk({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'c1',
+          type: 'function',
+          function: { name: 'read_file', arguments: '{"path":"config.json"}' }
+        }
+      ]
+    }),
+    mk(
+      { role: 'tool', tool_call_id: 'c1', content: '{"porta": 8123, "host": "alfa"}' },
+      { toolStatus: 'ok' }
+    ),
+    mk({ role: 'assistant', content: 'A porta é 8123. ' + 'x'.repeat(5000) }),
+    mk(
+      { role: 'user', content: compactionMessageText('Resumo: usuário tem um cofre.') },
+      { kind: 'compaction', synthetic: true, summaryOf: { fromSeq: 1, toSeq: 6 } }
+    ),
+    mk({ role: 'assistant', content: 'erro http' }, { kind: 'error', synthetic: true, error: 'x' }),
+    mk({ role: 'user', content: 'Qual era o código do cofre?' })
+  ]
+}
+
+test('read_history: cabeçalho com fronteiras, faixa, corte e resultados de tool', () => {
+  const h = historyWithBoundary()
+  assert.match(
+    historyHeader(h.filter((m) => m.meta.kind !== 'error')),
+    /8 mensagens \(#1–#9\); fronteiras de compactação: #7 \(resume #1–#6\) — as mensagens antes de #7 não estão mais no seu contexto/
+  )
+  const r = formatHistoryRange(h, { fromSeq: 1, toSeq: 6 })
+  assert.match(r, /^#1 user: O código secreto do cofre é PELICANO-4471\.$/m)
+  assert.match(r, /^#4 assistant: → chamou read_file\(\{"path":"config.json"\}\)$/m)
+  // resultado de tool omitido por padrão (só o tamanho)
+  assert.match(r, /^#5 tool \(read_file\): \[resultado omitido · 31 caracteres/m)
+  // mensagem longa cortada com marcador de como ler inteira
+  assert.match(r, /\[… [\d.]+ caracteres omitidos — leia inteira com from_seq=6 to_seq=6\]/)
+  assert.ok(!r.includes('erro http'), 'erros só de exibição ficam de fora')
+  assert.match(r, /\[mostrando #1–#6\]$/)
+  // uma única mensagem: inteira, inclusive resultado de tool
+  assert.match(formatHistoryRange(h, { fromSeq: 5, toSeq: 5 }), /"porta": 8123/)
+  assert.match(
+    formatHistoryRange(h, { fromSeq: 4, toSeq: 5, includeToolResults: true }),
+    /#5 tool \(read_file\): \{"porta": 8123/
+  )
+  const one = formatHistoryRange(h, { fromSeq: 6, toSeq: 6 })
+  assert.ok(one.includes('x'.repeat(5000)) && !one.includes('omitidos'))
+  // fronteira rotulada
+  assert.match(
+    formatHistoryRange(h, { fromSeq: 7, toSeq: 7 }),
+    /#7 user \[fronteira de compactação · resume #1–#6\]/
+  )
+  // limit + continuação
+  const lim = formatHistoryRange(h, { limit: 2 })
+  assert.match(lim, /#1 user/)
+  assert.ok(!/^#3 /m.test(lim))
+  assert.match(lim, /continue com from_seq=3/)
+  // só to_seq: as últimas `limit` até ele
+  assert.match(formatHistoryRange(h, { toSeq: 5, limit: 2 }), /^#4 [\s\S]*^#5 /m)
+  // teto de caracteres total
+  const big = Array.from({ length: 60 }, (_, i) =>
+    sm({ role: 'user', content: `m${i} ` + 'y'.repeat(1900) })
+  )
+  const capped = formatHistoryRange(big, { limit: 60 }, 8000)
+  assert.ok(capped.length <= 8200, `respeita o teto: ${capped.length}`)
+  assert.match(capped, /continue com from_seq=/)
+  assert.match(formatHistoryRange(h, { fromSeq: 50 }), /nenhuma mensagem na faixa/)
+  assert.equal(cutMessage('abc', 10, 1), 'abc')
+})
+
+test('read_history: busca sem caixa, trechos com #seq, resultados de tool e fallback por termos', async () => {
+  const h = historyWithBoundary()
+  const r = searchHistory(h, { query: 'pelicano' })
+  assert.match(r, /\[1 mensagem contém "pelicano"; mostrando 1\]/)
+  assert.match(r, /^#1 user: O código secreto do cofre é PELICANO-4471\.$/m)
+  // casa em resultados de tool e argumentos
+  assert.match(searchHistory(h, { query: '8123' }), /#5 tool \(read_file\): \{"porta": 8123/)
+  assert.match(searchHistory(h, { query: 'config.json' }), /#4 assistant: .*read_file\(/)
+  // nada com a frase exata → todos os termos
+  assert.match(searchHistory(h, { query: 'cofre secreto' }), /cont[eé]m todos os termos/)
+  assert.match(searchHistory(h, { query: 'inexistente' }), /nenhuma mensagem contém/)
+  // não acha a própria chamada do read_history
+  const withCall = [
+    ...h,
+    sm({
+      role: 'assistant',
+      content: null,
+      tool_calls: [
+        {
+          id: 'rh',
+          type: 'function',
+          function: { name: 'read_history', arguments: '{"query":"zzqq"}' }
+        }
+      ]
+    })
+  ]
+  assert.match(searchHistory(withCall, { query: 'zzqq' }), /nenhuma mensagem contém/)
+  // via tool (contexto do runner)
+  const t = await readHistoryTool({ query: 'PELICANO' }, {
+    cwd: '/',
+    signal: new AbortController().signal,
+    history: () => h
+  } as any)
+  assert.equal(t.status, 'ok')
+  assert.match(t.content, /#1 user/)
+  const none = await readHistoryTool({}, { cwd: '/', signal: new AbortController().signal } as any)
+  assert.equal(none.status, 'error')
+})
+
+test('compactação: nota menciona read_history (faixa) só se a tool estiver habilitada', () => {
+  assert.ok(compactionMessageText('R').endsWith(NOTE))
+  const t = compactionMessageText('R', { fromSeq: 1, toSeq: 6 })
+  assert.ok(t.endsWith(compactionNoteWithHistory(1, 6)))
+  assert.match(t, /mensagens #1–#6\).*read_history/)
+  const hist = [sm({ role: 'user', content: 'a' }), sm({ role: 'assistant', content: 'b' })]
+  const withTool = compactionMeta(mkChat(), { depth: 0 }, hist, 'R', 5, env)
+  assert.match(
+    withTool.text,
+    new RegExp(`mensagens #${hist[0].seq}–#${hist[1].seq}\\).*read_history`)
+  )
+  const without = compactionMeta(
+    mkChat({ enabledTools: ['bash'] }),
+    { depth: 0 },
+    hist,
+    'R',
+    5,
+    env
+  )
+  assert.ok(without.text.endsWith(NOTE))
+})
+
+test('mensagens entre chats: cabeçalho, saltos e ciclo de espera', () => {
+  const head = interChatHeader('Pesquisa  X', 'abc-123', { waitForReply: true })
+  assert.match(head, /^\[Mensagem do chat "Pesquisa X" \(id abc-123\) — o remetente aguarda/)
+  const reply = interChatHeader('A', 'id1', { canReply: true })
+  assert.match(reply, /use send_to_chat com chat_id "id1"\]$/)
+  assert.equal(interChatHeader('A', 'id1'), '[Mensagem do chat "A" (id id1)]')
+  const text = interChatText(head, 'oi\nduas linhas')
+  assert.deepEqual(splitInterChatText(text), { header: head, body: 'oi\nduas linhas' })
+  assert.deepEqual(splitInterChatText('normal'), { header: '', body: 'normal' })
+
+  // saltos: humano → 0; turno iniciado por inter-chat → hops dela
+  const human = [sm({ role: 'user', content: 'oi' }), sm({ role: 'assistant', content: 'ok' })]
+  assert.equal(currentInterChatHops(human), 0)
+  assert.deepEqual(nextInterChatHops(human), { hops: 1, allowed: true })
+  const fromChat = (hops: number): StoredMessage[] => [
+    sm({ role: 'user', content: 'humano antes' }),
+    sm({ role: 'user', content: '[Mensagem…]\nx' }, { kind: 'inter-chat', interChatHops: hops }),
+    sm({ role: 'assistant', content: null, tool_calls: [] }),
+    sm({ role: 'user', content: '<tool_result>…' }, { synthetic: true }),
+    sm({ role: 'user', content: 'resumo' }, { kind: 'compaction', synthetic: true })
+  ]
+  assert.equal(currentInterChatHops(fromChat(2)), 2)
+  assert.deepEqual(nextInterChatHops(fromChat(2)), { hops: 3, allowed: true })
+  assert.deepEqual(nextInterChatHops(fromChat(3)), { hops: 4, allowed: false })
+  // uma mensagem humana depois zera a cadeia
+  assert.equal(
+    currentInterChatHops([...fromChat(3), sm({ role: 'user', content: 'eu' }, { kind: 'queued' })]),
+    0
+  )
+
+  // ciclos de espera
+  assert.equal(wouldCreateWaitCycle([], 'A', 'B'), false)
+  assert.equal(wouldCreateWaitCycle([{ from: 'A', to: 'B' }], 'B', 'A'), true)
+  assert.equal(
+    wouldCreateWaitCycle(
+      [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'C' }
+      ],
+      'C',
+      'A'
+    ),
+    true
+  )
+  assert.equal(
+    wouldCreateWaitCycle(
+      [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'C' }
+      ],
+      'A',
+      'C'
+    ),
+    false
+  )
+  assert.equal(wouldCreateWaitCycle([{ from: 'A', to: 'B' }], 'C', 'B'), false)
+  assert.equal(wouldCreateWaitCycle([], 'A', 'A'), true)
+})
+
+test('get_chat_info / list_chats: formato, filtro, (este chat) e teto', () => {
+  const info = formatChatInfo({
+    chatId: 'c1',
+    title: 'Meu chat',
+    sessionId: 's2',
+    mainSessionId: 's1',
+    depth: 1,
+    parentSessionId: 's1',
+    sessionTitle: 'pesquisa',
+    model: 'openai/gpt-4.1-nano',
+    providerName: 'OpenRouter',
+    root: '/work',
+    createdAt: Date.UTC(2026, 0, 2, 3, 4)
+  })
+  assert.match(
+    info,
+    /^chat_id: c1\ntítulo: Meu chat\nsessão: s2 \(subagente, nível 1: "pesquisa"\)\nsessão-pai: s1\n/
+  )
+  assert.match(
+    info,
+    /provedor: OpenRouter\ndiretório raiz: \/work\ncriado em: 2026-01-0\d \d\d:\d\d \(UTC/
+  )
+  const now = 10_000_000
+  const chats = [
+    {
+      id: 'aaa',
+      title: 'Atual',
+      model: 'm1',
+      status: 'running' as const,
+      updatedAt: now,
+      self: true
+    },
+    {
+      id: 'bbb',
+      title: 'Pesquisa de preços',
+      model: 'm2',
+      status: 'idle' as const,
+      updatedAt: now - 5 * 60_000,
+      self: false
+    },
+    {
+      id: 'ccc',
+      title: '',
+      model: 'm3',
+      status: 'awaiting_approval' as const,
+      updatedAt: now - 3 * 3600_000,
+      self: false
+    }
+  ]
+  const all = formatChatList(chats, {}, { now })
+  assert.match(all, /^\[3 chats; mostrando 3\]/)
+  assert.match(all, /^aaa \(este chat\) · "Atual" · m1 · rodando · atualizado agora$/m)
+  assert.match(all, /^bbb · "Pesquisa de preços" · m2 · ocioso · atualizado há 5 min$/m)
+  assert.match(all, /^ccc · "Novo chat" · m3 · aguardando aprovação · atualizado há 3 h$/m)
+  assert.match(
+    formatChatList(chats, { query: 'PREÇOS' }, { now }),
+    /^\[1 chat com "PREÇOS"; mostrando 1\]\nbbb/
+  )
+  assert.match(formatChatList(chats, { limit: 1 }, { now }), /2 não listados/)
+  assert.match(formatChatList(chats, { query: 'zzz' }, { now }), /nenhum chat de 3/)
+})
+
+test('subagentes: callbacks em ordem, reivindicação, pendentes e texto', () => {
+  const reg = new ReportRegistry()
+  const a = reg.add({
+    sessionId: 'sa',
+    parentSessionId: 'p',
+    title: 'A',
+    model: 'm',
+    update: false
+  })
+  const b = reg.add({
+    sessionId: 'sb',
+    parentSessionId: 'p',
+    title: 'B',
+    model: 'm',
+    update: false
+  })
+  const c = reg.add({
+    sessionId: 'sc',
+    parentSessionId: 'q',
+    title: 'C',
+    model: 'm',
+    update: false
+  })
+  assert.deepEqual(
+    reg.pending('p').map((r) => r.sessionId),
+    ['sa', 'sb']
+  )
+  // B termina antes de A: callbacks na ordem de término
+  const delivered: string[] = []
+  const finishes: [typeof a, any][] = [
+    [b, { kind: 'final', text: 'resultado B' }],
+    [a, { kind: 'error', error: 'Erro HTTP 429' }]
+  ]
+  for (const [r, o] of finishes) {
+    if (reg.complete(r, o)) {
+      delivered.push(callbackText(r, o))
+      reg.sent(r, `q-${r.sessionId}`)
+    }
+  }
+  assert.equal(delivered.length, 2)
+  assert.match(delivered[0], /^\[Subagente "B" \(id sb\) concluiu\]\nresultado B$/)
+  assert.match(
+    delivered[1],
+    /^\[Subagente "A" \(id sa\) falhou\]\n\[falha do modelo m: Erro HTTP 429\]/
+  )
+  assert.equal(reg.pending('p').length, 0)
+  assert.equal(reg.complete(a, { kind: 'final', text: 'de novo' }), false, 'só completa uma vez')
+  // reivindicar depois de enfileirado: devolve o item da fila
+  assert.deepEqual(reg.claim(b), { queuedId: 'q-sb', sent: true })
+  // reivindicado antes de terminar (wait_subagents/message_subagent): sem callback
+  reg.claim(c)
+  assert.equal(reg.complete(c, { kind: 'final', text: 'x' }), false)
+  // atualização e cancelamento
+  const u = reg.add({ sessionId: 'sa', parentSessionId: 'p', title: 'A', model: 'm', update: true })
+  assert.equal(reg.latest('sa'), u)
+  assert.match(
+    callbackText(u, { kind: 'final', text: 'novo' }),
+    /^\[Subagente "A" \(id sa\) — atualização após nova mensagem\]\nnovo$/
+  )
+  assert.match(
+    callbackText(u, { kind: 'aborted', partial: '' }),
+    /^\[Subagente "A" \(id sa\) foi cancelado\]$/
+  )
+  assert.match(
+    callbackText(u, { kind: 'app-closed' }),
+    /não concluiu\]\n\(interrompido: o app foi fechado\)$/
+  )
+  assert.match(callbackText(u, { kind: 'final', text: '' }), /terminou sem retornar texto/)
+  // apagadas: sem callback
+  const d = reg.add({
+    sessionId: 'sd',
+    parentSessionId: 'p',
+    title: 'D',
+    model: 'm',
+    update: false
+  })
+  reg.drop(['sd'])
+  assert.equal(reg.complete(d, { kind: 'final', text: 'x' }), false)
+  assert.deepEqual(
+    reg.forParent('p').map((r) => r.sessionId),
+    ['sa', 'sb']
+  )
+  // corte do texto
+  assert.ok(callbackText(u, { kind: 'final', text: 'z'.repeat(50_000) }, 3000).length <= 3000)
+  assert.equal(parentMessageText('oi'), '[Mensagem do agente pai]\noi')
+})
+
+test('subagentes: posse (descendentes), resolução de id e subárvore', () => {
+  const ss = [
+    { id: 'main-0000', parentSessionId: null },
+    { id: 'aaaa-1111', parentSessionId: 'main-0000' },
+    { id: 'aaaa-2222', parentSessionId: 'main-0000' },
+    { id: 'bbbb-3333', parentSessionId: 'aaaa-1111' },
+    { id: 'cccc-4444', parentSessionId: 'aaaa-2222' }
+  ]
+  assert.equal(isDescendant(ss, 'main-0000', 'bbbb-3333'), true)
+  assert.equal(isDescendant(ss, 'aaaa-1111', 'cccc-4444'), false)
+  assert.equal(isDescendant(ss, 'aaaa-1111', 'aaaa-1111'), false)
+  assert.equal((resolveSubagentRef(ss, 'main-0000', 'bbbb-3333') as any).id, 'bbbb-3333')
+  assert.equal((resolveSubagentRef(ss, 'main-0000', 'bbbb') as any).id, 'bbbb-3333', 'prefixo')
+  assert.equal(resolveSubagentRef(ss, 'main-0000', 'aaaa'), 'ambiguous')
+  assert.equal(resolveSubagentRef(ss, 'aaaa-1111', 'cccc-4444'), 'not-owned', 'outro ramo')
+  assert.equal(resolveSubagentRef(ss, 'aaaa-1111', 'aaaa-1111'), 'not-owned', 'a própria sessão')
+  assert.equal(resolveSubagentRef(ss, 'aaaa-1111', 'main-0000'), 'not-owned', 'o pai')
+  assert.equal(resolveSubagentRef(ss, 'main-0000', 'zzzz-9'), null)
+  assert.deepEqual(subtreeIds(ss, ['aaaa-1111']), ['aaaa-1111', 'bbbb-3333'])
+  const list = formatSubagentList(
+    [
+      {
+        id: 'x1',
+        title: 'Busca',
+        model: 'm',
+        status: 'running',
+        background: true,
+        startedAt: 0,
+        result: 'pending',
+        tail: 'chamando bash'
+      },
+      {
+        id: 'x2',
+        title: 'Resumo',
+        model: 'm',
+        status: 'done',
+        background: false,
+        startedAt: 0,
+        finishedAt: 65_000,
+        result: 'tool',
+        tail: 'pronto'
+      }
+    ],
+    90_000
+  )
+  assert.match(list, /^\[2 subagentes; 1 em execução\]/)
+  assert.match(
+    list,
+    /x1 · "Busca" · m · rodando · em segundo plano · duração 1min 30s · resultado ainda não entregue/
+  )
+  assert.match(
+    list,
+    /x2 · "Resumo" · m · concluído · bloqueante · duração 1min 5s · resultado devolvido no delegate_task · último: "pronto"/
+  )
 })

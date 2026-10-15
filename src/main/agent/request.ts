@@ -70,10 +70,47 @@ export function environmentBlock(
   return `<environment>\n${lines.join('\n')}\n</environment>`
 }
 
-/** Tools disponíveis para a sessão: habilitadas no chat, na ordem fixa de TOOL_NAMES; delegate só se depth < 2. */
-export function availableTools(chat: Chat, session: Pick<Session, 'depth'>): ToolName[] {
+/** Tools que só fazem sentido com delegate_task disponível (subagentes da própria sessão). */
+const SUBAGENT_TOOLS: ToolName[] = [
+  'check_subagents',
+  'wait_subagents',
+  'cancel_subagent',
+  'message_subagent'
+]
+
+/** A sessão já chamou delegate_task (tem ou teve subagentes)? */
+export function hasDelegated(history: StoredMessage[]): boolean {
+  return history.some(
+    (m) =>
+      m.message.role === 'assistant' &&
+      !!m.message.tool_calls?.some((t) => t.function.name === 'delegate_task')
+  )
+}
+
+/**
+ * Tools disponíveis para a sessão: habilitadas no chat, na ordem fixa de TOOL_NAMES; delegate só se
+ * depth < 2. As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
+ * num SUBAGENTE, e quando o histórico é informado (request), só depois que ele criou algum
+ * subagente: modelos fracos não as confundem com "responder" a quem delegou (o prefixo de cache
+ * muda uma vez, no primeiro delegate). A principal as vê sempre (para planejar). Sem histórico
+ * (execução de tool), é permissivo.
+ */
+export function availableTools(
+  chat: Chat,
+  session: Pick<Session, 'depth'>,
+  history?: StoredMessage[]
+): ToolName[] {
   const enabled = new Set(chat.config.enabledTools ?? [])
-  return TOOL_NAMES.filter((n) => enabled.has(n) && (n !== 'delegate_task' || session.depth < 2))
+  const canDelegate =
+    enabled.has('delegate_task') &&
+    session.depth < 2 &&
+    (!history || session.depth === 0 || hasDelegated(history))
+  return TOOL_NAMES.filter(
+    (n) =>
+      enabled.has(n) &&
+      (n !== 'delegate_task' || session.depth < 2) &&
+      (!SUBAGENT_TOOLS.includes(n) || canDelegate)
+  )
 }
 
 export function toolDefinitions(names: ToolName[]): ToolDefinition[] {
@@ -84,7 +121,8 @@ export function toolDefinitions(names: ToolName[]): ToolDefinition[] {
 export function systemContent(
   chat: Chat,
   session: Pick<Session, 'depth'>,
-  env: EnvInfo = defaultEnvInfo()
+  env: EnvInfo = defaultEnvInfo(),
+  history?: StoredMessage[]
 ): string {
   const cfg = chat.config
   let s = session.depth === 0 ? (cfg.systemPrompt ?? '') : (cfg.subagentSystemPrompt ?? '')
@@ -94,7 +132,7 @@ export function systemContent(
   }
   if (cfg.envInPrompt) add(environmentBlock(cfg, env))
   if (cfg.toolsInPrompt) {
-    const defs = toolDefinitions(availableTools(chat, session))
+    const defs = toolDefinitions(availableTools(chat, session, history))
     add(cfg.toolsPromptText ?? defaultToolsPrompt(defs, cfg.nativeTools))
   }
   return s
@@ -271,7 +309,7 @@ export function buildRequest(
   const cfg = chat.config
   const openRouter = isOpenRouter(provider.baseUrl)
 
-  const sys = systemContent(chat, session, env)
+  const sys = systemContent(chat, session, env, history)
   const hist = sanitizeHistory(
     activeHistory(history)
       .filter((m) => m.meta?.kind !== 'error')
@@ -291,7 +329,7 @@ export function buildRequest(
     stream_options: { include_usage: true }
   }
 
-  const tools = availableTools(chat, session)
+  const tools = availableTools(chat, session, history)
   if (cfg.nativeTools && tools.length) body.tools = toolDefinitions(tools)
 
   const params = cfg.params ?? {}

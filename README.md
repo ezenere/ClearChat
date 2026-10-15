@@ -93,6 +93,22 @@ npm run install:local -- --uninstall
   modelo quando falham; se o modelo do subagente falhar, o `delegate_task` devolve
   `[falha do modelo X: …] … Tente outro modelo`.
 
+- **Entre chats** — `get_chat_info` (id/título/sessão/modelo/raiz do próprio chat), `list_chats`
+  (outros chats com estado e "(este chat)") e `send_to_chat` (entrega uma mensagem a outro chat como
+  se o usuário a digitasse: inicia um turno ou entra na fila; com `wait_for_reply` devolve a resposta
+  final). No destino a mensagem aparece como "De: <chat>" (link para a origem). Recusa o próprio chat,
+  cadeias de mais de 3 saltos e ciclos de espera (A aguardando B enquanto B tenta aguardar A).
+- **`read_history`** — lê o histórico salvo da sessão, inclusive o que ficou antes de uma
+  compactação (busca por texto com `#seq`, ou faixa `from_seq`/`to_seq`). Com ela habilitada, a nota da
+  fronteira de compactação diz que o original (#X–#Y) pode ser consultado.
+- **Subagentes em segundo plano** — `delegate_task` com `background: true` retorna na hora; o
+  resultado chega depois como mensagem "Subagente X concluiu" (acorda o agente se ele estiver
+  ocioso). `check_subagents`, `wait_subagents`, `cancel_subagent` e `message_subagent` (falar com um
+  subagente próprio). Subagente com filhos pendentes dorme ("aguardando subagentes") até os resultados
+  chegarem. Sem limite de concorrência. Você também pode conversar direto com um subagente (composer
+  na subsessão); se ele já tinha concluído, a nova resposta volta ao pai como atualização. Parar na
+  principal não derruba os subagentes em segundo plano ("Parar todos os subagentes" no seletor de sessão).
+
 ## Mock de UI (sem backend)
 
 `VITE_CLEAR_MOCK=1 npx electron-vite build` gera um renderer com uma API falsa
@@ -106,6 +122,8 @@ Rode `npm run build` depois para voltar ao bundle normal.
 npm run test:unit   # buildRequest (+ fronteira de compactação), parser SSE/usage, <tool_call>, DuckDuckGo, assinatura de app,
                     # confinação de caminhos, janelas do read_file, bash (corte início/fim + cd persistente),
                     # search/find_files, list_models (filtro/ordem/formato/corte) e erro de delegate,
+                    # read_history (faixa/busca/corte), cabeçalho/saltos/ciclo de espera entre chats,
+                    # list_chats/get_chat_info, callbacks e posse de subagentes,
                     # detecção de contexto excedido (Node puro, sem Electron)
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
@@ -123,7 +141,7 @@ OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
 
 - O E2E da UI digita a key no onboarding e percorre: novo chat (combobox de modelo, system prompt,
   PWD), write/read de arquivo, aprovação de bash (Permitir / Negar / Sempre neste chat), fila (chip)
-  e ⚡, Parar, delegate_task + subsessão somente leitura, edição de modelo/system prompt/params com
+  e ⚡, Parar, delegate_task + subsessão (banner + composer próprio), edição de modelo/system prompt/params com
   conferência no "Ver request", modo texto (tools nativas off), assinatura de app none/cline nos
   headers, aba Arquivos ("Usar como PWD"), edição de provider, editar/apagar/regenerar, erro HTTP
   persistido, reinício do app, indicador global de aprovação de subagente e layout em 900x600 — e
@@ -133,7 +151,12 @@ OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
 - O E2E do backend cobre ainda: compactação ponta a ponta (resumo persistido, request a partir da
   fronteira, conversa coerente depois, Parar cancela sem salvar), compactação automática e
   "tentar de novo", compactação reaproveitando o cache (Haiku), aviso de arquivo grande,
-  `search_files`, `list_models` (query "gpt-4.1" + tools_only), `cd` persistente no bash e rejeição de caminho fora da raiz.
+  `search_files`, `list_models` (query "gpt-4.1" + tools_only), `cd` persistente no bash e rejeição de caminho fora da raiz,
+  `send_to_chat` com `wait_for_reply` (A pergunta a B e relata a resposta; mensagem `inter-chat` em B) e
+  recusa do próprio chat, `read_history` recuperando um detalhe anterior à compactação, subagentes em
+  segundo plano (2 em paralelo acordando a principal, `wait_subagents`, `cancel_subagent`, usuário
+  falando com subagente concluído → atualização no pai, `message_subagent` com espera, nível 1 dormindo
+  até o neto terminar).
   O diálogo nativo "Escolher pasta" é substituído no main para devolver a pasta de rascunho.
 - A key é lida **somente do ambiente** (nunca grave em arquivo). O E2E usa `CLEARCHAT_USER_DATA`
   e um cwd de rascunho dentro de `CLEARCHAT_E2E_DIR` (apagado no início), escolhe um modelo barato

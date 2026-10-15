@@ -40,7 +40,32 @@ export const LIMITS = {
   browseMaxLinks: 40,
 
   /** bash: fração do limite mantida do início (o resto vem do fim). */
-  bashHeadRatio: 0.4
+  bashHeadRatio: 0.4,
+
+  /** list_chats: padrão / máximo de chats listados. */
+  chatsDefaultResults: 30,
+  chatsMaxResults: 100,
+
+  /** send_to_chat: máximo de saltos de uma cadeia de mensagens entre chats. */
+  interChatMaxHops: 3,
+  /** send_to_chat (wait_for_reply): espera padrão / máxima, em segundos. */
+  interChatDefaultTimeoutS: 300,
+  interChatMaxTimeoutS: 3600,
+
+  /** read_history (faixa): padrão / máximo de mensagens. */
+  historyDefaultMessages: 40,
+  historyMaxMessages: 200,
+  /** read_history: corte de cada mensagem (exceto ao ler uma única mensagem). */
+  historyMsgChars: 2000,
+  /** read_history (busca): padrão / máximo de mensagens encontradas. */
+  historySearchDefault: 20,
+  historySearchMax: 100,
+  /** read_history (busca): caracteres de contexto ao redor de cada ocorrência. */
+  historySnippetChars: 220,
+
+  /** wait_subagents / message_subagent (wait_for_reply): espera padrão / máxima, em segundos. */
+  subagentWaitDefaultS: 600,
+  subagentWaitMaxS: 3600
 } as const
 
 /** Aproximação usada na UI: ~4 caracteres por token. */
