@@ -7,19 +7,19 @@ directories:
 artifactName: ClearChat-${version}-${arch}.${ext}
 compression: maximum
 files:
-  # Só o necessário em runtime: out/ (main/preload/renderer), resources/ e node_modules de produção.
-  - '!**/.vscode/*'
-  - '!{src,e2e,scripts,docs,build,dist,test-results,playwright-report}{,/**}'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!electron-builder.yml'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,.editorconfig,.gitignore,dev-app-update.yml,CHANGELOG.md,README.md,SPEC.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,package-lock.json}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  # Lista de inclusão: só o necessário em runtime — out/ (main/preload/renderer), resources/ e
+  # package.json. O electron-builder acrescenta sozinho os node_modules de produção. (Uma lista de
+  # exclusão deixava passar .git e .claude/worktrees, as cópias de trabalho dos agentes.)
+  - out/**
+  - resources/**
+  - package.json
   - '!**/*.{map,ts,tsx,md,markdown}'
   - '!**/{test,tests,__tests__,example,examples,docs,.github}{,/**}'
   - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
   # headers de compilação (o better-sqlite3 usa os binários de prebuilds/)
   - '!node_modules/node-addon-api{,/**}'
+  # Fica aqui (e não em linux.files): um `files` por plataforma substitui esta lista inteira.
+  - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
 asarUnpack:
   - resources/**
   - node_modules/better-sqlite3/**
@@ -31,8 +31,6 @@ electronLanguages:
 
 linux:
   executableName: clearchat
-  files:
-    - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
   # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
   # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
   syncDesktopName: true
