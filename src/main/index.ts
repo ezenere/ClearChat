@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, nativeTheme } from 'electron'
+import { app, shell, BrowserWindow, nativeTheme, protocol } from 'electron'
 import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -7,6 +7,15 @@ import { registerIpc } from './ipc'
 import { registerEventWindow } from './events'
 import { initRunner, shutdownRunner } from './agent/runner'
 import { migrateLegacyData } from './migrate'
+import { ATTACHMENT_SCHEME, parseAttachmentUrl } from '@shared/attachments'
+import {
+  attachmentsDir,
+  gcAttachments,
+  mimeForFile,
+  readAttachment,
+  referencedFilesInDb,
+  setAttachmentsDir
+} from './attachments'
 
 const APP_NAME = 'ClearChat'
 const APP_ID = 'com.clearchat.app'
@@ -20,6 +29,11 @@ const isolatedUserData = process.env['CLEARCHAT_USER_DATA']
 if (isolatedUserData) {
   app.setPath('userData', resolve(isolatedUserData))
 }
+
+// clearchat-attachment://<sha256>.<ext> → arquivo do store de anexos (miniaturas no renderer).
+protocol.registerSchemesAsPrivileged([
+  { scheme: ATTACHMENT_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } }
+])
 
 const THEME_BG = '#0b0b0f'
 
@@ -82,6 +96,26 @@ app.whenReady().then(() => {
 
   getDb()
   console.log(`[clearchat] db: ${getDbPath()}`)
+
+  // Anexos: store content-addressed + GC de arquivos que nenhuma mensagem referencia.
+  setAttachmentsDir(join(app.getPath('userData'), 'attachments'))
+  try {
+    const gc = gcAttachments(attachmentsDir(), referencedFilesInDb(getDb()))
+    if (gc.deleted.length) console.log(`[clearchat] anexos órfãos apagados: ${gc.deleted.length}`)
+  } catch (e) {
+    console.error('[clearchat] gc de anexos', e)
+  }
+  protocol.handle(ATTACHMENT_SCHEME, (req) => {
+    const file = parseAttachmentUrl(req.url.replace(/\/+$/, ''))
+    if (!file) return new Response('bad request', { status: 400 })
+    try {
+      return new Response(new Uint8Array(readAttachment(file)), {
+        headers: { 'content-type': mimeForFile(file), 'cache-control': 'max-age=31536000' }
+      })
+    } catch {
+      return new Response('not found', { status: 404 })
+    }
+  })
 
   initRunner()
   registerIpc()

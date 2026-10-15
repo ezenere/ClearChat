@@ -6,6 +6,7 @@ import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSi
 import { TOOL_DEFINITIONS, TOOL_NAMES, type ToolDefinition } from '@shared/tools'
 import { activeHistory } from '@shared/context'
 import { bwrapAvailable } from '../tools/bash'
+import { expandAttachments } from '../attachments'
 import type {
   ApiMessage,
   Chat,
@@ -177,24 +178,26 @@ export type WireMessage =
   | { role: 'assistant'; content: ContentPart[]; tool_calls?: ToolCall[]; reasoning?: string }
   | { role: 'tool'; tool_call_id: string; content: ContentPart[] }
 
-/** Marca o último text part de uma mensagem com cache_control (na CÓPIA). */
+/**
+ * Marca o último text part de uma mensagem com cache_control (na CÓPIA). Mensagem só com anexos
+ * (sem text part): marca o último part (imagem/arquivo/áudio) — aceito via OpenRouter por
+ * Anthropic, OpenAI e Gemini (verificado empiricamente).
+ */
 function withCacheControl(content: string | ContentPart[]): ContentPart[] {
   const parts: ContentPart[] =
     typeof content === 'string' ? [{ type: 'text', text: content }] : content.map((p) => ({ ...p }))
-  for (let i = parts.length - 1; i >= 0; i--) {
-    if (parts[i].type === 'text') {
-      parts[i] = { ...parts[i], cache_control: { type: 'ephemeral' } }
-      break
-    }
-  }
+  let i = parts.length - 1
+  while (i >= 0 && parts[i].type !== 'text') i--
+  if (i < 0) i = parts.length - 1
+  if (i >= 0) parts[i] = { ...parts[i], cache_control: { type: 'ephemeral' } }
   return parts
 }
 
-/** Cópia da mensagem com breakpoint de cache; null se não houver texto onde marcar. */
+/** Cópia da mensagem com breakpoint de cache; null se não houver onde marcar (conteúdo vazio). */
 function markMessage(m: ApiMessage): WireMessage | null {
   const c = m.content
   if (c == null || (typeof c === 'string' && c === '')) return null
-  if (Array.isArray(c) && !c.some((p) => p.type === 'text')) return null
+  if (Array.isArray(c) && !c.length) return null
   return { ...m, content: withCacheControl(c) } as WireMessage
 }
 
@@ -282,7 +285,9 @@ export function buildRequest(
   if (sys) messages.push({ role: 'system', content: sys })
   messages.push(...hist)
 
-  const wire: WireMessage[] = cfg.cacheEnabled ? applyCacheBreakpoints(messages) : messages
+  // Anexos: referências clearchat-attachment:// → base64 e `_attachment` removido (só na cópia).
+  const sent = expandAttachments(messages)
+  const wire: WireMessage[] = cfg.cacheEnabled ? applyCacheBreakpoints(sent) : sent
 
   const body: Record<string, unknown> = {
     model: session.model,

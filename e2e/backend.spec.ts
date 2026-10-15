@@ -14,8 +14,10 @@ import { _electron as electron, type ElectronApplication, type Page } from 'play
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
   createWriteStream
 } from 'node:fs'
@@ -184,6 +186,57 @@ async function test(name: string, fn: () => Promise<string | void>): Promise<voi
     results.push({ name, ok: false, info: (e as Error).message, ms: Date.now() - t0 })
     console.log(`✖ ${name} — ${(e as Error).message}`)
   }
+}
+
+/** PDF mínimo (uma página, Helvetica) com o texto dado. */
+function makePdf(text: string): number[] {
+  const esc = text.replace(/[\\()]/g, (c) => '\\' + c)
+  const stream = `BT /F1 24 Tf 72 700 Td (${esc}) Tj ET`
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`,
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+  ]
+  let out = '%PDF-1.4\n'
+  const offs: number[] = []
+  objs.forEach((o, i) => {
+    offs.push(out.length)
+    out += `${i + 1} 0 obj\n${o}\nendobj\n`
+  })
+  const xref = out.length
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`
+  for (const o of offs) out += `${String(o).padStart(10, '0')} 00000 n \n`
+  out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return Array.from(Buffer.from(out, 'latin1'))
+}
+
+/** WAV PCM 16-bit mono 16 kHz: bipes de 0,5 s separados por 0,5 s de silêncio (3 s → 3 bipes). */
+function makeWav(freq: number, seconds: number): number[] {
+  const rate = 16000
+  const n = Math.floor(rate * seconds)
+  const b = Buffer.alloc(44 + n * 2)
+  b.write('RIFF', 0)
+  b.writeUInt32LE(36 + n * 2, 4)
+  b.write('WAVEfmt ', 8)
+  b.writeUInt32LE(16, 16)
+  b.writeUInt16LE(1, 20)
+  b.writeUInt16LE(1, 22)
+  b.writeUInt32LE(rate, 24)
+  b.writeUInt32LE(rate * 2, 28)
+  b.writeUInt16LE(2, 32)
+  b.writeUInt16LE(16, 34)
+  b.write('data', 36)
+  b.writeUInt32LE(n * 2, 40)
+  for (let i = 0; i < n; i++)
+    b.writeInt16LE(
+      Math.floor(i / (rate / 2)) % 2 === 0
+        ? Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 12000)
+        : 0,
+      44 + i * 2
+    )
+  return Array.from(b)
 }
 
 // ---------------- testes ----------------
@@ -1240,6 +1293,411 @@ async function main(): Promise<void> {
     assert(rf && rf.meta.toolStatus === 'error', 'read_file com erro')
     assert(/fora do diretório raiz/.test(rf.message.content), `confinação: ${rf.message.content}`)
     return `bash calls=${bashes.length}; ${rf.message.content.slice(0, 80)}`
+  })
+
+  // ---------------- anexos ----------------
+  const VISION_MODEL = process.env.E2E_VISION_MODEL || 'openai/gpt-4.1-nano'
+  const AUDIO_MODEL = process.env.E2E_AUDIO_MODEL || 'google/gemini-3.1-flash-lite'
+  const STORE = join(USER_DATA, 'attachments')
+
+  await test('anexo: imagem (PNG gerado) → modelo de visão descreve', async () => {
+    // PNG gerado num canvas do renderer: quadrado vermelho com o texto "CC42" em branco
+    const png = await page.evaluate(async () => {
+      const c = document.createElement('canvas')
+      c.width = 320
+      c.height = 320
+      const g = c.getContext('2d')!
+      g.fillStyle = '#e00000'
+      g.fillRect(0, 0, 320, 320)
+      g.fillStyle = '#ffffff'
+      g.font = 'bold 110px sans-serif'
+      g.textAlign = 'center'
+      g.textBaseline = 'middle'
+      g.fillText('CC42', 160, 165)
+      const blob: Blob = await new Promise((r) => c.toBlob((b) => r(b!), 'image/png'))
+      return Array.from(new Uint8Array(await blob.arrayBuffer()))
+    })
+    const att = await page.evaluate(
+      (bytes) =>
+        (window as any).api.attachments.add({
+          name: 'quadrado.png',
+          mime: 'image/png',
+          data: new Uint8Array(bytes)
+        }),
+      png
+    )
+    assert(
+      att.kind === 'image' && /^[0-9a-f]{64}\.png$/.test(att.file),
+      `add: ${JSON.stringify(att)}`
+    )
+    assert(existsSync(join(STORE, att.file)), 'arquivo no store')
+    // o protocolo clearchat-attachment:// serve a miniatura ao renderer
+    const served = await page.evaluate(
+      (f) =>
+        new Promise<string>((res) => {
+          const im = new Image()
+          im.onload = () => res(`${im.naturalWidth}x${im.naturalHeight}`)
+          im.onerror = () => res('erro')
+          im.src = `clearchat-attachment://${f}`
+        }),
+      att.file
+    )
+    assert(served === '320x320', `protocolo: ${served}`)
+    const models = await api<any[]>('providers.listModels', providerId)
+    const vm = models.find((m) => m.id === VISION_MODEL)
+    assert(
+      vm?.inputModalities?.includes('image'),
+      `inputModalities: ${JSON.stringify(vm?.inputModalities)}`
+    )
+    const { chat, sid: si } = await newChat({ model: VISION_MODEL, enabledTools: [] })
+    await api(
+      'agent.send',
+      si,
+      'What is the background color of this image and what text is written on it? Reply exactly as: <color>; <text>',
+      [att]
+    )
+    await waitIdle(chat.id, si)
+    const msgs = await messages(si)
+    addCost(msgs)
+    const u = msgs[0].message
+    assert(Array.isArray(u.content) && u.content.length === 2, 'content em parts')
+    assert(
+      u.content[0].type === 'image_url' &&
+        u.content[0].image_url.url === `clearchat-attachment://${att.file}` &&
+        u.content[0]._attachment?.name === 'quadrado.png',
+      `part persistido: ${JSON.stringify(u.content[0])}`
+    )
+    assert(u.content[1].type === 'text', 'texto por último')
+    assert(JSON.stringify(u).length < 1500, 'sem base64 no banco')
+    const answer = msgs.at(-1).message.content ?? ''
+    assert(
+      /red|vermelh|#?f{2}0{4}\b/i.test(answer) && /CC\s*-?\s*42/i.test(answer),
+      `resposta: ${answer}`
+    )
+    // preview: base64 encurtado + nota; a request real leva o arquivo inteiro
+    const pr = await api('agent.previewRequest', si)
+    const img = pr.body.messages.find((m: any) => m.role === 'user').content[0]
+    assert(
+      /^data:image\/png;base64,[A-Za-z0-9+/]{24}…\(\d/.test(img.image_url.url),
+      `preview: ${img.image_url.url}`
+    )
+    assert(!JSON.stringify(pr.body).includes('_attachment'), '_attachment no preview')
+    assert(pr.notes?.length === 1, 'nota do preview')
+    report.attachmentImage = answer
+    return `${VISION_MODEL}: "${answer.trim()}" · ${png.length} bytes`
+  })
+
+  await test('anexo: texto + PDF → conteúdo entendido', async () => {
+    const txt = await api('attachments.add', {
+      name: 'config.yaml',
+      data: new Uint8Array(Buffer.from('service: billing\nsecret_code: ZEBRA-7731\n'))
+    })
+    assert(txt.kind === 'text', `texto: ${txt.kind}`)
+    const pdf = await api('attachments.add', {
+      name: 'memo.pdf',
+      data: new Uint8Array(makePdf('The meeting password is PAPAYA.'))
+    })
+    assert(pdf.kind === 'pdf' && pdf.mime === 'application/pdf', `pdf: ${JSON.stringify(pdf)}`)
+    const { chat, sid: st } = await newChat({ model: VISION_MODEL, enabledTools: [] })
+    await api(
+      'agent.send',
+      st,
+      'From the attached files: what is the secret_code in the YAML and the meeting password in the PDF? Reply exactly as: <code>; <password>',
+      [txt, pdf]
+    )
+    await waitIdle(chat.id, st)
+    const msgs = await messages(st)
+    addCost(msgs)
+    const parts = msgs[0].message.content
+    assert(
+      parts[0].type === 'text' && parts[0].text.startsWith('<file name="config.yaml">\n'),
+      'arquivo de texto inline'
+    )
+    assert(
+      parts[1].type === 'file' && parts[1].file.file_data === `clearchat-attachment://${pdf.file}`,
+      'pdf por referência'
+    )
+    const answer = msgs.at(-1).message.content ?? ''
+    assert(
+      /ZEBRA-7731/.test(answer) && /PAPAYA/i.test(answer),
+      `resposta: ${answer} ${msgs.at(-1).meta.error ?? ''}`
+    )
+    return `"${answer.trim()}"`
+  })
+
+  await test('anexo: áudio (wav) → input_audio', async () => {
+    const models = await api<any[]>('providers.listModels', providerId)
+    if (!models.some((m) => m.id === AUDIO_MODEL && m.inputModalities?.includes('audio')))
+      return `pulado: ${AUDIO_MODEL} sem áudio`
+    const wav = await api('attachments.add', {
+      name: 'tom.wav',
+      data: new Uint8Array(makeWav(880, 3))
+    })
+    assert(wav.kind === 'audio' && wav.mime === 'audio/wav', `wav: ${JSON.stringify(wav)}`)
+    const { chat, sid: sa } = await newChat({ model: AUDIO_MODEL, enabledTools: [] })
+    await api(
+      'agent.send',
+      sa,
+      'Listen to the attached audio. How many separate beeps do you hear? Answer with just the number.',
+      [wav]
+    )
+    await waitIdle(chat.id, sa)
+    const msgs = await messages(sa)
+    addCost(msgs)
+    const pr = await api('agent.previewRequest', sa)
+    const part = pr.body.messages.find((m: any) => m.role === 'user').content[0]
+    assert(
+      part.type === 'input_audio' && part.input_audio.format === 'wav',
+      `part: ${JSON.stringify(part)}`
+    )
+    const answer = msgs.at(-1).message.content ?? ''
+    assert(msgs.at(-1).meta.kind !== 'error', `erro: ${answer}`)
+    // o modelo ouviu o áudio (conta bipes; modelos baratos às vezes erram a contagem exata: 3)
+    assert(/^\s*[1-6]\b|three|três|two|four/i.test(answer), `resposta: ${answer}`)
+    return `${AUDIO_MODEL}: "${answer.trim()}"`
+  })
+
+  await test('anexo: prefixo com imagem + arquivo é cacheado (haiku)', async () => {
+    const models = await api<any[]>('providers.listModels', providerId)
+    const cacheModel =
+      process.env.E2E_CACHE_MODEL ||
+      ['anthropic/claude-haiku-4.5', 'anthropic/claude-3.5-haiku'].find((id) =>
+        models.some((m) => m.id === id && m.inputModalities?.includes('image'))
+      )
+    if (!cacheModel) return 'pulado: nenhum haiku com imagem'
+    // arquivo de texto grande (> mínimo cacheável) + imagem: o 2º turno deve ler o 1º do cache
+    const doc = Array.from(
+      { length: 300 },
+      (_, i) =>
+        `Linha ${i + 1}: o item ${i + 1} custa ${(i * 7) % 97} reais e pesa ${(i * 13) % 50} kg.`
+    ).join('\n')
+    const txt = await api('attachments.add', {
+      name: 'tabela.txt',
+      data: new Uint8Array(Buffer.from(doc))
+    })
+    const png = await page.evaluate(async () => {
+      const c = document.createElement('canvas')
+      c.width = 200
+      c.height = 200
+      const g = c.getContext('2d')!
+      g.fillStyle = '#0050e0'
+      g.fillRect(0, 0, 200, 200)
+      const blob: Blob = await new Promise((r) => c.toBlob((b) => r(b!), 'image/png'))
+      return Array.from(new Uint8Array(await blob.arrayBuffer()))
+    })
+    const img = await api('attachments.add', {
+      name: 'azul.png',
+      data: new Uint8Array(png)
+    })
+    const { chat, sid: sc } = await newChat({ model: cacheModel, enabledTools: [] })
+    const turns: any[] = []
+    for (const [q, atts] of [
+      ['Quanto custa o item 42 da tabela e qual a cor da imagem? Responda curto.', [txt, img]],
+      ['Responda apenas: ok', []]
+    ] as const) {
+      await api('agent.send', sc, q, atts)
+      await waitIdle(chat.id, sc)
+      const msgs = await messages(sc)
+      assert(msgs.at(-1).meta.kind !== 'error', `erro: ${msgs.at(-1).message.content}`)
+      turns.push(msgs.at(-1).meta.usage)
+    }
+    addCost(await messages(sc))
+    const first = (await messages(sc)).find((m) => m.message.role === 'assistant')
+    assert(/azul|blue/i.test(first.message.content ?? ''), `resposta: ${first.message.content}`)
+    report.attachmentCaching = { model: cacheModel, turns }
+    assert((turns[1].cachedTokens ?? 0) > 3000, `sem cache no 2º turno: ${JSON.stringify(turns)}`)
+    return turns
+      .map(
+        (u, i) =>
+          `t${i + 1}: in=${u.promptTokens} cached=${u.cachedTokens ?? '-'} write=${u.cacheWriteTokens ?? '-'}`
+      )
+      .join(' · ')
+  })
+
+  await test('anexo na fila (drenado) e com ⚡ (forceSend)', async () => {
+    const { chat, sid: sq } = await newChat({
+      model: VISION_MODEL,
+      enabledTools: ['bash'],
+      autoApprove: ['bash']
+    })
+    const t1 = await api('attachments.add', {
+      name: 'a.txt',
+      data: new Uint8Array(Buffer.from('codeword: MANGO-11\n'))
+    })
+    const t2 = await api('attachments.add', {
+      name: 'b.txt',
+      data: new Uint8Array(Buffer.from('codeword: KIWI-22\n'))
+    })
+    const bashRunning = (): Promise<any> =>
+      waitFor(
+        async () =>
+          (await events()).find(
+            (e) => e.type === 'tool-running' && e.running && e.sessionId === sq
+          ),
+        60_000,
+        'bash rodando'
+      )
+    // 1) fila drenada no próximo passo
+    await clearEvents()
+    await api(
+      'agent.send',
+      sq,
+      'Use the bash tool to run exactly: sleep 3; echo done-1. Then say ok.'
+    )
+    await bashRunning()
+    const q = await api(
+      'agent.send',
+      sq,
+      'What is the codeword in the attached file? Reply with it only.',
+      [t1]
+    )
+    assert(q.queued === true, 'enfileirado')
+    const [item] = await api<any[]>('agent.getQueue', sq)
+    assert(item?.attachments?.[0]?.file === t1.file, `fila carrega anexo: ${JSON.stringify(item)}`)
+    await waitIdle(chat.id, sq)
+    let msgs = await messages(sq)
+    assertPairing(msgs)
+    const qm = msgs.find((m) => m.meta.kind === 'queued')
+    assert(
+      qm &&
+        Array.isArray(qm.message.content) &&
+        qm.message.content[0]._attachment?.name === 'a.txt',
+      'queued com anexo'
+    )
+    assert(
+      msgs
+        .slice(msgs.indexOf(qm))
+        .some((m) => m.message.role === 'assistant' && /MANGO-11/.test(m.message.content ?? '')),
+      'resposta à fila'
+    )
+    // 2) ⚡ durante a tool
+    await clearEvents()
+    await api(
+      'agent.send',
+      sq,
+      'Use the bash tool to run exactly: sleep 30; echo late. Then say ok.'
+    )
+    await bashRunning()
+    await api(
+      'agent.send',
+      sq,
+      'Forget that. What is the codeword in the attached file? Reply with it only.',
+      [t2]
+    )
+    const [f] = await api<any[]>('agent.getQueue', sq)
+    assert(f?.attachments?.length === 1, 'item ⚡ com anexo')
+    await api('agent.forceSend', f.id)
+    await waitIdle(chat.id, sq)
+    msgs = await messages(sq)
+    addCost(msgs)
+    assertPairing(msgs)
+    const fm = msgs.find((m) => m.meta.kind === 'forced')
+    assert(fm && fm.message.content[0]._attachment?.name === 'b.txt', 'forced com anexo')
+    const last = msgs.at(-1).message.content ?? ''
+    assert(/KIWI-22/.test(last), `resposta ⚡: ${last}`)
+    return `fila: ok · ⚡: "${last.trim()}"`
+  })
+
+  await test('anexo: erros legíveis + edição preserva + arquivo ausente', async () => {
+    const err = async (fn: () => Promise<unknown>): Promise<string> => {
+      try {
+        await fn()
+        return ''
+      } catch (e) {
+        return (e as Error).message
+      }
+    }
+    const zip = await err(() =>
+      api('attachments.add', {
+        name: 'x.zip',
+        mime: 'application/zip',
+        data: new Uint8Array([80, 75, 3, 4])
+      })
+    )
+    assert(/Tipo não suportado: "x.zip"/.test(zip), `zip: ${zip}`)
+    const big = await page.evaluate(async () => {
+      try {
+        await (window as any).api.attachments.add({
+          name: 'g.png',
+          data: new Uint8Array(20 * 1024 * 1024 + 1)
+        })
+        return ''
+      } catch (e) {
+        return (e as Error).message
+      }
+    })
+    assert(/limite por arquivo é 20\.0 MB/.test(big), `grande: ${big}`)
+    const { chat, sid: se } = await newChat({ enabledTools: [] })
+    const fakeFile = 'f'.repeat(64) + '.png'
+    const fake = await err(() =>
+      api('agent.send', se, 'oi', [
+        {
+          file: fakeFile,
+          name: 'x.png',
+          kind: 'image',
+          mime: 'image/png',
+          size: 1,
+          sha256: 'f'.repeat(64)
+        }
+      ])
+    )
+    assert(/não encontrado no disco/.test(fake), `fake: ${fake}`)
+    // edição via messages.update mantém o part do anexo (provider inexistente: o modelo não roda)
+    const img = await api('attachments.add', {
+      name: 'unico.png',
+      data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 9, 8, 7, 6, 5])
+    })
+    await api('chats.update', chat.id, { config: { providerId: 'inexistente' } })
+    await api('agent.send', se, 'texto original', [img])
+    await waitIdle(chat.id, se)
+    const u = (await messages(se)).find((m) => m.message.role === 'user')
+    assert(u && Array.isArray(u.message.content), 'msg com anexo salva')
+    const edited = {
+      ...u.message,
+      content: [u.message.content[0], { type: 'text', text: 'texto editado' }]
+    }
+    const up = await api('messages.update', u.id, edited)
+    assert(
+      up.message.content[0]._attachment?.name === 'unico.png' &&
+        up.message.content[1].text === 'texto editado',
+      'edição preserva anexo'
+    )
+    await api('chats.update', chat.id, { config: { providerId } })
+    // arquivo some do disco → preview/request com erro legível (sem crash)
+    rmSync(join(STORE, img.file))
+    const missing = await err(() => api('agent.previewRequest', se))
+    assert(/Anexo não encontrado no disco: "unico.png"/.test(missing), `ausente: ${missing}`)
+    await api('chats.delete', chat.id)
+    const clean = (t: string): string => t.replace(/^.*Error: /, '').slice(0, 60)
+    return `${clean(zip)}… · ${clean(missing)}…`
+  })
+
+  await test('anexo: GC no reinício apaga órfãos antigos, mantém referenciados', async () => {
+    const orphan = join(STORE, 'e'.repeat(64) + '.png')
+    writeFileSync(orphan, 'x')
+    const old = new Date(Date.now() - 2 * 3600_000)
+    const before = readdirSync(STORE).filter((f) => /^[0-9a-f]{64}\.[a-z0-9]+$/.test(f))
+    for (const f of before) utimesSync(join(STORE, f), old, old)
+    // anexos referenciados por alguma mensagem (antes do reinício)
+    const all = await Promise.all(
+      (await api<any[]>('chats.list')).map(async (c) =>
+        Promise.all((await api<any[]>('sessions.list', c.id)).map((s) => messages(s.id)))
+      )
+    )
+    const json = JSON.stringify(all)
+    const refd = before.filter((f) => json.includes(`clearchat-attachment://${f}`))
+    assert(refd.length >= 3, `referenciados: ${refd.length}`)
+    await app.close()
+    await launch()
+    const left = readdirSync(STORE)
+    assert(!existsSync(orphan), 'órfão apagado')
+    for (const f of refd) assert(left.includes(f), `referenciado mantido: ${f}`)
+    const gone = before.filter((f) => !left.includes(f))
+    assert(
+      gone.every((f) => !json.includes(`clearchat-attachment://${f}`)),
+      `apagou referenciado: ${gone.join(',')}`
+    )
+    return `referenciados mantidos: ${refd.length}; órfãos apagados: ${gone.length}`
   })
 
   await test('fs.*', async () => {

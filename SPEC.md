@@ -36,7 +36,8 @@ IDs: `crypto.randomUUID()`. Timestamps: `Date.now()`. Deletar chat apaga session
 
 ```ts
 export interface Provider { id: string; name: string; baseUrl: string; apiKey: string; headers: Record<string,string>; createdAt: number }
-export interface ModelInfo { id: string; name?: string; contextLength?: number; promptPrice?: number; completionPrice?: number; supportsTools?: boolean }
+export interface ModelInfo { id: string; name?: string; contextLength?: number; promptPrice?: number; completionPrice?: number; supportsTools?: boolean
+  inputModalities?: string[] }          // OpenRouter architecture.input_modalities (text, image, file, audio, video); ausente = desconhecido
 
 export interface ChatParams {           // só campos definidos (≠ undefined/null) vão para a request
   temperature?: number; top_p?: number; top_k?: number; max_tokens?: number
@@ -78,7 +79,13 @@ export interface Session { id: string; chatId: string; parentSessionId: string |
   depth: 0 | 1 | 2; model: string; title: string; task: string | null; status: SessionStatus; createdAt: number }
 
 // Formato OpenAI exato — é o que é persistido e reenviado byte-a-byte (essencial para token caching)
-export type ContentPart = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
+export type ContentPart =               // todos aceitam cache_control?: { type: 'ephemeral' } e _attachment?: AttachmentMeta (privado, nunca enviado)
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }                     // persistido: url = clearchat-attachment://<sha256>.<ext>
+  | { type: 'file'; file: { filename: string; file_data: string } }      // PDF (idem)
+  | { type: 'input_audio'; input_audio: { data: string; format: string } } // wav/mp3 (idem)
+export interface AttachmentMeta { name: string; mime: string; size: number; kind: 'image' | 'pdf' | 'audio' | 'text'; file: string; truncated?: boolean }
+export interface AttachmentInfo extends AttachmentMeta { sha256: string }   // anexo salvo no store (attachments.pick/add → agent.send)
 export interface ToolCall { id: string; type: 'function'; function: { name: string; arguments: string } }
 export type ApiMessage =
   | { role: 'system'; content: string | ContentPart[] }
@@ -103,7 +110,7 @@ export interface MessageMeta {
 }
 export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number }
 
-export interface QueuedMessage { id: string; sessionId: string; text: string; createdAt: number }
+export interface QueuedMessage { id: string; sessionId: string; text: string; createdAt: number; attachments?: AttachmentInfo[] }
 export interface ApprovalRequest { id: string; chatId: string; sessionId: string; toolCallId: string; toolName: ToolName; args: unknown; createdAt: number }
 export interface StreamDraft { content: string; reasoning: string; toolCalls: { id: string; name: string; arguments: string }[] }
 export interface DirEntry { name: string; path: string; isDir: boolean; size: number; mtime: number }
@@ -137,7 +144,7 @@ interface ClearApi {
   sessions:  { list(chatId): Session[]; messages(sessionId): StoredMessage[] }
   messages:  { update(id, message: ApiMessage): StoredMessage; delete(id): void }   // edição livre do histórico
   agent: {
-    send(sessionId, text): { queued: boolean }   // só sessão depth 0. idle → inicia turno; running → enfileira
+    send(sessionId, text, attachments?: AttachmentInfo[]): { queued: boolean }   // só sessão depth 0. idle → inicia turno; running → enfileira (com os anexos)
     forceSend(queuedId): void                   // ⚡: aborta o que está rodando e injeta a mensagem já
     removeQueued(queuedId): void
     getQueue(sessionId): QueuedMessage[]
@@ -145,7 +152,7 @@ interface ClearApi {
     regenerate(sessionId): void                  // remove mensagens após a última msg do usuário e roda de novo
     approve(requestId, decision: 'allow' | 'deny' | 'always'): void   // 'always' adiciona a chat.config.autoApprove
     pendingApprovals(): ApprovalRequest[]
-    previewRequest(sessionId): { url: string; headers: Record<string,string>; body: unknown }  // request EXATA da próxima chamada (apiKey mascarada)
+    previewRequest(sessionId): { url: string; headers: Record<string,string>; body: unknown; notes?: string[] }  // request EXATA da próxima chamada (apiKey mascarada; base64 de anexos encurtado + nota)
     runningSessions(): string[]
     compact(sessionId, opts?: { retry?: boolean }): { scheduled: boolean }  // só depth 0; ociosa → já; rodando → próximo limite de passo
   }
@@ -154,6 +161,8 @@ interface ClearApi {
   app: { capabilities(): { bwrap: boolean; ripgrep: boolean } }
   presets: { list(): Preset[]; create(input: PresetInput): Preset; update(id, patch: Partial<PresetInput>): Preset   // patch.config SUBSTITUI a config
              delete(id): void; duplicate(id): Preset }   // PresetInput = { name; description?; icon?; config: Partial<ChatConfig> }
+  attachments: { pick(): { items: AttachmentInfo[]; errors: string[] }        // diálogo nativo (multi); o main lê e salva no store
+                 add(input: { name; mime?; data: Uint8Array }): AttachmentInfo } // arrastar/colar: bytes do renderer → store (erro legível se grande/não suportado)
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
@@ -294,3 +303,25 @@ Estética: escura, elegante, minimalista (referência: Linear / Claude desktop /
 - **Cercas aninhadas** (`lib/fences.ts`, `normalizeFences`): um bloco cercado que contém outros com a mesma cerca (README em ` ```markdown ` com ` ```python ` dentro) tem a cerca **externa** (abertura + fechamento) reescrita com mais crases/tis que a maior interna, então o remark vê um bloco só; o rótulo é a linguagem externa e "Copiar" copia o conteúdo com as cercas internas intactas. Dentro de um bloco (caractere C, comprimento L) só cercas de C com ≥ L são estruturais: com info string abrem nível, nuas fecham o nível mais interno; uma nua na profundidade 0 é candidata a fechar o externo. Entre as leituras possíveis (fechar na 1ª, 2ª… candidata ou não fechar — streaming) vence a de menor penalidade: cerca nua que abre seguida de linha em branco, que fecha seguida de texto colado, bloco vazio (abre+fecha coladas), abre colada após um fechamento, e mensagem terminando com cerca aberta (1,5). O resto da mensagem é avaliado junto (programação dinâmica sobre as linhas-cerca). Empate → a mais cedo (CommonMark); se a externa é `markdown`/`md`/`mdx`, a mais tarde. Cercas de 4+ que já englobam as internas, `~~~`, listas indentadas e CRLF são respeitados; citações (`> ```) não são tratadas.
 - **Delimitadores de LaTeX** (`lib/math.ts`, `normalizeMath`), fora de blocos de código, código inline, blocos `$$` e escapes: `\[…\]` → `$$…$$` (em linhas próprias vira bloco de display com a indentação preservada; no meio da frase, inline) e `\(…\)` → `$…$`. `$…$` com um cifrão continua ligado (muitos modelos usam), mas só vale o par na regra do Pandoc — abertura com não-espaço à direita, fechamento com não-espaço à esquerda e sem dígito logo depois, na mesma linha; qualquer outro `$` vira `\$` (texto): "custa $5 e $10", "R$ 50" ficam texto. Streaming: `\[` sem fechamento no fim vira `$$` (a fórmula aparece aos poucos), `$$` aberto já vai até o fim, `$` sem par fica texto.
 - KaTeX: `throwOnError:false` (via rehype-katex) com `errorColor` vermelho suave — TeX inválido mostra o fonte cru, nunca derruba a mensagem; durante o streaming o erro fica cinza (a fórmula final quase sempre está incompleta). Display rola na horizontal se for larga; cor herdada do texto. CSS em `components/chat/markdown-math.css` + `katex/dist/katex.min.css`; as fontes do KaTeX são empacotadas pelo Vite em `out/renderer/assets` (carregadas via `font-src 'self'`, sem rede). **`katex` fica em `^0.16`, a mesma versão que o rehype-katex usa** — a 0.19 renomeou classes (`sizing` → `katex-sizing`) e o CSS deixaria de casar com o HTML gerado (subscritos em tamanho cheio).
+
+## Anexos (`src/shared/attachments.ts`, `src/main/attachments.ts`)
+
+Enviar arquivos aos modelos que os aceitam — imagens, PDF, áudio e arquivos de texto/código.
+
+- **Entrada (composer)**: botão 📎 "Anexar arquivos" (diálogo nativo via `attachments.pick`; o main lê os caminhos), **arrastar** arquivos para qualquer ponto do chat (overlay "Solte para anexar") e **colar** imagens (`attachments.add` com os bytes; imagem colada vira `colado-HHMMSS.png`). Cada arquivo vai na hora para o store e vira um chip acima do textarea (miniatura para imagens, ícone + nome + tamanho para os demais, X remove, (i) explica o envio). Pode enviar só anexos (texto vazio).
+- **Limites** (`ATTACHMENT_LIMITS` em `src/shared/limits.ts`): 20 MB por arquivo, 10 anexos e 50 MB por mensagem, 200.000 caracteres por arquivo de texto (o resto é cortado com `[… arquivo cortado: mostrando N de M caracteres]`). Erros legíveis em pt-BR (tamanho, tipo não suportado, arquivo vazio).
+- **Tipos** (`classifyAttachment`, por extensão/mime): imagem `png/jpg/webp/gif`; PDF; áudio `wav/mp3`; texto = extensões/mimes de texto e código, ou qualquer arquivo desconhecido que seja UTF-8 válido sem NUL. Outros binários (zip, docx, vídeo, bmp…) → "Tipo não suportado".
+- **Capacidades**: `ModelInfo.inputModalities` vem de `architecture.input_modalities` do `/models`. Imagem exige `image`, PDF `file`, áudio `audio`; texto funciona com qualquer modelo. Sem a modalidade → aviso inline "Este modelo não aceita imagens" (modalidades desconhecidas, ex.: provider não-OpenRouter → "Não sei se este modelo aceita…", assume só texto); Enter não envia — só o botão **"Enviar mesmo assim"** (confirmação explícita). PDF no OpenRouter num modelo sem `file`: sem aviso — o OpenRouter extrai o texto do PDF (plugin file-parser) para qualquer modelo; o (i) do chip explica.
+- **Codificação** (OpenAI-compatible / OpenRouter), um part por anexo, **anexos antes do texto** (`content: [...anexos, { type: 'text', text }]`; Anthropic recomenda imagens antes do texto, e o breakpoint de cache no último text part cobre a mensagem inteira):
+  - imagem → `{ type: 'image_url', image_url: { url: 'data:<mime>;base64,…' } }`
+  - PDF → `{ type: 'file', file: { filename, file_data: 'data:application/pdf;base64,…' } }`
+  - áudio → `{ type: 'input_audio', input_audio: { data: '<base64>', format: 'wav' | 'mp3' } }`
+  - texto → `{ type: 'text', text: '<file name="…">\n…\n</file>' }` (nome com `& " < >` escapados)
+- **Persistência / caching**: o `message_json` nunca guarda base64. Os bytes ficam em `userData/attachments/<sha256>.<ext>` (content-addressed: mesmo arquivo = mesmo nome, dedup; escrita atômica tmp + rename). O part persistido é o formato do fio com uma referência no lugar do base64 — `{ type: 'image_url', image_url: { url: 'clearchat-attachment://<sha256>.png' }, _attachment: { name, mime, size, kind, file } }` (idem `file.file_data` / `input_audio.data`); arquivos de texto ficam inline (já no formato enviado) com `_attachment`. O tipo de part é decidido no envio e fica gravado no histórico. `buildRequest` chama `expandAttachments` **na cópia** (depois de `sanitizeHistory`, antes dos breakpoints): referência → data URL/base64 dos bytes do arquivo, e todo `_attachment` é removido — mesmos arquivos ⇒ mesmos bytes em toda request (o cache de prefixo funciona; leitura com cache LRU em memória). Mensagens sem anexos continuam string, idênticas.
+- **cache_control**: continua no último text part da mensagem marcada; mensagem só com anexos (sem texto) recebe o breakpoint no último part (imagem/arquivo/áudio) — aceito via OpenRouter por Anthropic, OpenAI e Gemini (verificado).
+- **Arquivo ausente** no disco → `buildRequest` lança `Anexo não encontrado no disco: "nome" (caminho). Apague a mensagem que contém esse anexo para continuar a conversa.` — vira o erro persistido do turno / erro no "Ver request", nunca crash. Na UI a miniatura mostra "arquivo ausente".
+- **Preview** (`previewRequest`): mostra a estrutura expandida com o base64 encurtado (`data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA…(812 KB)`, `truncateBodyForPreview`) e `notes` ("Base64 de N anexos encurtado nesta visualização…") exibidas acima do Body.
+- **Renderer**: miniaturas servidas pelo protocolo `clearchat-attachment://` (registrado como privilegiado no main; só lê nomes `^[0-9a-f]{64}(\.[a-z0-9]+)?$` do store; o CSP inclui o esquema em `img-src`/`media-src`). Mensagem do usuário: anexos acima do balão — imagens clicáveis (lightbox, Esc fecha), chips de arquivo com nome/tamanho, arquivos de texto com "Ver conteúdo" (prévia expansível) — cada um com (i) exato (part, tamanho → base64, "enviado em base64 em toda request enquanto estiver no histórico — conta tokens e é cacheável"). A fila mostra 📎 com os nomes.
+- **Fila / ⚡ / edição**: `QueuedMessage.attachments` — a mensagem enfileirada leva os anexos e entra com eles no próximo passo (`kind: 'queued'`) ou no ⚡ (`kind: 'forced'`). `messages.update` (editar) preserva os parts de anexo: `withText` troca só o texto digitado.
+- **Histórico em texto**: `contentText` ignora parts de anexo (copiar, editar, título — sem texto, o título vira o nome dos anexos). Compactação: o modo `full` reenvia os anexos (prefixo em cache); `trimmed`/`tail` trocam imagem/PDF/áudio por `[imagem: nome]` / `[PDF: nome]` / `[áudio: nome]` e encurtam arquivos de texto; o prompt de compactação pede para citar anexos assim e descrever o conteúdo relevante.
+- **GC** (no início, antes da janela): apaga do store os arquivos que nenhuma `message_json` referencia (`LIKE '%clearchat-attachment://%'` + regex). Só nomes no formato do store (e temporários `.tmp-<uuid>`), só arquivos regulares e mais velhos que 1 h (anexos recém-escolhidos e ainda não enviados ficam; o dedup renova o mtime). Apagar chat/mensagem deixa órfãos até o próximo início.

@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type {
   AgentEvent,
   ApprovalRequest,
+  AttachmentInfo,
   Chat,
   ChatConfig,
   ModelInfo,
@@ -14,6 +15,8 @@ import type {
 } from '@shared/types'
 import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
 import { api, errorMessage } from '../lib/api'
+import { ATTACHMENT_LIMITS } from '@shared/limits'
+import { formatSize } from '@shared/attachments'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -70,6 +73,15 @@ function savePanelTab(tab: PanelTab): void {
   }
 }
 
+/** Anexo no composer: carregando (indo para o store do main) ou pronto para enviar. */
+export interface PendingAttachment {
+  id: string
+  name: string
+  size: number
+  status: 'loading' | 'ready'
+  info?: AttachmentInfo
+}
+
 /** Compactação em andamento/agendada por sessão (evento `compaction`). */
 export interface CompactionState {
   state: 'scheduled' | 'running'
@@ -107,6 +119,8 @@ interface State {
   capabilities: AppCapabilities
   /** Seção do painel Config para rolar até (ex.: 'contexto'). */
   configFocus: string | null
+  /** Anexos ainda não enviados, por sessão (composer). */
+  pendingAttachments: Record<string, PendingAttachment[]>
 }
 
 interface Actions {
@@ -127,7 +141,13 @@ interface Actions {
   deleteChat(chatId: string): Promise<void>
   patchConfig(chatId: string, patch: Partial<ChatConfig>): void
   flushConfig(chatId: string): Promise<void>
-  send(sessionId: string, text: string): Promise<boolean>
+  send(sessionId: string, text: string, attachments?: AttachmentInfo[]): Promise<boolean>
+  /** Anexa arquivos (arrastar/colar) ao composer da sessão. */
+  addFiles(sessionId: string, files: File[]): Promise<void>
+  /** Seletor nativo de arquivos (main lê e salva). */
+  pickFiles(sessionId: string): Promise<void>
+  removeAttachment(sessionId: string, id: string): void
+  clearAttachments(sessionId: string): void
   approve(id: string, decision: ApprovalDecision): Promise<void>
   loadModels(providerId: string, force?: boolean): Promise<void>
   setPanel(open: boolean, tab?: PanelTab): void
@@ -151,6 +171,7 @@ const pending = new Map<
   { patch: Partial<ChatConfig>; timer: ReturnType<typeof setTimeout> }
 >()
 let toastSeq = 0
+let attachmentSeq = 0
 let unsubscribe: (() => void) | null = null
 
 const SETTINGS_KEYS: (keyof AppSettings)[] = [
@@ -215,6 +236,7 @@ export const useStore = create<Store>()((set, get) => ({
   fsTick: {},
   capabilities: { bwrap: false, ripgrep: false },
   configFocus: null,
+  pendingAttachments: {},
 
   async run(fn, label) {
     try {
@@ -405,12 +427,88 @@ export const useStore = create<Store>()((set, get) => ({
     if (chat) set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? withPending(chat) : c)) }))
   },
 
-  async send(sessionId, text) {
+  async send(sessionId, text, attachments) {
     const session = get().sessions[sessionId]
     if (session) await get().flushConfig(session.chatId)
     set((s) => ({ errors: { ...s.errors, [sessionId]: undefined } }))
-    const res = await get().run(() => api.agent.send(sessionId, text), 'Falha ao enviar')
+    const res = await get().run(
+      () =>
+        attachments?.length
+          ? api.agent.send(sessionId, text, attachments)
+          : api.agent.send(sessionId, text),
+      'Falha ao enviar'
+    )
     return res !== undefined
+  },
+
+  async addFiles(sessionId, files) {
+    const setList = (fn: (l: PendingAttachment[]) => PendingAttachment[]): void =>
+      set((s) => ({
+        pendingAttachments: {
+          ...s.pendingAttachments,
+          [sessionId]: fn(s.pendingAttachments[sessionId] ?? [])
+        }
+      }))
+    for (const file of files) {
+      const count = get().pendingAttachments[sessionId]?.length ?? 0
+      if (count >= ATTACHMENT_LIMITS.maxFiles) {
+        get().toast(`No máximo ${ATTACHMENT_LIMITS.maxFiles} anexos por mensagem.`, 'error')
+        return
+      }
+      if (file.size > ATTACHMENT_LIMITS.maxFileBytes) {
+        get().toast(
+          `"${file.name}" tem ${formatSize(file.size)} — o limite por arquivo é ${formatSize(ATTACHMENT_LIMITS.maxFileBytes)}.`,
+          'error'
+        )
+        continue
+      }
+      const id = `att-${++attachmentSeq}`
+      setList((l) => [...l, { id, name: file.name, size: file.size, status: 'loading' }])
+      try {
+        const data = new Uint8Array(await file.arrayBuffer())
+        const info = await api.attachments.add({ name: file.name, mime: file.type, data })
+        setList((l) => l.map((a) => (a.id === id ? { ...a, status: 'ready', info } : a)))
+      } catch (err) {
+        setList((l) => l.filter((a) => a.id !== id))
+        get().toast(errorMessage(err), 'error')
+      }
+    }
+  },
+
+  async pickFiles(sessionId) {
+    const r = await get().run(() => api.attachments.pick(), 'Falha ao anexar')
+    if (!r) return
+    for (const e of r.errors) get().toast(e, 'error')
+    if (!r.items.length) return
+    set((s) => {
+      const cur = s.pendingAttachments[sessionId] ?? []
+      const room = Math.max(0, ATTACHMENT_LIMITS.maxFiles - cur.length)
+      if (r.items.length > room)
+        setTimeout(() =>
+          get().toast(`No máximo ${ATTACHMENT_LIMITS.maxFiles} anexos por mensagem.`, 'error')
+        )
+      const added = r.items.slice(0, room).map((info): PendingAttachment => ({
+        id: `att-${++attachmentSeq}`,
+        name: info.name,
+        size: info.size,
+        status: 'ready',
+        info
+      }))
+      return { pendingAttachments: { ...s.pendingAttachments, [sessionId]: [...cur, ...added] } }
+    })
+  },
+
+  removeAttachment(sessionId, id) {
+    set((s) => ({
+      pendingAttachments: {
+        ...s.pendingAttachments,
+        [sessionId]: (s.pendingAttachments[sessionId] ?? []).filter((a) => a.id !== id)
+      }
+    }))
+  },
+
+  clearAttachments(sessionId) {
+    set((s) => ({ pendingAttachments: { ...s.pendingAttachments, [sessionId]: [] } }))
   },
 
   async approve(id, decision) {
@@ -605,6 +703,7 @@ function applyEvent(e: AgentEvent): void {
 const EMPTY_MESSAGES: StoredMessage[] = []
 const EMPTY_QUEUE: QueuedMessage[] = []
 const EMPTY_RUNS: Record<string, ToolRun> = {}
+const EMPTY_ATTACHMENTS: PendingAttachment[] = []
 
 export const selectMessages =
   (sessionId: string) =>
@@ -618,6 +717,11 @@ export const selectRuns =
   (sessionId: string) =>
   (s: Store): Record<string, ToolRun> =>
     s.toolRuns[sessionId] ?? EMPTY_RUNS
+
+export const selectPendingAttachments =
+  (sessionId: string) =>
+  (s: Store): PendingAttachment[] =>
+    s.pendingAttachments[sessionId] ?? EMPTY_ATTACHMENTS
 
 export const isBusy = (status: Session['status'] | undefined): boolean =>
   status === 'running' || status === 'awaiting_approval'

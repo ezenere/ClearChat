@@ -7,7 +7,16 @@
 // só o resumo, dentro da mensagem de fronteira `role: user` (meta.kind 'compaction').
 import { compactionMessageText, COMPACTION_NOTE } from '@shared/defaults'
 import { activeHistory } from '@shared/context'
-import type { ApiMessage, Chat, Provider, Session, StoredMessage, ToolCall } from '@shared/types'
+import { attachmentPlaceholder } from '@shared/attachments'
+import type {
+  ApiMessage,
+  Chat,
+  ContentPart,
+  Provider,
+  Session,
+  StoredMessage,
+  ToolCall
+} from '@shared/types'
 import {
   availableTools,
   buildRequest,
@@ -51,7 +60,20 @@ function shrinkMessage(m: StoredMessage): StoredMessage {
     }
   } else if (msg.role === 'user' && typeof msg.content === 'string' && m.meta.kind !== 'compaction')
     next = { ...msg, content: shorten(msg.content, MSG_MAX) }
+  else if (msg.role === 'user' && Array.isArray(msg.content))
+    next = { ...msg, content: msg.content.map(shrinkPart) }
   return next === msg ? m : { ...m, message: next }
+}
+
+/**
+ * Anexos no histórico encurtado: binários (imagem/PDF/áudio) viram um placeholder de texto
+ * (`[imagem: foto.png]`) e arquivos de texto são cortados — o resumo menciona o anexo sem reenviá-lo.
+ */
+function shrinkPart(p: ContentPart): ContentPart {
+  const a = p._attachment
+  if (a && a.kind !== 'text') return { type: 'text', text: attachmentPlaceholder(a) }
+  if (p.type === 'text') return { type: 'text', text: shorten(p.text, a ? TOOL_MAX * 2 : MSG_MAX) }
+  return p
 }
 
 const msgChars = (m: StoredMessage): number => JSON.stringify(m.message).length

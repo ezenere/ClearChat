@@ -31,6 +31,12 @@ export function mapModel(m: Record<string, unknown>): ModelInfo | null {
     if (p !== undefined && p >= 0) info.promptPrice = p
     if (c !== undefined && c >= 0) info.completionPrice = c
   }
+  const arch = m.architecture as Record<string, unknown> | undefined
+  if (arch && Array.isArray(arch.input_modalities)) {
+    info.inputModalities = (arch.input_modalities as unknown[]).filter(
+      (x): x is string => typeof x === 'string'
+    )
+  }
   if (Array.isArray(m.supported_parameters)) {
     info.supportsTools = (m.supported_parameters as unknown[]).includes('tools')
   }

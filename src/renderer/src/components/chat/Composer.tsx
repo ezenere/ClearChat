@@ -1,19 +1,53 @@
-import { ArrowUp, Square, X, Zap } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import type { QueuedMessage, Session } from '@shared/types'
+import { ArrowUp, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { isOpenRouter } from '@shared/defaults'
+import { modalitySupport, modalityWarning, type ModalitySupport } from '@shared/attachments'
+import type { AttachmentInfo, QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
-import { isBusy, selectQueue, useStore } from '../../store'
+import { isBusy, selectPendingAttachments, selectQueue, useStore } from '../../store'
 import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
 import { AutoTextarea } from '../ui/controls'
+import { ComposerAttachmentChip } from './Attachments'
 import { CompactBanner, ContextMeter } from './ContextMeter'
+
+/** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
+function pastedName(file: File, i: number): File {
+  if (file.name && file.name !== 'image.png') return file
+  const d = new Date()
+  const p = (n: number): string => String(n).padStart(2, '0')
+  const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg')
+  const name = `colado-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${i ? `-${i + 1}` : ''}.${ext}`
+  return new File([file], name, { type: file.type })
+}
+
+/** Suporte do modelo atual a cada tipo de anexo (inputModalities do /models). */
+function useModalitySupport(session: Session): (a: AttachmentInfo) => ModalitySupport {
+  const chat = useStore((s) => s.chats.find((c) => c.id === session.chatId))
+  const providerId = chat?.config.providerId ?? ''
+  const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
+  const models = useStore((s) => s.models[providerId])
+  const loadModels = useStore((s) => s.loadModels)
+  useEffect(() => {
+    if (providerId) void loadModels(providerId)
+  }, [providerId, loadModels])
+  const model = models?.list.find((m) => m.id === session.model)
+  const openRouter = !!provider && isOpenRouter(provider.baseUrl)
+  return (a) => modalitySupport(a.kind, model, openRouter)
+}
 
 function QueueChip({ item }: { item: QueuedMessage }): React.JSX.Element {
   const run = useStore((s) => s.run)
   return (
     <div className="group relative max-w-[280px] min-w-[140px] animate-pop-in rounded-xl border border-border bg-elevated/90 py-2 pr-12 pl-3 shadow-[0_4px_16px_-8px_rgb(0_0_0/0.6)]">
       <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">{item.text}</p>
+      {item.attachments?.length ? (
+        <p className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-subtle">
+          <Paperclip className="size-3 shrink-0" />
+          {item.attachments.map((a) => a.name).join(', ')}
+        </p>
+      ) : null}
       <div className="absolute top-1 right-1 flex items-center">
         <Tip label="Enviar agora (interrompe o agente)">
           <button
@@ -55,17 +89,66 @@ export function Composer({
   const busy = isBusy(session.status)
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
+  const pending = useStore(selectPendingAttachments(session.id))
+  const addFiles = useStore((s) => s.addFiles)
+  const pickFiles = useStore((s) => s.pickFiles)
+  const removeAttachment = useStore((s) => s.removeAttachment)
+  const clearAttachments = useStore((s) => s.clearAttachments)
+  const supportOf = useModalitySupport(session)
+  /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
+  const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
   useEffect(() => {
     if (autoFocus) ref.current?.focus()
   }, [autoFocus, session.id])
 
-  const submit = async (): Promise<void> => {
+  const ready = pending.filter((a) => a.status === 'ready' && a.info)
+  const loading = pending.some((a) => a.status === 'loading')
+  const warnings = useMemo(() => {
+    const out = new Set<string>()
+    for (const a of ready) {
+      const w = modalityWarning(a.info!.kind, supportOf(a.info!))
+      if (w) out.add(w)
+    }
+    return [...out]
+  }, [ready, supportOf])
+  const warnKey = warnings.join('|')
+  const confirming = !!warnKey && confirmKey === warnKey
+  const canSend = !loading && (!!text.trim() || ready.length > 0)
+
+  const submit = async (force = false): Promise<void> => {
     const t = text.trim()
-    if (!t) return
+    if (!canSend) return
+    if (warnings.length && !force) {
+      setConfirmKey(warnKey)
+      return
+    }
+    const atts = ready.map((a) => a.info!)
     setText('')
-    const ok = await send(session.id, t)
-    if (!ok) setText(t)
+    setConfirmKey(null)
+    if (atts.length) clearAttachments(session.id)
+    const ok = await send(session.id, t, atts)
+    if (!ok) {
+      setText(t)
+      if (atts.length) {
+        // devolve os anexos ao composer
+        useStore.setState((s) => ({
+          pendingAttachments: {
+            ...s.pendingAttachments,
+            [session.id]: [
+              ...atts.map((info, i) => ({
+                id: `retry-${Date.now()}-${i}`,
+                name: info.name,
+                size: info.size,
+                status: 'ready' as const,
+                info
+              })),
+              ...(s.pendingAttachments[session.id] ?? [])
+            ]
+          }
+        }))
+      }
+    }
   }
 
   return (
@@ -92,6 +175,48 @@ export function Composer({
           )}
           onClick={() => ref.current?.focus()}
         >
+          {pending.length > 0 && (
+            <div className="flex flex-wrap gap-2 px-3 pt-3" onClick={(e) => e.stopPropagation()}>
+              {pending.map((a) => (
+                <ComposerAttachmentChip
+                  key={a.id}
+                  item={a}
+                  support={a.info ? supportOf(a.info) : undefined}
+                  onRemove={() => removeAttachment(session.id, a.id)}
+                />
+              ))}
+            </div>
+          )}
+          {warnings.length > 0 && (
+            <div
+              role="alert"
+              onClick={(e) => e.stopPropagation()}
+              className={cn(
+                'mx-3 mt-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors',
+                confirming
+                  ? 'border-warning/45 bg-warning/[0.1] text-warning'
+                  : 'border-warning/20 bg-warning/[0.05] text-warning/85'
+              )}
+            >
+              <TriangleAlert className="size-3.5 shrink-0" />
+              <span className="min-w-0 flex-1">
+                {warnings.join(' · ')}.{' '}
+                <span className="text-subtle">
+                  {confirming
+                    ? 'Confirme para enviar assim mesmo.'
+                    : 'A request pode falhar ou o anexo ser ignorado.'}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={() => void submit(true)}
+                disabled={!canSend}
+                className="shrink-0 rounded-md border border-warning/30 px-2 py-0.5 text-[11.5px] font-medium text-warning transition-colors hover:bg-warning/15 disabled:opacity-50"
+              >
+                Enviar mesmo assim
+              </button>
+            </div>
+          )}
           <AutoTextarea
             ref={ref}
             value={text}
@@ -99,6 +224,12 @@ export function Composer({
             maxRows={14}
             placeholder={busy ? 'Enviar para a fila…' : 'Mensagem…'}
             onChange={(e) => setText(e.target.value)}
+            onPaste={(e) => {
+              const files = [...e.clipboardData.files]
+              if (!files.length) return
+              e.preventDefault()
+              void addFiles(session.id, files.map(pastedName))
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault()
@@ -108,7 +239,20 @@ export function Composer({
             className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
           />
           <div className="flex items-center gap-2 px-2.5 pb-2.5">
-            <span className="flex items-center gap-1.5 pl-1.5 text-[11px] text-faint">
+            <Tip label="Anexar arquivos (imagens, PDF, áudio, texto) — ou arraste/cole">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  void pickFiles(session.id)
+                }}
+                className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
+                aria-label="Anexar arquivos"
+              >
+                <Paperclip className="size-4" />
+              </button>
+            </Tip>
+            <span className="flex items-center gap-1.5 text-[11px] text-faint">
               <ComposerInfo running={busy} />
               {busy ? (
                 <span className="flex items-center gap-1.5 text-subtle">
@@ -146,7 +290,7 @@ export function Composer({
               <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
                 <button
                   type="button"
-                  disabled={!text.trim()}
+                  disabled={!canSend}
                   onClick={(e) => {
                     e.stopPropagation()
                     void submit()

@@ -30,6 +30,31 @@ import {
 } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { crc32, deflateSync } from 'node:zlib'
+
+/** PNG RGB de cor sólida (sem dependências). */
+function solidPng(w: number, h: number, rgb: [number, number, number]): Buffer {
+  const row = Buffer.concat([Buffer.from([0]), Buffer.from(Array(w).fill(rgb).flat())])
+  const raw = Buffer.concat(Array(h).fill(row))
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const len = Buffer.alloc(4)
+    len.writeUInt32BE(data.length)
+    const td = Buffer.concat([Buffer.from(type, 'latin1'), data])
+    const crc = Buffer.alloc(4)
+    crc.writeUInt32BE(crc32(td))
+    return Buffer.concat([len, td, crc])
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(w, 0)
+  ihdr.writeUInt32BE(h, 4)
+  ihdr.set([8, 2, 0, 0, 0], 8)
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', ihdr),
+    chunk('IDAT', deflateSync(raw)),
+    chunk('IEND', Buffer.alloc(0))
+  ])
+}
 
 const KEY = process.env.OPENROUTER_API_KEY
 if (!KEY) {
@@ -67,12 +92,15 @@ async function launch(): Promise<void> {
   await page.waitForLoadState('domcontentloaded')
   await setSize(1280, 820)
   // diálogo nativo de pasta → devolve a pasta configurada em global.__pickDir
+  // seletor de arquivos (anexos, properties com 'openFile') → global.__pickFiles
   await app.evaluate(({ dialog }, dir) => {
     ;(globalThis as any).__pickDir = dir
-    dialog.showOpenDialog = (async () => ({
-      canceled: false,
-      filePaths: [(globalThis as any).__pickDir]
-    })) as any
+    dialog.showOpenDialog = (async (...args: any[]) => {
+      const opts = args.find((a) => a && Array.isArray(a.properties))
+      if (opts?.properties.includes('openFile'))
+        return { canceled: false, filePaths: (globalThis as any).__pickFiles ?? [] }
+      return { canceled: false, filePaths: [(globalThis as any).__pickDir] }
+    }) as any
   }, CWD)
 }
 
@@ -176,6 +204,18 @@ async function askLongBash(cmd: string): Promise<void> {
     await waitIdle(30_000)
   }
   throw new Error(`o modelo não executou: ${cmd}`)
+}
+
+/** Largura natural de uma <img> depois de carregar (0 = falhou). */
+async function imgWidth(img: Locator): Promise<number> {
+  return img.evaluate(
+    (im: HTMLImageElement) =>
+      new Promise<number>((res) => {
+        if (im.complete) return res(im.naturalWidth)
+        im.addEventListener('load', () => res(im.naturalWidth), { once: true })
+        im.addEventListener('error', () => res(0), { once: true })
+      })
+  )
 }
 
 /** Cards de tool da sessão visível. */
@@ -368,6 +408,160 @@ async function main(): Promise<void> {
     await toolCards('Ler arquivo').first().getByTestId('tool-size').waitFor({ timeout: 5000 })
     await shot('write-read')
   })
+
+  await step(
+    'anexos: botão (diálogo) + colar → chips, aviso de modalidade, miniatura enviada',
+    async () => {
+      const n0 = (await currentState()).msgs.length
+      // arquivos de teste: PNG vermelho (gerado aqui), texto e um WAV (gpt-4.1-nano não aceita áudio)
+      const png = join(BASE, 'vermelho.png')
+      writeFileSync(png, solidPng(256, 256, [220, 20, 20]))
+      const md = join(BASE, 'notas.md')
+      writeFileSync(md, '# Projeto Girassol\n\nTítulo do documento: GIRASSOL-9\n')
+      const wav = join(BASE, 'som.wav')
+      writeFileSync(
+        wav,
+        Buffer.from(
+          'RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00',
+          'latin1'
+        )
+      )
+      await app.evaluate(
+        (_e, files) => {
+          ;(globalThis as any).__pickFiles = files
+        },
+        [png, md, wav]
+      )
+      const chips = page.locator('[data-attachment-chip]')
+      await page.getByRole('button', { name: 'Anexar arquivos' }).click()
+      await chips.nth(2).waitFor({ timeout: 10_000 })
+      assert((await chips.count()) === 3, `chips: ${await chips.count()}`)
+      // miniatura da imagem no chip (servida por clearchat-attachment://)
+      assert((await imgWidth(chips.first().locator('img'))) === 256, 'miniatura no chip')
+      // aviso inline: o modelo não aceita áudio; Enter não envia (pede confirmação)
+      const alert = page.getByRole('alert').filter({ hasText: 'Este modelo não aceita áudio' })
+      await alert.waitFor({ timeout: 10_000 })
+      await sleep(300)
+      await shot('attach-warning')
+      await composer().click()
+      await composer().fill('teste')
+      await composer().press('Enter')
+      await alert.getByText('Confirme para enviar assim mesmo.').waitFor({ timeout: 3000 })
+      assert((await currentState()).msgs.length === n0, 'não enviou sem confirmar')
+      await page.getByRole('button', { name: 'Remover som.wav' }).click()
+      await alert.waitFor({ state: 'detached', timeout: 3000 })
+      // colar uma imagem da área de transferência
+      await composer().evaluate(
+        (el, bytes) => {
+          const dt = new DataTransfer()
+          dt.items.add(new File([new Uint8Array(bytes)], 'image.png', { type: 'image/png' }))
+          el.dispatchEvent(
+            new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true })
+          )
+        },
+        Array.from(solidPng(64, 64, [20, 120, 220]))
+      )
+      await chips.nth(2).waitFor({ timeout: 10_000 })
+      const pastedName = (await chips.nth(2).getAttribute('data-attachment-chip')) ?? ''
+      assert(/^colado-\d{6}\.png$/.test(pastedName), `nome colado: ${pastedName}`)
+      await shot('attach-chips')
+      // (i) do anexo explica o part enviado
+      const tip = await tooltipText(
+        chips.first().getByRole('button', { name: 'O que é enviado para a API' })
+      )
+      assert(
+        /image_url/.test(tip) && /base64 em toda request/.test(tip),
+        `tooltip: ${tip.slice(0, 120)}`
+      )
+      await page.getByRole('button', { name: `Remover ${pastedName}` }).click()
+      assert((await chips.count()) === 2, 'chip colado removido')
+      // arrastar e soltar um arquivo no chat: overlay "Solte para anexar" → chip
+      const dropZone = page.locator('[data-chat-drop]')
+      await dropZone.evaluate((el) => {
+        const dt = new DataTransfer()
+        dt.items.add(new File(['conteúdo arrastado\n'], 'arrastado.txt', { type: 'text/plain' }))
+        ;(window as any).__dt = dt
+        el.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true }))
+      })
+      await page.getByText('Solte para anexar').waitFor({ timeout: 3000 })
+      await sleep(250)
+      await shot('attach-drop')
+      await dropZone.evaluate((el) =>
+        el.dispatchEvent(
+          new DragEvent('drop', {
+            dataTransfer: (window as any).__dt,
+            bubbles: true,
+            cancelable: true
+          })
+        )
+      )
+      await page.getByText('Solte para anexar').waitFor({ state: 'detached', timeout: 3000 })
+      const dropped = page.locator('[data-attachment-chip="arrastado.txt"]')
+      await dropped.waitFor({ timeout: 5000 })
+      await page.getByRole('button', { name: 'Remover arrastado.txt' }).click()
+      assert((await chips.count()) === 2, 'chip arrastado removido')
+      // enviar: imagem + arquivo de texto
+      await composer().fill(
+        'Qual é a cor da imagem e qual é o título do documento em notas.md? Responda curto.'
+      )
+      await composer().press('Enter')
+      await waitIdle()
+      assert((await chips.count()) === 0, 'chips limpos após enviar')
+      const att = page.locator('[data-message-attachments]').last()
+      const sentThumb = att.locator('img')
+      await sentThumb.waitFor({ timeout: 10_000 })
+      assert((await imgWidth(sentThumb)) === 256, 'miniatura na mensagem enviada')
+      await att.getByText('notas.md').waitFor()
+      const { msgs } = await currentState()
+      const u = msgs.findLast((m) => m.message.role === 'user')
+      assert(
+        Array.isArray(u.message.content) &&
+          u.message.content[0].image_url?.url.startsWith('clearchat-attachment://') &&
+          u.message.content[1]._attachment?.name === 'notas.md',
+        'mensagem persistida com referências'
+      )
+      const answer = msgs.at(-1).message.content ?? ''
+      assert(/verm|red/i.test(answer) && /girassol/i.test(answer), `resposta: ${answer}`)
+      await shot('attach-sent')
+      await att.getByRole('button', { name: 'O que é enviado para a API' }).last().hover()
+      await page.getByRole('tooltip').first().waitFor({ timeout: 5000 })
+      await sleep(250)
+      await shot('attach-info')
+      await page.mouse.move(640, 5)
+      // prévia do arquivo de texto expansível
+      await att.getByRole('button', { name: 'Ver conteúdo' }).click()
+      await att.getByText('Título do documento: GIRASSOL-9').waitFor({ timeout: 3000 })
+      // lightbox
+      await sentThumb.click()
+      const lb = page.getByRole('dialog', { name: 'vermelho.png' })
+      await lb.waitFor({ timeout: 3000 })
+      await sleep(350)
+      await shot('attach-lightbox')
+      await page.keyboard.press('Escape')
+      await lb.waitFor({ state: 'detached', timeout: 3000 })
+      // Ver request: base64 encurtado + nota
+      await ensurePanel('Config')
+      const { body, dlg } = await openPreview()
+      const sent = body.messages.findLast((m: any) => m.role === 'user').content
+      assert(
+        /^data:image\/png;base64,.{24}…\(/.test(sent[0].image_url.url),
+        `preview: ${sent[0].image_url.url}`
+      )
+      await dlg.getByText(/encurtado nesta visualização/).waitFor()
+      await shot('attach-preview')
+      await closeModal()
+      // apaga o turno com anexos pela UI (os próximos passos seguem sem a imagem no histórico)
+      for (let i = 0; i < 2; i++) {
+        const row = page.locator('div.group\\/msg').last()
+        await row.hover()
+        await row.getByRole('button', { name: 'Apagar mensagem' }).click()
+        await row.getByRole('button', { name: 'Apagar?' }).click()
+        await sleep(400)
+      }
+      assert((await currentState()).msgs.length === n0, 'turno de anexos apagado')
+      return `resposta: ${answer.trim().slice(0, 80)}`
+    }
+  )
 
   await step('bash → Permitir', async () => {
     await sendMessage('Run this exact bash command with the bash tool: echo hello-ui-allow')

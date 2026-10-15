@@ -16,6 +16,8 @@ export interface ModelInfo {
   promptPrice?: number
   completionPrice?: number
   supportsTools?: boolean
+  /** Modalidades de entrada (OpenRouter `architecture.input_modalities`: text, image, file, audio, video). Ausente = desconhecido. */
+  inputModalities?: string[]
 }
 
 /** Só campos definidos (≠ undefined/null) vão para a request. */
@@ -134,7 +136,52 @@ export interface Session {
 }
 
 // Formato OpenAI exato — é o que é persistido e reenviado byte-a-byte (essencial para token caching)
-export type ContentPart = { type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }
+// Anexos (ver SPEC.md → "Anexos"): persistidos com `_attachment` (campo privado, nunca enviado) e,
+// nos binários, uma referência `clearchat-attachment://<sha256>.<ext>` no lugar do base64 — o
+// buildRequest expande para data URL/base64 na cópia enviada (mesmos bytes sempre → cacheável).
+export type CacheControl = { type: 'ephemeral' }
+
+/** Tipo de anexo: define como ele é codificado na request. */
+export type AttachmentKind = 'image' | 'pdf' | 'audio' | 'text'
+
+/** Metadados de um anexo (persistidos no part como `_attachment`; nunca vão para a API). */
+export interface AttachmentMeta {
+  name: string
+  mime: string
+  /** Bytes do arquivo original. */
+  size: number
+  kind: AttachmentKind
+  /** Arquivo no store de anexos: `<sha256>.<ext>` (content-addressed). */
+  file: string
+  /** text: o conteúdo foi cortado no limite de caracteres. */
+  truncated?: boolean
+}
+
+export type ContentPart =
+  | { type: 'text'; text: string; cache_control?: CacheControl; _attachment?: AttachmentMeta }
+  | {
+      type: 'image_url'
+      image_url: { url: string; detail?: 'auto' | 'low' | 'high' }
+      cache_control?: CacheControl
+      _attachment?: AttachmentMeta
+    }
+  | {
+      type: 'file'
+      file: { filename: string; file_data: string }
+      cache_control?: CacheControl
+      _attachment?: AttachmentMeta
+    }
+  | {
+      type: 'input_audio'
+      input_audio: { data: string; format: string }
+      cache_control?: CacheControl
+      _attachment?: AttachmentMeta
+    }
+
+/** Anexo já salvo no store (resultado de attachments.pick/add) — o que agent.send recebe. */
+export interface AttachmentInfo extends AttachmentMeta {
+  sha256: string
+}
 
 export interface ToolCall {
   id: string
@@ -201,6 +248,8 @@ export interface QueuedMessage {
   sessionId: string
   text: string
   createdAt: number
+  /** Anexos da mensagem enfileirada (já salvos no store). */
+  attachments?: AttachmentInfo[]
 }
 
 export interface ApprovalRequest {

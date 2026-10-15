@@ -18,7 +18,7 @@
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "lint": "eslint --cache .",
     "format": "prettier --write .",
-    "test:unit": "node --import ./e2e/ts-hooks.mjs --test e2e/unit.test.ts e2e/markdown.test.ts",
+    "test:unit": "node --import ./e2e/ts-hooks.mjs --test e2e/unit.test.ts e2e/markdown.test.ts e2e/attachments.test.ts",
     "test:e2e": "electron-vite build && node e2e/backend.spec.ts",
     "test:e2e:ui": "electron-vite build && node e2e/ui.spec.ts",
     "icons": "scripts/icons/render.sh",
