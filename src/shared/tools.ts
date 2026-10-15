@@ -332,3 +332,30 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
     ['id', 'message']
   )
 }
+
+/** Tools com o argumento `provider` (escolha entre os provedores configurados). */
+const PROVIDER_ARG_TOOLS: ToolName[] = ['list_models', 'delegate_task']
+
+/**
+ * Definição enviada na request, ajustada aos provedores configurados: com um provedor só, o
+ * argumento `provider` some (modelos fracos o preenchem com nomes inventados); com vários, ganha
+ * `enum` com os nomes (quando únicos). As demais tools ficam iguais (mesmo objeto).
+ */
+export function toolDefinitionFor(name: ToolName, providerNames: string[]): ToolDefinition {
+  const d = TOOL_DEFINITIONS[name]
+  if (!PROVIDER_ARG_TOOLS.includes(name)) return d
+  const { provider, ...rest } = d.function.parameters.properties
+  if (!provider) return d
+  const names = [...new Set(providerNames)]
+  const properties =
+    providerNames.length <= 1
+      ? rest
+      : {
+          ...d.function.parameters.properties,
+          provider: names.length === providerNames.length ? { ...provider, enum: names } : provider
+        }
+  return {
+    ...d,
+    function: { ...d.function, parameters: { ...d.function.parameters, properties } }
+  }
+}

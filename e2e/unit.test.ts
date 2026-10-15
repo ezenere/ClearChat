@@ -1040,7 +1040,7 @@ import {
   formatModelList,
   listModelsTool
 } from '../src/main/tools/models.ts'
-import { TOOL_DEFINITIONS } from '../src/shared/tools.ts'
+import { TOOL_DEFINITIONS, toolDefinitionFor } from '../src/shared/tools.ts'
 import type { ModelInfo } from '../src/shared/types.ts'
 
 const MODELS: ModelInfo[] = [
@@ -1265,6 +1265,12 @@ test('delegate_task: resolução de provedor + modelo do subagente', async () =>
     providerId: 'p-or2',
     model: 'anthropic/claude-opus-4'
   })
+  // provider = o da sessão com modelo inexistente → o modelo da sessão, com nota (como sem provider)
+  const own = await resolve({ provider: 'OpenRouter', model: 'gpt-3.5-turbo' })
+  assert.ok(!('error' in own))
+  assert.equal(own.providerId, 'p-or')
+  assert.equal(own.model, 'openai/gpt-4.1')
+  assert.match(own.note ?? '', /não existe no provedor OpenRouter/)
   // provider sem model: o modelo da sessão, se existir lá; senão erro pedindo model
   const noModel = await resolve({ provider: 'Anthropic' })
   assert.ok('error' in noModel && /informe "model"/.test(noModel.error), JSON.stringify(noModel))
@@ -1310,6 +1316,23 @@ test('delegate_task: resolução de provedor + modelo do subagente', async () =>
     }),
     { providerId: 'p-down', model: 'x/y' }
   )
+})
+
+test('toolDefinitionFor: provider some com 1 provedor, enum com vários', () => {
+  const props = (n: 'delegate_task' | 'list_models', names: string[]): any =>
+    toolDefinitionFor(n, names).function.parameters.properties
+  assert.ok(!('provider' in props('delegate_task', [])))
+  assert.ok(!('provider' in props('list_models', ['OpenRouter'])))
+  assert.deepEqual(props('delegate_task', ['OpenRouter', 'Anthropic']).provider.enum, [
+    'OpenRouter',
+    'Anthropic'
+  ])
+  // nomes repetidos: sem enum (o id resolve)
+  assert.ok(!('enum' in props('list_models', ['A', 'A'])).provider)
+  // o resto não muda; outras tools: o mesmo objeto
+  assert.ok('task' in props('delegate_task', []))
+  assert.equal(toolDefinitionFor('bash', ['A', 'B']), TOOL_DEFINITIONS.bash)
+  assert.ok('provider' in TOOL_DEFINITIONS.delegate_task.function.parameters.properties)
 })
 
 test('list_models: vários provedores — seções, contagens, erro inline, filtro e teto', async () => {

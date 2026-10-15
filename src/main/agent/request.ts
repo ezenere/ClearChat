@@ -3,7 +3,7 @@
 import * as os from 'os'
 import { defaultToolsPrompt, isOpenRouter } from '@shared/defaults'
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
-import { TOOL_DEFINITIONS, TOOL_NAMES, type ToolDefinition } from '@shared/tools'
+import { TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
 import { activeHistory } from '@shared/context'
 import { bwrapAvailable } from '../tools/bash'
 import { expandAttachments } from '../attachments'
@@ -114,8 +114,17 @@ export function availableTools(
   )
 }
 
-export function toolDefinitions(names: ToolName[]): ToolDefinition[] {
-  return names.map((n) => TOOL_DEFINITIONS[n])
+/** Nomes dos provedores configurados (o runner registra; sem registro = nenhum → sem `provider`). */
+let providerNamesSource: () => string[] = () => []
+export function setProviderNamesSource(fn: () => string[]): void {
+  providerNamesSource = fn
+}
+
+export function toolDefinitions(
+  names: ToolName[],
+  providerNames: string[] = providerNamesSource()
+): ToolDefinition[] {
+  return names.map((n) => toolDefinitionFor(n, providerNames))
 }
 
 /** Conteúdo do system prompt (string; vazio = não envia). */

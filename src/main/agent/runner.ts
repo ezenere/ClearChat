@@ -61,7 +61,7 @@ import {
 } from './subagents'
 import { listModels } from '../providers'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
-import { availableTools, buildRequest, maskRequest } from './request'
+import { availableTools, buildRequest, maskRequest, setProviderNamesSource } from './request'
 import {
   buildCompactionRequest,
   cleanSummary,
@@ -363,6 +363,9 @@ function finish(st: RunState, status: SessionStatus): void {
 // ---------------- compactação ----------------
 
 /** Provedor da sessão: principal = o do chat (atual); subsessão = o fixado ao criá-la. */
+// definições de tools com `provider` ajustado aos provedores configurados (request/preview/estimativa)
+setProviderNamesSource(() => providersRepo.list().map((p) => p.name))
+
 function providerFor(chat: Chat, session: Session): Provider | null {
   return providersRepo.get(sessionProviderId(chat.config, session))
 }

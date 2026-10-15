@@ -354,7 +354,8 @@ export type SubagentTarget =
 /**
  * Regras (testadas em e2e/unit.test.ts):
  * - `provider` (nome sem caixa ou id): esse provedor; desconhecido → erro com os nomes disponíveis.
- *   Sem `model`: o modelo da sessão (se existir lá). `model` que o /models dele não lista → erro.
+ *   Sem `model`: o modelo da sessão (se existir lá). `model` que o /models dele não lista → erro
+ *   (no próprio provedor da sessão: o modelo da sessão, com nota).
  * - sem `provider`: o da sessão chamadora. `model` que não existe nele mas existe em exatamente um
  *   outro provedor → esse outro (com nota); em vários → erro pedindo `provider`; em nenhum → o modelo
  *   da sessão (com nota). /models com falha → confia no pedido.
@@ -390,12 +391,20 @@ export async function resolveSubagentTarget(p: {
     const model = reqModel || p.callerModel
     if (m.id === p.callerProviderId && (!reqModel || reqModel === p.callerModel))
       return { providerId: m.id, model }
-    if ((await has(m.id, model)) === false)
+    if ((await has(m.id, model)) === false) {
+      // o próprio provedor da sessão: como sem `provider` (modelo inexistente → o da sessão)
+      if (m.id === p.callerProviderId)
+        return {
+          providerId: m.id,
+          model: p.callerModel,
+          note: `o modelo ${model} não existe no provedor ${m.name}; usando ${p.callerModel}.`
+        }
       return {
         error: reqModel
           ? `Erro: o modelo "${model}" não existe no provedor ${m.name}. Veja list_models com provider "${m.name}".`
           : `Erro: o modelo desta sessão (${model}) não existe no provedor ${m.name}; informe "model" (veja list_models com provider "${m.name}").`
       }
+    }
     return { providerId: m.id, model }
   }
   const callerName = p.providers.find((x) => x.id === p.callerProviderId)?.name ?? 'desta sessão'
