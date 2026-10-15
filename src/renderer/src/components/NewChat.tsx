@@ -1,4 +1,11 @@
-import { ArrowRight, BookmarkPlus, FolderOpen, FolderPlus, RotateCcw } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowRight,
+  BookmarkPlus,
+  FolderOpen,
+  FolderPlus,
+  RotateCcw
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
 import { isOpenRouter } from '@shared/defaults'
@@ -7,17 +14,16 @@ import type { ChatConfig, Preset } from '@shared/types'
 import { AppSignatureField, AppSignatureInfo } from './AppSignatureField'
 import { api } from '../lib/api'
 import { compactPath } from '../lib/format'
-import { initialPresetId, newChatBase, resolvePreset } from '../lib/presets'
+import { initialPresetId, newChatBase, presetProviderMissing, resolvePreset } from '../lib/presets'
 import { useStore } from '../store'
-import { ModelFieldInfo, ProviderFieldInfo, RootInfo, SystemPromptInfo } from './apiDocs'
+import { ModelFieldInfo, RootInfo, SystemPromptInfo } from './apiDocs'
 import { NewFolderForm } from './panel/FilesTab'
 import { ModelInfoLine } from './panel/editors'
 import { PresetPicker } from './presets/PresetPicker'
 import { SavePresetDialog } from './presets/SavePresetDialog'
 import { Tip } from './ui/Tooltip'
 import { AutoTextarea, Button, Kbd, Label } from './ui/controls'
-import { ModelCombobox } from './ui/ModelCombobox'
-import { Select } from './ui/Select'
+import { ModelPicker } from './ui/ModelPicker'
 
 type Custom = { referer: string; title: string }
 
@@ -89,6 +95,7 @@ export function NewChat(): React.JSX.Element {
   const [saveOpen, setSaveOpen] = useState(false)
 
   const changed = changedFields(form, resolved, preset)
+  const providerMissing = presetProviderMissing(preset, providers)
   const customized = !!preset && changed.length > 0
   const provider = providers.find((p) => p.id === form.providerId)
   const canStart = !!provider && form.model.trim().length > 0 && !!form.cwd
@@ -200,30 +207,26 @@ export function NewChat(): React.JSX.Element {
             </div>
           </div>
 
-          <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3">
-            <div>
-              <Label info={<ProviderFieldInfo />}>Provedor</Label>
-              <Select
-                value={form.providerId || null}
-                onChange={(providerId) => set({ providerId })}
-                options={providers.map((p) => ({
-                  value: p.id,
-                  label: p.name,
-                  description: p.baseUrl
-                }))}
-              />
+          <div>
+            <Label info={<ModelFieldInfo />}>Modelo</Label>
+            <ModelPicker
+              value={{ providerId: form.providerId, model: form.model }}
+              onChange={(ref) => set({ providerId: ref.providerId, model: ref.model })}
+            />
+            <div className="mt-1.5 empty:hidden">
+              <ModelInfoLine providerId={form.providerId} model={form.model} />
             </div>
-            <div>
-              <Label info={<ModelFieldInfo />}>Modelo</Label>
-              <ModelCombobox
-                providerId={form.providerId || null}
-                value={form.model}
-                onChange={(model) => set({ model })}
-              />
-              <div className="mt-1.5 empty:hidden">
-                <ModelInfoLine providerId={form.providerId} model={form.model} />
-              </div>
-            </div>
+            {providerMissing && !changed.includes('model') && !changed.includes('providerId') && (
+              <p
+                data-testid="preset-provider-missing"
+                className="mt-1.5 flex items-center gap-1.5 text-[11.5px] text-warning/85"
+              >
+                <AlertTriangle className="size-3 shrink-0" />
+                {`O provedor do modelo de “${preset?.name}” não existe mais — ${
+                  base.model ? 'usando o modelo padrão.' : 'escolha outro modelo.'
+                }`}
+              </p>
+            )}
           </div>
 
           <div>

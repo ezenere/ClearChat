@@ -69,7 +69,9 @@ function PreviewBody({ sessionId }: { sessionId: string }): React.JSX.Element {
         <span className="rounded bg-success/10 px-1.5 py-0.5 text-[10.5px] font-semibold text-success">
           POST
         </span>
-        <span className="min-w-0 flex-1 truncate text-fg/90">{data.url}</span>
+        <span data-testid="preview-url" className="min-w-0 flex-1 truncate text-fg/90">
+          {data.url}
+        </span>
         <span className="flex items-center font-sans">
           <CopyButton text={JSON.stringify(data.body, null, 2)} label="Copiar body" />
           <CopyButton text={full} label="Copiar tudo" />

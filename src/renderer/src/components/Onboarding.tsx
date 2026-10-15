@@ -19,7 +19,6 @@ export function Onboarding(): React.JSX.Element {
   const [error, setError] = useState<string | null>(null)
   const { testing, result, test, reset } = useProviderTest()
   const refreshProviders = useStore((s) => s.refreshProviders)
-  const setSetting = useStore((s) => s.setSetting)
 
   const submit = async (): Promise<void> => {
     const input = draftToInput(draft)
@@ -27,8 +26,7 @@ export function Onboarding(): React.JSX.Element {
     setSaving(true)
     setError(null)
     try {
-      const p = await api.providers.create(input)
-      await setSetting('defaultProviderId', p.id)
+      await api.providers.create(input)
       await refreshProviders()
     } catch (err) {
       setError(errorMessage(err))

@@ -28,6 +28,8 @@ import {
   rmSync,
   writeFileSync
 } from 'node:fs'
+import { createServer, type IncomingMessage, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { crc32, deflateSync } from 'node:zlib'
@@ -54,6 +56,64 @@ function solidPng(w: number, h: number, rgb: [number, number, number]): Buffer {
     chunk('IDAT', deflateSync(raw)),
     chunk('IEND', Buffer.alloc(0))
   ])
+}
+
+// ---------------- provedor OpenAI-compatible falso (local) ----------------
+// GET /v1/models (inclui o mesmo id do modelo do OpenRouter → mesmo id em dois provedores) e
+// POST /v1/chat/completions em SSE respondendo "FAKE-OK". Guarda as requests para conferência.
+const FAKE_KEY = 'fake-key-e2e-123456'
+const FAKE_MODEL = 'fake/echo-1'
+const fakeHits: { url: string; auth: string; body: any }[] = []
+let fakeServer: Server | null = null
+let fakeBase = ''
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  let data = ''
+  for await (const c of req) data += c
+  return data
+}
+
+async function startFakeProvider(modelIds: string[]): Promise<void> {
+  fakeServer = createServer((req, res) => {
+    void (async () => {
+      const url = req.url ?? ''
+      if (req.method === 'GET' && url.endsWith('/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            data: modelIds.map((id, i) => ({
+              id,
+              name: id === FAKE_MODEL ? 'Fake Echo 1' : undefined,
+              context_length: 32_000 * (i + 1),
+              pricing: { prompt: '0.0000001', completion: '0.0000002' },
+              supported_parameters: ['tools']
+            }))
+          })
+        )
+        return
+      }
+      if (req.method === 'POST' && url.endsWith('/chat/completions')) {
+        const body = JSON.parse((await readBody(req)) || '{}')
+        fakeHits.push({ url, auth: String(req.headers.authorization ?? ''), body })
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
+        const chunk = (o: unknown): boolean => res.write(`data: ${JSON.stringify(o)}\n\n`)
+        const base = { id: 'fake-1', object: 'chat.completion.chunk', model: body.model }
+        chunk({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: 'FAKE-' } }] })
+        chunk({ ...base, choices: [{ index: 0, delta: { content: 'OK' } }] })
+        chunk({
+          ...base,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+        })
+        res.end('data: [DONE]\n\n')
+        return
+      }
+      res.writeHead(404, { 'Content-Type': 'application/json' })
+      res.end('{"error":{"message":"not found"}}')
+    })()
+  })
+  await new Promise<void>((r) => fakeServer!.listen(0, '127.0.0.1', r))
+  fakeBase = `http://127.0.0.1:${(fakeServer!.address() as AddressInfo).port}/v1`
 }
 
 const KEY = process.env.OPENROUTER_API_KEY
@@ -222,13 +282,26 @@ async function imgWidth(img: Locator): Promise<number> {
 const toolCards = (label: string): Locator =>
   page.locator('div.rounded-xl').filter({ has: page.locator(`span:text-is("${label}")`) })
 
-async function pickModel(combobox: Locator, id: string): Promise<void> {
+/**
+ * Escolhe um modelo no ModelPicker (um seletor só, agrupado por provedor). `provider`: prefixo
+ * do nome do provedor (padrão "OpenRouter"); sem a opção na lista → "Usar <id> em <provedor>".
+ */
+async function pickModel(combobox: Locator, id: string, provider = 'OpenRouter'): Promise<void> {
   await combobox.click()
-  const search = page.getByPlaceholder('Buscar ou digitar o ID do modelo…')
+  const search = page.getByRole('textbox', { name: 'Buscar modelo' })
   await search.fill(id)
-  const exact = page.locator('button', { has: page.locator(`span.font-mono:text-is("${id}")`) })
+  const listbox = page.getByRole('listbox', { name: 'Modelos' })
+  const exact = listbox.locator(`[role=option][data-model="${id}"][data-provider^="${provider}"]`)
+  const free = listbox.locator(`[role=option][data-free][data-provider^="${provider}"]`)
+  await exact.or(free).first().waitFor({ timeout: 20_000 })
+  // espera a lista do provedor carregar antes de cair no ID livre
+  await exact
+    .first()
+    .waitFor({ timeout: 8000 })
+    .catch(() => {})
   if (await exact.count()) await exact.first().click()
-  else await search.press('Enter') // texto livre
+  else await free.first().click()
+  await listbox.waitFor({ state: 'detached', timeout: 5000 })
 }
 
 async function currentState(): Promise<{ chat: any; sid: string; msgs: any[] }> {
@@ -247,7 +320,8 @@ async function openPreview(): Promise<any> {
   const pres = dlg.locator('pre.hljs')
   const headers = JSON.parse(await pres.nth(0).innerText())
   const body = JSON.parse(await pres.nth(1).innerText())
-  return { headers, body, dlg }
+  const url = (await dlg.getByTestId('preview-url').innerText()).trim()
+  return { headers, body, dlg, url }
 }
 
 async function closeModal(): Promise<void> {
@@ -294,6 +368,7 @@ async function main(): Promise<void> {
   writeFileSync(join(CWD, 'readme.txt'), 'arquivo de exemplo do e2e\n')
   writeFileSync(join(CWD, 'sub', 'inner.txt'), 'dentro da subpasta\n')
   writeFileSync(join(CWD, 'slow.sh'), 'sleep 40\necho slow-done\n')
+  await startFakeProvider([FAKE_MODEL, MODEL, 'fake/other-2'])
   await launch()
 
   await step('onboarding (Testar → Continuar)', async () => {
@@ -829,6 +904,228 @@ async function main(): Promise<void> {
     )
   })
 
+  let fakeId = ''
+  let orId = ''
+
+  await step(
+    'dois provedores: grupos, recolher, busca em ambos, modelo do grupo 2 → Ver request/pílula',
+    async () => {
+      // adiciona o provedor falso (local) e um quebrado (porta fechada) pela UI
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      const dlg = page.getByRole('dialog')
+      await dlg.getByRole('button', { name: 'Provedores', exact: true }).click()
+      for (const [name, url, key] of [
+        ['Local Fake', fakeBase, FAKE_KEY],
+        ['Quebrado', 'http://127.0.0.1:9/v1', '']
+      ]) {
+        await dlg.getByRole('button', { name: 'Adicionar provedor' }).click()
+        await dlg.locator('input.field').nth(0).fill(name)
+        await dlg.locator('input.field').nth(1).fill(url)
+        if (key) await dlg.locator('input[type="password"]').fill(key)
+        await dlg.getByRole('button', { name: 'Adicionar', exact: true }).click()
+        await dlg.getByText(name, { exact: true }).waitFor({ timeout: 5000 })
+      }
+      assert(
+        (await dlg.getByText('padrão', { exact: true }).count()) === 0,
+        'provedores sem "padrão"'
+      )
+      await closeModal()
+      const ps = await read<any[]>('providers.list')
+      fakeId = ps.find((p) => p.name === 'Local Fake').id
+      orId = ps.find((p) => p.name.startsWith('OpenRouter')).id
+
+      await ensurePanel('Modelo')
+      const aside = page.getByTestId('right-panel')
+      assert(
+        (await aside.getByText('Provedor', { exact: true }).count()) === 0,
+        'sem seletor de provedor separado'
+      )
+      await aside.getByRole('combobox').click()
+      const list = page.getByRole('listbox', { name: 'Modelos' })
+      const group = (name: string): Locator =>
+        page.locator(`[data-testid="model-group"][data-provider^="${name}"]`).first()
+      const opt = (provider: string, id: string): Locator =>
+        list.locator(`[role=option][data-provider^="${provider}"][data-model="${id}"]`)
+      // o grupo da seleção atual (OpenRouter) vem aberto, centrado na seleção marcada
+      await group('OpenRouter').waitFor()
+      await opt('OpenRouter', MODEL).waitFor({ timeout: 15_000 })
+      assert((await opt('OpenRouter', MODEL).getAttribute('aria-selected')) === 'true', 'seleção')
+      await sleep(150)
+      await shot('picker-expanded')
+      // recolher o OpenRouter → os outros grupos aparecem
+      await group('OpenRouter').click()
+      assert((await group('OpenRouter').getAttribute('aria-expanded')) === 'false', 'recolhido')
+      assert(
+        (await list.locator('[role=option][data-provider^="OpenRouter"]').count()) === 0,
+        'sem opções'
+      )
+      await group('Local Fake').waitFor()
+      await group('Quebrado').waitFor()
+      await opt('Local Fake', FAKE_MODEL).waitFor({ timeout: 10_000 })
+      // o quebrado mostra erro com "tentar de novo" sem atrapalhar os outros
+      await list.getByRole('button', { name: 'tentar de novo' }).waitFor({ timeout: 20_000 })
+      const groupsText = await page
+        .locator('[data-testid="model-group"]')
+        .evaluateAll((els) => els.map((e) => e.textContent))
+      assert(
+        groupsText.some((t) => /Local Fake\s*3/.test(t ?? '')),
+        `contagem: ${groupsText.join(' | ')}`
+      )
+      await sleep(150)
+      await shot('picker-collapsed')
+      // a busca atravessa todos os grupos (inclusive o recolhido): o mesmo id nos dois
+      const search = page.getByRole('textbox', { name: 'Buscar modelo' })
+      await search.fill('gpt-4.1-nano')
+      await opt('Local Fake', MODEL).waitFor({ timeout: 5000 })
+      await opt('OpenRouter', MODEL).waitFor({ timeout: 5000 })
+      await group('Local Fake').waitFor()
+      await shot('picker-search')
+      // teclado: ↓ percorre só opções (pula cabeçalhos); Esc fecha
+      await search.press('ArrowDown')
+      await search.press('Escape')
+      await list.waitFor({ state: 'detached', timeout: 3000 })
+      // escolhe o modelo no grupo 2 (mesmo id, outro provedor)
+      await aside.getByRole('combobox').click()
+      await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(MODEL)
+      await opt('Local Fake', MODEL).click()
+      await list.waitFor({ state: 'detached', timeout: 3000 })
+      await aside.getByTestId('model-picker-provider').getByText('Local Fake').waitFor()
+      await page.getByTestId('model-pill-provider').getByText('Local Fake').waitFor()
+      await shot('picked-group-2')
+      const { url, headers, body } = await openPreview()
+      assert(url === `${fakeBase}/chat/completions`, `url ${url}`)
+      assert(
+        /^Bearer /.test(headers.Authorization) && !headers.Authorization.includes(FAKE_KEY),
+        `auth mascarada: ${headers.Authorization}`
+      )
+      assert(body.model === MODEL, `model ${body.model}`)
+      await closeModal()
+      await sleep(600)
+      const { chat } = await currentState()
+      assert(chat.config.providerId === fakeId && chat.config.model === MODEL, 'par salvo no chat')
+      // subsessões criadas antes continuam no provedor delas
+      const subs = (await read<any[]>('sessions.list', chat.id)).filter((x) => x.depth > 0)
+      assert(subs.length > 0, 'há subsessões')
+      assert(
+        subs.every((x) => x.providerId === orId),
+        `subsessões: ${subs.map((x) => x.providerId)}`
+      )
+      // a próxima request vai mesmo para o provedor novo
+      const before = fakeHits.length
+      await sendMessage('Diga oi (provedor falso)')
+      await waitIdle(30_000)
+      await page.getByText('FAKE-OK').last().waitFor({ timeout: 10_000 })
+      const hit = fakeHits[before]
+      assert(hit, 'request chegou ao provedor falso')
+      assert(hit.url === '/v1/chat/completions', `path ${hit.url}`)
+      assert(hit.auth === `Bearer ${FAKE_KEY}`, 'key do provedor falso')
+      assert(hit.body.model === MODEL && hit.body.stream === true, 'model/stream')
+      // reabrir: o OpenRouter continua recolhido (lembrado) e o grupo da seleção aberto
+      await aside.getByRole('combobox').click()
+      await group('OpenRouter').waitFor()
+      assert(
+        (await group('OpenRouter').getAttribute('aria-expanded')) === 'false',
+        'recolhimento lembrado'
+      )
+      assert(
+        (await opt('Local Fake', MODEL).getAttribute('aria-selected')) === 'true',
+        'seleção no grupo 2'
+      )
+      await group('OpenRouter').click() // expande de volta
+      await page.keyboard.press('Escape')
+      // volta ao OpenRouter: a request seguinte vai para lá
+      await pickModel(aside.getByRole('combobox'), MODEL, 'OpenRouter')
+      await page
+        .getByTestId('model-pill-provider')
+        .getByText(/OpenRouter/)
+        .waitFor()
+      const p2 = await openPreview()
+      assert(p2.url.startsWith('https://openrouter.ai/api/v1/'), `url ${p2.url}`)
+      await closeModal()
+      return `fake: ${fakeBase}`
+    }
+  )
+
+  await step(
+    'Novos chats: modelo padrão (par) · persona com provedor apagado → aviso · provedor apagado = não definido',
+    async () => {
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      const dlg = page.getByRole('dialog')
+      await dlg.getByRole('button', { name: 'Novos chats', exact: true }).click()
+      assert((await dlg.getByText('Provedor padrão').count()) === 0, 'sem "Provedor padrão"')
+      await dlg
+        .getByRole('combobox')
+        .getByText(/Não definido/)
+        .waitFor({ timeout: 5000 })
+      await pickModel(dlg.getByRole('combobox'), FAKE_MODEL, 'Local Fake')
+      await dlg.getByTestId('model-picker-provider').getByText('Local Fake').waitFor()
+      await sleep(300)
+      assert((await read('settings.get', 'defaultProviderId')) === fakeId, 'defaultProviderId')
+      assert((await read('settings.get', 'defaultModel')) === FAKE_MODEL, 'defaultModel')
+      await shot('settings-default-model')
+      // persona com o modelo do provedor falso
+      await dlg.getByRole('button', { name: 'Personas', exact: true }).click()
+      await dlg.getByRole('button', { name: 'Nova persona' }).click()
+      const ed = dlg.getByTestId('preset-editor')
+      await ed.getByLabel('Nome da persona').fill('Fake persona')
+      await ed.getByText('Segue o modelo padrão de “Novos chats”.').waitFor()
+      await pickModel(ed.getByRole('combobox'), 'fake/other-2', 'Local Fake')
+      await ed.getByText('Definido nesta persona.').waitFor()
+      await ed.getByRole('button', { name: 'Criar persona' }).click()
+      await presetRow('Fake persona').waitFor({ timeout: 5000 })
+      const fp = (await read<any[]>('presets.list')).find((x) => x.name === 'Fake persona')
+      assert(
+        fp.config.providerId === fakeId && fp.config.model === 'fake/other-2',
+        `par na persona: ${fp.config.providerId} ${fp.config.model}`
+      )
+      // Novo chat com a "Padrão" segue o par padrão
+      await closeModal()
+      await page.getByRole('button', { name: 'Novo chat' }).first().click()
+      await page.getByRole('heading', { name: 'Novo chat' }).waitFor({ timeout: 10_000 })
+      await page
+        .getByTestId('model-picker-provider')
+        .getByText('Local Fake')
+        .waitFor({ timeout: 5000 })
+      // apaga os provedores falso e quebrado
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      await dlg.getByRole('button', { name: 'Provedores', exact: true }).click()
+      for (const name of ['Local Fake', 'Quebrado']) {
+        const row = dlg.locator('div.group').filter({ has: page.getByText(name, { exact: true }) })
+        await row.hover()
+        await row.getByRole('button', { name: 'Remover' }).click()
+        await row.getByRole('button', { name: 'Remover?' }).click()
+        await row.waitFor({ state: 'detached', timeout: 5000 })
+      }
+      await dlg.getByRole('button', { name: 'Novos chats', exact: true }).click()
+      await dlg
+        .getByRole('combobox')
+        .getByText(/Não definido/)
+        .waitFor({ timeout: 5000 })
+      await closeModal()
+      // persona cujo provedor sumiu → par padrão (não definido) + aviso
+      const picker = page.getByTestId('preset-picker')
+      await picker.click()
+      await page.getByRole('option', { name: /Fake persona/ }).click()
+      await page.getByTestId('preset-provider-missing').waitFor({ timeout: 5000 })
+      await page.getByRole('combobox').getByText('Escolha um modelo…').waitFor()
+      await shot('preset-provider-missing')
+      // limpa: apaga a persona e volta à "Padrão"
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      await dlg.getByRole('button', { name: 'Personas', exact: true }).click()
+      const row = presetRow('Fake persona')
+      await row.hover()
+      await row.getByRole('button', { name: 'Apagar' }).click()
+      await row.getByRole('button', { name: 'Apagar?' }).click()
+      await row.waitFor({ state: 'detached', timeout: 5000 })
+      await closeModal()
+      // o chat que usou o falso continua com OpenRouter (voltamos antes); volta para ele
+      const { chat } = await currentState()
+      assert(chat.config.providerId === orId, 'chat no OpenRouter')
+      await page.locator('nav').getByText(chat.title).first().click()
+      await composer().waitFor({ timeout: 10_000 })
+    }
+  )
+
   await step('editar / apagar mensagem, regenerar', async () => {
     await ensurePanel('Modelo')
     // editar a primeira mensagem do usuário
@@ -1245,6 +1542,16 @@ async function main(): Promise<void> {
     await ensurePanel('Modelo')
     await sleep(300)
     await shot('min-size-drawer')
+    // seletor de modelo na gaveta: cabe na janela
+    await page.getByTestId('right-panel').getByRole('combobox').click()
+    const lb = page.getByRole('listbox', { name: 'Modelos' })
+    await lb.locator('[role=option]').first().waitFor({ timeout: 10_000 })
+    await sleep(200)
+    const pb = await lb.boundingBox()
+    assert(pb && pb.x >= 0 && pb.x + pb.width <= 900 && pb.y + pb.height <= 600, 'picker na janela')
+    await shot('min-size-picker')
+    await page.keyboard.press('Escape')
+    await lb.waitFor({ state: 'detached', timeout: 3000 })
     await page.mouse.click(300, 300)
     await panelTab('Modelo').waitFor({ state: 'detached', timeout: 3000 })
     // Novo chat em 900x600 (persona + campos sem scroll horizontal)
@@ -1259,6 +1566,7 @@ async function main(): Promise<void> {
   })
 
   await app.close()
+  fakeServer?.close()
   const failed = results.filter((r) => !r.ok)
   console.log(
     `\n${results.length - failed.length}/${results.length} passaram. Screenshots: ${SHOTS}`

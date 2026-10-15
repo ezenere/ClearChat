@@ -6,6 +6,7 @@ import {
   resolveContextWindow,
   type ContextUsage
 } from '@shared/context'
+import { sessionProviderId } from '@shared/models'
 import type { Chat, Session } from '@shared/types'
 import { selectMessages, useStore } from '../store'
 
@@ -22,7 +23,7 @@ export interface ContextInfo {
 /** Uso de contexto da sessão: última usage (ou estimativa pós-compactação) ÷ janela. */
 export function useContextInfo(chat: Chat, session: Session): ContextInfo {
   const messages = useStore(selectMessages(session.id))
-  const providerId = chat.config.providerId
+  const providerId = sessionProviderId(chat.config, session)
   const models = useStore((s) => s.models[providerId]?.list)
   const loadModels = useStore((s) => s.loadModels)
   useEffect(() => {

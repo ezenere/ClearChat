@@ -6,6 +6,7 @@ import { cn } from '../../lib/format'
 import { presetSummary } from '../../lib/presets'
 import { useStore } from '../../store'
 import { Popover } from '../ui/layers'
+import { ModelLabel } from '../ui/ModelLabel'
 import { PresetIcon } from './PresetIcon'
 
 export function PresetPicker({
@@ -27,7 +28,7 @@ export function PresetPicker({
   const anchor = useRef<HTMLButtonElement>(null)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const current = presets.find((p) => p.id === value) ?? null
-  const model = current ? resolve(current).model : ''
+  const cur = current ? resolve(current) : null
 
   return (
     <>
@@ -58,10 +59,13 @@ export function PresetPicker({
                 : 'Nenhuma persona salva ainda'}
           </span>
         </span>
-        {current && !customized && model && (
-          <span className="max-w-[40%] truncate font-mono text-[11px] text-subtle max-[1179px]:hidden">
-            {model}
-          </span>
+        {cur && !customized && cur.model && (
+          <ModelLabel
+            providerId={cur.providerId}
+            model={cur.model}
+            className="max-w-[45%] text-[11px] text-subtle max-[1179px]:hidden"
+            modelClassName="font-mono"
+          />
         )}
         <ChevronDown
           className={cn('size-3.5 shrink-0 text-subtle transition-transform', open && 'rotate-180')}
@@ -75,7 +79,7 @@ export function PresetPicker({
             </div>
           )}
           {presets.map((p) => {
-            const m = resolve(p).model
+            const c = resolve(p)
             return (
               <button
                 key={p.id}
@@ -91,8 +95,17 @@ export function PresetPicker({
                 <PresetIcon icon={p.icon} size="sm" />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[13px] text-fg">{p.name}</span>
-                  <span className="block truncate font-mono text-[10.5px] text-subtle">
-                    {m || 'sem modelo'}
+                  <span className="block truncate text-[10.5px] text-subtle">
+                    {c.model ? (
+                      <ModelLabel
+                        providerId={c.providerId}
+                        model={c.model}
+                        className="max-w-full"
+                        modelClassName="font-mono"
+                      />
+                    ) : (
+                      'sem modelo'
+                    )}
                   </span>
                 </span>
                 {p.id === value && <Check className="size-3.5 shrink-0 text-accent-strong" />}

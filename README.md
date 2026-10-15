@@ -64,14 +64,24 @@ npm run install:local -- --uninstall
   `clearchat.db` etc.) — aplicado com `app.setPath` antes do `ready`. Use para testes isolados sem
   tocar no seu banco real.
 
-## Personas e painel
+## Modelos, personas e painel
 
+- **Modelo = par (provedor, modelo)**: não há "provedor padrão" nem seletor de provedor. Um seletor
+  só (`components/ui/ModelPicker.tsx`) lista os modelos de todos os provedores, agrupados por
+  provedor (cabeçalho com nome e contagem, recolhível — lembrado no `localStorage`; o grupo da seleção
+  abre sozinho), com busca em todos os grupos, erro por provedor com "tentar de novo", "Usar
+  "<id>" em <provedor>" para IDs fora da lista e teclado (↑/↓, Enter, Esc). O mesmo id em dois
+  provedores (Opus via OpenRouter e via Anthropic) são opções diferentes. Trocar no meio do chat vale
+  na próxima request; subagentes ficam no provedor em que foram criados (`sessions.provider_id`).
+  "Novos chats" → Modelo padrão grava `defaultProviderId` + `defaultModel` juntos (provedor apagado
+  → não definido). A pílula do header mostra "<Provedor> · <modelo>".
 - **Personas** (presets de chat, `src/shared/presets.ts`): modelo, system prompt, parâmetros, tools,
   aprovação, contexto, assinatura etc. (opcionalmente o diretório raiz). No Novo chat escolha uma no
   topo; ao editar qualquer campo aparece "Salvar como persona" (nova ou atualizando a de origem). A aba
   Chat do painel salva a config do chat atual; Configurações → Personas lista, edita, duplica, apaga e
   define a padrão. Campos que a persona não define seguem "Novos chats"; a "Padrão" (criada na 1ª
-  execução, apagável) não define nenhum.
+  execução, apagável) não define nenhum. Provedor + modelo da persona andam juntos: sem modelo → o
+  par padrão; provedor apagado → o par padrão, com aviso.
 - **Painel direito**: abas Modelo · Chat · Tools · Arquivos; "Ver request" ({ }) no cabeçalho.
 
 ## Workspace, contexto e limites
@@ -95,7 +105,7 @@ npm run install:local -- --uninstall
   saída, `browse_url` pagina com `offset`, `list_dir`/`web_search`/`search_files`/`list_models` têm teto; o teto
   geral por resultado é configurável no chat ("Saída máx. por ferramenta"). `search_files` e
   `find_files` usam ripgrep quando disponível.
-- **`list_models`** ("Listar modelos"): o modelo lista os modelos do provedor do chat (`/models`,
+- **`list_models`** ("Listar modelos"): o modelo lista os modelos do provedor da sessão (`/models`,
   com cache) filtrando por `query`, `tools_only`, `free_only`, ordenando por id/preço/contexto — útil
   para escolher o modelo de um `delegate_task`. Uma linha por modelo (`ctx`, preço por 1M, `grátis`,
   `tools`, `(atual)`). Habilitada por padrão em chats novos; chats antigos podem ligá-la na Config.
@@ -126,7 +136,8 @@ Rode `npm run build` depois para voltar ao bundle normal.
 ## Testes
 
 ```bash
-npm run test:unit   # buildRequest (+ fronteira de compactação), parser SSE/usage, <tool_call>, DuckDuckGo, assinatura de app,
+npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedor, busca, ID livre, teclado,
+                    # virtualização, par padrão/persona/subsessão), buildRequest (+ fronteira de compactação), parser SSE/usage, <tool_call>, DuckDuckGo, assinatura de app,
                     # personas (snapshot/aplicar: campos copiados, cwd opcional, params, sanitização),
                     # anexos (e2e/attachments.test.ts: codificação por tipo, expansão determinística, _attachment removido,
                     # cache_control com parts mistos, preview encurtado, arquivo ausente, compactação, GC),
@@ -147,13 +158,17 @@ OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run tes
 OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
 ```
 
-- O E2E da UI digita a key no onboarding e percorre: novo chat (combobox de modelo, system prompt,
+- O E2E da UI digita a key no onboarding e percorre: novo chat (seletor de modelo, system prompt,
   PWD), write/read de arquivo, aprovação de bash (Permitir / Negar / Sempre neste chat), fila (chip)
   e ⚡, Parar, delegate_task + subsessão somente leitura, edição de modelo/system prompt/params com
   conferência no "Ver request", modo texto (tools nativas off), assinatura de app none/cline nos
   headers, aba Arquivos ("Usar como PWD"), edição de provider, editar/apagar/regenerar, erro HTTP
   persistido, reinício do app, indicador global de aprovação de subagente e layout em 900x600 — e
-  também o medidor de contexto, o banner de compactação (forçado com uma janela minúscula), o botão
+  também dois provedores no seletor de modelo (um OpenAI-compatible falso servido pelo próprio teste
+  em 127.0.0.1 — `/models` + `/chat/completions` SSE — e um quebrado): grupos com cabeçalho, recolher
+  (lembrado), busca nos dois, o mesmo id no grupo 2 → "Ver request" (URL/headers), pílula e a request
+  chegando ao provedor falso; subsessões antigas no provedor delas; "Modelo padrão" (par) nas
+  Configurações, persona com provedor apagado (aviso) e provedor apagado = não definido; e ainda o medidor de contexto, o banner de compactação (forçado com uma janela minúscula), o botão
   Compactar (divisor + card do resumo + "Ver request" compactado), a aba Arquivos confinada à raiz
   ("Usar como raiz", "Nova pasta…") e "Nova pasta…" no Novo chat — e ainda as abas do painel (Modelo ·
   Chat · Tools · Arquivos, "Ver request" de qualquer aba, aba lembrada entre reinícios) e as personas:

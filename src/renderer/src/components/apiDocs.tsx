@@ -46,21 +46,16 @@ export function ModelFieldInfo({ side }: { side?: Side }): React.JSX.Element {
   return (
     <ApiInfo title="Modelo" side={side}>
       <p>
-        Enviado no campo <C>model</C> do body de <C>POST /chat/completions</C>. Subagentes podem
-        usar outro modelo se a chamada de <C>delegate_task</C> informar <C>model</C>.
+        O que se escolhe é o par <b>provedor + modelo</b>: o id vai no campo <C>model</C> do body de{' '}
+        <C>POST {'{baseUrl}'}/chat/completions</C> <i>desse</i> provedor, com a key dele (
+        <C>Authorization: Bearer …</C>) e os headers extras dele. O mesmo id em dois provedores
+        (ex.: um Claude via OpenRouter e via Anthropic) são opções diferentes.
       </p>
-    </ApiInfo>
-  )
-}
-
-export function ProviderFieldInfo(): React.JSX.Element {
-  return (
-    <ApiInfo title="Provedor">
       <p>
-        Define a URL (<C>{'{baseUrl}'}/chat/completions</C>), o header{' '}
-        <C>Authorization: Bearer …</C> e os headers extras do provedor. Os headers{' '}
-        <C>HTTP-Referer</C>/<C>X-Title</C> vêm da &quot;Assinatura do app&quot;. Em OpenRouter
-        também vai <C>{'usage: { include: true }'}</C> no body.
+        <C>HTTP-Referer</C>/<C>X-Title</C> vêm da &quot;Assinatura do app&quot;; em OpenRouter
+        também vai <C>{'usage: { include: true }'}</C>. Trocar no meio do chat vale a partir da
+        próxima request; subagentes ficam no provedor da sessão que os criou e podem usar outro
+        modelo se o <C>delegate_task</C> informar <C>model</C>.
       </p>
     </ApiInfo>
   )

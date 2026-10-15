@@ -76,8 +76,18 @@ export function getDb(): Database.Database {
   conn.pragma('journal_mode = WAL')
   conn.pragma('foreign_keys = ON')
   conn.exec(SCHEMA)
+  migrate(conn)
   db = conn
   return conn
+}
+
+/** Colunas adicionadas depois do schema inicial (idempotente). */
+function migrate(conn: Database.Database): void {
+  const cols = (conn.prepare('PRAGMA table_info(sessions)').all() as { name: string }[]).map(
+    (c) => c.name
+  )
+  // provedor da subsessão (a principal segue o do chat)
+  if (!cols.includes('provider_id')) conn.exec('ALTER TABLE sessions ADD COLUMN provider_id TEXT')
 }
 
 export function closeDb(): void {

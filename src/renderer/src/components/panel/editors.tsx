@@ -1,7 +1,7 @@
 // Editores de ChatConfig independentes de onde a config mora: recebem `cfg` (config completa) e
 // `patch` (patch parcial). Usados pelas abas do painel (config do chat) e pelo editor de personas.
 import { RotateCcw } from 'lucide-react'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import {
   DEFAULT_COMPACT_PROMPT,
   DEFAULT_COMPACT_THRESHOLD,
@@ -25,7 +25,6 @@ import {
   ModelFieldInfo,
   NativeToolsInfo,
   ParamInfo,
-  ProviderFieldInfo,
   SandboxInfo,
   SystemPromptInfo,
   ToolDefInfo,
@@ -33,8 +32,7 @@ import {
 } from '../apiDocs'
 import { AppSignatureField, AppSignatureInfo } from '../AppSignatureField'
 import { AutoTextarea, Switch } from '../ui/controls'
-import { ModelCombobox } from '../ui/ModelCombobox'
-import { Select } from '../ui/Select'
+import { ModelPicker } from '../ui/ModelPicker'
 import { ExtraBodyEditor, NumberInput, Section, ToggleRow } from './fields'
 
 export interface CfgProps {
@@ -123,32 +121,22 @@ export function ModelInfoLine({
   )
 }
 
-export function ModelSection({ cfg, patch }: CfgProps): React.JSX.Element {
-  const providers = useStore((s) => s.providers)
+export function ModelSection({
+  cfg,
+  patch,
+  note
+}: CfgProps & { note?: ReactNode }): React.JSX.Element {
   return (
-    <Section title="Modelo">
+    <Section title="Modelo" aside={<ModelFieldInfo side="left" />}>
       <div>
-        <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted">
-          Provedor <ProviderFieldInfo />
-        </div>
-        <Select
-          value={cfg.providerId}
-          onChange={(providerId) => patch({ providerId })}
-          options={providers.map((p) => ({ value: p.id, label: p.name, description: p.baseUrl }))}
-        />
-      </div>
-      <div>
-        <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted">
-          Modelo <ModelFieldInfo side="left" />
-        </div>
-        <ModelCombobox
-          providerId={cfg.providerId}
-          value={cfg.model}
-          onChange={(model) => patch({ model })}
+        <ModelPicker
+          value={{ providerId: cfg.providerId, model: cfg.model }}
+          onChange={(ref) => patch({ providerId: ref.providerId, model: ref.model })}
         />
         <div className="mt-1.5 empty:hidden">
           <ModelInfoLine providerId={cfg.providerId} model={cfg.model} />
         </div>
+        {note && <div className="mt-1.5">{note}</div>}
       </div>
     </Section>
   )
@@ -301,10 +289,12 @@ export function RequestExtrasSection({
 }
 
 /** Aba Modelo inteira (painel e editor de persona). */
-export function ModelEditor(props: CfgProps & { scope: string }): React.JSX.Element {
+export function ModelEditor(
+  props: CfgProps & { scope: string; modelNote?: ReactNode }
+): React.JSX.Element {
   return (
     <>
-      <ModelSection {...props} />
+      <ModelSection cfg={props.cfg} patch={props.patch} note={props.modelNote} />
       <SystemPromptSection {...props} />
       <ParamsSection {...props} />
       <RequestExtrasSection {...props} />

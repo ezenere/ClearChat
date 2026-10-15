@@ -129,6 +129,11 @@ export interface Session {
   parentToolCallId: string | null
   depth: 0 | 1 | 2
   model: string
+  /**
+   * Provedor da subsessão (fixado ao criar). `null`/ausente na principal — ela segue
+   * `chat.config.providerId` — e em subsessões antigas (→ o do chat). Ver `sessionProviderId`.
+   */
+  providerId?: string | null
   title: string
   task: string | null
   status: SessionStatus

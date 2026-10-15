@@ -1,6 +1,7 @@
 import { FolderOpen, Pencil, Plus, RotateCcw, Server, Trash2 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { DEFAULT_BASE_URL, DEFAULT_SYSTEM_PROMPT } from '@shared/defaults'
+import { defaultModelRef } from '@shared/models'
 import type { Provider } from '@shared/types'
 import { api, errorMessage } from '../lib/api'
 import { cn, shortPath } from '../lib/format'
@@ -12,8 +13,9 @@ import { ProviderFields, TestButton, TestResult } from './ProviderForm'
 import { draftToInput, useProviderTest, type ProviderDraft } from '../lib/provider'
 import { AutoTextarea, Button, Label } from './ui/controls'
 import { Modal } from './ui/layers'
-import { ModelCombobox } from './ui/ModelCombobox'
+import { ModelPicker } from './ui/ModelPicker'
 import { Select } from './ui/Select'
+import { ModelInfoLine } from './panel/editors'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -97,7 +99,6 @@ function ProviderRow({
   const [confirm, setConfirm] = useState(false)
   const run = useStore((s) => s.run)
   const refreshProviders = useStore((s) => s.refreshProviders)
-  const isDefault = useStore((s) => s.settings.defaultProviderId === provider.id)
   return (
     <div
       className="group flex items-center gap-3 rounded-xl border border-border bg-bg/30 px-3.5 py-2.5"
@@ -107,14 +108,7 @@ function ProviderRow({
         <Server className="size-3.5 text-muted" />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2 text-[13px] font-medium">
-          {provider.name}
-          {isDefault && (
-            <span className="rounded bg-accent-soft px-1.5 py-px text-[10px] font-medium text-accent-strong">
-              padrão
-            </span>
-          )}
-        </div>
+        <div className="text-[13px] font-medium">{provider.name}</div>
         <div className="truncate font-mono text-[11px] text-subtle">
           {provider.baseUrl}
           {provider.apiKey && (
@@ -159,11 +153,15 @@ function DefaultsSection(): React.JSX.Element {
   const settings = useStore((s) => s.settings)
   const homeDir = useStore((s) => s.homeDir)
   const setSetting = useStore((s) => s.setSetting)
+  const setSettings = useStore((s) => s.setSettings)
   const run = useStore((s) => s.run)
   const [prompt, setPrompt] = useState(settings.defaultSystemPrompt ?? DEFAULT_SYSTEM_PROMPT)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const providerId =
-    providers.find((p) => p.id === settings.defaultProviderId)?.id ?? providers[0]?.id ?? null
+  // provedor apagado → padrão não definido
+  const def = defaultModelRef(
+    settings,
+    providers.map((p) => p.id)
+  )
 
   useEffect(
     () => () => {
@@ -185,22 +183,17 @@ function DefaultsSection(): React.JSX.Element {
         Padrões de chats novos — valem para os campos que a persona não define (a persona “Padrão”
         não define nenhum) e quando não há persona.
       </p>
-      <div className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-3">
-        <div>
-          <Label>Provedor padrão</Label>
-          <Select
-            value={providerId}
-            onChange={(v) => void setSetting('defaultProviderId', v)}
-            options={providers.map((p) => ({ value: p.id, label: p.name }))}
-          />
-        </div>
-        <div>
-          <Label info={<ModelFieldInfo />}>Modelo padrão</Label>
-          <ModelCombobox
-            providerId={providerId}
-            value={settings.defaultModel ?? ''}
-            onChange={(m) => void setSetting('defaultModel', m)}
-          />
+      <div>
+        <Label info={<ModelFieldInfo />}>Modelo padrão</Label>
+        <ModelPicker
+          value={def.providerId ? def : null}
+          placeholder="Não definido — escolha no Novo chat"
+          onChange={(ref) =>
+            void setSettings({ defaultProviderId: ref.providerId, defaultModel: ref.model })
+          }
+        />
+        <div className="mt-1.5 empty:hidden">
+          <ModelInfoLine providerId={def.providerId} model={def.model} />
         </div>
       </div>
       <div>

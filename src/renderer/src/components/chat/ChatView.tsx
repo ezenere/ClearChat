@@ -13,30 +13,64 @@ import { TOOL_LABELS } from '@shared/tools'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { CONFIRM_TOOLS } from '@shared/types'
 import type { Chat, Session } from '@shared/types'
+import { sessionProviderId } from '@shared/models'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
 import { useStore } from '../../store'
 import { TaskInfo } from '../apiDocs'
 import { TopBar } from '../TopBar'
 import { IconButton } from '../ui/controls'
+import { ModelLabel } from '../ui/ModelLabel'
 import { Tip } from '../ui/Tooltip'
 import { Composer } from './Composer'
 import { ContextMeter } from './ContextMeter'
 import { MessageList } from './MessageList'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
 
-function ModelPill({ model }: { model: string }): React.JSX.Element {
+function ModelPill({
+  providerId,
+  model
+}: {
+  providerId: string
+  model: string
+}): React.JSX.Element {
   const setPanel = useStore((s) => s.setPanel)
+  const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
   const [vendor, name] = model.includes('/')
     ? [model.split('/')[0], model.split('/').slice(1).join('/')]
     : ['', model]
   return (
-    <Tip label="Modelo · abrir configurações do chat" side="bottom">
+    <Tip
+      label={
+        <span className="max-w-[360px]">
+          <span className="text-muted">{provider?.name ?? 'Provedor removido'}</span>
+          <span className="text-faint"> · </span>
+          <span className="font-mono">{model || 'sem modelo'}</span>
+          <span className="block text-[11px] text-subtle">
+            Enviado como <code className="font-mono">model</code> para{' '}
+            {provider ? `${provider.baseUrl}/chat/completions` : 'o endpoint do provedor'} · clique
+            para trocar
+          </span>
+        </span>
+      }
+      side="bottom"
+    >
       <button
         type="button"
+        data-testid="model-pill"
         onClick={() => setPanel(true, 'model')}
-        className="no-drag flex h-7 max-w-[260px] min-w-0 shrink items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 text-xs transition-colors hover:border-border-strong hover:bg-hover max-[1179px]:max-w-[180px]"
+        className="no-drag flex h-7 max-w-[340px] min-w-0 shrink items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 text-xs transition-colors hover:border-border-strong hover:bg-hover max-[1179px]:max-w-[220px]"
       >
         <Sparkles className="size-3 shrink-0 text-accent-strong" />
+        <span
+          data-testid="model-pill-provider"
+          className={cn(
+            'max-w-[120px] shrink-0 truncate max-[1179px]:max-w-[80px]',
+            provider ? 'text-subtle' : 'text-warning/85'
+          )}
+        >
+          {provider?.name ?? 'provedor removido'}
+        </span>
+        <span className="shrink-0 text-faint">·</span>
         {vendor && <span className="shrink-0 text-subtle max-[1179px]:hidden">{vendor}/</span>}
         <span className="truncate font-medium text-fg/90">{name || 'sem modelo'}</span>
       </button>
@@ -58,9 +92,13 @@ function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
         <button
           type="button"
           onClick={() => setPanel(true, 'model')}
-          className="rounded-full border border-border px-2.5 py-1 font-mono text-muted hover:border-border-strong hover:text-fg"
+          className="flex max-w-full items-center rounded-full border border-border px-2.5 py-1 text-muted hover:border-border-strong hover:text-fg"
         >
-          {chat.config.model || 'sem modelo'}
+          <ModelLabel
+            providerId={chat.config.providerId}
+            model={chat.config.model}
+            modelClassName="font-mono"
+          />
         </button>
         <button
           type="button"
@@ -145,7 +183,10 @@ export function ChatHeader({
           <span className="truncate text-[13px] font-medium">{chat.title || 'Novo chat'}</span>
         )}
       </div>
-      <ModelPill model={isSub ? session.model : chat.config.model} />
+      <ModelPill
+        providerId={sessionProviderId(chat.config, isSub ? session : null)}
+        model={isSub ? session.model : chat.config.model}
+      />
       <SessionSwitcher chatId={chat.id} currentId={session?.id ?? chat.mainSessionId} />
       <AutoApproveBadge chat={chat} />
     </TopBar>
@@ -166,6 +207,13 @@ function SubBanner({ chat, session }: { chat: Chat; session: Session }): React.J
         <span className="text-muted">somente leitura</span>
         <StatusDot status={session.status} className="ml-1" />
         <TaskInfo task={session.task} />
+        <span className="text-faint">·</span>
+        <ModelLabel
+          providerId={sessionProviderId(chat.config, session)}
+          model={session.model}
+          className="max-w-[260px] text-[12px]"
+          modelClassName="font-mono text-[11.5px] text-muted"
+        />
         <div className="ml-auto flex items-center gap-1">
           <ContextMeter chat={chat} session={session} />
           {parent && parent.depth > 0 && (

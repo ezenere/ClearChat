@@ -4,6 +4,8 @@ import type { Session, SessionStatus } from '@shared/types'
 import { cn, sessionLabel } from '../../lib/format'
 import { useStore } from '../../store'
 import { Popover } from '../ui/layers'
+import { ModelLabel } from '../ui/ModelLabel'
+import { sessionProviderId } from '@shared/models'
 
 const STATUS_LABEL: Record<SessionStatus, string> = {
   idle: 'ociosa',
@@ -46,6 +48,7 @@ export function SessionSwitcher({
   currentId: string
 }): React.JSX.Element | null {
   const all = useStore((s) => s.sessions)
+  const chat = useStore((s) => s.chats.find((c) => c.id === chatId))
   const approvals = useStore((s) => s.approvals)
   const openSession = useStore((s) => s.openSession)
   const [open, setOpen] = useState(false)
@@ -95,9 +98,13 @@ export function SessionSwitcher({
         {approvals.some((a) => a.sessionId === s.id) && (
           <span className="rounded bg-warning/10 px-1 text-[10px] text-warning">aprovação</span>
         )}
-        <span className="shrink-0 font-mono text-[10px] text-faint">
-          {s.model.split('/').pop()}
-        </span>
+        <ModelLabel
+          providerId={chat ? sessionProviderId(chat.config, s) : null}
+          model={s.model}
+          short
+          className="max-w-[45%] shrink-0 text-[10px] text-faint"
+          modelClassName="font-mono"
+        />
         <StatusDot status={s.status} />
         {s.id === currentId && <Check className="size-3.5 shrink-0 text-accent-strong" />}
       </button>

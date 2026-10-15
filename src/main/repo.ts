@@ -152,6 +152,7 @@ interface SessionRow {
   parent_tool_call_id: string | null
   depth: number
   model: string
+  provider_id: string | null
   title: string
   task: string | null
   status: string
@@ -165,6 +166,7 @@ const toSession = (r: SessionRow): Session => ({
   parentToolCallId: r.parent_tool_call_id,
   depth: Math.min(2, Math.max(0, r.depth)) as 0 | 1 | 2,
   model: r.model,
+  providerId: r.provider_id ?? null,
   title: r.title,
   task: r.task,
   status: r.status as SessionStatus,
@@ -184,11 +186,16 @@ export const sessionsRepo = {
     return r ? toSession(r) : null
   },
   create(s: Omit<Session, 'id' | 'createdAt'>): Session {
-    const sess: Session = { ...s, id: randomUUID(), createdAt: Date.now() }
+    const sess: Session = {
+      ...s,
+      providerId: s.providerId ?? null,
+      id: randomUUID(),
+      createdAt: Date.now()
+    }
     getDb()
       .prepare(
-        `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, title, task, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         sess.id,
@@ -197,6 +204,7 @@ export const sessionsRepo = {
         sess.parentToolCallId,
         sess.depth,
         sess.model,
+        sess.providerId,
         sess.title,
         sess.task,
         sess.status,

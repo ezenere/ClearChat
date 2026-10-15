@@ -1,27 +1,36 @@
 // Personas no renderer: config base de um chat novo (padrões de "Novos chats") e resolução de
 // uma persona sobre ela.
 import { DEFAULT_CHAT_CONFIG, isOpenRouter } from '@shared/defaults'
+import { defaultModelRef, resolvePresetModel } from '@shared/models'
 import { DEFAULT_PRESET_NAME, applyPreset } from '@shared/presets'
 import type { ChatConfig, Preset, Provider } from '@shared/types'
 import type { AppSettings } from '../store'
 
-/** Config que um chat novo teria sem persona (mesma regra do main em chats.create). */
+/**
+ * Config que um chat novo teria sem persona. Modelo = o par padrão (provedor + modelo) de "Novos
+ * chats"; sem ele (ou com o provedor apagado), nenhum — o Novo chat pede para escolher.
+ */
 export function newChatBase(
   settings: AppSettings,
   providers: Provider[],
   homeDir: string | null
 ): ChatConfig {
-  const provider = providers.find((p) => p.id === settings.defaultProviderId) ?? providers[0]
+  const ref = defaultModelRef(
+    settings,
+    providers.map((p) => p.id)
+  )
+  const provider = providers.find((p) => p.id === ref.providerId)
   return DEFAULT_CHAT_CONFIG(settings.defaultCwd ?? homeDir ?? '', {
-    providerId: provider?.id ?? '',
-    model: settings.defaultModel ?? undefined,
+    providerId: ref.providerId,
+    model: ref.model,
     systemPrompt: settings.defaultSystemPrompt ?? undefined,
     baseUrl: provider?.baseUrl
   })
 }
 
 /**
- * Config completa de uma persona: persona sobre a base. Provedor apagado → o da base; sem
+ * Config completa de uma persona: persona sobre a base. Provedor + modelo andam juntos
+ * (`resolvePresetModel`): sem modelo ou com o provedor apagado → o par padrão. Sem
  * `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
  */
 export function resolvePreset(
@@ -30,12 +39,30 @@ export function resolvePreset(
   providers: Provider[]
 ): ChatConfig {
   const cfg = applyPreset(base, preset?.config)
-  if (!providers.some((p) => p.id === cfg.providerId)) cfg.providerId = base.providerId
+  const { ref } = resolvePresetModel(
+    { providerId: base.providerId, model: base.model },
+    preset?.config,
+    providers.map((p) => p.id)
+  )
+  cfg.providerId = ref.providerId
+  cfg.model = ref.model
   if (preset?.config.cacheEnabled === undefined) {
     const prov = providers.find((p) => p.id === cfg.providerId)
     if (prov) cfg.cacheEnabled = isOpenRouter(prov.baseUrl)
   }
   return cfg
+}
+
+/** A persona define um modelo cujo provedor foi apagado (→ usa o par padrão; a UI avisa). */
+export function presetProviderMissing(
+  preset: Pick<Preset, 'config'> | null | undefined,
+  providers: Provider[]
+): boolean {
+  return resolvePresetModel(
+    { providerId: '', model: '' },
+    preset?.config,
+    providers.map((p) => p.id)
+  ).missingProvider
 }
 
 /** Persona inicial do Novo chat: a padrão → "Padrão" → a primeira → nenhuma. */
@@ -49,7 +76,7 @@ export function initialPresetId(presets: Preset[], defaultPresetId: string | nul
 }
 
 const FIELD_LABELS: Record<string, string> = {
-  providerId: 'provedor',
+  providerId: 'modelo',
   model: 'modelo',
   systemPrompt: 'system prompt',
   params: 'parâmetros',

@@ -13,7 +13,8 @@ import type {
   ToolName
 } from '@shared/types'
 import type { ApprovalDecision, CompactOptions, RequestPreview } from '@shared/ipc'
-import type { ModelInfo } from '@shared/types'
+import type { ModelInfo, Provider } from '@shared/types'
+import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
 import { clampToolOutput } from '@shared/limits'
 import {
@@ -315,11 +316,16 @@ function finish(st: RunState, status: SessionStatus): void {
 
 // ---------------- compactação ----------------
 
+/** Provedor da sessão: principal = o do chat (atual); subsessão = o fixado ao criá-la. */
+function providerFor(chat: Chat, session: Session): Provider | null {
+  return providersRepo.get(sessionProviderId(chat.config, session))
+}
+
 const windowCache = new Map<string, { at: number; models: ModelInfo[] | null }>()
 
 /** Janela de contexto da sessão (override do chat / contextLength do modelo via /models, em cache). */
 async function contextWindowFor(chat: Chat, session: Session): Promise<number | null> {
-  const provider = providersRepo.get(chat.config.providerId)
+  const provider = providerFor(chat, session)
   let models: ModelInfo[] | null = null
   if (provider) {
     const c = windowCache.get(provider.id)
@@ -363,7 +369,7 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
   if (!session) return { kind: 'error', error: 'Sessão não encontrada.' }
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return { kind: 'error', error: 'Chat não encontrado.' }
-  const provider = providersRepo.get(chat.config.providerId)
+  const provider = providerFor(chat, session)
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
   repairTail(session.id)
   const history = messagesRepo.list(session.id)
@@ -588,7 +594,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!session) return { kind: 'error', error: 'Sessão não encontrada (chat apagado?).' }
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return { kind: 'error', error: 'Chat não encontrado.' }
-  const provider = providersRepo.get(chat.config.providerId)
+  const provider = providerFor(chat, session)
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
   if (!session.model) return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
 
@@ -774,7 +780,7 @@ async function executeTool(
       return done(await runDelegate(st, session, chat, toolCallId, args, signal))
     }
     const root = chat.config.cwd
-    const provider = name === 'list_models' ? providersRepo.get(chat.config.providerId) : null
+    const provider = name === 'list_models' ? providerFor(chat, session) : null
     const r = await runLocalTool(name, args, {
       cwd: root,
       confine: chat.config.confineToRoot !== false,
@@ -814,7 +820,7 @@ async function resolveSubagentModel(
 ): Promise<string> {
   const req = typeof requested === 'string' ? requested.trim() : ''
   if (!req || req === session.model) return session.model
-  const provider = providersRepo.get(chat.config.providerId)
+  const provider = providerFor(chat, session)
   if (!provider) return session.model
   try {
     const models = await listModels(provider)
@@ -848,6 +854,8 @@ async function runDelegate(
     parentToolCallId: toolCallId,
     depth: (session.depth + 1) as 1 | 2,
     model,
+    // o subagente fica no provedor da sessão que o criou (trocar o do chat depois não o muda)
+    providerId: sessionProviderId(chat.config, session),
     title,
     task,
     status: 'running'
@@ -1032,7 +1040,7 @@ export function previewRequest(sessionId: string): RequestPreview {
   if (!session) throw new Error('Sessão não encontrada.')
   const chat = chatsRepo.get(session.chatId)
   if (!chat) throw new Error('Chat não encontrado.')
-  const provider = providersRepo.get(chat.config.providerId)
+  const provider = providerFor(chat, session)
   if (!provider) throw new Error('Nenhum provider configurado para este chat.')
   const req = buildRequest(chat, session, messagesRepo.list(sessionId), provider)
   const masked = maskRequest(req, provider.apiKey)

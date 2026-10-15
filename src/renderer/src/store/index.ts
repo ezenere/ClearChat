@@ -132,6 +132,8 @@ interface Actions {
   deletePreset(id: string): Promise<void>
   duplicatePreset(id: string): Promise<Preset | null>
   setSetting<K extends keyof AppSettings>(key: K, value: AppSettings[K]): Promise<void>
+  /** Várias de uma vez (ex.: o par defaultProviderId + defaultModel). */
+  setSettings(patch: Partial<AppSettings>): Promise<void>
   goNew(): void
   openChat(chatId: string, sessionId?: string): Promise<void>
   openSession(sessionId: string): Promise<void>
@@ -328,6 +330,14 @@ export const useStore = create<Store>()((set, get) => ({
   async setSetting(key, value) {
     set((s) => ({ settings: { ...s.settings, [key]: value } }))
     await get().run(() => api.settings.set(key, value), 'Erro ao salvar configuração')
+  },
+
+  async setSettings(patch) {
+    set((s) => ({ settings: { ...s.settings, ...patch } }))
+    await get().run(
+      () => Promise.all(Object.entries(patch).map(([k, v]) => api.settings.set(k, v))),
+      'Erro ao salvar configuração'
+    )
   },
 
   goNew() {

@@ -17,7 +17,7 @@ import { patchPresetConfig, type PresetConfig } from '@shared/presets'
 import type { ChatConfig, Preset } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn, compactPath } from '../../lib/format'
-import { newChatBase, presetSummary, resolvePreset } from '../../lib/presets'
+import { newChatBase, presetProviderMissing, presetSummary, resolvePreset } from '../../lib/presets'
 import { useStore } from '../../store'
 import { RootInfo } from '../apiDocs'
 import {
@@ -30,6 +30,7 @@ import {
 } from '../panel/editors'
 import { Section, ToggleRow } from '../panel/fields'
 import { Button, IconButton, Label } from '../ui/controls'
+import { ModelLabel } from '../ui/ModelLabel'
 import { IconPicker, PresetIcon } from './PresetIcon'
 
 function useResolver(): (p: Pick<Preset, 'config'> | null) => ChatConfig {
@@ -52,7 +53,7 @@ function PresetRow({ preset, onEdit }: { preset: Preset; onEdit: () => void }): 
   const deletePreset = useStore((s) => s.deletePreset)
   const duplicatePreset = useStore((s) => s.duplicatePreset)
   const resolve = useResolver()
-  const model = resolve(preset).model
+  const cfg = resolve(preset)
   return (
     <div
       data-testid="preset-row"
@@ -70,7 +71,15 @@ function PresetRow({ preset, onEdit }: { preset: Preset; onEdit: () => void }): 
           )}
         </div>
         <div className="truncate text-[11.5px] text-subtle">
-          <span className="font-mono text-[11px]">{model || 'sem modelo'}</span>
+          {cfg.model ? (
+            <ModelLabel
+              providerId={cfg.providerId}
+              model={cfg.model}
+              modelClassName="font-mono text-[11px]"
+            />
+          ) : (
+            <span className="font-mono text-[11px]">sem modelo</span>
+          )}
           <span className="text-faint"> · {preset.description || presetSummary(preset)}</span>
         </div>
       </div>
@@ -217,6 +226,38 @@ export function PresetEditor({
   const cfg = resolve({ config: draft })
   const patch = (p: Partial<ChatConfig>): void => setDraft((d) => patchPresetConfig(d, p))
   const scope = `preset:${preset?.id ?? 'new'}`
+  const providers = useStore((s) => s.providers)
+  const missing = presetProviderMissing({ config: draft }, providers)
+  const ownModel = !!draft.model?.trim() && !missing
+  const modelNote = (
+    <p className="flex items-center gap-1.5 text-[11.5px] text-subtle">
+      {missing ? (
+        <span data-testid="preset-provider-missing" className="text-warning/85">
+          O provedor desta persona não existe mais — usando o modelo padrão.
+        </span>
+      ) : ownModel ? (
+        'Definido nesta persona.'
+      ) : (
+        'Segue o modelo padrão de “Novos chats”.'
+      )}
+      {(ownModel || missing) && (
+        <button
+          type="button"
+          onClick={() =>
+            setDraft((d) => {
+              const next = { ...d }
+              delete next.providerId
+              delete next.model
+              return next
+            })
+          }
+          className="inline-flex items-center gap-1 text-subtle underline-offset-2 hover:text-fg hover:underline"
+        >
+          Usar o padrão
+        </button>
+      )}
+    </p>
+  )
 
   const save = async (): Promise<void> => {
     if (!name.trim()) return
@@ -305,7 +346,7 @@ export function PresetEditor({
           </span>
         </div>
         {tab === 'model' ? (
-          <ModelEditor cfg={cfg} patch={patch} scope={scope} />
+          <ModelEditor cfg={cfg} patch={patch} scope={scope} modelNote={modelNote} />
         ) : tab === 'chat' ? (
           <PresetChatEditor
             cfg={cfg}

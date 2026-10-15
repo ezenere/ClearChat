@@ -80,7 +80,8 @@ export function Popover({
   width = 'anchor',
   align = 'start',
   className,
-  maxHeight = 360
+  maxHeight = 360,
+  minWidth = 0
 }: {
   open: boolean
   onClose: () => void
@@ -90,6 +91,8 @@ export function Popover({
   align?: 'start' | 'end'
   className?: string
   maxHeight?: number
+  /** Com `width="anchor"`: largura mínima (limitada à janela). */
+  minWidth?: number
 }): React.JSX.Element | null {
   const ref = useRef<HTMLDivElement>(null)
   const [style, setStyle] = useState<CSSProperties | null>(null)
@@ -101,7 +104,10 @@ export function Popover({
       const a = anchor.current
       if (!a) return
       const r = a.getBoundingClientRect()
-      const w = width === 'anchor' ? r.width : width
+      const w = Math.min(
+        window.innerWidth - 16,
+        width === 'anchor' ? Math.max(r.width, minWidth) : width
+      )
       const below = window.innerHeight - r.bottom - 12
       const above = r.top - 12
       const up = below < 220 && above > below
@@ -122,7 +128,7 @@ export function Popover({
       window.removeEventListener('resize', place)
       window.removeEventListener('scroll', place, true)
     }
-  }, [open, anchor, width, align, maxHeight])
+  }, [open, anchor, width, align, maxHeight, minWidth])
 
   useEffect(() => {
     if (!open) return
