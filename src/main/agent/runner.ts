@@ -48,6 +48,8 @@ import {
   clearQueue
 } from './queue'
 import { formatTextToolResult, parseTextToolCalls } from './textTools'
+import { buildUserContent, truncateBodyForPreview, validateAttachments } from '../attachments'
+import type { AttachmentInfo } from '@shared/types'
 
 export const CANCELLED_TEXT = '[Interrompido pelo usuário antes de concluir]'
 export const DENIED_TEXT = 'O usuário negou a execução desta ferramenta.'
@@ -256,9 +258,14 @@ function maybeSetTitle(session: Session, text: string): void {
   emit({ type: 'chat-updated', chat: updated })
 }
 
-function appendUser(session: Session, text: string, meta: MessageMeta = {}): StoredMessage {
-  maybeSetTitle(session, text)
-  return append(session.id, { role: 'user', content: text }, meta)
+function appendUser(
+  session: Session,
+  text: string,
+  meta: MessageMeta = {},
+  attachments: AttachmentInfo[] = []
+): StoredMessage {
+  maybeSetTitle(session, text.trim() ? text : attachments.map((a) => a.name).join(', '))
+  return append(session.id, { role: 'user', content: buildUserContent(text, attachments) }, meta)
 }
 
 // ---------------- loop ----------------
@@ -453,7 +460,7 @@ function onAborted(st: RunState, partial: string): 'continue' | LoopOutcome {
     st.compactOnly = false
     for (const f of st.forced.splice(0)) {
       const s = sessionsRepo.get(st.sessionId)
-      if (s) appendUser(s, f.text, { kind: 'forced' })
+      if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
     }
     return 'continue'
   }
@@ -508,7 +515,7 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
         }
         for (const f of st.forced.splice(0)) {
           const s = sessionsRepo.get(st.sessionId)
-          if (s) appendUser(s, f.text, { kind: 'forced' })
+          if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
         }
       }
     }
@@ -516,7 +523,7 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
     if (st.depth === 0) {
       for (const q of drainQueue(st.sessionId)) {
         const s = sessionsRepo.get(st.sessionId)
-        if (s) appendUser(s, q.text, { kind: 'queued' })
+        if (s) appendUser(s, q.text, { kind: 'queued' }, q.attachments)
       }
     }
     const signal = st.controller.signal
@@ -566,7 +573,7 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
     if (st.forced.length) {
       for (const f of st.forced.splice(0)) {
         const s = sessionsRepo.get(st.sessionId)
-        if (s) appendUser(s, f.text, { kind: 'forced' })
+        if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
       }
       continue
     }
@@ -908,17 +915,23 @@ export function compact(sessionId: string, opts: CompactOptions = {}): { schedul
   return { scheduled: false }
 }
 
-export function send(sessionId: string, text: string): { queued: boolean } {
+export function send(
+  sessionId: string,
+  text: string,
+  attachmentsInput?: AttachmentInfo[]
+): { queued: boolean } {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
   if (session.depth !== 0) throw new Error('Subsessões são somente leitura.')
-  if (!text || !text.trim()) throw new Error('Mensagem vazia.')
+  const attachments = validateAttachments(attachmentsInput)
+  text = typeof text === 'string' ? text : ''
+  if (!text.trim() && !attachments.length) throw new Error('Mensagem vazia.')
   if (runs.has(sessionId)) {
-    enqueue(sessionId, text)
+    enqueue(sessionId, text, attachments)
     return { queued: true }
   }
   repairTail(sessionId)
-  appendUser(session, text)
+  appendUser(session, text, {}, attachments)
   startLoop(session)
   return { queued: false }
 }
@@ -940,7 +953,7 @@ export function forceSend(queuedId: string): void {
     return
   }
   repairTail(session.id)
-  appendUser(session, item.text)
+  appendUser(session, item.text, {}, item.attachments)
   startLoop(session)
 }
 
@@ -1022,7 +1035,17 @@ export function previewRequest(sessionId: string): RequestPreview {
   const provider = providersRepo.get(chat.config.providerId)
   if (!provider) throw new Error('Nenhum provider configurado para este chat.')
   const req = buildRequest(chat, session, messagesRepo.list(sessionId), provider)
-  return maskRequest(req, provider.apiKey)
+  const masked = maskRequest(req, provider.apiKey)
+  // anexos: o base64 aparece encurtado (a request real leva o arquivo inteiro)
+  const { body, truncated } = truncateBodyForPreview(masked.body)
+  if (!truncated) return masked
+  return {
+    ...masked,
+    body,
+    notes: [
+      `Base64 de ${truncated} anexo${truncated > 1 ? 's' : ''} encurtado nesta visualização (…(tamanho)); a request real envia o arquivo inteiro.`
+    ]
+  }
 }
 
 export function runningSessions(): string[] {

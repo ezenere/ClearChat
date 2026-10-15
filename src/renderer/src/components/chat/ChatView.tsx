@@ -4,10 +4,13 @@ import {
   ChevronRight,
   FolderOpen,
   PanelRight,
+  Paperclip,
   ShieldOff,
   Sparkles
 } from 'lucide-react'
+import { useRef, useState } from 'react'
 import { TOOL_LABELS } from '@shared/tools'
+import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { CONFIRM_TOOLS } from '@shared/types'
 import type { Chat, Session } from '@shared/types'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
@@ -195,12 +198,63 @@ export function ChatView({
   sessionId: string
 }): React.JSX.Element {
   const session = useStore((s) => s.sessions[sessionId])
+  const addFiles = useStore((s) => s.addFiles)
+  const [dragging, setDragging] = useState(false)
+  const depth = useRef(0)
   if (!session) {
     return <div className="flex-1" />
   }
   const isSub = session.depth > 0
+  const hasFiles = (e: React.DragEvent): boolean => [...e.dataTransfer.types].includes('Files')
+  // Arrastar arquivos para qualquer ponto do chat (só na sessão principal) → anexos do composer.
+  const dropProps = isSub
+    ? {}
+    : {
+        onDragEnter: (e: React.DragEvent) => {
+          if (!hasFiles(e)) return
+          e.preventDefault()
+          depth.current++
+          setDragging(true)
+        },
+        onDragOver: (e: React.DragEvent) => {
+          if (!hasFiles(e)) return
+          e.preventDefault()
+          e.dataTransfer.dropEffect = 'copy'
+        },
+        onDragLeave: (e: React.DragEvent) => {
+          if (!hasFiles(e)) return
+          depth.current = Math.max(0, depth.current - 1)
+          if (!depth.current) setDragging(false)
+        },
+        onDrop: (e: React.DragEvent) => {
+          if (!hasFiles(e)) return
+          e.preventDefault()
+          depth.current = 0
+          setDragging(false)
+          const files = [...e.dataTransfer.files]
+          if (files.length) void addFiles(session.id, files)
+        }
+      }
   return (
-    <div className={cn('flex min-h-0 min-w-0 flex-1 flex-col')}>
+    <div
+      className={cn('relative flex min-h-0 min-w-0 flex-1 flex-col')}
+      data-chat-drop
+      {...dropProps}
+    >
+      {dragging && (
+        <div className="pointer-events-none absolute inset-3 z-30 flex animate-fade-in items-center justify-center rounded-2xl border-2 border-dashed border-accent/50 bg-bg/80 backdrop-blur-[2px]">
+          <div className="flex flex-col items-center gap-2 text-center">
+            <span className="flex size-11 items-center justify-center rounded-2xl bg-accent-soft text-accent-strong">
+              <Paperclip className="size-5" />
+            </span>
+            <span className="text-[14px] font-medium">Solte para anexar</span>
+            <span className="text-[12px] text-subtle">
+              Imagens, PDF, áudio (wav/mp3) e arquivos de texto · até{' '}
+              {ATTACHMENT_LIMITS.maxFileBytes / 1024 / 1024} MB cada
+            </span>
+          </div>
+        </div>
+      )}
       {isSub && <SubBanner chat={chat} session={session} />}
       <MessageList
         chatId={chat.id}

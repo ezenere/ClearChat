@@ -469,8 +469,20 @@ export function createMockApi(scenario: string): ClearApi {
       }
     },
     agent: {
-      send: async (sid, text) => {
-        const m = msg(sid, { role: 'user', content: text })
+      send: async (sid, text, atts) => {
+        const m = msg(sid, {
+          role: 'user',
+          content: atts?.length
+            ? [
+                ...atts.map((a) => ({
+                  type: 'image_url' as const,
+                  image_url: { url: `clearchat-attachment://${a.file}` },
+                  _attachment: a
+                })),
+                { type: 'text' as const, text }
+              ]
+            : text
+        })
         messages.push(m)
         emit({ type: 'message-added', message: m })
         return { queued: false }
@@ -550,6 +562,31 @@ export function createMockApi(scenario: string): ClearApi {
     },
     app: {
       capabilities: () => delay({ bwrap: true, ripgrep: true })
+    },
+    attachments: {
+      pick: () =>
+        delay({
+          items: [
+            {
+              sha256: 'a'.repeat(64),
+              name: 'diagrama.png',
+              mime: 'image/png',
+              size: 48_213,
+              kind: 'image' as const,
+              file: `${'a'.repeat(64)}.png`
+            }
+          ],
+          errors: []
+        }),
+      add: (input) =>
+        delay({
+          sha256: 'b'.repeat(64),
+          name: input.name,
+          mime: input.mime || 'application/octet-stream',
+          size: input.data.byteLength,
+          kind: 'text' as const,
+          file: `${'b'.repeat(64)}.txt`
+        })
     },
     onEvent: (cb) => {
       listeners.add(cb)

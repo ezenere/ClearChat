@@ -1,21 +1,31 @@
 import type { ApiMessage, ContentPart, ModelInfo, Session } from '@shared/types'
+import { contentText } from '@shared/attachments'
 
 export { clsx as cn } from 'clsx'
 
+/** Texto da mensagem (parts de anexo ficam de fora). */
 export function messageText(content: string | ContentPart[] | null | undefined): string {
-  if (content == null) return ''
-  if (typeof content === 'string') return content
-  return content.map((p) => p.text).join('')
+  return contentText(content)
 }
 
-/** Substitui o texto de uma mensagem preservando o formato (string vs. content parts). */
+/**
+ * Substitui o texto de uma mensagem preservando o formato (string vs. content parts) e os anexos:
+ * os parts de anexo ficam intactos (mesma ordem) e o texto digitado vira um único text part no fim.
+ */
 export function withText(message: ApiMessage, text: string): ApiMessage {
   if (message.role === 'tool') return { ...message, content: text }
   if (message.role === 'assistant') return { ...message, content: text }
   if (typeof message.content === 'string') return { ...message, content: text }
   const parts = message.content
-  if (parts.length === 0) return { ...message, content: text }
-  return { ...message, content: [{ ...parts[0], text }] }
+  const attachments = parts.filter((p) => p._attachment)
+  if (!attachments.length) {
+    if (parts.length === 0) return { ...message, content: text }
+    const first = parts.find((p) => p.type === 'text') ?? { type: 'text' as const, text: '' }
+    return { ...message, content: [{ ...first, text } as ContentPart] }
+  }
+  const next: ContentPart[] = [...attachments]
+  if (text.trim()) next.push({ type: 'text', text })
+  return { ...message, content: next }
 }
 
 export function formatTokens(n: number | undefined): string {

@@ -93,6 +93,18 @@ npm run install:local -- --uninstall
   modelo quando falham; se o modelo do subagente falhar, o `delegate_task` devolve
   `[falha do modelo X: …] … Tente outro modelo`.
 
+## Anexos
+
+- 📎 no composer (diálogo nativo), arrastar arquivos para o chat ou colar imagens. Imagens
+  (png/jpg/webp/gif), PDF, áudio (wav/mp3) e arquivos de texto/código; até 20 MB por arquivo e
+  10 por mensagem (`ATTACHMENT_LIMITS` em `src/shared/limits.ts`).
+- Os bytes ficam em `userData/attachments/<sha256>.<ext>` (dedup); o histórico guarda só
+  referências `clearchat-attachment://…` e o `buildRequest` as expande para base64 em cada request
+  (mesmos bytes sempre → cacheável). "Ver request" mostra o base64 encurtado.
+- Aviso quando o modelo não declara a modalidade (`input_modalities` do `/models`); enviar assim
+  mesmo exige confirmação. PDF no OpenRouter funciona com qualquer modelo (o OpenRouter extrai o texto).
+- Arquivos órfãos (chat/mensagem apagados) são removidos no próximo início do app.
+
 ## Mock de UI (sem backend)
 
 `VITE_CLEAR_MOCK=1 npx electron-vite build` gera um renderer com uma API falsa
@@ -104,6 +116,8 @@ Rode `npm run build` depois para voltar ao bundle normal.
 
 ```bash
 npm run test:unit   # buildRequest (+ fronteira de compactação), parser SSE/usage, <tool_call>, DuckDuckGo, assinatura de app,
+                    # anexos (e2e/attachments.test.ts: codificação por tipo, expansão determinística, _attachment removido,
+                    # cache_control com parts mistos, preview encurtado, arquivo ausente, compactação, GC),
                     # confinação de caminhos, janelas do read_file, bash (corte início/fim + cd persistente),
                     # search/find_files, list_models (filtro/ordem/formato/corte) e erro de delegate,
                     # detecção de contexto excedido (Node puro, sem Electron)
@@ -130,6 +144,12 @@ OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
   também o medidor de contexto, o banner de compactação (forçado com uma janela minúscula), o botão
   Compactar (divisor + card do resumo + "Ver request" compactado), a aba Arquivos confinada à raiz
   ("Usar como raiz", "Nova pasta…") e "Nova pasta…" no Novo chat.
+- Anexos — backend (`node e2e/backend.spec.ts anexo`): PNG gerado (quadrado vermelho "CC42") descrito por
+  um modelo de visão barato (`E2E_VISION_MODEL`, padrão `openai/gpt-4.1-nano`), texto + PDF entendidos, áudio
+  wav (`E2E_AUDIO_MODEL`, padrão `google/gemini-3.1-flash-lite`), anexo na fila e no ⚡, erros legíveis,
+  arquivo ausente e GC no reinício. UI (`node e2e/ui.spec.ts anexos`): botão (diálogo mockado no main),
+  colar imagem, chips, aviso de modalidade + confirmação, miniatura/lightbox/prévia na mensagem enviada e
+  "Ver request" encurtado.
 - O E2E do backend cobre ainda: compactação ponta a ponta (resumo persistido, request a partir da
   fronteira, conversa coerente depois, Parar cancela sem salvar), compactação automática e
   "tentar de novo", compactação reaproveitando o cache (Haiku), aviso de arquivo grande,

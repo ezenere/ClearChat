@@ -6,6 +6,8 @@ import {
   IPC,
   type AppCapabilities,
   type ApprovalDecision,
+  type AttachmentAddInput,
+  type AttachmentPickResult,
   type CompactOptions,
   type ChatCreateInput,
   type ChatUpdateInput,
@@ -13,7 +15,7 @@ import {
   type ProviderPatch,
   type ProviderTestInput
 } from '@shared/ipc'
-import type { ApiMessage, Chat } from '@shared/types'
+import type { ApiMessage, AttachmentInfo, Chat } from '@shared/types'
 import { emit } from './events'
 import { chatsRepo, messagesRepo, providersRepo, sessionsRepo, settingsRepo } from './repo'
 import { invalidateModels, listModels, testProvider } from './providers'
@@ -21,6 +23,11 @@ import * as fsapi from './fsapi'
 import * as runner from './agent/runner'
 import { bwrapAvailable } from './tools/bash'
 import { ripgrepAvailable } from './tools/search'
+import { readFile as readFileAsync, stat } from 'fs/promises'
+import { basename } from 'path'
+import { ATTACHMENT_LIMITS } from '@shared/limits'
+import { formatSize } from '@shared/attachments'
+import { saveAttachment } from './attachments'
 
 type Handler = (...args: never[]) => unknown
 
@@ -93,7 +100,8 @@ export function registerIpc(): void {
     [IPC.messages.delete]: (id: string) => runner.deleteMessage(id),
 
     // ---- agent ----
-    [IPC.agent.send]: (sessionId: string, text: string) => runner.send(sessionId, text),
+    [IPC.agent.send]: (sessionId: string, text: string, attachments?: AttachmentInfo[]) =>
+      runner.send(sessionId, text, attachments),
     [IPC.agent.forceSend]: (queuedId: string) => runner.forceSend(queuedId),
     [IPC.agent.removeQueued]: (queuedId: string) => runner.removeQueued(queuedId),
     [IPC.agent.getQueue]: (sessionId: string) => runner.getQueue(sessionId),
@@ -121,6 +129,37 @@ export function registerIpc(): void {
     },
     [IPC.fs.homeDir]: () => fsapi.homeDir(),
     [IPC.fs.mkdir]: (path: string) => fsapi.mkdir(path),
+
+    // ---- anexos ----
+    [IPC.attachments.pick]: async (): Promise<AttachmentPickResult> => {
+      const win = BrowserWindow.getFocusedWindow()
+      const opts: Electron.OpenDialogOptions = {
+        title: 'Anexar arquivos',
+        properties: ['openFile', 'multiSelections']
+      }
+      const r = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
+      const out: AttachmentPickResult = { items: [], errors: [] }
+      if (r.canceled) return out
+      for (const path of r.filePaths) {
+        const name = basename(path)
+        try {
+          const st = await stat(path)
+          if (!st.isFile()) throw new Error(`"${name}" não é um arquivo.`)
+          if (st.size > ATTACHMENT_LIMITS.maxFileBytes)
+            throw new Error(
+              `"${name}" tem ${formatSize(st.size)} — o limite por arquivo é ${formatSize(ATTACHMENT_LIMITS.maxFileBytes)}.`
+            )
+          out.items.push(saveAttachment({ name, data: await readFileAsync(path) }))
+        } catch (e) {
+          out.errors.push((e as Error).message)
+        }
+      }
+      return out
+    },
+    [IPC.attachments.add]: (input: AttachmentAddInput) => {
+      if (!input || !(input.data instanceof Uint8Array)) throw new Error('Arquivo inválido.')
+      return saveAttachment(input)
+    },
 
     // ---- app ----
     [IPC.app.capabilities]: (): AppCapabilities => ({

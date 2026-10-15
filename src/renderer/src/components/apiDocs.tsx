@@ -3,8 +3,10 @@ import { useEffect, useState } from 'react'
 import { TOOL_DEFINITIONS } from '@shared/tools'
 import { COMPACTION_NOTE, compactionMessageText } from '@shared/defaults'
 import { LIMITS } from '@shared/limits'
-import type { ApiMessage, ChatParams, StoredMessage, ToolName } from '@shared/types'
+import { audioFormat, contentText, formatSize, messageAttachments } from '@shared/attachments'
+import type { ApiMessage, AttachmentMeta, ChatParams, StoredMessage, ToolName } from '@shared/types'
 import { api } from '../lib/api'
+import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { ApiInfo, C } from './ui/Tooltip'
 
 type Side = 'top' | 'right' | 'bottom' | 'left'
@@ -194,7 +196,7 @@ function systemText(body: unknown): string | null {
   const msgs = (body as { messages?: ApiMessage[] } | null)?.messages
   const sys = msgs?.find((m) => m.role === 'system')
   if (!sys) return null
-  return typeof sys.content === 'string' ? sys.content : sys.content.map((p) => p.text).join('')
+  return contentText(sys.content)
 }
 
 /** Busca o bloco <environment> exato via previewRequest; cai num modelo se o main não responder. */
@@ -435,6 +437,12 @@ export function ComposerInfo({ running }: { running: boolean }): React.JSX.Eleme
         Enviada como uma nova mensagem <C>{'{ role: "user", content: "<texto>" }'}</C> (string) no
         fim do array <C>messages</C>, depois de todo o histórico.
       </p>
+      <p>
+        Com anexos, <C>content</C> vira um array: um part por anexo (imagem → <C>image_url</C>, PDF
+        → <C>file</C>, áudio → <C>input_audio</C>, texto → <C>text</C> com{' '}
+        <C>{'<file name="…">'}</C>) e, por último, <C>{'{ type: "text", text }'}</C> com o que você
+        digitou.
+      </p>
       {running && (
         <p>
           O agente está trabalhando: a mensagem entra na <strong className="text-fg">fila</strong> e
@@ -527,6 +535,13 @@ export function MessageInfo({
       side={side}
     >
       <p>{desc[m.role]}</p>
+      {messageAttachments(m).length > 0 && (
+        <p>
+          Anexos: no banco ficam só referências <C>clearchat-attachment://…</C> (e o campo privado{' '}
+          <C>_attachment</C>); em cada request elas viram o conteúdo em base64 e <C>_attachment</C>{' '}
+          é removido. Veja o resultado em &quot;Ver request&quot;.
+        </p>
+      )}
       {msg.meta.synthetic && (
         <p>
           Não foi escrita por você nem pelo modelo: o app a inseriu para manter a conversa
@@ -546,6 +561,84 @@ export function TaskInfo({ task, side }: { task: string | null; side?: Side }): 
         como primeira mensagem <C>{'role: "user"'}</C>, exatamente o argumento <C>task</C> da
         chamada <C>delegate_task</C>. O texto final dele volta para esta sessão como o resultado{' '}
         <C>{'role: "tool"'}</C>.
+      </p>
+    </ApiInfo>
+  )
+}
+
+const LIMITS_TEXT_CHARS = ATTACHMENT_LIMITS.maxTextChars
+const b64Size = (n: number): number => Math.ceil(n / 3) * 4
+
+/** (i) de um anexo: como exatamente ele vai na request. */
+export function AttachmentApiInfo({
+  meta,
+  openRouterParsed,
+  side = 'top',
+  className
+}: {
+  meta: AttachmentMeta
+  className?: string
+  /** PDF num modelo sem suporte nativo via OpenRouter (o OpenRouter extrai o texto). */
+  openRouterParsed?: boolean
+  side?: Side
+}): React.JSX.Element {
+  const name = JSON.stringify(meta.name)
+  const shape =
+    meta.kind === 'image'
+      ? `{ "type": "image_url", "image_url": { "url": "data:${meta.mime};base64,…" } }`
+      : meta.kind === 'pdf'
+        ? `{ "type": "file", "file": { "filename": ${name}, "file_data": "data:application/pdf;base64,…" } }`
+        : meta.kind === 'audio'
+          ? `{ "type": "input_audio", "input_audio": { "data": "<base64>", "format": "${audioFormat(meta.mime)}" } }`
+          : `{ "type": "text", "text": "<file name=${name}>\n…conteúdo…\n</file>" }`
+  return (
+    <ApiInfo
+      title={meta.name}
+      side={side}
+      className={className}
+      code={shape}
+      codeLabel="Part enviado no content da mensagem role: user:"
+    >
+      {meta.kind === 'text' ? (
+        <p>
+          Arquivo de texto ({formatSize(meta.size)}): o conteúdo vai como um part <C>text</C>,
+          dentro de <C>{'<file name="…">'}</C> — funciona com qualquer modelo.
+          {meta.truncated && (
+            <>
+              {' '}
+              <strong className="text-warning">Cortado</strong> no limite de{' '}
+              {LIMITS_TEXT_CHARS.toLocaleString('pt-BR')} caracteres.
+            </>
+          )}{' '}
+          Enviado em toda request enquanto estiver no histórico — conta tokens e é cacheável.
+        </p>
+      ) : (
+        <p>
+          {formatSize(meta.size)} → ~{formatSize(b64Size(meta.size))} em base64.{' '}
+          <strong className="text-fg">
+            Enviado em base64 em toda request enquanto estiver no histórico
+          </strong>{' '}
+          — conta tokens e é cacheável (os bytes são sempre os mesmos).
+        </p>
+      )}
+      {meta.kind === 'pdf' && (
+        <p>
+          {openRouterParsed
+            ? 'Este modelo não lê PDF nativamente: o OpenRouter extrai o texto do PDF (plugin file-parser) antes de repassar.'
+            : 'No OpenRouter, modelos sem suporte nativo a PDF recebem o texto extraído pelo plugin file-parser.'}
+        </p>
+      )}
+      <p>
+        {meta.kind === 'text' ? (
+          <>O texto fica salvo no histórico já no formato enviado (sem base64).</>
+        ) : (
+          <>
+            No banco fica só uma referência (<C>clearchat-attachment://{meta.file.slice(0, 10)}…</C>
+            ); o arquivo fica em <C>userData/attachments</C> e vira base64 na hora de montar cada
+            request.
+          </>
+        )}{' '}
+        Os anexos vêm antes do texto no array <C>content</C>.
       </p>
     </ApiInfo>
   )

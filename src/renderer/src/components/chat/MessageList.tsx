@@ -15,6 +15,7 @@ import {
   Zap
 } from 'lucide-react'
 import { isContextLengthError, latestBoundaryIndex } from '@shared/context'
+import { messageAttachments } from '@shared/attachments'
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { ApprovalRequest, Session, StoredMessage, StreamDraft } from '@shared/types'
 import { api } from '../../lib/api'
@@ -40,6 +41,7 @@ import { AutoTextarea, Button, Spinner } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import { CopyButton, Markdown } from './Markdown'
 import { OrphanApproval, ToolCard } from './ToolCard'
+import { MessageAttachments } from './Attachments'
 
 // ---------- Bits ----------
 
@@ -302,6 +304,7 @@ function UserMessage({
   const run = useStore((s) => s.run)
   const [editing, setEditing] = useState(false)
   const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
+  const hasAttachments = messageAttachments(msg.message).length > 0
   const kind = msg.meta.kind
   return (
     <div className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2">
@@ -322,9 +325,14 @@ function UserMessage({
               {kind === 'forced' ? 'enviada agora (interrompeu o agente)' : 'da fila'}
             </span>
           )}
-          <div className="max-w-[85%] rounded-2xl rounded-br-md border border-border bg-elevated px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg shadow-[0_1px_0_rgb(255_255_255/0.03)_inset]">
-            {text}
-          </div>
+          {msg.message.role === 'user' && Array.isArray(msg.message.content) && (
+            <MessageAttachments parts={msg.message.content} />
+          )}
+          {(text || !hasAttachments) && (
+            <div className="max-w-[85%] rounded-2xl rounded-br-md border border-border bg-elevated px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg shadow-[0_1px_0_rgb(255_255_255/0.03)_inset]">
+              {text}
+            </div>
+          )}
           <MessageActions msg={msg} canEdit={canEdit} onEdit={() => setEditing(true)} align="end" />
         </>
       )}

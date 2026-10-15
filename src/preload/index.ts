@@ -33,7 +33,7 @@ const api: ClearApi = {
     delete: (id) => invoke(IPC.messages.delete, id)
   },
   agent: {
-    send: (sessionId, text) => invoke(IPC.agent.send, sessionId, text),
+    send: (sessionId, text, attachments) => invoke(IPC.agent.send, sessionId, text, attachments),
     forceSend: (queuedId) => invoke(IPC.agent.forceSend, queuedId),
     removeQueued: (queuedId) => invoke(IPC.agent.removeQueued, queuedId),
     getQueue: (sessionId) => invoke(IPC.agent.getQueue, sessionId),
@@ -54,6 +54,10 @@ const api: ClearApi = {
   },
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
+  },
+  attachments: {
+    pick: () => invoke(IPC.attachments.pick),
+    add: (input) => invoke(IPC.attachments.add, input)
   },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)

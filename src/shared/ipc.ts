@@ -4,6 +4,7 @@ import type {
   AgentEvent,
   ApiMessage,
   ApprovalRequest,
+  AttachmentInfo,
   Chat,
   ChatConfig,
   DirEntry,
@@ -64,6 +65,10 @@ export const IPC = {
   },
   app: {
     capabilities: 'app:capabilities'
+  },
+  attachments: {
+    pick: 'attachments:pick',
+    add: 'attachments:add'
   }
 } as const
 
@@ -109,6 +114,21 @@ export interface RequestPreview {
   url: string
   headers: Record<string, string>
   body: unknown
+  /** Avisos sobre a exibição (ex.: base64 de anexos encurtado no preview). */
+  notes?: string[]
+}
+
+/** Arquivo enviado pelo renderer (arrastar/colar) para o store de anexos. */
+export interface AttachmentAddInput {
+  name: string
+  mime?: string
+  data: Uint8Array
+}
+
+/** Resultado do seletor de arquivos: anexos salvos + erros legíveis (tamanho/tipo). */
+export interface AttachmentPickResult {
+  items: AttachmentInfo[]
+  errors: string[]
 }
 
 export interface FileContent {
@@ -159,8 +179,15 @@ export interface ClearApi {
     delete(id: string): Promise<void>
   }
   agent: {
-    /** Só sessão depth 0. idle → inicia turno; running → enfileira. */
-    send(sessionId: string, text: string): Promise<{ queued: boolean }>
+    /**
+     * Só sessão depth 0. idle → inicia turno; running → enfileira. `attachments`: anexos já
+     * salvos via attachments.pick/add (texto pode ser vazio se houver anexos).
+     */
+    send(
+      sessionId: string,
+      text: string,
+      attachments?: AttachmentInfo[]
+    ): Promise<{ queued: boolean }>
     /** ⚡: aborta o que está rodando e injeta a mensagem já. */
     forceSend(queuedId: string): Promise<void>
     removeQueued(queuedId: string): Promise<void>
@@ -190,6 +217,13 @@ export interface ClearApi {
   }
   app: {
     capabilities(): Promise<AppCapabilities>
+  }
+  /** Anexos: salvos no store content-addressed (userData/attachments) antes do envio. */
+  attachments: {
+    /** Diálogo nativo (múltiplos arquivos); lê e salva no main. */
+    pick(): Promise<AttachmentPickResult>
+    /** Salva bytes vindos do renderer (arrastar/colar). Erro legível se grande demais/não suportado. */
+    add(input: AttachmentAddInput): Promise<AttachmentInfo>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

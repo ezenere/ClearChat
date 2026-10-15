@@ -62,6 +62,7 @@ export const DEFAULT_COMPACT_PROMPT = `A conversa acima está ficando longa dema
 Regras:
 - Resuma SOMENTE as mensagens acima desta. Esta instrução de resumir não faz parte da conversa: não a mencione.
 - Preserve LITERALMENTE todo fato que o usuário informou sobre si ou sobre o trabalho (nomes, identificadores, números, senhas/códigos de teste, preferências), mesmo que pareça trivial.
+- Anexos (imagens, PDFs, áudios, arquivos) não serão reenviados: cite cada um como [imagem: nome], [PDF: nome] etc. e descreva o que for relevante do conteúdo dele.
 - Não chame ferramentas; responda apenas com o resumo, em Markdown, nestas seções:
 
 ## Objetivo
