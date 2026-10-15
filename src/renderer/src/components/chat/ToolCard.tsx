@@ -18,6 +18,14 @@ import {
   Terminal,
   Wrench,
   ArrowUpRight,
+  CircleStop,
+  History,
+  Hourglass,
+  Info,
+  ListChecks,
+  MessageSquareText,
+  MessagesSquare,
+  Send,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
@@ -30,6 +38,7 @@ import { MessageInfo, TaskInfo } from '../apiDocs'
 import { ApiInfo, C, Tip } from '../ui/Tooltip'
 import { Button, Spinner } from '../ui/controls'
 import { CopyButton } from './Markdown'
+import { StatusDot } from './SessionSwitcher'
 
 const ICONS: Record<ToolName, LucideIcon> = {
   list_dir: FolderTree,
@@ -42,8 +51,18 @@ const ICONS: Record<ToolName, LucideIcon> = {
   web_search: Search,
   browse_url: Globe,
   list_models: Cpu,
-  delegate_task: Bot
+  delegate_task: Bot,
+  get_chat_info: Info,
+  list_chats: MessagesSquare,
+  send_to_chat: Send,
+  read_history: History,
+  check_subagents: ListChecks,
+  wait_subagents: Hourglass,
+  cancel_subagent: CircleStop,
+  message_subagent: MessageSquareText
 }
+
+const shortId = (id: string): string => (id.length > 12 ? `${id.slice(0, 8)}…` : id)
 
 export interface ToolCallView {
   id: string
@@ -88,6 +107,54 @@ function summary(name: string, args: Record<string, unknown> | null): string {
         .join(' · ')
     case 'find_files':
       return pick('glob') + (pick('path') ? `  ${pick('path')}` : '')
+    case 'list_chats':
+      return [
+        pick('query') && `"${pick('query')}"`,
+        args.limit != null && `limite ${String(args.limit)}`
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    case 'send_to_chat':
+      return [
+        `→ ${shortId(pick('chat_id'))}`,
+        args.wait_for_reply === true && 'aguarda resposta',
+        pick('message')
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    case 'read_history': {
+      const range =
+        args.from_seq != null || args.to_seq != null
+          ? `#${args.from_seq != null ? String(args.from_seq) : '…'}–#${args.to_seq != null ? String(args.to_seq) : '…'}`
+          : ''
+      return [
+        pick('query') && `"${pick('query')}"`,
+        range,
+        args.include_tool_results === true && 'com resultados de tools'
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    }
+    case 'wait_subagents': {
+      const ids = Array.isArray(args.ids) ? args.ids.length : 0
+      return [
+        ids ? `${ids} subagente${ids > 1 ? 's' : ''}` : 'todos os pendentes',
+        pick('mode') === 'any' ? 'o primeiro' : '',
+        args.timeout_s != null && `até ${String(args.timeout_s)}s`
+      ]
+        .filter(Boolean)
+        .join(' · ')
+    }
+    case 'cancel_subagent':
+      return shortId(pick('id'))
+    case 'message_subagent':
+      return [
+        `→ ${shortId(pick('id'))}`,
+        args.wait_for_reply === true && 'aguarda resposta',
+        pick('message')
+      ]
+        .filter(Boolean)
+        .join(' · ')
     case 'read_file': {
       const o = Number(args.offset ?? 1) || 1
       const l = args.limit != null ? Number(args.limit) : null
@@ -230,6 +297,21 @@ export function ToolCard({
   const Icon = ICONS[name] ?? Wrench
   const isDelegate = name === 'delegate_task'
   const resultText = result && result.message.role === 'tool' ? result.message.content : ''
+  const background = isDelegate && (result?.meta.background === true || args?.background === true)
+  const sessions = useStore((s) => s.sessions)
+  const chats = useStore((s) => s.chats)
+  // send_to_chat: chat de destino (id resolvido no resultado ou o argumento)
+  const targetChatId =
+    name === 'send_to_chat'
+      ? (result?.meta.targetChatId ?? (typeof args?.chat_id === 'string' ? args.chat_id : ''))
+      : ''
+  const targetChat = targetChatId ? chats.find((c) => c.id === targetChatId) : undefined
+  // message_subagent / cancel_subagent: subsessão alvo
+  const targetSub =
+    name === 'message_subagent' || name === 'cancel_subagent'
+      ? (result?.meta.subSessionId && sessions[result.meta.subSessionId]) ||
+        (typeof args?.id === 'string' ? sessions[args.id] : undefined)
+      : undefined
 
   // Tools rodam em sequência: sem `tool-running` ainda, a chamada está só na fila ('pendente').
   const status: Status = streaming
@@ -245,7 +327,22 @@ export function ToolCard({
   const expanded = open || !!approval
   const subId = result?.meta.subSessionId ?? subSession?.id
   const label = TOOL_LABELS[name] ?? call.name
-  const sum = summary(call.name, args)
+  let sum = summary(call.name, args)
+  if (targetChat)
+    sum = [
+      `→ ${targetChat.title || 'Novo chat'}`,
+      args?.wait_for_reply === true && 'aguarda resposta'
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  if (targetSub)
+    sum = [
+      `→ ${targetSub.title || 'Subagente'}`,
+      name === 'message_subagent' && args?.wait_for_reply === true && 'aguarda resposta'
+    ]
+      .filter(Boolean)
+      .join(' · ')
+  const liveSub = subId ? sessions[subId] : undefined
   const root = useStore((s) => s.chats.find((c) => c.id === chatId)?.config.cwd)
   const shellCwd = result?.meta.shellCwd
   const shellRel =
@@ -315,6 +412,15 @@ export function ToolCard({
 
       {isDelegate && !streaming && (
         <div className="flex items-center gap-3 border-t border-border/70 px-3.5 py-2.5">
+          {background && (
+            <span
+              data-testid="bg-badge"
+              className="flex shrink-0 items-center gap-1.5 rounded-md bg-accent-soft px-1.5 py-0.5 text-[10.5px] font-medium text-accent-strong"
+            >
+              em segundo plano
+              {liveSub && <StatusDot status={liveSub.status} />}
+            </span>
+          )}
           <p className="line-clamp-2 min-w-0 flex-1 text-[12.5px] leading-relaxed text-muted">
             {typeof args?.task === 'string' ? args.task : ''}
           </p>
@@ -329,6 +435,53 @@ export function ToolCard({
               Abrir subsessão
             </Button>
           )}
+        </div>
+      )}
+
+      {name === 'send_to_chat' && !streaming && (
+        <div className="border-t border-border/70 px-3.5 py-2.5">
+          <div className="flex items-center gap-3">
+            <p className="line-clamp-2 min-w-0 flex-1 text-[12.5px] leading-relaxed text-muted">
+              {typeof args?.message === 'string' ? args.message : ''}
+            </p>
+            {targetChat && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => void openChat(targetChat.id)}
+                icon={<ArrowUpRight className="size-3.5" />}
+              >
+                Abrir chat
+              </Button>
+            )}
+          </div>
+          {args?.wait_for_reply === true && result?.meta.toolStatus === 'ok' && (
+            <p
+              data-testid="inter-chat-reply"
+              className="mt-2 line-clamp-4 rounded-lg bg-bg/60 px-3 py-2 text-[12.5px] leading-relaxed whitespace-pre-wrap text-fg/85"
+            >
+              {resultText.replace(/^Resposta do chat [^\n]*:\n\n/, '')}
+            </p>
+          )}
+        </div>
+      )}
+
+      {targetSub && !streaming && (
+        <div className="flex items-center gap-3 border-t border-border/70 px-3.5 py-2.5">
+          <StatusDot status={targetSub.status} />
+          <p className="line-clamp-2 min-w-0 flex-1 text-[12.5px] leading-relaxed text-muted">
+            {name === 'message_subagent' && typeof args?.message === 'string'
+              ? args.message
+              : targetSub.title}
+          </p>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void openChat(chatId, targetSub.id)}
+            icon={<ArrowUpRight className="size-3.5" />}
+          >
+            Abrir subsessão
+          </Button>
         </div>
       )}
 

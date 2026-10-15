@@ -738,7 +738,7 @@ async function main(): Promise<void> {
     return `parou em ${Date.now() - t0}ms`
   })
 
-  await step('delegate_task → subsessão somente leitura → volta', async () => {
+  await step('delegate_task → subsessão (conversa direta) → volta', async () => {
     await sendMessage(
       'Use the delegate_task tool (title "listar arquivos") to ask a subagent to call list_dir on the working directory and report the file names. Then tell me the names.'
     )
@@ -758,10 +758,11 @@ async function main(): Promise<void> {
     await page.getByRole('button', { name: /\d+ sub/ }).click()
     await shot('session-switcher')
     await page.locator('button', { hasText: 'listar arquivos' }).last().click()
-    await page.getByText('somente leitura').waitFor({ timeout: 5000 })
-    assert((await composer().count()) === 0, 'subsessão sem composer')
+    await page.getByText('Conversando com o subagente').waitFor({ timeout: 5000 })
+    // conversa direta com o subagente: composer próprio
+    await page.locator('textarea[placeholder="Mensagem ao subagente…"]').waitFor({ timeout: 5000 })
     await page.getByText('readme.txt').first().waitFor({ timeout: 5000 })
-    await page.getByText('Esta subsessão usa o modelo').waitFor({ timeout: 5000 })
+    await page.getByText('Este subagente usa').waitFor({ timeout: 5000 })
     await sleep(500) // deixa as animações de entrada terminarem
     await shot('subsession')
     await page.getByRole('button', { name: 'Voltar à principal' }).click()
@@ -1481,7 +1482,7 @@ async function main(): Promise<void> {
       .getByText('Permitir que o subagente execute')
       .waitFor({ timeout: 5000 })
     await indicator.click()
-    await page.getByText('somente leitura').waitFor({ timeout: 5000 })
+    await page.getByText('Conversando com o subagente').waitFor({ timeout: 5000 })
     await shot('subagent-approval')
     await page.getByRole('button', { name: 'Permitir' }).click()
     await page.getByRole('button', { name: 'Voltar à principal' }).click()

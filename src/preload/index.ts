@@ -43,7 +43,8 @@ const api: ClearApi = {
     pendingApprovals: () => invoke(IPC.agent.pendingApprovals),
     previewRequest: (sessionId) => invoke(IPC.agent.previewRequest, sessionId),
     runningSessions: () => invoke(IPC.agent.runningSessions),
-    compact: (sessionId, opts) => invoke(IPC.agent.compact, sessionId, opts)
+    compact: (sessionId, opts) => invoke(IPC.agent.compact, sessionId, opts),
+    stopSubagents: (chatId) => invoke(IPC.agent.stopSubagents, chatId)
   },
   fs: {
     listDir: (path) => invoke(IPC.fs.listDir, path),

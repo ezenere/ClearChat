@@ -226,11 +226,13 @@ export const sessionsRepo = {
   /** Na inicialização: sessões que ficaram rodando → 'interrupted'. Retorna os ids afetados. */
   markStaleInterrupted(): string[] {
     const rows = getDb()
-      .prepare("SELECT id FROM sessions WHERE status IN ('running', 'awaiting_approval')")
+      .prepare(
+        "SELECT id FROM sessions WHERE status IN ('running', 'awaiting_approval', 'waiting')"
+      )
       .all() as { id: string }[]
     getDb()
       .prepare(
-        "UPDATE sessions SET status = 'interrupted' WHERE status IN ('running', 'awaiting_approval')"
+        "UPDATE sessions SET status = 'interrupted' WHERE status IN ('running', 'awaiting_approval', 'waiting')"
       )
       .run()
     return rows.map((r) => r.id)

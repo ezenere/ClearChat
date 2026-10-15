@@ -2,7 +2,7 @@ import { promises as fs } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { LIMITS } from '@shared/limits'
-import type { ModelInfo } from '@shared/types'
+import type { ModelInfo, StoredMessage } from '@shared/types'
 
 export const MAX_OUTPUT: number = LIMITS.maxToolOutputChars
 
@@ -30,6 +30,35 @@ export interface ToolContext {
   cacheKey?: string
   /** list_models: modelos do provedor do chat (providers.listModels, com cache). */
   models?: { providerName: string; current?: string; list: () => Promise<ModelInfo[]> }
+  /** get_chat_info / list_chats: dados do chat chamador e dos outros chats (fornecidos pelo runner). */
+  chats?: { self: () => ChatInfoData; list: () => ChatListEntry[] }
+  /** read_history: mensagens persistidas da sessão chamadora (inclui as anteriores às fronteiras). */
+  history?: () => StoredMessage[]
+}
+
+/** get_chat_info: o chat/sessão que chamou a tool. */
+export interface ChatInfoData {
+  chatId: string
+  title: string
+  sessionId: string
+  mainSessionId: string
+  depth: number
+  parentSessionId: string | null
+  sessionTitle: string
+  model: string
+  providerName: string
+  root: string
+  createdAt: number
+}
+
+/** list_chats: uma linha por chat. */
+export interface ChatListEntry {
+  id: string
+  title: string
+  model: string
+  status: 'idle' | 'running' | 'awaiting_approval'
+  updatedAt: number
+  self: boolean
 }
 
 export interface ToolResult {

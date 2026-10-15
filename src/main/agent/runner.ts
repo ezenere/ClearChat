@@ -16,7 +16,15 @@ import type { ApprovalDecision, CompactOptions, RequestPreview } from '@shared/i
 import type { ModelInfo, Provider } from '@shared/types'
 import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
-import { clampToolOutput } from '@shared/limits'
+import { clampToolOutput, LIMITS } from '@shared/limits'
+import {
+  interChatHeader,
+  interChatText,
+  nextInterChatHops,
+  splitInterChatText,
+  wouldCreateWaitCycle,
+  type WaitEdge
+} from '@shared/interChat'
 import {
   compactThreshold,
   contextUsage,
@@ -27,8 +35,25 @@ import {
 import { emit } from '../events'
 import { chatsRepo, messagesRepo, providersRepo, sessionsRepo } from '../repo'
 import { parseToolArgs, runLocalTool, shellStateFor } from '../tools'
-import { truncate, truncateHeadTail } from '../tools/util'
+import {
+  abortError,
+  truncate,
+  truncateHeadTail,
+  type ChatListEntry,
+  type ToolContext
+} from '../tools/util'
 import { delegateEmptyText, delegateFailureText } from '../tools/models'
+import {
+  callbackText,
+  formatSubagentList,
+  fmtDuration,
+  parentMessageText,
+  ReportRegistry,
+  resolveSubagentRef,
+  subtreeIds,
+  type Report,
+  type SubagentRow
+} from './subagents'
 import { listModels } from '../providers'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
 import { availableTools, buildRequest, maskRequest } from './request'
@@ -44,6 +69,7 @@ import {
   enqueue,
   getQueue,
   hasQueued,
+  isQueued,
   requeueFront,
   takeQueued,
   clearQueue
@@ -90,6 +116,8 @@ interface RunState {
   compactOnly: boolean
   /** Já houve compactação automática desde a última chamada bem-sucedida (evita laço). */
   autoCompactTried: boolean
+  /** Execução de subsessão que reporta ao pai por callback (segundo plano / retomada). */
+  report?: Report
 }
 
 interface ToolOutcome {
@@ -97,10 +125,20 @@ interface ToolOutcome {
   status: 'ok' | 'error' | 'denied' | 'cancelled'
   subSessionId?: string
   shellCwd?: string
+  /** send_to_chat: chat de destino resolvido. */
+  targetChatId?: string
+  /** delegate_task em segundo plano. */
+  background?: boolean
   durationMs: number
 }
 
 const runs = new Map<string, RunState>()
+/** Execuções de subsessões que reportam ao pai por callback (segundo plano / retomadas). */
+const reports = new ReportRegistry()
+/** Promise resolvida depois que o callback de cada execução foi tratado (por id do Report). */
+const reportSettled = new Map<number, Promise<void>>()
+/** Subagentes dormindo (status 'waiting'): acorda quando chega mensagem/callback. */
+const wakers = new Map<string, () => void>()
 
 const DEBUG = !!process.env['CLEARCHAT_DEBUG']
 const dbg = (...a: unknown[]): void => {
@@ -187,6 +225,7 @@ export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<voi
     .map((s) => s.id)
   if (!roots.length) return
   const doomed = subtree(parent.chatId, roots)
+  reports.drop(doomed.map((s) => s.id)) // apagadas: nenhum callback delas
   const live = doomed.map((s) => runs.get(s.id)).filter((x): x is RunState => !!x)
   for (const st of live) {
     st.stopRequested = true
@@ -265,7 +304,9 @@ function appendUser(
   meta: MessageMeta = {},
   attachments: AttachmentInfo[] = []
 ): StoredMessage {
-  maybeSetTitle(session, text.trim() ? text : attachments.map((a) => a.name).join(', '))
+  // mensagem de outro chat: o título (se ainda não houver) vem do corpo, sem o cabeçalho
+  const titleText = meta.kind === 'inter-chat' ? splitInterChatText(text).body : text
+  maybeSetTitle(session, titleText.trim() ? titleText : attachments.map((a) => a.name).join(', '))
   return append(session.id, { role: 'user', content: buildUserContent(text, attachments) }, meta)
 }
 
@@ -466,7 +507,7 @@ function onAborted(st: RunState, partial: string): 'continue' | LoopOutcome {
     st.compactOnly = false
     for (const f of st.forced.splice(0)) {
       const s = sessionsRepo.get(st.sessionId)
-      if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
+      if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
     }
     return 'continue'
   }
@@ -512,25 +553,21 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
       if (st.compactOnly) {
         st.compactOnly = false
         const more =
-          (req.retry && cr.kind !== 'error') ||
-          st.forced.length > 0 ||
-          (st.depth === 0 && hasQueued(st.sessionId))
+          (req.retry && cr.kind !== 'error') || st.forced.length > 0 || hasQueued(st.sessionId)
         if (!more) {
           finish(st, st.depth === 0 ? 'idle' : 'done')
           return { kind: 'final', text: lastText }
         }
         for (const f of st.forced.splice(0)) {
           const s = sessionsRepo.get(st.sessionId)
-          if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
+          if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
         }
       }
     }
 
-    if (st.depth === 0) {
-      for (const q of drainQueue(st.sessionId)) {
-        const s = sessionsRepo.get(st.sessionId)
-        if (s) appendUser(s, q.text, { kind: 'queued' }, q.attachments)
-      }
+    for (const q of drainQueue(st.sessionId)) {
+      const s = sessionsRepo.get(st.sessionId)
+      if (s) appendUser(s, q.text, { kind: 'queued', ...q.meta }, q.attachments)
     }
     const signal = st.controller.signal
     let res: StepResult
@@ -579,11 +616,26 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
     if (st.forced.length) {
       for (const f of st.forced.splice(0)) {
         const s = sessionsRepo.get(st.sessionId)
-        if (s) appendUser(s, f.text, { kind: 'forced' }, f.attachments)
+        if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
       }
       continue
     }
-    if (st.depth === 0 && hasQueued(st.sessionId)) continue
+    if (hasQueued(st.sessionId)) continue
+    // Subagente com filhos em segundo plano pendentes: dorme até os callbacks; só reporta ao pai
+    // quando encerrar um turno sem filhos pendentes.
+    if (st.depth > 0 && reports.pending(st.sessionId).length) {
+      const aborted = await sleepWhilePending(st)
+      if (shuttingDown) {
+        if (runs.get(st.sessionId) === st) runs.delete(st.sessionId)
+        return { kind: 'aborted', partial: '' }
+      }
+      if (aborted) {
+        const r = onAborted(st, res.text)
+        if (r === 'continue') continue
+        return r
+      }
+      if (hasQueued(st.sessionId)) continue
+    }
     finish(st, st.depth === 0 ? 'idle' : 'done')
     return { kind: 'final', text: res.text }
   }
@@ -677,6 +729,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       const tmeta: MessageMeta = { toolStatus: r.status, durationMs: r.durationMs }
       if (r.subSessionId) tmeta.subSessionId = r.subSessionId
       if (r.shellCwd) tmeta.shellCwd = r.shellCwd
+      if (r.targetChatId) tmeta.targetChatId = r.targetChatId
+      if (r.background) tmeta.background = true
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
         tmeta.kind = 'tool-cancelled'
@@ -689,8 +743,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   }
 
   // ---- modo texto (sem tools nativas) ----
-  if (!chat.config.nativeTools && availableTools(chat, session).length && acc.content) {
-    const parsed = parseTextToolCalls(acc.content, availableTools(chat, session))
+  if (!chat.config.nativeTools && availableTools(chat, session, history).length && acc.content) {
+    const parsed = parseTextToolCalls(acc.content, availableTools(chat, session, history))
     if (parsed.length) {
       const parts: string[] = []
       let subSessionId: string | undefined
@@ -779,6 +833,12 @@ async function executeTool(
     if (name === 'delegate_task') {
       return done(await runDelegate(st, session, chat, toolCallId, args, signal))
     }
+    if (name === 'send_to_chat') return done(await runSendToChat(session, chat, args, signal))
+    if (name === 'check_subagents') return done(runCheckSubagents(session, chat))
+    if (name === 'wait_subagents') return done(await runWaitSubagents(session, chat, args, signal))
+    if (name === 'cancel_subagent') return done(await runCancelSubagent(session, chat, args))
+    if (name === 'message_subagent')
+      return done(await runMessageSubagent(session, chat, args, signal))
     const root = chat.config.cwd
     const provider = name === 'list_models' ? providerFor(chat, session) : null
     const r = await runLocalTool(name, args, {
@@ -794,6 +854,9 @@ async function executeTool(
       models: provider
         ? { providerName: provider.name, current: session.model, list: () => listModels(provider) }
         : undefined,
+      chats:
+        name === 'get_chat_info' || name === 'list_chats' ? chatToolsCtx(chat, session) : undefined,
+      history: name === 'read_history' ? () => messagesRepo.list(session.id) : undefined,
       signal,
       onOutput: (partial) => {
         latest = partial
@@ -843,6 +906,7 @@ async function runDelegate(
   }
   const task = typeof args.task === 'string' ? args.task.trim() : ''
   if (!task) return { content: 'Erro: argumento obrigatório "task" ausente.', status: 'error' }
+  const background = args.background === true || args.background === 'true'
   const model = await resolveSubagentModel(chat, session, args.model)
   const rawTitle =
     (typeof args.title === 'string' && args.title.trim()) || task.replace(/\s+/g, ' ')
@@ -862,6 +926,18 @@ async function runDelegate(
   })
   emit({ type: 'session-created', session: child })
   append(child.id, { role: 'user', content: task }, { synthetic: true })
+
+  if (background) {
+    // sem o signal do pai: Parar/⚡ na sessão pai não derrubam subagentes em segundo plano
+    const bst = startLoop(child)
+    attachReport(bst, child, false)
+    return {
+      content: `Subagente iniciado em segundo plano (id ${child.id}, modelo ${model}). Você receberá o resultado automaticamente quando ele terminar.`,
+      status: 'ok',
+      subSessionId: child.id,
+      background: true
+    }
+  }
 
   const cst = startLoop(child, signal)
   const outcome = await cst.done
@@ -887,6 +963,649 @@ async function runDelegate(
     content: delegateFailureText(model, outcome.error),
     status: 'error',
     subSessionId: child.id
+  }
+}
+
+// ---------------- chats: get_chat_info / list_chats / send_to_chat ----------------
+
+/** Estado de um chat para list_chats: aprovação pendente > alguma sessão rodando > ocioso. */
+function chatStatus(chatId: string): ChatListEntry['status'] {
+  if (listApprovals().some((a) => a.chatId === chatId)) return 'awaiting_approval'
+  for (const st of runs.values()) if (st.chatId === chatId) return 'running'
+  return 'idle'
+}
+
+function chatToolsCtx(chat: Chat, session: Session): ToolContext['chats'] {
+  return {
+    self: () => ({
+      chatId: chat.id,
+      title: chat.title,
+      sessionId: session.id,
+      mainSessionId: chat.mainSessionId,
+      depth: session.depth,
+      parentSessionId: session.parentSessionId,
+      sessionTitle: session.title,
+      model: session.model,
+      providerName: providerFor(chat, session)?.name ?? '',
+      root: chat.config.cwd,
+      createdAt: chat.createdAt
+    }),
+    list: () =>
+      chatsRepo.list().map((c) => ({
+        id: c.id,
+        title: c.title,
+        model: c.config.model,
+        status: chatStatus(c.id),
+        updatedAt: c.updatedAt,
+        self: c.id === chat.id
+      }))
+  }
+}
+
+/** Esperas em andamento (send_to_chat com wait_for_reply): chat que espera → chat aguardado. */
+const waitEdges: (WaitEdge & { id: number })[] = []
+let waitSeq = 0
+
+/** Id exato ou prefixo único (≥ 4 caracteres) — modelos às vezes abreviam UUIDs. */
+function resolveChatRef(ref: string): Chat | 'ambiguous' | null {
+  const exact = chatsRepo.get(ref)
+  if (exact) return exact
+  const r = ref.toLowerCase()
+  if (r.length < 4) return null
+  const m = chatsRepo.list().filter((c) => c.id.startsWith(r))
+  return m.length === 1 ? m[0] : m.length > 1 ? 'ambiguous' : null
+}
+
+/**
+ * Entrega uma mensagem `role: user` a uma sessão como se o usuário a digitasse: rodando (ou
+ * dormindo) → fila, injetada no próximo limite de passo; ociosa → inicia um turno. Subsessão
+ * retomada → a nova resposta final volta ao pai como callback (atualização). `wake=false` só
+ * registra a mensagem numa sessão parada (não inicia turno).
+ */
+function deliverToSession(
+  session: Session,
+  text: string,
+  meta: MessageMeta,
+  wake = true,
+  attachments: AttachmentInfo[] = []
+): { queuedId?: string; run?: RunState } {
+  const cur = runs.get(session.id)
+  if (cur) {
+    const q = enqueue(session.id, text, attachments, meta)
+    wakeSession(session.id)
+    return { queuedId: q.id, run: cur }
+  }
+  repairTail(session.id)
+  appendUser(session, text, meta, attachments)
+  if (!wake) return {}
+  const run = startLoop(session)
+  if (session.depth > 0 && session.parentSessionId) attachReport(run, session, true)
+  return { run }
+}
+
+function lastAssistantText(sessionId: string): string {
+  const msgs = messagesRepo.list(sessionId)
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]
+    if (m.message.role === 'assistant' && m.meta.kind !== 'error') return m.message.content ?? ''
+  }
+  return ''
+}
+
+/** Fim de `done`, timeout (ms) ou abort do chamador (rejeita com AbortError). */
+function raceDone<T>(done: Promise<T>, ms: number, signal: AbortSignal): Promise<T | 'timeout'> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(abortError())
+    if (ms <= 0) return resolve('timeout')
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', onAbort)
+    }
+    const onAbort = (): void => {
+      cleanup()
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve('timeout')
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+    void done.then((o) => {
+      cleanup()
+      resolve(o)
+    })
+  })
+}
+
+type TurnWait = (LoopOutcome | { kind: 'timeout' } | { kind: 'undelivered' }) & { run?: RunState }
+
+/**
+ * Aguarda o turno do chat de destino que vai tratar a mensagem entregue terminar. Se ela ficou na
+ * fila e o loop acabou sem entregá-la (Parar), devolve 'undelivered'.
+ */
+async function waitForTurn(
+  sessionId: string,
+  queuedId: string | undefined,
+  signal: AbortSignal,
+  ms: number
+): Promise<TurnWait> {
+  const deadline = Date.now() + ms
+  for (;;) {
+    if (signal.aborted) throw abortError()
+    const st = runs.get(sessionId)
+    if (!st) {
+      if (queuedId && isQueued(sessionId, queuedId)) return { kind: 'undelivered' }
+      return { kind: 'final', text: lastAssistantText(sessionId) }
+    }
+    const r = await raceDone(st.done, deadline - Date.now(), signal)
+    if (r === 'timeout') return { kind: 'timeout', run: st }
+    if (queuedId && isQueued(sessionId, queuedId)) {
+      const again = runs.get(sessionId)
+      if (again && again !== st) continue
+      return { kind: 'undelivered' }
+    }
+    return { ...r, run: st }
+  }
+}
+
+async function runSendToChat(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown>,
+  signal: AbortSignal
+): Promise<Omit<ToolOutcome, 'durationMs'>> {
+  const fail = (content: string, targetChatId?: string): Omit<ToolOutcome, 'durationMs'> => ({
+    content,
+    status: 'error',
+    ...(targetChatId ? { targetChatId } : {})
+  })
+  const ref = typeof args.chat_id === 'string' ? args.chat_id.trim() : ''
+  const message = typeof args.message === 'string' ? args.message.trim() : ''
+  if (!ref)
+    return fail('Erro: argumento obrigatório "chat_id" ausente. Use list_chats para ver os ids.')
+  if (!message) return fail('Erro: argumento obrigatório "message" ausente ou vazio.')
+  const target = resolveChatRef(ref)
+  if (target === 'ambiguous')
+    return fail(
+      `Erro: "${ref}" corresponde a mais de um chat. Use o id completo (veja list_chats).`
+    )
+  if (!target) return fail(`Erro: chat não encontrado: "${ref}". Use list_chats para ver os ids.`)
+  if (target.id === chat.id)
+    return fail(
+      'Erro: não é possível enviar uma mensagem para o próprio chat. Para falar com o usuário, responda normalmente.',
+      target.id
+    )
+  const tname = `"${target.title || 'Novo chat'}" (id ${target.id})`
+  const targetSession = sessionsRepo.get(target.mainSessionId)
+  if (!targetSession) return fail(`Erro: o chat ${tname} não tem sessão principal.`, target.id)
+
+  // Laço entre chats: o turno atual deste chat já veio de uma cadeia de mensagens entre chats?
+  const { hops, allowed } = nextInterChatHops(messagesRepo.list(chat.mainSessionId))
+  if (!allowed)
+    return fail(
+      `Erro: limite de ${LIMITS.interChatMaxHops} saltos entre chats atingido — este turno já faz parte de uma cadeia de ${hops - 1} mensagens entre chats. A mensagem NÃO foi enviada; responda normalmente em vez de reenviar.`,
+      target.id
+    )
+  const wait = args.wait_for_reply === true || args.wait_for_reply === 'true'
+  const rawT = typeof args.timeout_s === 'number' ? args.timeout_s : Number(args.timeout_s)
+  const timeoutS =
+    Number.isFinite(rawT) && rawT > 0
+      ? Math.min(LIMITS.interChatMaxTimeoutS, Math.max(1, Math.round(rawT)))
+      : LIMITS.interChatDefaultTimeoutS
+  if (wait && wouldCreateWaitCycle(waitEdges, chat.id, target.id))
+    return fail(
+      `Erro: ciclo de espera — o chat ${tname} já está aguardando (direta ou indiretamente) uma resposta deste chat; aguardá-lo travaria os dois. A mensagem NÃO foi enviada. Responda normalmente (sua resposta final volta para ele) ou envie sem wait_for_reply.`,
+      target.id
+    )
+
+  const header = interChatHeader(chat.title, chat.id, {
+    waitForReply: wait,
+    canReply: availableTools(target, targetSession).includes('send_to_chat')
+  })
+  const meta: MessageMeta = {
+    kind: 'inter-chat',
+    fromChatId: chat.id,
+    fromSessionId: session.id,
+    fromChatTitle: chat.title,
+    interChatHops: hops
+  }
+  // registra a espera ANTES de entregar: o destino pode tentar aguardar este chat de imediato
+  const edge = wait ? { id: ++waitSeq, from: chat.id, to: target.id } : null
+  if (edge) waitEdges.push(edge)
+  const done = (
+    content: string,
+    status: ToolOutcome['status'] = 'ok'
+  ): Omit<ToolOutcome, 'durationMs'> => ({ content, status, targetChatId: target.id })
+  try {
+    const d = deliverToSession(targetSession, interChatText(header, message), meta)
+    const fresh = chatsRepo.get(target.id)
+    if (fresh) emit({ type: 'chat-updated', chat: fresh }) // sidebar: ordem / "atualizado"
+    if (!wait)
+      return done(
+        d.queuedId
+          ? `Mensagem enfileirada no chat ${tname}: ele está ocupado; será entregue no próximo passo dele. A resposta não volta automaticamente.`
+          : `Mensagem entregue ao chat ${tname}: iniciou um turno lá. A resposta não volta automaticamente (use wait_for_reply=true para aguardar).`
+      )
+    let r: TurnWait
+    try {
+      r = await waitForTurn(targetSession.id, d.queuedId, signal, timeoutS * 1000)
+    } catch (e) {
+      if (signal.aborted || (e as Error).name === 'AbortError')
+        return done(
+          `${CANCELLED_TEXT} A mensagem já tinha sido entregue ao chat ${tname}; a resposta ficará lá.`,
+          'cancelled'
+        )
+      throw e
+    }
+    const max = clampToolOutput(chat.config.maxToolOutputChars)
+    switch (r.kind) {
+      case 'final':
+        return done(
+          truncateHeadTail(
+            `Resposta do chat ${tname}:\n\n${r.text.trim() || '(o chat terminou o turno sem texto)'}`,
+            max,
+            0.5
+          )
+        )
+      case 'timeout':
+        return done(
+          `[O chat ${tname} ainda está rodando após ${timeoutS}s; a resposta ficará no chat ${target.id}. A mensagem foi entregue — não reenvie; verifique depois com list_chats.]`
+        )
+      case 'undelivered':
+        return done(
+          `[A mensagem ficou na fila do chat ${tname}: o turno dele foi interrompido antes de entregá-la.]`,
+          'error'
+        )
+      case 'aborted': {
+        const partial = r.partial.trim()
+        return done(
+          `[O turno do chat ${tname} foi interrompido antes de terminar.]${partial ? `\n\nResposta parcial:\n${truncate(partial, max)}` : ''}`,
+          'error'
+        )
+      }
+      default:
+        return done(`Erro no chat ${tname}: ${r.error}`, 'error')
+    }
+  } finally {
+    if (edge) {
+      const i = waitEdges.findIndex((e) => e.id === edge.id)
+      if (i !== -1) waitEdges.splice(i, 1)
+    }
+  }
+}
+
+// ---------------- subagentes em segundo plano / callbacks / mensagens a subagentes ----------------
+
+function wakeSession(sessionId: string): void {
+  wakers.get(sessionId)?.()
+}
+
+/**
+ * Subagente que encerrou o turno com filhos em segundo plano pendentes: status 'waiting' até
+ * chegar mensagem/callback na fila (ou não haver mais pendentes). Retorna true se foi abortado.
+ */
+async function sleepWhilePending(st: RunState): Promise<boolean> {
+  setStatus(st.sessionId, 'waiting')
+  while (
+    reports.pending(st.sessionId).length &&
+    !hasQueued(st.sessionId) &&
+    !st.controller.signal.aborted
+  ) {
+    const sig = st.controller.signal
+    await new Promise<void>((resolve) => {
+      const done = (): void => {
+        if (wakers.get(st.sessionId) === done) wakers.delete(st.sessionId)
+        sig.removeEventListener('abort', done)
+        resolve()
+      }
+      wakers.set(st.sessionId, done)
+      sig.addEventListener('abort', done, { once: true })
+    })
+  }
+  const aborted = st.controller.signal.aborted
+  if (!aborted && !shuttingDown) setStatus(st.sessionId, 'running')
+  return aborted
+}
+
+/** Registra que a execução `run` da subsessão reporta ao pai por callback quando terminar. */
+function attachReport(run: RunState, session: Session, update: boolean): Report {
+  const r = reports.add({
+    sessionId: session.id,
+    parentSessionId: session.parentSessionId ?? '',
+    title: session.title,
+    model: session.model,
+    update
+  })
+  run.report = r
+  reportSettled.set(
+    r.id,
+    run.done.then((o) => onReportDone(r, o))
+  )
+  return r
+}
+
+const callbackMeta = (r: Pick<Report, 'sessionId' | 'update'>): MessageMeta => ({
+  kind: 'subagent-callback',
+  synthetic: true,
+  subSessionId: r.sessionId,
+  ...(r.update ? { callbackUpdate: true } : {})
+})
+
+/**
+ * Fim de uma execução que reporta ao pai: entrega o callback (fila se o pai estiver rodando;
+ * acorda o pai se estiver ocioso), salvo se o resultado foi reivindicado ou a subsessão apagada.
+ * Chamado na ordem em que as execuções terminam → callbacks na mesma ordem.
+ */
+function onReportDone(r: Report, o: LoopOutcome): void {
+  if (shuttingDown) return
+  try {
+    if (reports.complete(r, o)) {
+      const parent = sessionsRepo.get(r.parentSessionId)
+      const chat = parent && chatsRepo.get(parent.chatId)
+      if (parent && chat) {
+        const text = callbackText(r, o, clampToolOutput(chat.config.maxToolOutputChars))
+        const d = deliverToSession(parent, text, callbackMeta(r), !r.silent)
+        reports.sent(r, d.queuedId)
+      }
+    }
+  } catch (e) {
+    console.error('[clearchat] callback de subagente', r.sessionId, e)
+  } finally {
+    reportSettled.delete(r.id)
+    wakeSession(r.parentSessionId) // pai dormindo reavalia os pendentes
+    reports.prune()
+  }
+}
+
+/** Callback "(interrompido: o app foi fechado)" gravado direto no pai (sem acordá-lo). */
+function appendAppClosedCallback(
+  parentSessionId: string,
+  r: Pick<Report, 'title' | 'sessionId' | 'model' | 'update'>
+): void {
+  if (!sessionsRepo.get(parentSessionId)) return
+  const m = messagesRepo.append(
+    parentSessionId,
+    { role: 'user', content: callbackText(r, { kind: 'app-closed' }) },
+    callbackMeta(r)
+  )
+  emit({ type: 'message-added', message: m })
+}
+
+/**
+ * Para uma subsessão e todos os descendentes (inclusive em segundo plano). Os callbacks dos
+ * descendentes só são registrados nos pais (também parados), sem acordá-los; o da raiz segue normal.
+ */
+async function stopSubtree(session: Session): Promise<void> {
+  const ids = subtreeIds(sessionsRepo.list(session.chatId), [session.id])
+  const set = new Set(ids)
+  for (const r of reports.all())
+    if (set.has(r.sessionId) && r.sessionId !== session.id && !r.outcome) r.silent = true
+  const sts = ids.map((id) => runs.get(id)).filter((x): x is RunState => !!x)
+  for (const st of sts) {
+    st.stopRequested = true
+    if (st.forced.length) requeueFront(st.sessionId, st.forced.splice(0))
+    st.controller.abort()
+  }
+  await Promise.all(sts.map((st) => waitDone(st)))
+}
+
+/** "Parar todos os subagentes" do chat (a sessão principal continua). */
+export async function stopSubagents(chatId: string): Promise<void> {
+  const all = sessionsRepo.list(chatId)
+  const tops = all.filter((s) => s.depth === 1)
+  await Promise.all(tops.map((s) => stopSubtree(s)))
+}
+
+/** Última atividade de uma subsessão (texto curto para check_subagents). */
+function sessionTail(sessionId: string): string {
+  const msgs = messagesRepo.list(sessionId)
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i].message
+    if (msgs[i].meta.kind === 'error') return `erro: ${msgs[i].meta.error ?? ''}`
+    if (m.role === 'assistant') {
+      if (m.content?.trim()) return m.content
+      if (m.tool_calls?.length)
+        return `chamando ${m.tool_calls.map((t) => t.function.name).join(', ')}`
+    }
+    if (m.role === 'tool') return `resultado de tool (${m.content.length} caracteres)`
+  }
+  return ''
+}
+
+function runCheckSubagents(session: Session, chat: Chat): Omit<ToolOutcome, 'durationMs'> {
+  const kids = sessionsRepo.list(chat.id).filter((s) => s.parentSessionId === session.id)
+  const pm = messagesRepo.list(session.id)
+  const rows: SubagentRow[] = kids.map((k) => {
+    const rep = reports.latest(k.id)
+    const toolMsg = pm.find((m) => m.message.role === 'tool' && m.meta.subSessionId === k.id)
+    const background = !!toolMsg?.meta.background
+    const running = runs.has(k.id)
+    const hasCallback = pm.some(
+      (m) => m.meta.kind === 'subagent-callback' && m.meta.subSessionId === k.id
+    )
+    const msgs = messagesRepo.list(k.id)
+    let result: SubagentRow['result']
+    if (running) result = rep ? 'pending' : 'none'
+    else if (rep) result = rep.claimed || rep.callbackSent ? 'delivered' : 'pending'
+    else if (background || hasCallback) result = hasCallback ? 'delivered' : 'none'
+    else result = toolMsg ? 'tool' : 'none'
+    return {
+      id: k.id,
+      title: k.title,
+      model: k.model,
+      status: k.status,
+      background,
+      startedAt: k.createdAt,
+      finishedAt: running ? undefined : (rep?.finishedAt ?? msgs.at(-1)?.createdAt ?? k.createdAt),
+      result,
+      tail: sessionTail(k.id)
+    }
+  })
+  return { content: formatSubagentList(rows), status: 'ok' }
+}
+
+const subTitle = (s: Pick<Session, 'title' | 'id'>): string =>
+  `"${s.title || 'Subagente'}" (id ${s.id})`
+
+function resolveOwnSubagent(
+  session: Session,
+  chat: Chat,
+  ref: string
+): { ok: Session } | { error: string } {
+  const r = resolveSubagentRef(sessionsRepo.list(chat.id), session.id, ref)
+  if (r === null)
+    return {
+      error: `Erro: subagente não encontrado: "${ref}". Use check_subagents para ver os ids.`
+    }
+  if (r === 'ambiguous')
+    return { error: `Erro: "${ref}" corresponde a mais de um subagente. Use o id completo.` }
+  if (r === 'not-owned')
+    return {
+      error: `Erro: "${ref}" não é um subagente desta sessão — só é possível falar com os próprios subagentes (diretos ou descendentes). Use check_subagents.`
+    }
+  return { ok: r }
+}
+
+const clampWaitS = (v: unknown): number => {
+  const n = typeof v === 'number' ? v : Number(v)
+  return Number.isFinite(n) && n > 0
+    ? Math.min(LIMITS.subagentWaitMaxS, Math.max(1, Math.round(n)))
+    : LIMITS.subagentWaitDefaultS
+}
+
+/** Reivindica o resultado de uma execução: sem callback (retira da fila do pai, se já estava lá). */
+function claimReport(r: Report): string {
+  const c = reports.claim(r)
+  if (c.queuedId && takeQueued(c.queuedId)) return ''
+  return c.sent ? ' (já tinha chegado antes como mensagem)' : ''
+}
+
+async function runWaitSubagents(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown>,
+  signal: AbortSignal
+): Promise<Omit<ToolOutcome, 'durationMs'>> {
+  const rawIds = Array.isArray(args.ids)
+    ? args.ids.filter((x): x is string => typeof x === 'string' && !!x.trim())
+    : typeof args.ids === 'string' && args.ids.trim()
+      ? [args.ids]
+      : []
+  const mode = args.mode === 'any' ? 'any' : 'all'
+  const timeoutS = clampWaitS(args.timeout_s)
+  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  let targets: Report[]
+  if (rawIds.length) {
+    targets = []
+    for (const id of rawIds) {
+      const res = resolveOwnSubagent(session, chat, id)
+      if ('error' in res) return { content: res.error, status: 'error' }
+      const rep = reports.latest(res.ok.id)
+      if (!rep || rep.parentSessionId !== session.id)
+        return {
+          content: `Erro: o subagente ${subTitle(res.ok)} não está em segundo plano nesta sessão (estado: ${res.ok.status}). Use check_subagents.`,
+          status: 'error'
+        }
+      if (!targets.includes(rep)) targets.push(rep)
+    }
+  } else {
+    targets = reports
+      .forParent(session.id)
+      .filter(
+        (r) =>
+          !r.claimed &&
+          (!r.outcome ||
+            !r.callbackSent ||
+            (!!r.callbackQueuedId && isQueued(session.id, r.callbackQueuedId)))
+      )
+  }
+  if (!targets.length)
+    return { content: '[nenhum subagente em segundo plano pendente nesta sessão]', status: 'ok' }
+  const running = targets.filter((r) => !r.outcome)
+  let timedOut = false
+  if (running.length) {
+    const settled = running.map((r) => reportSettled.get(r.id) ?? Promise.resolve())
+    const all: Promise<unknown> = mode === 'all' ? Promise.all(settled) : Promise.race(settled)
+    try {
+      timedOut = (await raceDone(all, timeoutS * 1000, signal)) === 'timeout'
+    } catch (e) {
+      if (signal.aborted || (e as Error).name === 'AbortError')
+        return {
+          content: `${CANCELLED_TEXT} Os subagentes continuam rodando; os resultados chegarão como mensagem.`,
+          status: 'cancelled'
+        }
+      throw e
+    }
+  }
+  const finished = targets.filter((r) => r.outcome)
+  const parts: string[] = []
+  const per = Math.max(1000, Math.floor((max - 400) / Math.max(1, targets.length)))
+  for (const r of targets) {
+    if (r.outcome) parts.push(callbackText(r, r.outcome, per) + claimReport(r))
+    else
+      parts.push(
+        `[Subagente "${r.title}" (id ${r.sessionId}) ainda rodando · ${fmtDuration(Date.now() - r.startedAt)} — o resultado chegará como mensagem]`
+      )
+  }
+  const head = timedOut
+    ? `[tempo esgotado após ${timeoutS}s: ${finished.length} de ${targets.length} subagentes terminaram]`
+    : `[${finished.length} de ${targets.length} subagentes terminaram]`
+  return { content: truncateHeadTail(`${head}\n\n${parts.join('\n\n')}`, max, 0.5), status: 'ok' }
+}
+
+async function runCancelSubagent(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown>
+): Promise<Omit<ToolOutcome, 'durationMs'>> {
+  const ref = typeof args.id === 'string' ? args.id.trim() : ''
+  if (!ref) return { content: 'Erro: argumento obrigatório "id" ausente.', status: 'error' }
+  const res = resolveOwnSubagent(session, chat, ref)
+  if ('error' in res) return { content: res.error, status: 'error' }
+  const target = res.ok
+  if (!runs.has(target.id))
+    return {
+      content: `O subagente ${subTitle(target)} não está em execução (estado: ${target.status}).`,
+      status: 'ok',
+      subSessionId: target.id
+    }
+  const rep = runs.get(target.id)?.report
+  await stopSubtree(target)
+  return {
+    content: `Subagente ${subTitle(target)} cancelado (com os subagentes dele).${rep ? ' O cancelamento chegará como mensagem de resultado.' : ''}`,
+    status: 'ok',
+    subSessionId: target.id
+  }
+}
+
+async function runMessageSubagent(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown>,
+  signal: AbortSignal
+): Promise<Omit<ToolOutcome, 'durationMs'>> {
+  const ref = typeof args.id === 'string' ? args.id.trim() : ''
+  const message = typeof args.message === 'string' ? args.message.trim() : ''
+  if (!ref) return { content: 'Erro: argumento obrigatório "id" ausente.', status: 'error' }
+  if (!message)
+    return { content: 'Erro: argumento obrigatório "message" ausente ou vazio.', status: 'error' }
+  const res = resolveOwnSubagent(session, chat, ref)
+  if ('error' in res) return { content: res.error, status: 'error' }
+  const target = res.ok
+  const wait = args.wait_for_reply === true || args.wait_for_reply === 'true'
+  const timeoutS = clampWaitS(args.timeout_s)
+  const d = deliverToSession(target, parentMessageText(message), {
+    kind: 'parent-message',
+    fromSessionId: session.id
+  })
+  const out = (
+    content: string,
+    status: ToolOutcome['status'] = 'ok'
+  ): Omit<ToolOutcome, 'durationMs'> => ({ content, status, subSessionId: target.id })
+  const name = subTitle(target)
+  if (!wait)
+    return out(
+      d.queuedId
+        ? `Mensagem enfileirada para o subagente ${name}: ele está rodando e a recebe no próximo passo.`
+        : `Mensagem entregue ao subagente ${name}: ele retomou o trabalho; a nova resposta final chegará como mensagem.`
+    )
+  let r: TurnWait
+  try {
+    r = await waitForTurn(target.id, d.queuedId, signal, timeoutS * 1000)
+  } catch (e) {
+    if (signal.aborted || (e as Error).name === 'AbortError')
+      return out(
+        `${CANCELLED_TEXT} A mensagem já tinha sido entregue ao subagente ${name}; a resposta chegará como mensagem.`,
+        'cancelled'
+      )
+    throw e
+  }
+  // a resposta volta aqui: o callback dessa execução não é injetado de novo (se vinha para esta sessão)
+  const rep = r.run?.report
+  if (rep && rep.parentSessionId === session.id && r.kind !== 'timeout') claimReport(rep)
+  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  switch (r.kind) {
+    case 'final':
+      return out(
+        truncateHeadTail(
+          `Resposta do subagente ${name}:\n\n${r.text.trim() || delegateEmptyText(target.model)}`,
+          max,
+          0.5
+        )
+      )
+    case 'timeout':
+      return out(
+        `[O subagente ${name} ainda está rodando após ${timeoutS}s; a resposta chegará como mensagem.]`
+      )
+    case 'undelivered':
+      return out(
+        `[A mensagem ficou na fila do subagente ${name}: ele foi parado antes de recebê-la.]`,
+        'error'
+      )
+    case 'aborted':
+      return out(`[O subagente ${name} foi interrompido antes de responder.]`, 'error')
+    default:
+      return out(delegateFailureText(target.model, r.error), 'error')
   }
 }
 
@@ -923,6 +1642,10 @@ export function compact(sessionId: string, opts: CompactOptions = {}): { schedul
   return { scheduled: false }
 }
 
+/**
+ * Mensagem do usuário. Sessão principal ou subagente (conversa direta): rodando → fila; ociosa →
+ * inicia um turno; subagente concluído → retoma e a nova resposta final volta ao pai (callback).
+ */
 export function send(
   sessionId: string,
   text: string,
@@ -930,18 +1653,10 @@ export function send(
 ): { queued: boolean } {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
-  if (session.depth !== 0) throw new Error('Subsessões são somente leitura.')
   const attachments = validateAttachments(attachmentsInput)
   text = typeof text === 'string' ? text : ''
   if (!text.trim() && !attachments.length) throw new Error('Mensagem vazia.')
-  if (runs.has(sessionId)) {
-    enqueue(sessionId, text, attachments)
-    return { queued: true }
-  }
-  repairTail(sessionId)
-  appendUser(session, text, {}, attachments)
-  startLoop(session)
-  return { queued: false }
+  return { queued: !!deliverToSession(session, text, {}, true, attachments).queuedId }
 }
 
 export function forceSend(queuedId: string): void {
@@ -960,9 +1675,7 @@ export function forceSend(queuedId: string): void {
     requeueFront(item.sessionId, [item])
     return
   }
-  repairTail(session.id)
-  appendUser(session, item.text, {}, item.attachments)
-  startLoop(session)
+  deliverToSession(session, item.text, item.meta ?? {}, true, item.attachments)
 }
 
 export function removeQueued(queuedId: string): void {
@@ -976,6 +1689,9 @@ async function waitDone(st: RunState, ms = 15_000): Promise<void> {
 }
 
 export async function stop(sessionId: string): Promise<void> {
+  const session = sessionsRepo.get(sessionId)
+  // subagente: para ele e todos os descendentes (inclusive os em segundo plano)
+  if (session && session.depth > 0) return stopSubtree(session)
   const st = runs.get(sessionId)
   if (!st) return
   st.stopRequested = true
@@ -1066,6 +1782,7 @@ export function isRunning(sessionId: string): boolean {
 
 /** Aborta todas as sessões de um chat (antes de apagá-lo). */
 export async function stopChat(chatId: string): Promise<void> {
+  reports.drop(sessionsRepo.list(chatId).map((s) => s.id)) // chat sendo apagado: sem callbacks
   const sts = [...runs.values()].filter((s) => s.chatId === chatId)
   for (const st of sts) {
     st.stopRequested = true
@@ -1079,11 +1796,30 @@ export async function stopChat(chatId: string): Promise<void> {
 
 /** Inicialização: sessões que ficaram 'running'/'awaiting_approval' → 'interrupted' (+ repara pareamento). */
 export function initRunner(): void {
-  for (const id of sessionsRepo.markStaleInterrupted()) {
+  const stale = sessionsRepo.markStaleInterrupted()
+  for (const id of stale) {
     try {
       repairTail(id)
     } catch (e) {
       console.error('[clearchat] repairTail', id, e)
+    }
+  }
+  // Subagentes que reportariam por callback (segundo plano / retomados) e ficaram rodando num
+  // fechamento abrupto: o pai recebe "(interrompido: o app foi fechado)", sem ser acordado.
+  for (const id of stale) {
+    try {
+      const s = sessionsRepo.get(id)
+      if (!s || s.depth === 0 || !s.parentSessionId) continue
+      const pm = messagesRepo.list(s.parentSessionId)
+      if (!pm.some((m) => m.message.role === 'tool' && m.meta.subSessionId === id)) continue
+      appendAppClosedCallback(s.parentSessionId, {
+        title: s.title,
+        sessionId: s.id,
+        model: s.model,
+        update: false
+      })
+    } catch (e) {
+      console.error('[clearchat] callback de subagente interrompido', id, e)
     }
   }
 }
@@ -1101,6 +1837,16 @@ export function shutdownRunner(): void {
       if (s) emit({ type: 'session-updated', session: s })
     } catch (e) {
       console.error('[clearchat] shutdown', id, e)
+    }
+  }
+  // subagentes em segundo plano/retomados ainda rodando: o pai recebe o callback agora (sem acordar)
+  for (const r of reports.all()) {
+    if (r.outcome || r.dropped || r.claimed || !runs.has(r.sessionId)) continue
+    reports.complete(r, { kind: 'app-closed' })
+    try {
+      appendAppClosedCallback(r.parentSessionId, r)
+    } catch (e) {
+      console.error('[clearchat] shutdown callback', r.sessionId, e)
     }
   }
   shuttingDown = true

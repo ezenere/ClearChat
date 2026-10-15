@@ -89,9 +89,24 @@ Seja específico (caminhos, nomes, números) e conciso. Não invente nada.`
 export const COMPACTION_NOTE =
   'O histórico anterior desta conversa foi compactado no resumo acima para economizar contexto; as mensagens originais não estão mais disponíveis. Continue o trabalho a partir daqui.'
 
-/** Conteúdo exato da mensagem de fronteira (`role: user`) que substitui o histórico anterior. */
-export function compactionMessageText(summary: string): string {
-  return `<conversation_summary>\n${summary.trim()}\n</conversation_summary>\n\n${COMPACTION_NOTE}`
+/**
+ * Nota usada quando read_history está habilitada na sessão no momento da compactação: as mensagens
+ * originais (seq X–Y) continuam salvas e podem ser consultadas.
+ */
+export function compactionNoteWithHistory(fromSeq: number, toSeq: number): string {
+  return `O histórico anterior desta conversa (mensagens #${fromSeq}–#${toSeq}) foi compactado no resumo acima para economizar contexto. As mensagens originais continuam salvas: se precisar de um detalhe que não está no resumo, consulte-as com a ferramenta read_history (query para buscar texto, ou from_seq/to_seq para ler uma faixa). Continue o trabalho a partir daqui.`
+}
+
+/**
+ * Conteúdo exato da mensagem de fronteira (`role: user`) que substitui o histórico anterior.
+ * `history` = faixa consultável com read_history (só se a tool estiver habilitada ao compactar).
+ */
+export function compactionMessageText(
+  summary: string,
+  history?: { fromSeq: number; toSeq: number }
+): string {
+  const note = history ? compactionNoteWithHistory(history.fromSeq, history.toSeq) : COMPACTION_NOTE
+  return `<conversation_summary>\n${summary.trim()}\n</conversation_summary>\n\n${note}`
 }
 
 /**
@@ -113,6 +128,13 @@ export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean
     has('list_models') &&
       has('delegate_task') &&
       '- Para escolher o modelo de um subagente, consulte list_models antes de delegate_task. Modelos grátis: só tarefas fáceis e sem dados pessoais; são instáveis — se falharem, use outro modelo.',
+    has('delegate_task') &&
+      has('wait_subagents') &&
+      '- Subagentes em segundo plano (delegate_task com background=true) rodam em paralelo e o resultado chega sozinho como mensagem; não consulte em loop — use wait_subagents ou encerre o turno. Use message_subagent para atualizar um subagente.',
+    has('read_history') &&
+      '- Depois de uma compactação, use read_history para recuperar detalhes do histórico original que não estejam no resumo.',
+    has('send_to_chat') &&
+      '- send_to_chat entrega uma mensagem a outro chat como se fosse o usuário (ids via list_chats). Mensagens vindas de outros chats começam com [Mensagem do chat "…" (id …)].',
     '- Algumas ferramentas exigem aprovação do usuário; se ele negar, não insista — siga sem ela ou pergunte.',
     '- Quando terminar, responda normalmente, sem chamar ferramentas.'
   ]

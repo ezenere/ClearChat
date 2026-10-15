@@ -55,7 +55,8 @@ export const IPC = {
     pendingApprovals: 'agent:pendingApprovals',
     previewRequest: 'agent:previewRequest',
     runningSessions: 'agent:runningSessions',
-    compact: 'agent:compact'
+    compact: 'agent:compact',
+    stopSubagents: 'agent:stopSubagents'
   },
   fs: {
     listDir: 'fs:listDir',
@@ -224,6 +225,8 @@ export interface ClearApi {
      * próximo limite de passo (`scheduled: true`).
      */
     compact(sessionId: string, opts?: CompactOptions): Promise<{ scheduled: boolean }>
+    /** Para todos os subagentes do chat (inclusive em segundo plano); a sessão principal continua. */
+    stopSubagents(chatId: string): Promise<void>
   }
   fs: {
     listDir(path: string): Promise<DirEntry[]>

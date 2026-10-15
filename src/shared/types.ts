@@ -48,6 +48,14 @@ export type ToolName =
   | 'browse_url'
   | 'list_models'
   | 'delegate_task'
+  | 'get_chat_info'
+  | 'list_chats'
+  | 'send_to_chat'
+  | 'read_history'
+  | 'check_subagents'
+  | 'wait_subagents'
+  | 'cancel_subagent'
+  | 'message_subagent'
 
 export const CONFIRM_TOOLS: ToolName[] = ['bash', 'web_search', 'browse_url']
 
@@ -120,7 +128,14 @@ export interface Chat {
 }
 
 export type SessionStatus =
-  'idle' | 'running' | 'awaiting_approval' | 'done' | 'error' | 'interrupted'
+  | 'idle'
+  | 'running'
+  | 'awaiting_approval'
+  | 'done'
+  | 'error'
+  | 'interrupted'
+  /** Subagente que encerrou o turno com subagentes em segundo plano pendentes: dorme até os callbacks. */
+  | 'waiting'
 
 export interface Session {
   id: string
@@ -214,7 +229,17 @@ export interface MessageMeta {
   synthetic?: boolean
   /** 'error' = erro HTTP/modelo persistido só para exibição (synthetic; NUNCA enviado à API). */
   /** 'compaction' = fronteira de compactação (role user com o resumo; buildRequest envia daqui em diante). */
-  kind?: 'queued' | 'forced' | 'interrupt-notice' | 'tool-cancelled' | 'error' | 'compaction'
+  /** 'inter-chat' = mensagem entregue por outro chat (send_to_chat), role user com cabeçalho. */
+  kind?:
+    | 'queued'
+    | 'forced'
+    | 'interrupt-notice'
+    | 'tool-cancelled'
+    | 'error'
+    | 'compaction'
+    | 'inter-chat'
+    | 'subagent-callback'
+    | 'parent-message'
   /** Resposta do assistente cortada pelo usuário. */
   interrupted?: boolean
   usage?: Usage
@@ -237,6 +262,22 @@ export interface MessageMeta {
   contextEstimate?: number
   /** Usage da chamada de resumo (não faz parte do histórico enviado). */
   compactUsage?: Usage
+  // ---- mensagens entre chats (kind 'inter-chat', no chat de destino) ----
+  /** Chat que enviou a mensagem. */
+  fromChatId?: string
+  /** Sessão (principal ou subagente) do chat de origem que chamou send_to_chat. */
+  fromSessionId?: string
+  /** Título do chat de origem no momento do envio (exibição se ele for apagado/renomeado). */
+  fromChatTitle?: string
+  /** Saltos da cadeia de mensagens entre chats (1 = enviada a partir de um turno humano). */
+  interChatHops?: number
+  /** send_to_chat (mensagem tool no remetente): chat de destino resolvido. */
+  targetChatId?: string
+  // ---- subagentes ----
+  /** delegate_task com background=true (mensagem tool no pai). */
+  background?: boolean
+  /** kind 'subagent-callback': resultado de uma retomada (atualização após nova mensagem). */
+  callbackUpdate?: boolean
 }
 
 export interface StoredMessage {
@@ -255,6 +296,8 @@ export interface QueuedMessage {
   createdAt: number
   /** Anexos da mensagem enfileirada (já salvos no store). */
   attachments?: AttachmentInfo[]
+  /** Meta extra aplicada ao persistir (ex.: kind 'inter-chat' + origem). */
+  meta?: MessageMeta
 }
 
 export interface ApprovalRequest {

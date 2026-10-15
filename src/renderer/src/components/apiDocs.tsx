@@ -381,7 +381,10 @@ export function CompactionMessageInfo({
       </p>
       <p className="text-subtle">
         Criada pelo app: conteúdo = <C>{'<conversation_summary>…</conversation_summary>'}</C> + a
-        nota “{COMPACTION_NOTE}” Apague-a para voltar a enviar o histórico completo.
+        nota “{COMPACTION_NOTE}” Se a ferramenta <C>read_history</C> estava habilitada ao compactar,
+        a nota diz que o histórico original (mensagens #X–#Y) continua salvo e pode ser consultado
+        com <C>read_history</C> (busca ou faixa). Apague-a para voltar a enviar o histórico
+        completo.
       </p>
     </ApiInfo>
   )
@@ -488,6 +491,19 @@ export function MessageInfo({
       </ApiInfo>
     )
   }
+  const origin = originInfo(msg)
+  if (origin) {
+    return (
+      <ApiInfo
+        title={origin.title}
+        code={JSON.stringify(m, null, 2)}
+        codeLabel="Objeto exato no array messages:"
+        side={side}
+      >
+        {origin.body}
+      </ApiInfo>
+    )
+  }
   const desc: Record<ApiMessage['role'], React.ReactNode> = {
     user: (
       <>
@@ -547,6 +563,60 @@ export function MessageInfo({
       )}
     </ApiInfo>
   )
+}
+
+/** (i) de mensagens que não foram digitadas aqui: outro chat, agente pai, resultado de subagente. */
+function originInfo(msg: StoredMessage): { title: string; body: React.ReactNode } | null {
+  const k = msg.meta.kind
+  if (k === 'inter-chat')
+    return {
+      title: 'Mensagem de outro chat',
+      body: (
+        <>
+          <p>
+            Entregue pelo chat de origem com a ferramenta <C>send_to_chat</C>, como se o usuário a
+            digitasse aqui: vai no histórico como <C>{'role: "user"'}</C>, reenviada em toda
+            request.
+          </p>
+          <p className="text-subtle">
+            A primeira linha (<C>{'[Mensagem do chat "…" (id …)]'}</C>) é um cabeçalho do app para o
+            modelo saber de onde veio. Saltos na cadeia entre chats: {msg.meta.interChatHops ?? 1}{' '}
+            (máx. {LIMITS.interChatMaxHops}).
+          </p>
+        </>
+      )
+    }
+  if (k === 'parent-message')
+    return {
+      title: 'Mensagem do agente pai',
+      body: (
+        <p>
+          Enviada pelo agente pai com <C>message_subagent</C>. Vai no histórico do subagente como{' '}
+          <C>{'role: "user"'}</C>, com o cabeçalho <C>[Mensagem do agente pai]</C> na primeira
+          linha.
+        </p>
+      )
+    }
+  if (k === 'subagent-callback')
+    return {
+      title: msg.meta.callbackUpdate
+        ? 'Atualização de subagente (criada pelo app)'
+        : 'Resultado de subagente (criada pelo app)',
+      body: (
+        <>
+          <p>
+            Quando um subagente em segundo plano (ou retomado por uma mensagem nova) termina, o app
+            insere o resultado aqui como mensagem <C>{'role: "user"'}</C> sintética: na fila, se o
+            agente estava rodando (entra no próximo passo), ou iniciando um turno novo, se estava
+            ocioso.
+          </p>
+          <p className="text-subtle">
+            Primeira linha = cabeçalho do app; o resto = resposta final do subagente (ou a falha).
+          </p>
+        </>
+      )
+    }
+  return null
 }
 
 export function TaskInfo({ task, side }: { task: string | null; side?: Side }): React.JSX.Element {

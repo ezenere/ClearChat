@@ -563,7 +563,8 @@ export function createMockApi(scenario: string): ClearApi {
         })
       },
       runningSessions: () => delay([]),
-      compact: () => delay({ scheduled: false })
+      compact: () => delay({ scheduled: false }),
+      stopSubagents: () => delay(undefined)
     },
     fs: {
       listDir: (p) =>

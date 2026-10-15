@@ -734,7 +734,7 @@ export const selectPendingAttachments =
     s.pendingAttachments[sessionId] ?? EMPTY_ATTACHMENTS
 
 export const isBusy = (status: Session['status'] | undefined): boolean =>
-  status === 'running' || status === 'awaiting_approval'
+  status === 'running' || status === 'awaiting_approval' || status === 'waiting'
 
 export const currentChat = (s: Store): Chat | undefined =>
   s.view.kind === 'chat'

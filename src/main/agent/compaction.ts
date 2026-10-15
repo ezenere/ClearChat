@@ -147,11 +147,15 @@ export function buildCompactionRequest(
   return req
 }
 
-/** Remove tags <conversation_summary> que o modelo possa ter repetido. */
+/** Remove tags <conversation_summary> (e a nota da fronteira) que o modelo possa ter repetido. */
 export function cleanSummary(text: string): string {
   return text
     .replace(/<\/?conversation_summary>/g, '')
     .replace(COMPACTION_NOTE, '')
+    .replace(
+      /O histórico anterior desta conversa \(mensagens #\d+–#\d+\) foi compactado[^\n]*/g,
+      ''
+    )
     .trim()
 }
 
@@ -172,9 +176,15 @@ export function compactionMeta(
   insertBeforeSeq?: number
 } {
   const { summarized: active, pending } = splitPending(history)
-  const text = compactionMessageText(summary)
-  const sys = systemContent(chat, session, env)
-  const tools = availableTools(chat, session)
+  const summaryOf = { fromSeq: active[0]?.seq ?? 0, toSeq: active[active.length - 1]?.seq ?? 0 }
+  const tools = availableTools(chat, session, history)
+  // read_history habilitada ao compactar → a nota diz que o original (seq X–Y) é consultável.
+  const firstSeq = history.find((m) => m.meta?.kind !== 'error')?.seq ?? summaryOf.fromSeq
+  const text = compactionMessageText(
+    summary,
+    tools.includes('read_history') ? { fromSeq: firstSeq, toSeq: summaryOf.toSeq } : undefined
+  )
+  const sys = systemContent(chat, session, env, history)
   const toolsChars =
     chat.config.nativeTools && tools.length ? JSON.stringify(toolDefinitions(tools)).length : 0
   const pendingChars = pending.reduce((n, m) => n + JSON.stringify(m.message.content).length, 0)
@@ -183,7 +193,7 @@ export function compactionMeta(
   )
   return {
     text,
-    summaryOf: { fromSeq: active[0]?.seq ?? 0, toSeq: active[active.length - 1]?.seq ?? 0 },
+    summaryOf,
     compactedCount: active.length,
     contextEstimate: overhead + (summaryTokens || Math.ceil(summary.length / 4)),
     ...(pending.length ? { insertBeforeSeq: pending[0].seq } : {})

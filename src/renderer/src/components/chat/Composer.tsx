@@ -2,9 +2,11 @@ import { ArrowUp, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { isOpenRouter } from '@shared/defaults'
 import { modalitySupport, modalityWarning, type ModalitySupport } from '@shared/attachments'
+import { sessionProviderId } from '@shared/models'
 import type { AttachmentInfo, QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
+import { splitInterChatText } from '@shared/interChat'
 import { isBusy, selectPendingAttachments, selectQueue, useStore } from '../../store'
 import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
@@ -25,7 +27,7 @@ function pastedName(file: File, i: number): File {
 /** Suporte do modelo atual a cada tipo de anexo (inputModalities do /models). */
 function useModalitySupport(session: Session): (a: AttachmentInfo) => ModalitySupport {
   const chat = useStore((s) => s.chats.find((c) => c.id === session.chatId))
-  const providerId = chat?.config.providerId ?? ''
+  const providerId = chat ? sessionProviderId(chat.config, session) : ''
   const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
   const models = useStore((s) => s.models[providerId])
   const loadModels = useStore((s) => s.loadModels)
@@ -37,11 +39,34 @@ function useModalitySupport(session: Session): (a: AttachmentInfo) => ModalitySu
   return (a) => modalitySupport(a.kind, model, openRouter)
 }
 
+/** Origem de um item da fila que não foi digitado pelo usuário (outro chat, pai, subagente). */
+function queueOrigin(item: QueuedMessage): { label: string; text: string } | null {
+  const kind = item.meta?.kind
+  if (kind === 'inter-chat')
+    return {
+      label: `De: ${item.meta?.fromChatTitle || 'outro chat'}`,
+      text: splitInterChatText(item.text).body
+    }
+  if (kind === 'parent-message')
+    return { label: 'Agente pai', text: item.text.replace(/^\[Mensagem do agente pai\]\n/, '') }
+  if (kind === 'subagent-callback')
+    return { label: 'Resultado de subagente', text: item.text.split('\n')[0] }
+  return null
+}
+
 function QueueChip({ item }: { item: QueuedMessage }): React.JSX.Element {
   const run = useStore((s) => s.run)
+  const origin = queueOrigin(item)
   return (
     <div className="group relative max-w-[280px] min-w-[140px] animate-pop-in rounded-xl border border-border bg-elevated/90 py-2 pr-12 pl-3 shadow-[0_4px_16px_-8px_rgb(0_0_0/0.6)]">
-      <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">{item.text}</p>
+      {origin && (
+        <p className="mb-0.5 truncate text-[10.5px] font-medium text-accent-strong/90">
+          {origin.label}
+        </p>
+      )}
+      <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">
+        {origin ? origin.text : item.text}
+      </p>
       {item.attachments?.length ? (
         <p className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-subtle">
           <Paperclip className="size-3 shrink-0" />
@@ -222,7 +247,13 @@ export function Composer({
             value={text}
             minRows={1}
             maxRows={14}
-            placeholder={busy ? 'Enviar para a fila…' : 'Mensagem…'}
+            placeholder={
+              busy
+                ? 'Enviar para a fila…'
+                : session.depth > 0
+                  ? 'Mensagem ao subagente…'
+                  : 'Mensagem…'
+            }
             onChange={(e) => setText(e.target.value)}
             onPaste={(e) => {
               const files = [...e.clipboardData.files]
@@ -259,9 +290,11 @@ export function Composer({
                   <span className="size-1.5 animate-pulse-soft rounded-full bg-accent-strong" />
                   {session.status === 'awaiting_approval'
                     ? 'Aguardando aprovação'
-                    : compaction?.state === 'running'
-                      ? 'Compactando conversa…'
-                      : 'Trabalhando…'}
+                    : session.status === 'waiting'
+                      ? 'Aguardando subagentes'
+                      : compaction?.state === 'running'
+                        ? 'Compactando conversa…'
+                        : 'Trabalhando…'}
                 </span>
               ) : (
                 <span>

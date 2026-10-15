@@ -6,6 +6,8 @@ import { useStore, type PanelTab } from '../../store'
 import { IconButton } from '../ui/controls'
 import { ChatTab, ModelTab, ToolsTab } from './ConfigTabs'
 import { Note } from './fields'
+import { ModelLabel } from '../ui/ModelLabel'
+import { sessionProviderId } from '@shared/models'
 import { FilesTab } from './FilesTab'
 
 const TABS: { id: PanelTab; label: string; icon: typeof Sparkles }[] = [
@@ -91,9 +93,16 @@ export function RightPanel({
         {tab !== 'files' && isSub && (
           <div className="px-4 pt-4">
             <Note>
-              Configuração do chat (compartilhada). Esta subsessão usa o modelo{' '}
-              <span className="font-mono text-fg/90">{viewSession.model}</span> e o system prompt de
-              subagentes (aba Tools); &quot;Ver request&quot; mostra a request dela.
+              Configuração do chat (compartilhada por todas as sessões dele — editar aqui vale para
+              o chat, não só para esta subsessão). Este subagente usa{' '}
+              <ModelLabel
+                providerId={sessionProviderId(chat.config, viewSession)}
+                model={viewSession.model}
+                className="text-fg/90"
+                modelClassName="font-mono"
+              />{' '}
+              e o system prompt de subagentes (aba Tools); &quot;Ver request&quot; mostra a request
+              dela. Para falar com ele, use o campo de mensagem — as respostas voltam ao agente pai.
             </Note>
           </div>
         )}
