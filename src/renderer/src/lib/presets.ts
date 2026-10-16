@@ -86,7 +86,7 @@ const FIELD_LABELS: Record<string, string> = {
   nativeTools: 'tools',
   toolsInPrompt: 'tools',
   toolsPromptText: 'tools',
-  autoApprove: 'aprovação',
+  approvalModes: 'aprovação',
   subagentSystemPrompt: 'subagentes',
   envInPrompt: 'ambiente',
   cacheEnabled: 'cache',

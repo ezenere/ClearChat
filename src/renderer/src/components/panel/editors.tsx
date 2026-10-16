@@ -8,13 +8,19 @@ import {
   defaultToolsPrompt
 } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
+import {
+  conflictOmitted,
+  paramSupport,
+  safeExtraBody,
+  type ParamKey,
+  type ParamSupport
+} from '@shared/modelParams'
 import { LIMITS, approxTokens, clampToolOutput } from '@shared/limits'
 import { currentToolDefinition, TOOL_LABELS, TOOL_NAMES } from '@shared/tools'
-import { CONFIRM_TOOLS, type ChatConfig, type ChatParams, type ToolName } from '@shared/types'
+import type { ChatConfig, ChatParams, ToolName } from '@shared/types'
 import { cn, formatTokens, modelMeta } from '../../lib/format'
 import { useStore } from '../../store'
 import {
-  AutoApproveInfo,
   CacheInfo,
   CompactPromptInfo,
   ConfineInfo,
@@ -35,6 +41,7 @@ import { AutoTextarea, Switch } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { ExtraBodyEditor, NumberInput, Section, ToggleRow } from './fields'
 import { SmartApproveSection } from './SmartApproveSection'
+import { ChatApprovalSection } from '../approvals/ChatApprovalSection'
 
 export interface CfgProps {
   cfg: ChatConfig
@@ -164,6 +171,25 @@ function useOpenRouter(providerId: string): boolean {
   return provider ? providerKind(provider) === 'openrouter' : false
 }
 
+/**
+ * O que o modelo do chat aceita (@shared/modelParams): o painel só mostra estes. Sem modelo →
+ * tudo. Os valores salvos dos ocultos ficam no chat (voltam ao trocar para um modelo que aceite).
+ */
+function useParamSupport(cfg: ChatConfig): ParamSupport | null {
+  const provider = useStore((s) => s.providers.find((p) => p.id === cfg.providerId))
+  const info = useStore((s) =>
+    cfg.providerId ? s.models[cfg.providerId]?.list.find((m) => m.id === cfg.model) : undefined
+  )
+  if (!provider || !cfg.model.trim()) return null
+  return paramSupport({
+    kind: providerKind(provider),
+    model: cfg.model,
+    info,
+    extra: safeExtraBody(cfg.params.extraBody),
+    params: cfg.params
+  })
+}
+
 export function ParamsSection({
   cfg,
   patch,
@@ -172,71 +198,108 @@ export function ParamsSection({
   const openRouter = useOpenRouter(cfg.providerId)
   const setParam = useSetParam(cfg, patch, scope)
   const mem = rememberedFor(scope)
+  const support = useParamSupport(cfg)
+  const visible = (k: ParamKey): boolean => !support || support.supported.includes(k)
+  const conflicts = support ? conflictOmitted(support) : new Set<ParamKey>()
+  /** Liga um parâmetro; se ele tiver par exclusivo (ex.: temperature/top_p no Claude 4.x), desliga o outro. */
+  const turnOn = (key: NumParam, value: number): void => {
+    const other = support?.exclusive.flatMap(([a, b]) =>
+      a === key ? [b] : b === key ? [a] : []
+    )[0]
+    if (!other || cfg.params[other] == null) return setParam(key, value)
+    rememberedFor(scope)[other] = cfg.params[other]
+    patch({ params: { ...cfg.params, [key]: value, [other]: null } as unknown as ChatParams })
+  }
   return (
     <Section title="Parâmetros">
-      <p className="-mt-1 text-[11.5px] text-subtle">Só os parâmetros ligados entram na request.</p>
+      <p className="-mt-1 text-[11.5px] text-subtle">
+        Só os parâmetros ligados entram na request
+        {support && support.supported.length < NUM_PARAMS.length + 1
+          ? ' (os que o modelo não aceita ficam ocultos).'
+          : '.'}
+      </p>
       <div className="space-y-1">
-        {NUM_PARAMS.map((p) => {
+        {NUM_PARAMS.filter((p) => visible(p.key)).map((p) => {
           const on = cfg.params[p.key] != null
+          const conflict =
+            on && conflicts.has(p.key)
+              ? support?.omitted.find((o) => o.key === p.key)?.reason
+              : undefined
           return (
-            <div key={p.key} className="flex h-8 items-center gap-2.5">
-              <Switch
-                size="sm"
-                checked={on}
-                label={`Enviar ${p.key}`}
-                onChange={(v) =>
-                  setParam(p.key, v ? ((mem[p.key] as number | undefined) ?? p.def) : undefined)
-                }
-              />
-              <span
-                className={cn(
-                  'min-w-0 flex-1 truncate font-mono text-[12px]',
-                  on ? 'text-fg/90' : 'text-subtle'
-                )}
-              >
-                {p.key}
-              </span>
-              <ParamInfo name={p.key} openRouter={openRouter} />
-              <NumberInput
-                value={
-                  on ? (cfg.params[p.key] as number) : ((mem[p.key] as number | undefined) ?? p.def)
-                }
-                disabled={!on}
-                step={p.step}
-                min={p.min}
-                max={p.max}
-                int={p.int}
-                label={p.key}
-                onCommit={(v) => setParam(p.key, v)}
-              />
+            <div key={p.key}>
+              <div className="flex h-8 items-center gap-2.5">
+                <Switch
+                  size="sm"
+                  checked={on}
+                  label={`Enviar ${p.key}`}
+                  onChange={(v) =>
+                    v
+                      ? turnOn(p.key, (mem[p.key] as number | undefined) ?? p.def)
+                      : setParam(p.key, undefined)
+                  }
+                />
+                <span
+                  className={cn(
+                    'min-w-0 flex-1 truncate font-mono text-[12px]',
+                    on ? 'text-fg/90' : 'text-subtle'
+                  )}
+                >
+                  {p.key}
+                </span>
+                <ParamInfo name={p.key} openRouter={openRouter} />
+                <NumberInput
+                  value={
+                    on
+                      ? (cfg.params[p.key] as number)
+                      : ((mem[p.key] as number | undefined) ?? p.def)
+                  }
+                  disabled={!on}
+                  step={p.step}
+                  min={p.min}
+                  max={p.max}
+                  int={p.int}
+                  label={p.key}
+                  onCommit={(v) => setParam(p.key, v)}
+                />
+              </div>
+              {conflict && (
+                <p
+                  data-testid={`param-conflict-${p.key}`}
+                  className="ml-[38px] text-[11px] text-subtle"
+                >
+                  Não enviado: {conflict}.
+                </p>
+              )}
             </div>
           )
         })}
-        <div className="flex h-8 items-center gap-2.5">
-          <Switch
-            size="sm"
-            checked={cfg.params.reasoning_effort != null}
-            label="Enviar reasoning_effort"
-            onChange={(v) =>
-              setParam(
-                'reasoning_effort',
-                v
-                  ? ((mem.reasoning_effort as ChatParams['reasoning_effort']) ?? 'medium')
-                  : undefined
-              )
-            }
-          />
-          <span
-            className={cn(
-              'min-w-0 flex-1 truncate font-mono text-[12px]',
-              cfg.params.reasoning_effort != null ? 'text-fg/90' : 'text-subtle'
-            )}
-          >
-            reasoning_effort
-          </span>
-          <ParamInfo name="reasoning_effort" openRouter={openRouter} />
-        </div>
-        {cfg.params.reasoning_effort != null && (
+        {visible('reasoning_effort') && (
+          <div className="flex h-8 items-center gap-2.5">
+            <Switch
+              size="sm"
+              checked={cfg.params.reasoning_effort != null}
+              label="Enviar reasoning_effort"
+              onChange={(v) =>
+                setParam(
+                  'reasoning_effort',
+                  v
+                    ? ((mem.reasoning_effort as ChatParams['reasoning_effort']) ?? 'medium')
+                    : undefined
+                )
+              }
+            />
+            <span
+              className={cn(
+                'min-w-0 flex-1 truncate font-mono text-[12px]',
+                cfg.params.reasoning_effort != null ? 'text-fg/90' : 'text-subtle'
+              )}
+            >
+              reasoning_effort
+            </span>
+            <ParamInfo name="reasoning_effort" openRouter={openRouter} />
+          </div>
+        )}
+        {visible('reasoning_effort') && cfg.params.reasoning_effort != null && (
           <div className="ml-[38px] flex animate-fade-in rounded-lg border border-border bg-bg/60 p-0.5">
             {EFFORTS.map((e) => (
               <button
@@ -564,49 +627,6 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
   )
 }
 
-export function AutoApproveSection({ cfg, patch }: CfgProps): React.JSX.Element {
-  const autoAll = CONFIRM_TOOLS.every((t) => cfg.autoApprove.includes(t))
-  const autoSome = CONFIRM_TOOLS.some((t) => cfg.autoApprove.includes(t))
-  return (
-    <Section title="Aprovação automática" aside={<AutoApproveInfo />}>
-      <div className="flex items-start gap-3 rounded-lg border border-border bg-bg/40 px-3 py-2.5">
-        <div className="min-w-0 flex-1">
-          <div className="text-[13px] font-medium text-fg/90">Auto-aprovar tudo</div>
-          <p className="mt-0.5 text-[11.5px] leading-snug text-subtle">
-            {autoAll
-              ? 'Terminal, pesquisa e navegação rodam sem pedir confirmação.'
-              : autoSome
-                ? 'Parcial: algumas ferramentas rodam sem confirmação.'
-                : 'O app pede sua confirmação antes de cada execução.'}
-          </p>
-        </div>
-        <div className="pt-0.5">
-          <Switch
-            checked={autoAll}
-            indeterminate={autoSome && !autoAll}
-            label="Auto-aprovar tudo"
-            onChange={(v) => patch({ autoApprove: v ? [...CONFIRM_TOOLS] : [] })}
-          />
-        </div>
-      </div>
-      {[...CONFIRM_TOOLS, ...cfg.autoApprove.filter((t) => !CONFIRM_TOOLS.includes(t))].map((t) => (
-        <ToggleRow
-          key={t}
-          label={TOOL_LABELS[t]}
-          checked={cfg.autoApprove.includes(t)}
-          onChange={(v) =>
-            patch({
-              autoApprove: v
-                ? [...cfg.autoApprove.filter((x) => x !== t), t]
-                : cfg.autoApprove.filter((x) => x !== t)
-            })
-          }
-        />
-      ))}
-    </Section>
-  )
-}
-
 export function SubagentSection({ cfg, patch }: CfgProps): React.JSX.Element {
   return (
     <Section title="Subagentes" aside={<SystemPromptInfo subagent side="left" />}>
@@ -657,7 +677,7 @@ export function ToolsEditor(props: CfgProps): React.JSX.Element {
     <>
       <ToolsListSection {...props} />
       <ToolsPromptSection {...props} />
-      <AutoApproveSection {...props} />
+      <ChatApprovalSection {...props} />
       <SmartApproveSection {...props} />
       <SubagentSection {...props} />
       <LimitsSection {...props} />

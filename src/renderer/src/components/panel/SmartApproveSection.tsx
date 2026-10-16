@@ -17,6 +17,7 @@ import {
   validateLabels
 } from '@shared/smartApprove'
 import { TOOL_LABELS } from '@shared/tools'
+import { APPROVAL_ITEMS, effectiveMode, ITEM_LABEL } from '@shared/approvalPolicy'
 import {
   CONFIRM_TOOLS,
   type SmartApproveConfig,
@@ -81,7 +82,7 @@ function SmartRequestInfo({
         Para cada chamada avaliada, o app faz uma request{' '}
         <strong className="text-fg">separada</strong> ao modelo escolhido (fora do histórico; o
         agente não a vê): <C>{'role: "system"'}</C> = o prompt, <C>{'role: "user"'}</C> = o template
-        com os placeholders preenchidos, <C>temperature: 0</C>,{' '}
+        com os placeholders preenchidos, <C>temperature: 0</C> (omitido se o modelo não aceita),{' '}
         <C>max_tokens: {SMART_APPROVE_DEFAULTS.maxTokens}</C>. Headers: os do provedor do juiz + a
         assinatura do app deste chat.
       </p>
@@ -127,8 +128,10 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
 
   const toggleTool = (t: ToolName, on: boolean): void => {
     const next = on ? [...tools.filter((x) => x !== t), t] : tools.filter((x) => x !== t)
-    set({ tools: TEST_TOOLS.filter((x) => next.includes(x)) })
+    set({ tools: SMART_APPROVE_EXTRA_TOOLS.filter((x) => next.includes(x)) })
   }
+  const global = useStore((s) => s.approvalSettings.modes)
+  const smartItems = APPROVAL_ITEMS.filter((i) => effectiveMode(cfg, global, i) === 'smart')
 
   const runTest = async (): Promise<void> => {
     setTesting(true)
@@ -168,9 +171,8 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
       aside={<SmartRequestInfo cfg={cfg} patch={patch} sa={sa} tool={testTool} args={parsedArgs} />}
     >
       <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
-        Um modelo avalia cada chamada que pediria confirmação e aprova, rejeita ou pergunta a você.
-        Erro, demora ou resposta ambígua → pergunta a você. Tools em “Aprovação automática” rodam
-        direto.
+        Um modelo avalia as chamadas dos itens em modo “Smart-Approve” (seção Aprovações acima) e
+        aprova, rejeita ou pergunta a você. Erro, demora ou resposta ambígua → pergunta a você.
       </p>
 
       <div data-testid="smart-approve-model" className="flex items-center gap-1.5">
@@ -223,9 +225,14 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
       <div className={cn('space-y-3 transition-opacity', !active && 'opacity-60')}>
         <div>
           <div className="mb-1 text-[11px] text-subtle">Ferramentas avaliadas</div>
+          <p data-testid="smart-items" className="mb-1.5 text-[11.5px] leading-snug text-subtle">
+            {smartItems.length
+              ? `Pelo modo Smart-Approve: ${smartItems.map((i) => ITEM_LABEL[i]).join(', ')}.`
+              : 'Nenhum item está no modo Smart-Approve (seção Aprovações).'}
+          </p>
+          <div className="mb-0.5 text-[10.5px] text-faint">Extras (passam a pedir confirmação)</div>
           <div className="-mx-1.5 space-y-px">
-            {TEST_TOOLS.map((t) => {
-              const confirm = CONFIRM_TOOLS.includes(t)
+            {SMART_APPROVE_EXTRA_TOOLS.map((t) => {
               const on = tools.includes(t)
               return (
                 <label
@@ -248,13 +255,13 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
                     {TOOL_LABELS[t]}
                   </span>
                   <span className="text-[10.5px] text-faint">
-                    {confirm ? 'pede confirmação' : on ? 'passa a pedir confirmação' : ''}
+                    {on ? 'passa a pedir confirmação' : ''}
                   </span>
                 </label>
               )
             })}
           </div>
-          {tools.some((t) => !CONFIRM_TOOLS.includes(t)) && (
+          {tools.length > 0 && (
             <p className="mt-1 text-[11px] leading-snug text-subtle">
               Com o Smart-Approve ligado, as tools extras marcadas passam pelo juiz e, se ele não
               aprovar, pedem sua confirmação.

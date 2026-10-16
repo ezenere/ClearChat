@@ -1,7 +1,41 @@
 # ClearChat
 
-Chat desktop minimalista (Electron + React + TypeScript + Tailwind v4) para qualquer endpoint
-OpenAI-compatible. O contrato do projeto está em [SPEC.md](./SPEC.md).
+Chat desktop minimalista com IA e agentes — Electron + React + TypeScript + Tailwind v4. Funciona com
+qualquer endpoint OpenAI-compatible, com adaptadores próprios para **OpenRouter** e **Anthropic (API
+nativa)**. Você vê e controla exatamente o que vai para a API. O contrato do projeto está em
+[SPEC.md](./SPEC.md).
+
+**[Baixar a versão mais recente](https://github.com/ezenere/ClearChat/releases/latest)** — Windows,
+macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
+
+![Chat com agente: tool de shell aguardando aprovação comando a comando](docs/screenshots/chat.png)
+
+## Destaques
+
+- **Qualquer provedor**: OpenAI-compatible genérico, OpenRouter e Anthropic nativa (PDF como documento,
+  prompt caching, thinking/effort). Parâmetros que o modelo não aceita somem do painel e não vão na request.
+- **Agente com ferramentas**: arquivos, shell do usuário (zsh/bash com o seu ambiente), processos em segundo
+  plano (emuladores, dev servers, logs com busca), pesquisa na web (DuckDuckGo → Brave), navegador oculto,
+  leitura de imagens e PDFs, busca em outros chats.
+- **Subagentes**: em paralelo, com modelo próprio, em segundo plano — acordam o agente ao terminar.
+  Mensagens entre chats.
+- **Aprovações sob controle**: por item (comandos, processos, páginas, busca), escolha **Sempre permitir**,
+  **Smart-Approve** (um modelo juiz decide) ou **Whitelist/Blacklist** — cada sub-comando de `a && b | c`
+  é avaliado separadamente, com um parser conservador ("na dúvida, pergunta").
+- **Transparência total**: "Ver request" mostra o body exato enviado; cada mensagem e tool tem um (i) com o
+  conteúdo real; custo, tokens e cache por resposta.
+- **Anexos**: imagens, PDF, áudio e arquivos de texto, conforme o que o modelo aceita.
+
+| | |
+|---|---|
+| ![Fila de aprovações de subagentes acima do campo de mensagem](docs/screenshots/aprovacoes-fila.png) | ![Questionário do agente com ícones e opções](docs/screenshots/questionario.png) |
+| **Fila de aprovações** — vários subagentes pedindo ao mesmo tempo: "1 de 3", um de cada vez; falhas em vermelho. | **Questionário (`ask_user`)** — o agente pergunta com opções, ícones, imagens e ajuda; sempre há "Outro". |
+| ![Configurações de aprovações com whitelist, blacklist e teste de comando](docs/screenshots/configuracoes-aprovacoes.png) | ![Card de falha de conexão com Tentar de novo e Cancelar](docs/screenshots/falha-conexao.png) |
+| **Whitelist/Blacklist** globais com "Testar comando": veja o veredito de cada sub-comando. | **Falha de conexão** — caiu a rede? Você decide: tentar de novo ou cancelar. |
+
+![Markdown com LaTeX, blocos de código aninhados e streaming](docs/screenshots/markdown.png)
+
+> Os prints usam o mock de UI (dados fictícios) — veja [Mock de UI](#mock-de-ui-sem-backend).
 
 ## Desenvolvimento
 
@@ -17,18 +51,24 @@ npm run lint       # eslint
 npm run icons      # regenera os ícones a partir de build/icon.svg (rsvg-convert + ImageMagick)
 ```
 
-## Empacotamento (Linux)
+## Empacotamento
 
 ```bash
 unset ELECTRON_RUN_AS_NODE
 npm run dist           # typecheck + build + AppImage, deb, pacman e tar.gz em dist/
 npm run dist:appimage  # só o AppImage
 npm run dist:dir       # só a pasta desempacotada (dist/linux-unpacked)
+npm run dist:mac       # .dmg para Apple Silicon e Intel (precisa rodar no macOS)
+npm run dist:win       # instalador NSIS x64 (no macOS/Linux faz cross-build)
+npm run dist:all       # Linux + Windows + macOS de uma vez (rode no macOS)
 npm run install:local  # instala o AppImage mais recente de dist/ para o seu usuário (sem root)
 npm run install:local -- --uninstall
 ```
 
-- Artefatos: `dist/ClearChat-<versão>-<arch>.{AppImage,deb,pacman,tar.gz}` (o `<arch>` segue a
+- macOS/Windows: os pacotes **não são assinados com certificado de distribuição nem notarizados** — o
+  Gatekeeper/SmartScreen avisam na primeira abertura (macOS: botão direito → Abrir, ou
+  `xattr -dr com.apple.quarantine /Applications/ClearChat.app`; Windows: "Mais informações" → "Executar assim mesmo").
+- Artefatos Linux: `dist/ClearChat-<versão>-<arch>.{AppImage,deb,pacman,tar.gz}` (o `<arch>` segue a
   convenção de cada formato: `x86_64`, `amd64`, `x64`). No Arch: `sudo pacman -U dist/ClearChat-*.pacman`.
   O AppImage precisa do `fuse2`.
 - `install:local` copia o AppImage para `~/.local/bin/ClearChat.AppImage` (+ link `clearchat`), cria
@@ -134,20 +174,32 @@ npm run install:local -- --uninstall
   na subsessão); se ele já tinha concluído, a nova resposta volta ao pai como atualização. Parar na
   principal não derruba os subagentes em segundo plano ("Parar todos os subagentes" no seletor de sessão).
 
+## Aprovações
+
+- Cada item tem um modo: **Comandos** (`shell`), **Processos** (`process_start`), **Páginas** (`browse_url`)
+  e **Busca web** (`web_search`) — **Sempre permitir**, **Smart-Approve** (o juiz decide) ou **Listas**
+  (Busca: **Perguntar**). Padrão global em Configurações → **Aprovações** (todos em Listas); cada chat
+  (aba Tools) e persona pode ajustar. `process_stop` nunca pergunta (só para processos do próprio chat).
+- **Listas** (globais): o comando é desmontado em sub-comandos (`|`, `&&`, `;`, `$(…)`, `bash -c`, `sudo`…);
+  blacklist bloqueia tudo (precede), whitelist libera, o resto vira um card com **Sim / Sim + whitelist /
+  Não / Não + blacklist** por sub-comando ("+ lista" sugere `git push *`, editável). `eval`, `xargs`,
+  `find -exec`, redirecionamento para arquivo e o que o parser não entende sempre perguntam. Páginas:
+  domínio (`github.com`, `*.github.com`) ou prefixo de URL. "Testar comando/URL" mostra a decomposição.
+
 ## Smart-Approve
 
 - Aba Tools → **Smart-Approve**: um modelo "juiz" (qualquer provedor) avalia cada chamada que pediria
-  confirmação (`bash`, `web_search`, `browse_url`; opcionalmente `write_file`/`edit_file`/`send_to_chat`/
+  dos itens em modo Smart-Approve (opcionalmente também `write_file`/`edit_file`/`send_to_chat`/
   `delegate_task`) e **aprova** (roda), **rejeita** (o agente recebe `Rejeitado pelo Smart-Approve (<modelo>):
   <motivo>`) ou **pergunta a você** (card de aprovação com o motivo). Erro, demora (tempo máximo) ou resposta
-  ambígua → pergunta a você; nunca libera por falha. Ordem: Auto-aprovação → juiz → você.
+  ambígua → pergunta a você; nunca libera por falha. Sem juiz configurado, o modo Smart-Approve pergunta.
 - A chamada ao juiz é separada (fora do histórico; `temperature: 0`, `max_tokens: 300`), com prompt + template
   editáveis (placeholders `{{tool}}`, `{{args}}`, `{{cwd}}`, `{{last_user_message}}`, `{{recent_context}}`…),
   rótulos configuráveis e "Testar". O (i) mostra a request exata; o custo aparece no rodapé ("juiz $…").
 - **Executar mesmo assim** (numa rejeição): manda "Pode executar … ; eu aprovo." e libera **uma vez** a
   próxima chamada idêntica (mesma tool + mesmos argumentos, 15 min) sem juiz nem confirmação.
-- O selo "Auto-aprovação" no header abre um popover para revogar tools (uma ou todas) e desligar o
-  Smart-Approve. Vale também para personas (campo `smartApprove`).
+- O selo do header mostra os modos efetivos do chat (revogar "Sempre", ligar/desligar o Smart-Approve,
+  atalho para Configurações → Aprovações). Vale também para personas (campo `smartApprove`).
 
 ## Anexos
 
@@ -166,6 +218,9 @@ npm run install:local -- --uninstall
 `VITE_CLEAR_MOCK=1 npx electron-vite build` gera um renderer com uma API falsa
 (`src/renderer/src/dev/mockApi.ts`); sirva `out/renderer` e abra `index.html?scenario=<nome>`
 (`chat`, `onboarding`, `stream`, `reasoning` — raciocínio longo salvo + um turno ainda pensando;
+`subagents` — no chat "Resumo do artigo sobre CRDTs", 3 subagentes pedindo aprovação + 1 que falha (fila acima do
+composer); `subagents-other` — o mesmo, aberto em outro chat (sidebar âmbar/vermelha); `subagents-question` — com
+um questionário na principal (a fila espera);
 `markdown` — cercas aninhadas, LaTeX e um rascunho com fórmula incompleta, no chat "Ideias de nomes").
 Rode `npm run build` depois para voltar ao bundle normal.
 
@@ -182,6 +237,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # read_history (faixa/busca/corte), cabeçalho/saltos/ciclo de espera entre chats,
                     # Smart-Approve (e2e/smartApprove.test.ts: parse dos rótulos, template, ordem de decisão,
                     # juiz contra servidor local — aprovar/rejeitar/perguntar, falhas → perguntar —, liberação única, personas),
+                    # aprovações (e2e/approvals.test.ts: parser de comandos com casos adversariais, padrões
+                    # por tokens, domínio/prefixo de URL, blacklist > whitelist, rotas por modo, migração),
                     # list_chats/get_chat_info, callbacks e posse de subagentes,
                     # detecção de contexto excedido (Node puro, sem Electron)
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
@@ -191,6 +248,9 @@ unset ELECTRON_RUN_AS_NODE
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-e2e npm run test:e2e
 # só alguns testes (filtro por nome, separado por vírgula):
 OPENROUTER_API_KEY=... node e2e/backend.spec.ts 'delegate,fila'
+
+# E2E das aprovações em modo Listas (UI real, 100% local: provedor falso — sem key)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-approvals-e2e npm run test:e2e:approvals
 
 # E2E do Smart-Approve (UI real, 100% local: um provedor OpenAI-compatible falso faz o agente e o juiz — sem key)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-smart-e2e npm run test:e2e:smart
@@ -206,10 +266,10 @@ OPENROUTER_API_KEY=... node e2e/ui.spec.ts 'delegate'
   verde, custo no rodapé, body com `temperature: 0`/sem tools, agente não vê o juiz), REJECTED (resultado
   negado ao agente) + "Executar mesmo assim" (mensagem do usuário, chamada idêntica roda sem juiz, liberação
   única), ASK-USER (card com o motivo), resposta malformada e timeout (card de aprovação), "Testar", popover do
-  header (revogar uma / todas, desligar o Smart-Approve → bash volta a pedir confirmação sem juiz) e a seção no
+  header (modos efetivos, revogar "Sempre", desligar o Smart-Approve → modo smart sem juiz pergunta com aviso) e a seção no
   editor de personas.
 - O E2E da UI digita a key no onboarding e percorre: novo chat (seletor de modelo, system prompt,
-  PWD), write/read de arquivo, aprovação de bash (Permitir / Negar / Sempre neste chat), fila (chip)
+  PWD), write/read de arquivo, aprovação de bash (Sim / Não / Sim + whitelist), fila (chip)
   e ⚡, Parar, delegate_task + subsessão (banner + composer próprio), edição de modelo/system prompt/params com
   conferência no "Ver request", modo texto (tools nativas off), assinatura de app none/cline nos
   headers, aba Arquivos ("Usar como PWD"), edição de provider, editar/apagar/regenerar, erro HTTP

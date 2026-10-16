@@ -12,11 +12,10 @@ import {
   Square
 } from 'lucide-react'
 import { useRef, useState } from 'react'
-import { TOOL_LABELS } from '@shared/tools'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
-import { CONFIRM_TOOLS } from '@shared/types'
-import type { Chat, ChatConfig, Session, ToolName } from '@shared/types'
-import { normalizeSmartApprove, smartApproveActive, smartApproveTools } from '@shared/smartApprove'
+import type { ApprovalItem, ApprovalMode, Chat, ChatConfig, Session } from '@shared/types'
+import { normalizeSmartApprove, smartApproveActive } from '@shared/smartApprove'
+import { APPROVAL_ITEMS, effectiveMode, ITEM_LABEL, modeLabel } from '@shared/approvalPolicy'
 import { sessionProviderId } from '@shared/models'
 import { providerKind } from '@shared/providerKinds'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
@@ -126,35 +125,48 @@ function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
 
 function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
   const setPanel = useStore((s) => s.setPanel)
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const patchConfig = useStore((s) => s.patchConfig)
   const flushConfig = useStore((s) => s.flushConfig)
+  const global = useStore((s) => s.approvalSettings.modes)
   const [open, setOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
-  const tools = chat.config.autoApprove
   const sa = normalizeSmartApprove(chat.config.smartApprove)
-  const smartOn = smartApproveActive(sa)
-  if (tools.length === 0 && !smartOn && !open) return null
-  // revogar salva na hora (sem o debounce da config)
+  const judge = smartApproveActive(sa)
+  const modes = APPROVAL_ITEMS.map((i) => ({
+    item: i,
+    mode: effectiveMode(chat.config, global, i),
+    own: !!chat.config.approvalModes?.[i]
+  }))
+  const always = modes.filter((m) => m.mode === 'always')
+  const smart = modes.filter((m) => m.mode === 'smart')
+  // aparece quando algo foge do "pergunta/listas": sempre permitir ou Smart-Approve
+  if (!always.length && !smart.length && !open) return null
+  // salva na hora (sem o debounce da config)
   const save = (p: Partial<ChatConfig>): void => {
     patchConfig(chat.id, p)
     void flushConfig(chat.id)
   }
-  const revoke = (t: ToolName): void => save({ autoApprove: tools.filter((x) => x !== t) })
-  const allConfirm = CONFIRM_TOOLS.every((t) => tools.includes(t))
-  const label =
-    tools.length === 0
-      ? 'Smart-Approve'
-      : `${allConfirm && tools.length === CONFIRM_TOOLS.length ? 'Auto-aprovação' : `Auto-aprovação · ${tools.length}`}${smartOn ? ' · Smart' : ''}`
+  const setMode = (item: ApprovalItem, mode: ApprovalMode | null): void => {
+    const next = { ...(chat.config.approvalModes ?? {}) }
+    if (mode) next[item] = mode
+    else delete next[item]
+    save({ approvalModes: next })
+  }
+  const label = always.length
+    ? `Sempre: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}${smart.length ? ' · Smart' : ''}`
+    : 'Smart-Approve'
   return (
     <>
       <Tip
         side="bottom"
         label={
           <span>
-            {tools.length
-              ? `Executam sem pedir confirmação: ${tools.map((t) => TOOL_LABELS[t] ?? t).join(', ')}`
+            {always.length
+              ? `Rodam sem pedir confirmação: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}`
               : 'Smart-Approve decide as confirmações'}
-            {tools.length > 0 && smartOn ? ' · Smart-Approve ligado' : ''} · clique para revogar
+            {always.length > 0 && smart.length > 0 ? ' · Smart-Approve em outros itens' : ''} ·
+            clique para ver os modos
           </span>
         }
       >
@@ -163,74 +175,84 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           type="button"
           data-testid="auto-approve-badge"
           onClick={() => setOpen((o) => !o)}
-          aria-label="Auto-aprovação"
+          aria-label="Aprovações"
           aria-expanded={open}
           className={cn(
-            'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
-            tools.length
+            'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
+            always.length
               ? 'border-warning/25 bg-warning/[0.06] text-warning/90 hover:bg-warning/[0.12]'
               : 'border-accent/25 bg-accent-soft/50 text-accent-strong hover:bg-accent-soft'
           )}
         >
-          {tools.length ? <ShieldOff className="size-3.5" /> : <ShieldCheck className="size-3.5" />}
-          <span className="max-[1179px]:hidden">{label}</span>
+          {always.length ? (
+            <ShieldOff className="size-3.5 shrink-0" />
+          ) : (
+            <ShieldCheck className="size-3.5 shrink-0" />
+          )}
+          <span className="truncate max-[1179px]:hidden">{label}</span>
         </button>
       </Tip>
       <Popover
         open={open}
         onClose={() => setOpen(false)}
         anchor={anchor}
-        width={320}
+        width={330}
         align="end"
-        maxHeight={420}
+        maxHeight={460}
       >
         <div data-testid="auto-approve-popover" className="flex flex-col py-1.5">
-          <div className="flex items-center gap-2 px-3 pt-1 pb-1.5">
-            <span className="text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
-              Sem confirmação
-            </span>
-            {tools.length > 1 && (
-              <button
-                type="button"
-                onClick={() => save({ autoApprove: [] })}
-                className="ml-auto text-[11.5px] text-danger/85 hover:text-danger"
-              >
-                Revogar tudo
-              </button>
-            )}
+          <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
+            Aprovações deste chat
           </div>
-          {tools.length === 0 ? (
-            <p className="px-3 pb-1.5 text-[12px] text-subtle">
-              Nenhuma tool roda sem confirmação.
-            </p>
-          ) : (
-            tools.map((t) => (
-              <div
-                key={t}
-                data-testid="auto-approve-item"
-                className="group flex h-8 items-center gap-2 px-3 hover:bg-hover/60"
-              >
+          {modes.map(({ item, mode, own }) => (
+            <div
+              key={item}
+              data-testid="auto-approve-item"
+              className="flex h-8 items-center gap-2 px-3 hover:bg-hover/60"
+            >
+              {mode === 'always' ? (
                 <ShieldOff className="size-3.5 shrink-0 text-warning/80" />
-                <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
-                  {TOOL_LABELS[t] ?? t}
-                </span>
-                <span className="font-mono text-[10.5px] text-faint">{t}</span>
+              ) : (
+                <ShieldCheck
+                  className={cn(
+                    'size-3.5 shrink-0',
+                    mode === 'smart' ? 'text-accent-strong' : 'text-faint'
+                  )}
+                />
+              )}
+              <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
+                {ITEM_LABEL[item]}
+              </span>
+              <span
+                className={cn(
+                  'text-[11.5px]',
+                  mode === 'always' ? 'text-warning/90' : 'text-subtle'
+                )}
+              >
+                {modeLabel(item, mode)}
+                {!own && <span className="text-faint"> · global</span>}
+                {mode === 'smart' && !judge && <span className="text-warning/90"> (sem juiz)</span>}
+              </span>
+              {mode === 'always' && (
                 <button
                   type="button"
-                  onClick={() => revoke(t)}
-                  aria-label={`Revogar ${TOOL_LABELS[t] ?? t}`}
+                  onClick={() =>
+                    // volta ao global; se o global também for "sempre", força Listas neste chat
+                    setMode(item, own && global[item] !== 'always' ? null : 'lists')
+                  }
+                  aria-label={`Revogar ${ITEM_LABEL[item]}`}
                   className="rounded-md px-1.5 py-0.5 text-[11.5px] text-danger/85 hover:bg-danger/10 hover:text-danger"
                 >
                   Revogar
                 </button>
-              </div>
-            ))
-          )}
-          {(smartOn || sa.model) && (
+              )}
+            </div>
+          ))}
+          {smart.length > 0 && (
             <div className="mt-1.5 border-t border-border/70 px-3 pt-2.5 pb-1.5">
               <div className="flex items-center gap-2">
                 <ShieldCheck
-                  className={cn('size-3.5 shrink-0', smartOn ? 'text-accent-strong' : 'text-faint')}
+                  className={cn('size-3.5 shrink-0', judge ? 'text-accent-strong' : 'text-faint')}
                 />
                 <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
                   Smart-Approve
@@ -249,20 +271,20 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
                 </span>
                 <Switch
                   size="sm"
-                  checked={smartOn}
+                  checked={judge}
                   disabled={!sa.model}
                   label="Smart-Approve"
                   onChange={(enabled) => save({ smartApprove: { ...sa, enabled } })}
                 />
               </div>
               <p className="mt-1 pl-5.5 text-[11.5px] leading-snug text-subtle">
-                {smartOn
-                  ? `Avalia ${smartApproveTools(sa).length} ferramenta${smartApproveTools(sa).length === 1 ? '' : 's'} antes de pedir sua confirmação.`
-                  : 'Desligado: as confirmações voltam a ser suas.'}
+                {judge
+                  ? `Decide: ${smart.map((m) => ITEM_LABEL[m.item]).join(', ')}.`
+                  : 'Configure o modelo do Smart-Approve: sem juiz ligado, esses itens pedem sua confirmação.'}
               </p>
             </div>
           )}
-          <div className="mt-1.5 border-t border-border/70 px-1.5 pt-1.5">
+          <div className="mt-1.5 flex flex-col border-t border-border/70 px-1.5 pt-1.5">
             <button
               type="button"
               onClick={() => {
@@ -271,7 +293,17 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
               }}
               className="flex h-7 w-full items-center gap-1.5 rounded-md px-1.5 text-[12px] text-accent-strong hover:bg-accent-soft"
             >
-              <Settings2 className="size-3.5" /> Abrir aba Tools
+              <Settings2 className="size-3.5" /> Ajustar neste chat (aba Tools)
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false)
+                setSettingsOpen(true, 'approvals')
+              }}
+              className="flex h-7 w-full items-center gap-1.5 rounded-md px-1.5 text-[12px] text-accent-strong hover:bg-accent-soft"
+            >
+              <Settings2 className="size-3.5" /> Configurações → Aprovações
             </button>
           </div>
         </div>

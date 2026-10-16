@@ -250,11 +250,17 @@ export function anthropicTools(defs: ToolDefinition[]): Record<string, unknown>[
 }
 
 /**
- * Body nativo de /messages. Params: max_tokens (obrigatório), temperature, top_p, top_k e
- * stop → stop_sequences; penalties/seed/repetition_penalty/reasoning_effort ignorados (não existem
- * na API; thinking precisaria reenviar blocos assinados — use extraBody se quiser). extraBody é
- * mesclado por último.
+ * Body nativo de /messages. Params: max_tokens (obrigatório), temperature, top_p, top_k,
+ * reasoning_effort → `output_config: {effort}` ('minimal' → 'low': a API só aceita
+ * low/medium/high/xhigh/max) e stop → stop_sequences; penalties/seed/repetition_penalty ignorados
+ * (não existem na API). Quem chama já filtrou os params pelo modelo (@shared/modelParams) — aqui
+ * vai o que vier. extraBody é mesclado por último.
  */
+/** reasoning_effort do chat → `output_config.effort` (a API não tem 'minimal'). */
+export function anthropicEffort(e: NonNullable<ChatParams['reasoning_effort']>): string {
+  return e === 'minimal' ? 'low' : e
+}
+
 export function buildAnthropicBody(input: {
   model: string
   messages: ApiMessage[]
@@ -279,6 +285,8 @@ export function buildAnthropicBody(input: {
   if (ok(params.temperature)) body.temperature = params.temperature
   if (ok(params.top_p)) body.top_p = params.top_p
   if (ok(params.top_k)) body.top_k = params.top_k
+  if (params.reasoning_effort)
+    body.output_config = { effort: anthropicEffort(params.reasoning_effort) }
   const stop = params.stop
   if (stop) body.stop_sequences = Array.isArray(stop) ? stop : [stop]
   body.stream = true

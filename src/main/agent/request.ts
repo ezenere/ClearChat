@@ -8,6 +8,8 @@ import { TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tool
 import { activeHistory } from '@shared/context'
 import { bwrapAvailable, shellLabel } from '../tools/bash'
 import { expandAttachments, hoistToolMedia } from '../attachments'
+import { paramSupport, type ParamSupport } from '@shared/modelParams'
+import { cachedModelInfo } from '../providers'
 import { adapterFor, buildHeaders, chatCompletionsUrl } from './adapters'
 import { buildAnthropicBody, dropAudioParts } from './adapters/anthropic'
 import type {
@@ -16,6 +18,7 @@ import type {
   ChatConfig,
   ChatParams,
   ContentPart,
+  ModelInfo,
   Provider,
   Session,
   StoredMessage,
@@ -32,9 +35,42 @@ export interface BuiltRequest {
    * streamChat usa para escolher o parser; o preview pode mostrar.
    */
   kind?: ProviderKind
+  /**
+   * Notas legíveis sobre a montagem (ex.: "temperature omitido: não suportado por …") — parâmetros
+   * ligados no chat que o modelo não aceita não são enviados (@shared/modelParams). O preview mostra.
+   */
+  notes?: string[]
 }
 
 export { buildHeaders, chatCompletionsUrl }
+
+/**
+ * Item do /models do modelo (para os parâmetros aceitos). Padrão: o cache de providers.listModels
+ * (sem rede; vazio → desconhecido → todos os params). Testes podem trocar.
+ */
+let modelInfoSource: (providerId: string, model: string) => ModelInfo | undefined = cachedModelInfo
+export function setModelInfoSource(
+  fn: (providerId: string, model: string) => ModelInfo | undefined
+): void {
+  modelInfoSource = fn
+}
+export function modelInfoFor(providerId: string, model: string): ModelInfo | undefined {
+  return modelInfoSource(providerId, model)
+}
+
+/**
+ * Params do chat filtrados pelo modelo (paramSupport). O valor salvo não muda; só não vai.
+ * `extra` = extraBody já parseado (thinking da Anthropic).
+ */
+export function filterParams(
+  params: ChatParams,
+  kind: ProviderKind,
+  providerId: string,
+  model: string,
+  extra: Record<string, unknown> | null
+): ParamSupport {
+  return paramSupport({ kind, model, info: modelInfoFor(providerId, model), extra, params })
+}
 
 export interface EnvInfo {
   os: string
@@ -159,17 +195,6 @@ export function systemContent(
   }
   return s
 }
-
-const PARAM_KEYS: (keyof ChatParams)[] = [
-  'temperature',
-  'top_p',
-  'top_k',
-  'max_tokens',
-  'frequency_penalty',
-  'presence_penalty',
-  'repetition_penalty',
-  'seed'
-]
 
 export function parseExtraBody(extra: string | undefined): Record<string, unknown> | null {
   if (extra == null || !extra.trim()) return null
@@ -333,6 +358,10 @@ export function buildRequest(
   const adapter = adapterFor(kind)
   const tools = availableTools(chat, session, history)
   const params = cfg.params ?? {}
+  const extra = parseExtraBody(params.extraBody)
+  // Só o que o modelo aceita (o resto fica salvo no chat, mas não vai) — ver @shared/modelParams.
+  const support = filterParams(params, kind, provider.id, session.model, extra)
+  const notes = support.notes.length ? { notes: support.notes } : {}
 
   if (kind === 'anthropic') {
     // Anexos: áudio vira placeholder (a API não aceita); demais referências → base64 (na cópia).
@@ -344,11 +373,12 @@ export function buildRequest(
         model: session.model,
         messages: sent,
         tools: cfg.nativeTools && tools.length ? toolDefinitions(tools) : undefined,
-        params,
+        params: support.send,
         cacheEnabled: cfg.cacheEnabled,
-        extra: parseExtraBody(params.extraBody)
+        extra
       }),
-      kind
+      kind,
+      ...notes
     }
   }
 
@@ -367,24 +397,22 @@ export function buildRequest(
 
   if (cfg.nativeTools && tools.length) body.tools = toolDefinitions(tools)
 
-  for (const k of PARAM_KEYS) {
-    const v = params[k]
-    if (v !== undefined && v !== null && !(typeof v === 'number' && Number.isNaN(v))) body[k] = v
-  }
-  if (params.reasoning_effort) {
-    if (openRouter) body.reasoning = { effort: params.reasoning_effort }
-    else body.reasoning_effort = params.reasoning_effort
+  const { reasoning_effort: effort, ...sampling } = support.send
+  Object.assign(body, sampling)
+  if (effort) {
+    if (openRouter) body.reasoning = { effort }
+    else body.reasoning_effort = effort
   }
   if (openRouter) body.usage = { include: true }
 
-  const extra = parseExtraBody(params.extraBody)
   if (extra) Object.assign(body, extra)
 
   return {
     url: adapter.chatUrl(provider.baseUrl),
     headers: adapter.headers(provider, signature),
     body,
-    kind
+    kind,
+    ...notes
   }
 }
 

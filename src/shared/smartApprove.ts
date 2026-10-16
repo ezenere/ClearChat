@@ -2,10 +2,8 @@
 // Funções puras (main: runner/juiz; renderer: editor, (i) com a request de exemplo). Ver SPEC.md →
 // "Smart-Approve".
 //
-// Ordem de decisão de uma chamada que pede confirmação (approvalRoute):
-//   1. tool em autoApprove        → roda
-//   2. Smart-Approve ativo p/ ela → juiz (aprovar → roda · rejeitar → não roda · perguntar → usuário)
-//   3. senão                      → pergunta ao usuário (fluxo de sempre)
+// Quando o juiz é chamado: ver approvalRoute em approvalPolicy.ts (modo `smart` do item, ou tools
+// extras marcadas). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
 // Qualquer erro, tempo esgotado ou resposta ambígua do juiz → pergunta ao usuário (nunca libera).
 import { contentText } from './attachments'
 import { activeHistory } from './context'
@@ -15,9 +13,7 @@ import {
   DEFAULT_SMART_APPROVE_TEMPLATE
 } from './defaults'
 import {
-  CONFIRM_TOOLS,
   type ApiMessage,
-  type ChatConfig,
   type SmartApproveConfig,
   type SmartApproveDecision,
   type SmartApproveLabels,
@@ -114,32 +110,23 @@ export function normalizeSmartApprove(
       SMART_APPROVE_DEFAULTS.maxTimeoutS,
       SMART_APPROVE_DEFAULTS.timeoutS
     ),
-    ...(Array.isArray(s.tools) ? { tools: [...new Set(s.tools)] } : {})
+    // só os extras (as de CONFIRM_TOOLS usam o juiz pelo modo do item — approvalPolicy.ts)
+    tools: Array.isArray(s.tools)
+      ? [...new Set(s.tools)].filter((t) => SMART_APPROVE_EXTRA_TOOLS.includes(t))
+      : []
   }
 }
 
-/** Tools avaliadas pelo juiz (padrão: CONFIRM_TOOLS). */
+/** Tools EXTRAS avaliadas pelo juiz (fora de CONFIRM_TOOLS; padrão nenhuma). */
 export function smartApproveTools(sa: Partial<SmartApproveConfig> | null | undefined): ToolName[] {
-  return Array.isArray(sa?.tools) ? sa.tools : [...CONFIRM_TOOLS]
+  return Array.isArray(sa?.tools)
+    ? sa.tools.filter((t) => SMART_APPROVE_EXTRA_TOOLS.includes(t))
+    : []
 }
 
 /** Ligado E com um modelo escolhido. */
 export function smartApproveActive(sa: Partial<SmartApproveConfig> | null | undefined): boolean {
   return !!sa?.enabled && !!sa.providerId && !!sa.model?.trim()
-}
-
-export type ApprovalRoute = 'run' | 'judge' | 'user'
-
-/** Ordem de decisão (ver o topo do arquivo). */
-export function approvalRoute(
-  cfg: Pick<ChatConfig, 'autoApprove'> & { smartApprove?: Partial<SmartApproveConfig> },
-  tool: ToolName
-): ApprovalRoute {
-  const judged =
-    smartApproveActive(cfg.smartApprove) && smartApproveTools(cfg.smartApprove).includes(tool)
-  if (!CONFIRM_TOOLS.includes(tool) && !judged) return 'run'
-  if (cfg.autoApprove?.includes(tool)) return 'run'
-  return judged ? 'judge' : 'user'
 }
 
 // ---------------- parse da resposta ----------------

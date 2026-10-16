@@ -1,6 +1,7 @@
 // read_history: lê o histórico PERSISTIDO da sessão chamadora — inclusive as mensagens anteriores
 // às fronteiras de compactação (que não vão mais para a API). Busca (query) ou faixa (from/to).
-// Tudo puro sobre StoredMessage[] — testado em e2e/unit.test.ts.
+// Tudo puro sobre StoredMessage[] — testado em e2e/unit.test.ts. Outros chats (chat_id / scope
+// "all"): HistoryStore (consultas + índice FTS5, ver searchIndex.ts) — e2e/historySearch.test.ts.
 import { contentText, messageAttachments, toolContentText } from '@shared/attachments'
 import { LIMITS } from '@shared/limits'
 import type { ApiMessage, StoredMessage } from '@shared/types'
@@ -15,6 +16,15 @@ import {
   type ToolContext,
   type ToolResult
 } from './util'
+import type { HistoryStore, StoreSession } from '../historyStore'
+import {
+  ftsQuery,
+  matchSnippet,
+  queryTerms,
+  searchableText,
+  type SearchFilter,
+  type SearchHit
+} from '../searchIndex'
 
 export interface HistoryOptions {
   query?: string
@@ -101,10 +111,10 @@ export function describeMessage(
 }
 
 /** Cabeçalho: total de mensagens e onde estão as fronteiras de compactação. */
-export function historyHeader(msgs: StoredMessage[]): string {
-  if (!msgs.length) return '[histórico desta sessão: vazio]'
+export function historyHeader(msgs: StoredMessage[], label = 'desta sessão'): string {
+  if (!msgs.length) return `[histórico ${label}: vazio]`
   const bounds = msgs.filter((m) => m.meta.kind === 'compaction')
-  const base = `[histórico desta sessão: ${fmtNum(msgs.length)} mensagens (#${msgs[0].seq}–#${msgs[msgs.length - 1].seq})`
+  const base = `[histórico ${label}: ${fmtNum(msgs.length)} mensagens (#${msgs[0].seq}–#${msgs[msgs.length - 1].seq})`
   if (!bounds.length) return `${base}; sem compactações]`
   const list = bounds
     .map((b) => {
@@ -113,6 +123,7 @@ export function historyHeader(msgs: StoredMessage[]): string {
     })
     .join(', ')
   const last = bounds[bounds.length - 1]
+  if (label !== 'desta sessão') return `${base}; fronteiras de compactação: ${list}]`
   return `${base}; fronteiras de compactação: ${list} — as mensagens antes de #${last.seq} não estão mais no seu contexto]`
 }
 
@@ -120,10 +131,11 @@ export function historyHeader(msgs: StoredMessage[]): string {
 export function formatHistoryRange(
   history: StoredMessage[],
   opts: HistoryOptions,
-  maxChars: number = LIMITS.maxToolOutputChars
+  maxChars: number = LIMITS.maxToolOutputChars,
+  label?: string
 ): string {
   const msgs = historyMessages(history)
-  const header = historyHeader(msgs)
+  const header = historyHeader(msgs, label)
   if (!msgs.length) return header
   const limit = clampInt(opts.limit, LIMITS.historyDefaultMessages, LIMITS.historyMaxMessages)
   const { fromSeq: from, toSeq: to } = opts
@@ -188,10 +200,11 @@ function snippet(text: string, at: number, len: number): string {
 export function searchHistory(
   history: StoredMessage[],
   opts: HistoryOptions & { query: string },
-  maxChars: number = LIMITS.maxToolOutputChars
+  maxChars: number = LIMITS.maxToolOutputChars,
+  label?: string
 ): string {
   const all = historyMessages(history)
-  const header = historyHeader(all)
+  const header = historyHeader(all, label)
   const names = toolNameMap(all)
   const msgs = all.filter(
     (m) =>
@@ -235,11 +248,247 @@ export function searchHistory(
   return `${header}\n${head}\n${lines.join('\n')}\n[para ler uma mensagem inteira: from_seq=N to_seq=N.${more}]`
 }
 
+// ---------------- outros chats (chat_id / scope "all") ----------------
+
+const titleOf = (t: string): string => `"${(t || 'Novo chat').replace(/\s+/g, ' ')}"`
+const shortSession = (id: string): string => id.slice(0, 8)
+
+/** Resolve id ou prefixo único (≥ 4) entre `items` (como send_to_chat). */
+export function resolveRef<T extends { id: string }>(
+  items: T[],
+  ref: string
+): T | 'ambiguous' | null {
+  const r = ref.trim().toLowerCase()
+  const exact = items.find((i) => i.id === r || i.id === ref.trim())
+  if (exact) return exact
+  if (r.length < 4) return null
+  const m = items.filter((i) => i.id.toLowerCase().startsWith(r))
+  return m.length === 1 ? m[0] : m.length > 1 ? 'ambiguous' : null
+}
+
+/** Rótulo de papel de um resultado (busca no índice): `user`, `tool (shell)`, … + subagente. */
+function hitLine(
+  store: HistoryStore,
+  hit: SearchHit,
+  sessions: Map<string, StoreSession>,
+  terms: string[]
+): string {
+  const m = store.message(hit.messageId)
+  const names = new Map<string, string>()
+  if (m?.message.role === 'tool') {
+    const n = store.toolName(m.sessionId, m.seq, m.message.tool_call_id)
+    if (n) names.set(m.message.tool_call_id, n)
+  }
+  const role = m ? describeMessage(m, names, false).label : '?'
+  const s = sessions.get(hit.sessionId)
+  const sub =
+    s && s.depth > 0 ? ` [subagente ${titleOf(s.title)} · session_id ${shortSession(s.id)}]` : ''
+  const st = m ? searchableText(m.message, m.meta) : { body: '', tool: '' }
+  const text = [st.body, st.tool].filter(Boolean).join('\n')
+  return `#${hit.seq} ${role}${sub}: ${matchSnippet(text, terms, LIMITS.historySnippetChars)}`
+}
+
+/** FTS com todos os termos; sem resultado → qualquer termo (bm25 favorece quem tem mais). */
+function ftsSearch(
+  store: HistoryStore,
+  query: string,
+  f: SearchFilter
+): { hits: SearchHit[]; expr: string; any: boolean } | null {
+  const all = ftsQuery(query, 'all')
+  if (!all) return null
+  const hits = store.search(all, f)
+  if (hits.length) return { hits, expr: all, any: false }
+  const any = ftsQuery(query, 'any')
+  if (!any || any === all) return { hits, expr: all, any: false }
+  return { hits: store.search(any, f), expr: any, any: true }
+}
+
+const NO_TERMS = (q: string): string =>
+  `[a busca "${q}" não tem termos pesquisáveis (letras ou números) — tente palavras do conteúdo]`
+
+const nChats = (n: number): string => `${fmtNum(n)} ${n === 1 ? 'chat' : 'chats'}`
+const nMsgs = (n: number): string => `${fmtNum(n)} ${n === 1 ? 'mensagem' : 'mensagens'}`
+
+/** Busca/leitura num chat específico (sessão principal; busca inclui subagentes). */
+export function readOtherChat(
+  store: HistoryStore,
+  ref: string,
+  opts: HistoryOptions & { sessionRef?: string },
+  maxChars: number = LIMITS.maxToolOutputChars
+): { ok: boolean; text: string } {
+  const chat = resolveRef(store.chats(), ref)
+  if (chat === 'ambiguous')
+    return {
+      ok: false,
+      text: `Erro: "${ref}" corresponde a mais de um chat. Use o id completo (veja list_chats).`
+    }
+  if (!chat)
+    return {
+      ok: false,
+      text: `Erro: chat não encontrado: "${ref}". Use list_chats ou read_history com scope "all" para achá-lo.`
+    }
+  const sessions = store.sessions(chat.id)
+  let session =
+    sessions.find((s) => s.id === chat.mainSessionId) ?? sessions.find((s) => s.depth === 0)
+  if (opts.sessionRef) {
+    const s = resolveRef(sessions, opts.sessionRef)
+    if (s === 'ambiguous')
+      return {
+        ok: false,
+        text: `Erro: "${opts.sessionRef}" corresponde a mais de uma sessão do chat ${chat.id}.`
+      }
+    if (!s)
+      return {
+        ok: false,
+        text: `Erro: sessão "${opts.sessionRef}" não encontrada no chat ${titleOf(chat.title)} (id ${chat.id}).`
+      }
+    session = s
+  }
+  if (!session) return { ok: false, text: `Erro: o chat ${chat.id} não tem sessão principal.` }
+  const subs = sessions.filter((s) => s.depth > 0).length
+  const label =
+    session.depth > 0
+      ? `do subagente ${titleOf(session.title)} (session_id ${shortSession(session.id)}) no chat ${titleOf(chat.title)} (id ${chat.id})`
+      : `do chat ${titleOf(chat.title)} (id ${chat.id}, sessão principal${subs ? `; ${subs} subagente${subs > 1 ? 's' : ''}` : ''})`
+  const q = opts.query?.trim()
+  if (!q)
+    return { ok: true, text: formatHistoryRange(store.messages(session.id), opts, maxChars, label) }
+  // busca: índice FTS (relevância) no chat inteiro — ou só na sessão pedida / com faixa de seq
+  if (!store.indexReady)
+    return {
+      ok: true,
+      text: searchHistory(store.messages(session.id), { ...opts, query: q }, maxChars, label)
+    }
+  const scoped = !!opts.sessionRef || opts.fromSeq != null || opts.toSeq != null
+  const limit = clampInt(opts.limit, LIMITS.historySearchDefault, LIMITS.historySearchMax)
+  const filter: SearchFilter = {
+    chatId: chat.id,
+    sessionId: scoped ? session.id : undefined,
+    fromSeq: opts.fromSeq,
+    toSeq: opts.toSeq,
+    limit
+  }
+  const r = ftsSearch(store, q, filter)
+  if (!r) return { ok: true, text: NO_TERMS(q) }
+  const header = `[busca no histórico ${label}]`
+  if (!r.hits.length)
+    return {
+      ok: true,
+      text: `${header}\n[nenhuma mensagem com "${q}" — tente outros termos ou leia uma faixa com from_seq/to_seq]`
+    }
+  const total = store.countByChat(r.expr, filter).get(chat.id) ?? r.hits.length
+  const smap = new Map(sessions.map((s) => [s.id, s]))
+  const terms = queryTerms(q)
+  const lines: string[] = []
+  let used = header.length + 400
+  for (const h of r.hits) {
+    const line = hitLine(store, h, smap, terms)
+    if (lines.length && used + line.length + 1 > maxChars) break
+    lines.push(line)
+    used += line.length + 1
+  }
+  const how = r.any ? `com algum dos termos de "${q}" (nenhuma tem todos)` : `com "${q}"`
+  return {
+    ok: true,
+    text: `${header}\n[${fmtNum(total)} ${total === 1 ? 'mensagem' : 'mensagens'} ${how}, mais relevantes primeiro; mostrando ${lines.length}]\n${lines.join('\n')}\n[para ler uma mensagem inteira: chat_id="${chat.id}" from_seq=N to_seq=N (+ session_id para as de subagente)]`
+  }
+}
+
+/** Data curta local: 2026-10-15. */
+function fmtDate(ts: number): string {
+  const d = new Date(ts)
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** Busca em todos os chats menos `selfChatId`; resultados agrupados por chat. */
+export function searchAllChats(
+  store: HistoryStore,
+  query: string,
+  selfChatId: string | undefined,
+  opts: { limit?: number } = {},
+  maxChars: number = LIMITS.maxToolOutputChars
+): { ok: boolean; text: string } {
+  if (!store.indexReady)
+    return {
+      ok: false,
+      text: 'Erro: índice de busca indisponível — use list_chats e read_history com chat_id.'
+    }
+  const q = query.trim()
+  const maxChats = clampInt(opts.limit, LIMITS.historyAllChatsDefault, LIMITS.historyAllChatsMax)
+  const per = LIMITS.historyAllPerChat
+  const filter: SearchFilter = { excludeChatId: selfChatId, limit: 400 }
+  const r = ftsSearch(store, q, filter)
+  if (!r) return { ok: true, text: NO_TERMS(q) }
+  const chats = store.chats().filter((c) => c.id !== selfChatId)
+  const byId = new Map(chats.map((c) => [c.id, c]))
+  // chats cujo título casa (sem acento/caixa) — úteis mesmo sem mensagens encontradas
+  const terms = normalizeText(q).split(/\s+/).filter(Boolean)
+  const titleHits = chats.filter((c) => {
+    const t = normalizeText(c.title || 'Novo chat')
+    return terms.every((x) => t.includes(x))
+  })
+  const counts = r.hits.length
+    ? store.countByChat(r.expr, { excludeChatId: selfChatId })
+    : new Map()
+  const groups = new Map<string, SearchHit[]>()
+  for (const h of r.hits) {
+    if (!byId.has(h.chatId)) continue
+    const g = groups.get(h.chatId) ?? []
+    if (!groups.has(h.chatId)) {
+      if (groups.size >= maxChats) continue
+      groups.set(h.chatId, g)
+    }
+    if (g.length < per) g.push(h)
+  }
+  const qterms = queryTerms(q)
+  const out: string[] = []
+  let used = 600
+  let shownChats = 0
+  for (const [chatId, hits] of groups) {
+    const c = byId.get(chatId)!
+    const smap = new Map(store.sessions(chatId).map((s) => [s.id, s]))
+    const n = counts.get(chatId) ?? hits.length
+    const head = `## ${titleOf(c.title)} · chat_id ${c.id} · atualizado ${fmtDate(c.updatedAt)} · ${nMsgs(n)}`
+    const block = [head]
+    for (const h of hits) block.push(hitLine(store, h, smap, qterms))
+    let text = block.join('\n')
+    if (used + text.length + 1 > maxChars) {
+      if (shownChats) break
+      text = text.slice(0, Math.max(200, maxChars - used))
+    }
+    out.push(text)
+    used += text.length + 1
+    shownChats++
+  }
+  const totalMsgs = [...counts.values()].reduce((a, b) => a + b, 0)
+  const how = r.any ? `com algum dos termos (nenhuma tem todos)` : 'com todos os termos'
+  const where = `busca em ${nChats(chats.length)}${selfChatId ? ' (exceto este)' : ''} por "${q}"`
+  const head = r.hits.length
+    ? `[${where}: ${nMsgs(totalMsgs)} ${how} em ${nChats(counts.size)}; mostrando ${shownChats} (mais relevantes primeiro, até ${per} trechos cada)]`
+    : `[${where}: nenhuma mensagem encontrada]`
+  const extraTitles = titleHits.filter((c) => !groups.has(c.id)).slice(0, 5)
+  const titles = extraTitles.length
+    ? `\n[chats com título parecido: ${extraTitles.map((c) => `${titleOf(c.title)} (chat_id ${c.id})`).join(', ')}]`
+    : ''
+  const more =
+    counts.size > shownChats
+      ? ` Há mais ${fmtNum(counts.size - shownChats)} chat(s): refine a busca ou aumente limit.`
+      : ''
+  const foot = r.hits.length
+    ? `\n[para ler uma mensagem: read_history chat_id=<id> from_seq=N to_seq=N (+ session_id para subagente); para buscar só num chat: chat_id + query.${more}]`
+    : ''
+  return { ok: true, text: `${head}${out.length ? `\n${out.join('\n')}` : ''}${titles}${foot}` }
+}
+
+/** Minúsculas sem acentos (comparação de títulos). */
+export const normalizeText = (s: string): string =>
+  s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+
 export async function readHistoryTool(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  if (!ctx.history) return fail('Erro: histórico indisponível nesta sessão.')
   const opts: HistoryOptions = {
     query: optString(args, 'query'),
     fromSeq: optNumber(args, 'from_seq'),
@@ -248,8 +497,26 @@ export async function readHistoryTool(
     includeToolResults: optBool(args, 'include_tool_results')
   }
   const max = maxOutputOf(ctx)
-  const history = ctx.history()
+  const chatRef = optString(args, 'chat_id')?.trim()
+  const scope = optString(args, 'scope')
+  const sessionRef = optString(args, 'session_id')?.trim()
   const q = opts.query?.trim()
+  if (scope != null && scope !== 'all' && scope !== 'session')
+    return fail('Erro: scope deve ser "all" (todos os outros chats) ou omitido.')
+  if (scope === 'all' || chatRef) {
+    if (!ctx.historyStore) return fail('Erro: busca em outros chats indisponível nesta sessão.')
+    if (scope === 'all') {
+      if (chatRef) return fail('Erro: use chat_id (um chat) OU scope "all" (todos), não os dois.')
+      if (!q) return fail('Erro: scope "all" exige query (o texto a buscar em todos os chats).')
+      const r = searchAllChats(ctx.historyStore, q, ctx.chatId, { limit: opts.limit }, max)
+      return r.ok ? ok(r.text) : fail(r.text)
+    }
+    const r = readOtherChat(ctx.historyStore, chatRef!, { ...opts, query: q, sessionRef }, max)
+    return r.ok ? ok(r.text) : fail(r.text)
+  }
+  if (sessionRef) return fail('Erro: session_id só vale junto com chat_id.')
+  if (!ctx.history) return fail('Erro: histórico indisponível nesta sessão.')
+  const history = ctx.history()
   return ok(
     q ? searchHistory(history, { ...opts, query: q }, max) : formatHistoryRange(history, opts, max)
   )

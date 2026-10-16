@@ -1,6 +1,7 @@
 // providers.listModels / providers.test — GET {baseUrl}/models pelo adaptador do provider
 // (OpenAI-compatible/OpenRouter: mapModel; Anthropic nativa: mapAnthropicModel, paginado).
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
+import { openRouterSupportedParams } from '@shared/modelParams'
 import type { ProviderTestInput, ProviderTestResult } from '@shared/ipc'
 import type { ModelInfo, Provider } from '@shared/types'
 import { adapterFor } from './agent/adapters'
@@ -41,6 +42,8 @@ export function mapModel(m: Record<string, unknown>): ModelInfo | null {
   }
   if (Array.isArray(m.supported_parameters)) {
     info.supportsTools = (m.supported_parameters as unknown[]).includes('tools')
+    const params = openRouterSupportedParams(m.supported_parameters)
+    if (params) info.supportedParams = params
   }
   return info
 }
@@ -130,4 +133,12 @@ export async function testProvider(p: ProviderTestInput): Promise<ProviderTestRe
   } catch (e) {
     return { ok: false, error: (e as Error).message }
   }
+}
+
+/**
+ * Item do /models já em cache (sem rede; ignora a validade — só serve para saber os parâmetros
+ * aceitos). Desconhecido → undefined (o filtro de parâmetros trata como "todos").
+ */
+export function cachedModelInfo(providerId: string, model: string): ModelInfo | undefined {
+  return cache.get(providerId)?.models.find((m) => m.id === model)
 }

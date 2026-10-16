@@ -21,7 +21,17 @@ import {
 import { splitInterChatText } from '@shared/interChat'
 import { isContextLengthError, latestBoundaryIndex } from '@shared/context'
 import { messageAttachments } from '@shared/attachments'
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from 'react'
 import type { ApprovalRequest, Session, StoredMessage, StreamDraft } from '@shared/types'
 import { api } from '../../lib/api'
 import {
@@ -46,7 +56,17 @@ import { AutoTextarea, Button, Spinner } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import { CopyButton, Markdown } from './Markdown'
 import { OrphanApproval, ToolCard } from './ToolCard'
+import { anchorFor, anchorId } from '../../lib/approvalAnchors'
+import { useAnchorRoot } from '../../lib/useAnchor'
 import { MessageAttachments } from './Attachments'
+import {
+  dayKey,
+  dayLabel,
+  dayStarts,
+  formatFullDateTime,
+  formatTime,
+  msUntilNextDay
+} from '../../lib/dates'
 
 // ---------- Bits ----------
 
@@ -222,6 +242,67 @@ function UsageFooter({
   )
 }
 
+/** Hora da mensagem ("14:28"); tooltip com data e hora completas. */
+function MsgTime({ ts, className }: { ts: number; className?: string }): React.JSX.Element {
+  return (
+    <Tip label={formatFullDateTime(ts)}>
+      <span
+        data-testid="msg-time"
+        className={cn(
+          'shrink-0 cursor-default text-[11px] whitespace-nowrap text-faint tabular-nums transition-colors select-none group-hover/msg:text-subtle',
+          className
+        )}
+      >
+        {formatTime(ts)}
+      </span>
+    </Tip>
+  )
+}
+
+/** Pílula do dia entre mensagens ("Hoje" / "Ontem" / "qui., 15 de out."). */
+function DayPill({ label, className }: { label: string; className?: string }): React.JSX.Element {
+  return (
+    <span
+      className={cn(
+        'rounded-full border border-border bg-elevated/90 px-2.5 py-0.5 text-[11px] font-medium text-muted shadow-[0_1px_2px_rgb(0_0_0/0.25)]',
+        className
+      )}
+    >
+      {label}
+    </span>
+  )
+}
+
+function DaySeparator({ ts, now }: { ts: number; now: number }): React.JSX.Element {
+  return (
+    <div
+      data-day-sep={ts}
+      data-day-label={dayLabel(ts, now)}
+      data-testid="day-separator"
+      className="pointer-events-none flex justify-center py-3 select-none"
+    >
+      <DayPill label={dayLabel(ts, now)} />
+    </div>
+  )
+}
+
+/** "Agora" que muda à meia-noite local (e ao voltar o foco, p/ cobrir suspensão) — Hoje → Ontem. */
+function useToday(): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setTimeout(() => setNow(Date.now()), msUntilNextDay(now))
+    const onFocus = (): void => {
+      if (dayKey(Date.now()) !== dayKey(now)) setNow(Date.now())
+    }
+    window.addEventListener('focus', onFocus)
+    return () => {
+      clearTimeout(t)
+      window.removeEventListener('focus', onFocus)
+    }
+  }, [now])
+  return now
+}
+
 function ActionBtn({
   label,
   onClick,
@@ -388,9 +469,32 @@ function UserMessage({
               {text}
             </div>
           )}
-          <MessageActions msg={msg} canEdit={canEdit} onEdit={() => setEditing(true)} align="end" />
+          <BubbleFooter msg={msg}>
+            <MessageActions
+              msg={msg}
+              canEdit={canEdit}
+              onEdit={() => setEditing(true)}
+              align="end"
+            />
+          </BubbleFooter>
         </>
       )}
+    </div>
+  )
+}
+
+/** Linha sob o balão (alinhada à direita): ações no hover + hora sempre visível. */
+function BubbleFooter({
+  msg,
+  children
+}: {
+  msg: StoredMessage
+  children: ReactNode
+}): React.JSX.Element {
+  return (
+    <div className="-mt-0.5 flex min-h-6 items-center justify-end gap-1.5 pr-1">
+      {children}
+      <MsgTime ts={msg.createdAt} />
     </div>
   )
 }
@@ -425,6 +529,7 @@ function SyntheticMessage({
           </ActionBtn>
         </span>
       )}
+      <MsgTime ts={msg.createdAt} />
     </div>
   )
 }
@@ -473,28 +578,31 @@ function ErrorMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React.JSX
         text={text}
         action={ctxError ? <CompactRetryButton sessionId={ctx.sessionId} /> : undefined}
       />
-      {canEdit && (
-        <div className="-mt-1 flex items-center gap-0.5 opacity-0 transition-opacity group-hover/msg:opacity-100 focus-within:opacity-100">
-          <MessageInfo msg={msg} />
-          <ActionBtn
-            label="Apagar mensagem"
-            onClick={() => void run(() => api.messages.delete(msg.id), 'Erro ao apagar mensagem')}
-            danger
-          >
-            <Trash2 className="size-3.5" />
-          </ActionBtn>
-          {isLast && (
+      <div className="-mt-1 flex min-h-6 items-center gap-0.5">
+        {canEdit && (
+          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/msg:opacity-100 focus-within:opacity-100">
+            <MessageInfo msg={msg} />
             <ActionBtn
-              label="Tentar de novo (regenerar)"
-              onClick={() =>
-                void run(() => api.agent.regenerate(ctx.sessionId), 'Erro ao regenerar')
-              }
+              label="Apagar mensagem"
+              onClick={() => void run(() => api.messages.delete(msg.id), 'Erro ao apagar mensagem')}
+              danger
             >
-              <RotateCcw className="size-3.5" />
+              <Trash2 className="size-3.5" />
             </ActionBtn>
-          )}
-        </div>
-      )}
+            {isLast && (
+              <ActionBtn
+                label="Tentar de novo (regenerar)"
+                onClick={() =>
+                  void run(() => api.agent.regenerate(ctx.sessionId), 'Erro ao regenerar')
+                }
+              >
+                <RotateCcw className="size-3.5" />
+              </ActionBtn>
+            )}
+          </div>
+        )}
+        <MsgTime ts={msg.createdAt} className="ml-auto" />
+      </div>
     </div>
   )
 }
@@ -620,6 +728,8 @@ function CompactionCard({
               <span>{formatDuration(meta.durationMs)}</span>
             </>
           )}
+          <span>·</span>
+          <MsgTime ts={msg.createdAt} className="text-faint" />
         </span>
       </div>
     </div>
@@ -722,7 +832,14 @@ function InterChatMessage({
           <div className="max-w-[85%] rounded-2xl rounded-br-md border border-accent-strong/30 bg-accent-soft/40 px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg">
             {body}
           </div>
-          <MessageActions msg={msg} canEdit={canEdit} onEdit={() => setEditing(true)} align="end" />
+          <BubbleFooter msg={msg}>
+            <MessageActions
+              msg={msg}
+              canEdit={canEdit}
+              onEdit={() => setEditing(true)}
+              align="end"
+            />
+          </BubbleFooter>
         </>
       )}
     </div>
@@ -773,7 +890,9 @@ function SubsessionUserMessage({
           {body}
         </div>
       )}
-      <MessageActions msg={msg} canEdit={canEdit} onEdit={() => undefined} align="end" />
+      <BubbleFooter msg={msg}>
+        <MessageActions msg={msg} canEdit={canEdit} onEdit={() => undefined} align="end" />
+      </BubbleFooter>
     </div>
   )
 }
@@ -841,6 +960,7 @@ function CallbackCard({
               <Trash2 className="size-3.5" />
             </ActionBtn>
           )}
+          <MsgTime ts={msg.createdAt} className="ml-1" />
         </span>
       </div>
       {!open && body && (
@@ -868,6 +988,8 @@ interface Ctx {
   /** Aprovações de todas as sessões (para mostrar a do subagente no card de delegate). */
   allApprovals: ApprovalRequest[]
   childByToolCall: Map<string, Session>
+  /** Aprovações das subárvores dos delegates desta sessão, por âncora (card do delegate). */
+  hostedBy: Map<string, ApprovalRequest[]>
   lastAssistantId: string | null
 }
 
@@ -901,14 +1023,17 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
       )}
       {m.tool_calls?.map((tc) => {
         const sub = ctx.childByToolCall.get(tc.id)
+        const approval = ctx.approvals.find((a) => a.toolCallId === tc.id)
+        const key = anchorId(ctx.sessionId, tc.id)
         return (
           <ToolCard
             key={tc.id}
             call={{ id: tc.id, name: tc.function.name, arguments: tc.function.arguments }}
             result={ctx.results.get(tc.id)}
             run={ctx.runs[tc.id]}
-            approval={ctx.approvals.find((a) => a.toolCallId === tc.id)}
-            subApproval={sub ? ctx.allApprovals.find((a) => a.sessionId === sub.id) : undefined}
+            approval={approval}
+            subApprovals={sub ? ctx.hostedBy.get(key) : undefined}
+            anchor={approval || sub ? key : undefined}
             sessionBusy={ctx.busy}
             subSession={sub}
             chatId={ctx.chatId}
@@ -929,6 +1054,7 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
                 : undefined
             }
           />
+          <MsgTime ts={msg.createdAt} className="ml-auto" />
         </div>
       )}
     </div>
@@ -947,8 +1073,9 @@ function OrphanTool({ msg, canEdit }: { msg: StoredMessage; canEdit: boolean }):
           {text}
         </pre>
       </div>
-      <div className="mt-1">
+      <div className="mt-1 flex min-h-6 items-center">
         <MessageActions msg={msg} canEdit={canEdit} onEdit={() => {}} />
+        <MsgTime ts={msg.createdAt} className="ml-auto" />
       </div>
     </div>
   )
@@ -1024,6 +1151,12 @@ export function MessageList({
     for (const s of Object.values(sessions))
       if (s.parentSessionId === sessionId && s.parentToolCallId)
         childByToolCall.set(s.parentToolCallId, s)
+    const hostedBy = new Map<string, ApprovalRequest[]>()
+    for (const a of [...allApprovals].sort((x, y) => x.createdAt - y.createdAt)) {
+      if (a.sessionId === sessionId || a.chatId !== chatId) continue
+      const key = anchorFor(a.sessionId, a.toolCallId, sessionId, sessions)
+      if (key) hostedBy.set(key, [...(hostedBy.get(key) ?? []), a])
+    }
     let lastAssistantId: string | null = null
     for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].message.role === 'assistant') {
@@ -1043,6 +1176,7 @@ export function MessageList({
       approvals: allApprovals.filter((a) => a.sessionId === sessionId),
       allApprovals,
       childByToolCall,
+      hostedBy,
       lastAssistantId
     }
   }, [messages, sessions, sessionId, chatId, busy, readOnly, runs, allApprovals])
@@ -1076,15 +1210,101 @@ export function MessageList({
       if (pinned.current) el.scrollTop = el.scrollHeight
     })
     ro.observe(content)
+    // o scroller encolhe quando algo aparece acima do composer (fila de aprovações, avisos)
+    ro.observe(el)
     return () => ro.disconnect()
   }, [])
 
+  useAnchorRoot(scroller)
+
+  // ---- data fixa no topo ao rolar (estilo WhatsApp) ----
+  // Só aparece com rolagem do USUÁRIO (roda/toque/teclado/arrastar a barra) — o auto-scroll do
+  // "preso ao fim" não a mostra. Rótulo = dia do último separador que já passou do topo; nenhum
+  // passou (início da conversa, separador visível) → não aparece; o separador seguinte chegando
+  // ao topo esconde a pílula (o próprio separador ocupa o lugar). Some 1,5 s após parar. Conversa
+  // de um dia só (um separador) → nunca aparece.
+  const [stickyState, setSticky] = useState<{ label: string; show: boolean; sid?: string }>({
+    label: '',
+    show: false
+  })
+  // ao trocar de sessão a pílula da anterior não vale (o rótulo é por sessão)
+  const sticky =
+    stickyState.sid === sessionId ? stickyState : { label: '', show: false, sid: sessionId }
+  const userScrollAt = useRef(0)
+  const dragging = useRef(false)
+  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    const el = scroller.current
+    if (!el) return
+    const mark = (): void => {
+      userScrollAt.current = Date.now()
+    }
+    const down = (): void => {
+      dragging.current = true
+      mark()
+    }
+    const up = (): void => {
+      dragging.current = false
+    }
+    el.addEventListener('wheel', mark, { passive: true })
+    el.addEventListener('touchmove', mark, { passive: true })
+    el.addEventListener('keydown', mark)
+    el.addEventListener('pointerdown', down)
+    window.addEventListener('pointerup', up)
+    return () => {
+      el.removeEventListener('wheel', mark)
+      el.removeEventListener('touchmove', mark)
+      el.removeEventListener('keydown', mark)
+      el.removeEventListener('pointerdown', down)
+      window.removeEventListener('pointerup', up)
+      if (hideTimer.current) clearTimeout(hideTimer.current)
+    }
+  }, [])
+  const STICKY_BAND = 40
+  const updateSticky = useCallback((): void => {
+    const el = scroller.current
+    if (!el) return
+    const user = dragging.current || Date.now() - userScrollAt.current < 800
+    if (!user) return
+    const top = el.getBoundingClientRect().top
+    let label = ''
+    let nextNear = false
+    const seps = el.querySelectorAll<HTMLElement>('[data-day-sep]')
+    // conversa de um dia só: o separador do topo já diz o dia — sem pílula fixa
+    if (seps.length < 2) return
+    for (const sep of seps) {
+      const r = sep.getBoundingClientRect()
+      if (r.top <= top + 4) label = sep.dataset.dayLabel ?? ''
+      else {
+        nextNear = r.top < top + STICKY_BAND
+        break
+      }
+    }
+    const show = !!label && !nextNear
+    setSticky((s) => {
+      const prev = s.sid === sessionId ? s.label : ''
+      const next = label || prev
+      return s.sid === sessionId && s.label === next && s.show === show
+        ? s
+        : { label: next, show, sid: sessionId }
+    })
+    if (hideTimer.current) clearTimeout(hideTimer.current)
+    hideTimer.current = setTimeout(() => setSticky((s) => ({ ...s, show: false })), 1500)
+  }, [sessionId])
+
+  const lastTop = useRef(0)
   const onScroll = (): void => {
     const el = scroller.current
     if (!el) return
     const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60
-    pinned.current = bottom
+    // Só desfixa do fim quando o usuário rola para CIMA: o scroll-anchoring do navegador também
+    // dispara `scroll` (descendo um pouco) quando o conteúdo cresce, antes do ResizeObserver.
+    const up = el.scrollTop < lastTop.current - 1
+    lastTop.current = el.scrollTop
+    if (bottom) pinned.current = true
+    else if (up) pinned.current = false
     if (bottom !== atBottom) setAtBottom(bottom)
+    updateSticky()
   }
 
   // O erro do evento `error` também é persistido como mensagem (meta.kind 'error'): não duplica.
@@ -1094,6 +1314,7 @@ export function MessageList({
   const showThinking =
     busy &&
     session.status !== 'waiting' &&
+    session.status !== 'awaiting_retry' &&
     !draft &&
     compaction?.state !== 'running' &&
     Object.values(runs).every((r) => !r.running && !r.judging) &&
@@ -1133,6 +1354,25 @@ export function MessageList({
   const activeMsgs = boundary > 0 ? messages.slice(boundary) : messages
   const oldCount = oldMsgs.filter((m) => m.meta.kind !== 'error').length
 
+  // ---- separadores de dia (sobre as mensagens que de fato aparecem) ----
+  const now = useToday()
+  const starts = useMemo(() => {
+    const shown = (showOld ? messages : messages.slice(Math.max(boundary, 0))).filter(
+      (m) => !(m.message.role === 'tool' && knownCalls.has(m.message.tool_call_id))
+    )
+    return dayStarts(shown)
+  }, [messages, boundary, showOld, knownCalls])
+  const renderItem = (m: StoredMessage, old: boolean): ReactNode => {
+    const el = renderMessage(m, old)
+    if (!el) return null
+    return (
+      <Fragment key={m.id}>
+        {starts.has(m.id) && <DaySeparator ts={m.createdAt} now={now} />}
+        {el}
+      </Fragment>
+    )
+  }
+
   return (
     <div className="relative min-h-0 flex-1">
       <div ref={scroller} onScroll={onScroll} className="absolute inset-0 overflow-y-auto">
@@ -1143,7 +1383,7 @@ export function MessageList({
               data-testid="compacted-old"
               className="opacity-[0.55] transition-opacity duration-200 hover:opacity-80"
             >
-              {oldMsgs.map((m) => renderMessage(m, true))}
+              {oldMsgs.map((m) => renderItem(m, true))}
             </div>
           )}
           {oldMsgs.length > 0 && (
@@ -1167,13 +1407,13 @@ export function MessageList({
               <span className="h-px flex-1 bg-gradient-to-l from-transparent to-border-strong" />
             </div>
           )}
-          {activeMsgs.map((m) => renderMessage(m, false))}
+          {activeMsgs.map((m) => renderItem(m, false))}
           {compaction && <LiveCompaction state={compaction} />}
           {draft && <DraftView draft={draft} ctx={ctx} />}
           {ctx.approvals
             .filter((a) => !knownCalls.has(a.toolCallId))
             .map((a) => (
-              <OrphanApproval key={a.id} request={a} />
+              <OrphanApproval key={a.id} request={a} anchor={anchorId(sessionId, a.toolCallId)} />
             ))}
           {showThinking && <Thinking />}
           {error && !persistedError && (
@@ -1188,6 +1428,22 @@ export function MessageList({
             />
           )}
         </div>
+      </div>
+      <div
+        aria-hidden
+        data-testid="sticky-day"
+        data-show={sticky.show || undefined}
+        className={cn(
+          'pointer-events-none absolute inset-x-0 top-2 z-10 flex justify-center transition-opacity',
+          sticky.show ? 'opacity-100 duration-150' : 'opacity-0 duration-500'
+        )}
+      >
+        {sticky.label && (
+          <DayPill
+            label={sticky.label}
+            className="border-border-strong bg-elevated shadow-popover"
+          />
+        )}
       </div>
       {!atBottom && (
         <button

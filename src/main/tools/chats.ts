@@ -38,7 +38,8 @@ const STATUS_LABEL: Record<ChatListEntry['status'], string> = {
   idle: 'ocioso',
   running: 'rodando',
   awaiting_approval: 'aguardando aprovação',
-  awaiting_input: 'aguardando resposta do usuário'
+  awaiting_input: 'aguardando resposta do usuário',
+  awaiting_retry: 'aguardando decisão do usuário (falha de conexão)'
 }
 
 export function formatChatInfo(i: ChatInfoData): string {
@@ -74,13 +75,16 @@ export function formatChatList(
   info: { maxChars?: number; now?: number } = {}
 ): string {
   const q = opts.query?.trim().toLowerCase()
-  const matched = q
-    ? chats.filter((c) => (c.title || 'Novo chat').toLowerCase().includes(q) || c.id.startsWith(q))
-    : chats
+  const matched = q ? rankChatsByTitle(chats, q) : chats
   const limit = clampChatsLimit(opts.limit)
   const max = info.maxChars ?? LIMITS.maxToolOutputChars
+  const hint = q
+    ? `\n[para procurar "${opts.query}" no conteúdo das conversas: read_history com scope "all" e query]`
+    : ''
   if (!matched.length)
-    return q ? `[nenhum chat de ${chats.length} casa com "${opts.query}"]` : '[nenhum chat]'
+    return q
+      ? `[nenhum chat de ${chats.length} tem "${opts.query}" no título]${hint}`
+      : '[nenhum chat]'
   const lines: string[] = []
   let used = 200
   for (const c of matched.slice(0, limit)) {
@@ -100,7 +104,31 @@ export function formatChatList(
     lines.length < matched.length
       ? `\n[${fmtNum(matched.length - lines.length)} não listados — refine com query ou aumente limit]`
       : ''
-  return `${head}\n${lines.join('\n')}${tail}`
+  return `${head}\n${lines.join('\n')}${tail}${hint}`
+}
+
+const norm = (s: string): string => s.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+
+/**
+ * Chats cujo título tem todos os termos de `q` (sem acentos/caixa) ou cujo id começa com `q`,
+ * mais relevantes primeiro: título igual > começa com > contém a frase > todos os termos;
+ * empate = ordem original (mais recentes primeiro).
+ */
+export function rankChatsByTitle(chats: ChatListEntry[], q: string): ChatListEntry[] {
+  const nq = norm(q.trim())
+  const terms = nq.split(/\s+/).filter(Boolean)
+  const scored: { c: ChatListEntry; score: number; i: number }[] = []
+  chats.forEach((c, i) => {
+    const t = norm(c.title || 'Novo chat')
+    let score = -1
+    if (t === nq) score = 0
+    else if (t.startsWith(nq)) score = 1
+    else if (t.includes(nq)) score = 2
+    else if (terms.length && terms.every((x) => t.includes(x))) score = 3
+    else if (c.id.startsWith(q.trim().toLowerCase())) score = 4
+    if (score >= 0) scored.push({ c, score, i })
+  })
+  return scored.sort((a, b) => a.score - b.score || a.i - b.i).map((x) => x.c)
 }
 
 export async function getChatInfoTool(

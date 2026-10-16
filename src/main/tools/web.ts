@@ -1,6 +1,16 @@
-// web_search (DuckDuckGo HTML) e browse_url (BrowserWindow oculta).
+// web_search (DuckDuckGo HTML → fallback Brave Search; lógica pura em webSearch.ts) e
+// browse_url (BrowserWindow oculta).
 import { BrowserWindow, session as electronSession } from 'electron'
-import { parseDdgHtml, type SearchResult } from './ddg'
+import { isBraveBlocked } from './brave'
+import {
+  fmtSecs,
+  normalizeSearchInterval,
+  runGatedWebSearch,
+  SEARCH_INTERVAL_SETTING,
+  SearchGate,
+  type SearchPage
+} from './webSearch'
+import { settingsRepo } from '../repo'
 import { LIMITS } from '@shared/limits'
 import {
   abortError,
@@ -47,43 +57,111 @@ async function ddgFetch(
   return text
 }
 
+/** Intervalo mínimo GLOBAL entre pesquisas (todos os chats/sessões/subagentes do processo). */
+const searchGate = new SearchGate({
+  intervalMs: () => normalizeSearchInterval(settingsRepo.get(SEARCH_INTERVAL_SETTING)) * 1000
+})
+
 export async function webSearch(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
   const query = requireString(args, 'query').trim()
-  let results: SearchResult[] = []
-  let blocked = false
-  let lastErr = ''
-  for (const method of ['POST', 'GET'] as const) {
-    try {
-      const html = await ddgFetch(query, method, ctx.signal)
-      results = parseDdgHtml(html)
-      if (results.length) break
-      if (/anomaly|captcha/i.test(html)) blocked = true
-      else if (/no-results|Nenhum resultado|No results/i.test(html)) break
-    } catch (e) {
-      if (ctx.signal.aborted) throw abortError()
-      lastErr = (e as Error).message
+  let waited = false
+  const r = await runGatedWebSearch(
+    query,
+    { ddg: ddgFetch, brave: braveFetch },
+    ctx.signal,
+    searchGate,
+    (ms) => {
+      waited = true
+      ctx.onOutput?.(`Aguardando intervalo entre pesquisas… (${fmtSecs(ms)} s)`)
     }
+  )
+  if (waited) ctx.onOutput?.('Pesquisando…')
+  return r.status === 'error' ? r : ok(truncate(r.content, maxOutputOf(ctx)))
+}
+
+/**
+ * Brave Search: `fetch` simples recebe 429 + página "needs JavaScript / captcha"; a página carregada
+ * numa BrowserWindow oculta (UA de Chrome, sem "Electron") vem completa (SSR). Devolve o HTML
+ * renderizado — o parse é puro (brave.ts).
+ */
+export async function braveFetch(query: string, signal: AbortSignal): Promise<SearchPage> {
+  const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`
+  const win = new BrowserWindow({
+    show: false,
+    width: 1280,
+    height: 900,
+    webPreferences: {
+      session: browseSession(),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      images: false,
+      spellcheck: false
+    }
+  })
+  const wc = win.webContents
+  wc.setAudioMuted(true)
+  wc.setWindowOpenHandler(() => ({ action: 'deny' }))
+  const timers: NodeJS.Timeout[] = []
+  const sleep = (ms: number): Promise<void> => new Promise((r) => timers.push(setTimeout(r, ms)))
+  let onAbort: (() => void) | null = null
+  const aborted = new Promise<never>((_res, rej) => {
+    onAbort = () => rej(abortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+  aborted.catch(() => {})
+  let status: number | undefined
+  wc.on('did-navigate', (_e, _u, code) => {
+    if (code > 0) status = code
+  })
+  const html = (): Promise<string> =>
+    Promise.race([
+      wc.executeJavaScript('document.documentElement.outerHTML', true) as Promise<string>,
+      sleep(5000).then(() => {
+        throw new Error('timeout ao ler a página')
+      }),
+      aborted
+    ])
+  try {
+    if (signal.aborted) throw abortError()
+    const loaded = new Promise<'loaded'>((res, rej) => {
+      wc.once('did-finish-load', () => res('loaded'))
+      wc.on('did-fail-load', (_e, code, desc, _u, isMain) => {
+        if (isMain && code !== -3) rej(new Error(`falha ao carregar (${code} ${desc})`))
+      })
+    })
+    loaded.catch(() => {})
+    void wc.loadURL(url, { userAgent: cleanUserAgent(wc.getUserAgent()) }).catch(() => {})
+    const first = await Promise.race([
+      loaded,
+      sleep(BRAVE_TIMEOUT).then(() => 'timeout' as const),
+      aborted
+    ])
+    let page = await html()
+    // SSR: os resultados já vêm no load; se não vieram (hidratação lenta), espera um pouco.
+    if (!/data-type="web"/.test(page) && !isBraveBlocked(page, status)) {
+      await Promise.race([sleep(SETTLE_MS), aborted])
+      page = await html()
+    }
+    if (first === 'timeout' && !/data-type="web"/.test(page))
+      throw new Error(`timeout de ${BRAVE_TIMEOUT / 1000}s`)
+    return { html: page, status }
+  } finally {
+    timers.forEach(clearTimeout)
+    if (onAbort) signal.removeEventListener('abort', onAbort)
+    if (!win.isDestroyed()) win.destroy()
   }
-  if (!results.length) {
-    if (blocked)
-      return fail(
-        'Erro: o DuckDuckGo bloqueou a busca (verificação anti-robô). Tente novamente mais tarde ou use browse_url.'
-      )
-    if (lastErr) return fail(`Erro na pesquisa: ${lastErr}`)
-    return ok(`Nenhum resultado para "${query}".`)
-  }
-  const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n).trimEnd()}…` : s)
-  const out = results
-    .slice(0, LIMITS.webMaxResults)
-    .map(
-      (r, i) =>
-        `${i + 1}. ${clip(r.title, 200)}\n   ${r.url}${r.snippet ? `\n   ${clip(r.snippet, LIMITS.webSnippetChars)}` : ''}`
-    )
-    .join('\n\n')
-  return ok(truncate(`Resultados para "${query}":\n\n${out}`, maxOutputOf(ctx)))
+}
+
+const BRAVE_TIMEOUT = 20_000
+
+/** UA do Chromium sem os marcadores do Electron/app (sites tratam "Electron" como robô). */
+function cleanUserAgent(ua: string): string {
+  return ua.replace(/ Electron\/\S+/, '').replace(/ clearchat\/\S+/i, '')
 }
 
 // ---------------- browse_url ----------------
@@ -216,10 +294,7 @@ export async function browseUrl(
       })
     })
     loaded.catch(() => {})
-    const ua = wc
-      .getUserAgent()
-      .replace(/ Electron\/\S+/, '')
-      .replace(/ clearchat\/\S+/i, '')
+    const ua = cleanUserAgent(wc.getUserAgent())
     void wc.loadURL(url.toString(), { userAgent: ua }).catch(() => {})
     const first = await Promise.race([
       loaded,

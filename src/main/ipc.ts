@@ -41,6 +41,9 @@ import { basename } from 'path'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { formatSize } from '@shared/attachments'
 import { saveAttachment } from './attachments'
+import { getApprovalSettings, updateApprovalSettings } from './approvalSettings'
+import type { ApprovalItemDecision } from '@shared/approvalPolicy'
+import type { ApprovalSettings } from '@shared/types'
 
 type Handler = (...args: never[]) => unknown
 
@@ -122,8 +125,11 @@ export function registerIpc(): void {
     [IPC.agent.getQueue]: (sessionId: string) => runner.getQueue(sessionId),
     [IPC.agent.stop]: (sessionId: string) => runner.stop(sessionId),
     [IPC.agent.regenerate]: (sessionId: string) => runner.regenerate(sessionId),
-    [IPC.agent.approve]: (requestId: string, decision: ApprovalDecision) =>
-      runner.approve(requestId, decision),
+    [IPC.agent.approve]: (
+      requestId: string,
+      decision: ApprovalDecision,
+      items?: ApprovalItemDecision[]
+    ) => runner.approve(requestId, decision, items),
     [IPC.agent.pendingApprovals]: () => runner.pendingApprovals(),
     [IPC.agent.previewRequest]: (sessionId: string) => runner.previewRequest(sessionId),
     [IPC.agent.runningSessions]: () => runner.runningSessions(),
@@ -132,6 +138,11 @@ export function registerIpc(): void {
     [IPC.agent.stopSubagents]: (chatId: string) => runner.stopSubagents(chatId),
     [IPC.agent.smartOverride]: (messageId: string) => runner.smartOverride(messageId),
     [IPC.agent.smartApproveTest]: (input: SmartApproveTestInput) => runner.smartApproveTest(input),
+
+    // ---- aprovações (modos globais + listas) ----
+    [IPC.approvals.getSettings]: () => getApprovalSettings(),
+    [IPC.approvals.updateSettings]: (patch: Partial<ApprovalSettings>) =>
+      updateApprovalSettings(patch ?? {}),
 
     // ---- fs ----
     [IPC.fs.listDir]: (path: string) => fsapi.listDir(path),
@@ -190,6 +201,11 @@ export function registerIpc(): void {
     [IPC.questions.answer]: (id: string, answers: unknown) => answerQuestion(id, answers),
     [IPC.questions.cancel]: (id: string) => runner.cancelQuestionRequest(id),
     [IPC.questions.pending]: () => runner.pendingQuestions(),
+
+    // ---- falha de conexão com o provedor (Tentar de novo / Cancelar) ----
+    [IPC.retries.retry]: (id: string) => runner.retryRequest(id),
+    [IPC.retries.cancel]: (id: string) => runner.cancelRetryRequest(id),
+    [IPC.retries.pending]: () => runner.pendingRetries(),
 
     // ---- processos em segundo plano (process_start) ----
     [IPC.processes.list]: (chatId: string) => listProcesses(chatId),

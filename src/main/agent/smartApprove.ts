@@ -18,7 +18,7 @@ import type {
   ToolName
 } from '@shared/types'
 import { newAccumulator, streamChat } from './llm'
-import { maskRequest, type BuiltRequest } from './request'
+import { filterParams, maskRequest, type BuiltRequest } from './request'
 import { adapterFor } from './adapters'
 import { buildAnthropicBody } from './adapters/anthropic'
 
@@ -44,23 +44,32 @@ export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltReque
   const kind = providerKind(provider)
   const adapter = adapterFor(kind)
   const messages = buildJudgeMessages(sa, input.ctx)
-  // Anthropic nativa: mesmos parâmetros (temperature 0, max_tokens) no formato /messages.
-  const body =
-    kind === 'anthropic'
-      ? buildAnthropicBody({
-          model: sa.model,
-          messages,
-          params: {
-            temperature: SMART_APPROVE_DEFAULTS.temperature,
-            max_tokens: SMART_APPROVE_DEFAULTS.maxTokens
-          }
-        })
-      : buildJudgeBody(sa.model, messages, kind === 'openrouter')
+  // Parâmetros fixos (temperature 0, max_tokens) passam pelo mesmo filtro do chat: modelos que
+  // rejeitam temperature (ex.: claude-sonnet-5-5 nativo → 400) recebem a request sem ele.
+  const support = filterParams(
+    {
+      temperature: SMART_APPROVE_DEFAULTS.temperature,
+      max_tokens: SMART_APPROVE_DEFAULTS.maxTokens
+    },
+    kind,
+    provider.id,
+    sa.model,
+    null
+  )
+  let body: Record<string, unknown>
+  if (kind === 'anthropic') {
+    // max_tokens é obrigatório na API nativa (o filtro nunca o tira na Anthropic)
+    body = buildAnthropicBody({ model: sa.model, messages, params: support.send })
+  } else {
+    body = buildJudgeBody(sa.model, messages, kind === 'openrouter')
+    for (const k of ['temperature', 'max_tokens'] as const) if (!(k in support.send)) delete body[k]
+  }
   return {
     url: adapter.chatUrl(provider.baseUrl),
     headers: adapter.headers(provider, signature),
     body,
-    kind
+    kind,
+    ...(support.notes.length ? { notes: support.notes } : {})
   }
 }
 

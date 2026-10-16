@@ -27,16 +27,24 @@ import {
   MessagesSquare,
   Send,
   ShieldCheck,
+  ShieldX,
   Play,
   ScrollText,
   Activity,
   MessageCircleQuestion,
+  WifiOff,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { TOOL_LABELS } from '@shared/tools'
 import { approxTokens } from '@shared/limits'
-import type { ApprovalRequest, Session, StoredMessage, ToolName } from '@shared/types'
+import type {
+  ApprovalRecord,
+  ApprovalRequest,
+  Session,
+  StoredMessage,
+  ToolName
+} from '@shared/types'
 import { cn, formatTokens, prettyJson } from '../../lib/format'
 import { useStore, type ToolRun } from '../../store'
 import { MessageInfo, TaskInfo } from '../apiDocs'
@@ -46,9 +54,12 @@ import { CopyButton } from './Markdown'
 import { StatusDot } from './SessionSwitcher'
 import { ModelLabel } from '../ui/ModelLabel'
 import { SmartApproveLine } from './SmartApprove'
+import { ApprovalPrompt } from './ApprovalCard'
 import { AskUserAnswers, AskUserQuestionsList } from './AskUser'
 import { ToolResultMedia } from './Attachments'
 import { toolContentText } from '@shared/attachments'
+import { isAnchorShown, shortFailure } from '../../lib/approvalAnchors'
+import { useAnchor } from '../../lib/useAnchor'
 
 const ICONS: Record<ToolName, LucideIcon> = {
   list_dir: FolderTree,
@@ -161,6 +172,8 @@ function summary(name: string, args: Record<string, unknown> | null): string {
           ? `#${args.from_seq != null ? String(args.from_seq) : '…'}–#${args.to_seq != null ? String(args.to_seq) : '…'}`
           : ''
       return [
+        pick('scope') === 'all' && 'todos os outros chats',
+        pick('chat_id') && `chat ${shortId(pick('chat_id'))}`,
         pick('query') && `"${pick('query')}"`,
         range,
         args.include_tool_results === true && 'com resultados de tools'
@@ -260,48 +273,71 @@ function StatusChip({ status }: { status: Status }): React.JSX.Element | null {
   )
 }
 
-function ApprovalPrompt({
-  request,
-  fromSubagent
-}: {
-  request: ApprovalRequest
-  fromSubagent?: boolean
-}): React.JSX.Element {
-  const approve = useStore((s) => s.approve)
-  const detail = fromSubagent
-    ? summary(request.toolName, request.args as Record<string, unknown>)
-    : ''
-  return (
-    <div className="border-t border-warning/20 bg-warning/[0.045] px-3.5 py-3">
-      <div className="flex items-center gap-2 text-[13px] text-fg">
-        <Hand className="size-3.5 shrink-0 text-warning" />
-        <span className="min-w-0">
-          Permitir que {fromSubagent ? 'o subagente' : 'o agente'} execute <C>{request.toolName}</C>
-          ?
-        </span>
-      </div>
-      {detail && (
-        <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-bg/70 px-3 py-2 font-mono text-[11.5px] whitespace-pre-wrap text-fg/85">
-          {detail}
-        </pre>
+/** Gate de aprovação (meta.approval): liberado pela whitelist / bloqueado pela blacklist / sempre. */
+function ApprovalLine({ rec }: { rec: ApprovalRecord }): React.JSX.Element | null {
+  const line = (
+    cls: string,
+    icon: ReactNode,
+    text: ReactNode,
+    testId: string
+  ): React.JSX.Element => (
+    <div
+      data-testid={testId}
+      className={cn(
+        'flex items-start gap-1.5 border-t border-border/70 px-3.5 py-2 text-[12px]',
+        cls
       )}
-      {request.smartApprove && (
-        <div className="-mx-3.5 mt-2 border-y border-warning/15 bg-bg/30">
-          <SmartApproveLine rec={request.smartApprove} pending />
-        </div>
-      )}
-      <div className="mt-2.5 flex flex-wrap items-center gap-2">
-        <Button variant="primary" size="sm" onClick={() => void approve(request.id, 'allow')}>
-          Permitir
-        </Button>
-        <Button variant="secondary" size="sm" onClick={() => void approve(request.id, 'deny')}>
-          Negar
-        </Button>
-        <Button variant="ghost" size="sm" onClick={() => void approve(request.id, 'always')}>
-          Sempre neste chat
-        </Button>
-      </div>
+    >
+      {icon}
+      <span className="min-w-0">{text}</span>
     </div>
+  )
+  if (rec.blocked)
+    return line(
+      'text-danger/90',
+      <ShieldX className="mt-px size-3.5 shrink-0" />,
+      <>
+        Bloqueado pela blacklist: <C>{rec.blocked.entry}</C> casou com <C>{rec.blocked.text}</C>
+      </>,
+      'approval-blocked'
+    )
+  const parts: ReactNode[] = []
+  if (rec.allowed?.length)
+    parts.push(
+      <span key="w">
+        Liberado pela whitelist:{' '}
+        {rec.allowed.map((a, i) => (
+          <span key={i}>
+            {i > 0 && ', '}
+            <C>{a.entry}</C>
+          </span>
+        ))}
+      </span>
+    )
+  if (rec.userAllowed?.length)
+    parts.push(
+      <span key="u">
+        {parts.length ? ' · ' : ''}você permitiu {rec.userAllowed.length}{' '}
+        {rec.userAllowed.length === 1 ? 'item' : 'itens'}
+      </span>
+    )
+  if (rec.denied)
+    return line(
+      'text-danger/90',
+      <Ban className="mt-px size-3.5 shrink-0" />,
+      <>
+        Você negou <C>{rec.denied}</C>
+        {parts.length ? <> · {parts}</> : null}
+      </>,
+      'approval-denied'
+    )
+  // modo "Sempre permitir": sem linha (seria ruído em todo card; o selo do header mostra o modo)
+  if (!parts.length) return null
+  return line(
+    'text-subtle',
+    <ShieldCheck className="mt-px size-3.5 shrink-0 text-success/80" />,
+    parts,
+    'approval-allowed'
   )
 }
 
@@ -337,9 +373,11 @@ export function ToolCard({
   run,
   approval,
   subApproval,
+  subApprovals,
   streaming,
   subSession,
-  chatId
+  chatId,
+  anchor
 }: {
   call: ToolCallView
   result?: StoredMessage
@@ -347,13 +385,21 @@ export function ToolCard({
   approval?: ApprovalRequest
   /** Aprovação pendente na subsessão criada por este delegate_task. */
   subApproval?: ApprovalRequest
+  /** Todas as aprovações pendentes na subárvore deste delegate_task (subagente e netos), mais antiga primeiro. */
+  subApprovals?: ApprovalRequest[]
   streaming?: boolean
   /** (legado; o status agora vem de `tool-running`) */
   sessionBusy?: boolean
   subSession?: Session
   chatId: string
+  /** Id de âncora (lib/approvalAnchors): visível → as aprovações ficam aqui; fora da tela → na fila do composer. */
+  anchor?: string
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
+  const anchorRef = useAnchor<HTMLDivElement>(anchor ?? null)
+  /** Card na tela (ou sem âncora): mostra os cards de aprovação; fora → só um aviso (estão na fila). */
+  const onScreen = useStore((s) => !anchor || isAnchorShown(s.anchorVis, anchor))
+  const hosted = subApprovals ?? (subApproval ? [subApproval] : [])
   const openChat = useStore((s) => s.openChat)
   const args = parseArgs(call.arguments)
   const name = call.name as ToolName
@@ -388,7 +434,7 @@ export function ToolCard({
   // Tools rodam em sequência: sem `tool-running` ainda, a chamada está só na fila ('pendente').
   const status: Status = streaming
     ? 'streaming'
-    : approval || subApproval
+    : approval || hosted.length
       ? 'approval'
       : question && !result
         ? 'input'
@@ -419,6 +465,10 @@ export function ToolCard({
       .filter(Boolean)
       .join(' · ')
   const liveSub = subId ? sessions[subId] : undefined
+  /** Falha de conexão aguardando decisão na subsessão deste delegate_task. */
+  const subRetry = useStore((s) =>
+    isDelegate && subId ? s.retries.find((r) => r.sessionId === subId) : undefined
+  )
   const root = useStore((s) => s.chats.find((c) => c.id === chatId)?.config.cwd)
   const chatProviderId = useStore((s) => s.chats.find((c) => c.id === chatId)?.config.providerId)
   const shellCwd = result?.meta.shellCwd
@@ -431,11 +481,20 @@ export function ToolCard({
           : shellCwd
       : null
 
+  const subFailed = isDelegate && liveSub?.status === 'error'
+  const subError = useStore((s) => (subFailed && subId ? s.errors[subId] : undefined))
   return (
     <div
+      ref={anchorRef}
+      data-anchor={anchor}
+      data-testid={isDelegate ? 'delegate-card' : undefined}
       className={cn(
         'my-2 overflow-hidden rounded-xl border bg-surface/70 transition-colors',
-        approval ? 'border-warning/35 shadow-[0_0_0_3px_rgb(245_181_68/0.06)]' : 'border-border'
+        approval || hosted.length
+          ? 'border-warning/35 shadow-[0_0_0_3px_rgb(245_181_68/0.06)]'
+          : subFailed
+            ? 'border-danger/30'
+            : 'border-border'
       )}
     >
       <div
@@ -488,6 +547,7 @@ export function ToolCard({
         <StatusChip status={status} />
       </div>
 
+      {result?.meta.approval && <ApprovalLine rec={result.meta.approval} />}
       {result?.meta.smartApprove && (
         <SmartApproveLine rec={result.meta.smartApprove} messageId={result.id} />
       )}
@@ -626,9 +686,70 @@ export function ToolCard({
           )}
         </div>
       )}
-      {approval && <ApprovalPrompt request={approval} />}
-      {!approval && subApproval && <ApprovalPrompt request={subApproval} fromSubagent />}
+      {subRetry && subId && (
+        <div
+          data-testid="sub-retry"
+          className="flex items-center gap-2 border-t border-warning/20 bg-warning/[0.045] px-3.5 py-2.5 text-[12.5px] text-fg"
+        >
+          <WifiOff className="size-3.5 shrink-0 text-warning" />
+          <span className="min-w-0 flex-1">
+            Subagente aguardando sua decisão (falha de conexão)
+            <span className="block truncate text-[11.5px] text-muted">{subRetry.error}</span>
+          </span>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => void openChat(chatId, subId)}
+            icon={<ArrowUpRight className="size-3.5" />}
+          >
+            Abrir subsessão
+          </Button>
+        </div>
+      )}
+      {subFailed && (
+        <div
+          data-testid="sub-failed"
+          className="flex items-center gap-2 border-t border-danger/20 bg-danger/[0.05] px-3.5 py-2 text-[12.5px] text-fg"
+        >
+          <CircleX className="size-3.5 shrink-0 text-danger" />
+          <span className="min-w-0 flex-1 truncate">
+            Subagente falhou
+            {subError && <span className="text-muted">: {shortFailure(subError)}</span>}
+          </span>
+        </div>
+      )}
+      {onScreen && approval && <ApprovalPrompt request={approval} />}
+      {onScreen &&
+        !approval &&
+        hosted.map((a) => <ApprovalWithDetail key={a.id} request={a} fromSubagent />)}
+      {!onScreen && (approval || hosted.length > 0) && (
+        <div className="flex items-center gap-2 border-t border-warning/20 bg-warning/[0.045] px-3.5 py-2 text-[12px] text-warning/90">
+          <Hand className="size-3.5 shrink-0" />
+          Aguardando aprovação — na fila acima do campo de mensagem
+        </div>
+      )}
     </div>
+  )
+}
+
+/** Card de aprovação com o resumo dos argumentos (pedidos de subagentes / fila do composer). */
+export function ApprovalWithDetail({
+  request,
+  fromSubagent
+}: {
+  request: ApprovalRequest
+  fromSubagent?: boolean
+}): React.JSX.Element {
+  return (
+    <ApprovalPrompt
+      request={request}
+      fromSubagent={fromSubagent}
+      detail={
+        request.check
+          ? undefined
+          : summary(request.toolName, request.args as Record<string, unknown>)
+      }
+    />
   )
 }
 
@@ -746,13 +867,32 @@ function ProcessStartInfo({
   )
 }
 
-export function OrphanApproval({ request }: { request: ApprovalRequest }): React.JSX.Element {
+export function OrphanApproval({
+  request,
+  anchor
+}: {
+  request: ApprovalRequest
+  anchor: string
+}): React.JSX.Element {
+  const ref = useAnchor<HTMLDivElement>(anchor)
+  const onScreen = useStore((s) => isAnchorShown(s.anchorVis, anchor))
   return (
-    <div className="my-2 overflow-hidden rounded-xl border border-warning/35 bg-surface/70">
+    <div
+      ref={ref}
+      data-anchor={anchor}
+      className="my-2 overflow-hidden rounded-xl border border-warning/35 bg-surface/70"
+    >
       <div className="px-3.5 pt-3 font-mono text-[11.5px] whitespace-pre-wrap text-muted">
         {JSON.stringify(request.args, null, 2)}
       </div>
-      <ApprovalPrompt request={request} />
+      {onScreen ? (
+        <ApprovalPrompt request={request} />
+      ) : (
+        <div className="mt-2 flex items-center gap-2 border-t border-warning/20 bg-warning/[0.045] px-3.5 py-2 text-[12px] text-warning/90">
+          <Hand className="size-3.5 shrink-0" />
+          Aguardando aprovação — na fila acima do campo de mensagem
+        </div>
+      )}
     </div>
   )
 }

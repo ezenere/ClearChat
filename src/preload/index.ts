@@ -39,7 +39,7 @@ const api: ClearApi = {
     getQueue: (sessionId) => invoke(IPC.agent.getQueue, sessionId),
     stop: (sessionId) => invoke(IPC.agent.stop, sessionId),
     regenerate: (sessionId) => invoke(IPC.agent.regenerate, sessionId),
-    approve: (requestId, decision) => invoke(IPC.agent.approve, requestId, decision),
+    approve: (requestId, decision, items) => invoke(IPC.agent.approve, requestId, decision, items),
     pendingApprovals: () => invoke(IPC.agent.pendingApprovals),
     previewRequest: (sessionId) => invoke(IPC.agent.previewRequest, sessionId),
     runningSessions: () => invoke(IPC.agent.runningSessions),
@@ -74,10 +74,19 @@ const api: ClearApi = {
     cancel: (id) => invoke(IPC.questions.cancel, id),
     pending: () => invoke(IPC.questions.pending)
   },
+  retries: {
+    retry: (id) => invoke(IPC.retries.retry, id),
+    cancel: (id) => invoke(IPC.retries.cancel, id),
+    pending: () => invoke(IPC.retries.pending)
+  },
   processes: {
     list: (chatId) => invoke(IPC.processes.list, chatId),
     stop: (chatId, id) => invoke(IPC.processes.stop, chatId, id),
     logs: (chatId, id, tail) => invoke(IPC.processes.logs, chatId, id, tail)
+  },
+  approvals: {
+    getSettings: () => invoke(IPC.approvals.getSettings),
+    updateSettings: (patch) => invoke(IPC.approvals.updateSettings, patch)
   },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)

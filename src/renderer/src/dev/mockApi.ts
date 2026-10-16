@@ -4,7 +4,9 @@ import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
 import type { ClearApi } from '@shared/ipc'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
+import { evaluateLists, normalizeApprovalSettings } from '@shared/approvalPolicy'
 import type {
+  ApprovalSettings,
   AgentEvent,
   ApprovalRequest,
   Chat,
@@ -14,6 +16,7 @@ import type {
   Provider,
   QueuedMessage,
   QuestionRequest,
+  RetryRequest,
   Session,
   StoredMessage
 } from '@shared/types'
@@ -137,7 +140,7 @@ export function createMockApi(scenario: string): ClearApi {
     kind: 'openrouter'
   })
   cfg.params = { temperature: 0.7 }
-  cfg.autoApprove = ['web_search', 'browse_url']
+  cfg.approvalModes = { search: 'always', pages: 'always' }
 
   const chats: Chat[] =
     scenario === 'onboarding'
@@ -243,22 +246,36 @@ export function createMockApi(scenario: string): ClearApi {
   const msg = (
     sessionId: string,
     message: StoredMessage['message'],
-    meta: StoredMessage['meta'] = {}
+    meta: StoredMessage['meta'] = {},
+    createdAt = now
   ): StoredMessage => ({
     id: id('m'),
     sessionId,
     seq: ++seq,
     message,
     meta,
-    createdAt: now
+    createdAt
   })
+  /** Hora local fixa N dias atrás (separadores de dia "Ontem" / "<dia da semana>" no chat c1). */
+  const daysAgo = (n: number, h: number, m: number, s = 0): number => {
+    const d = new Date(now)
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate() - n, h, m, s).getTime()
+  }
+  /** Hoje, N minutos atrás (sem cruzar a meia-noite). */
+  const minAgo = (n: number): number =>
+    Math.max(now - n * 60_000, new Date(new Date(now).setHours(0, 0, 0, 0)).getTime() + 1000)
 
   const messages: StoredMessage[] = [
-    msg('s1', {
-      role: 'user',
-      content:
-        'O parser de SSE em `src/main/agent/llm.ts` está engolindo a última linha quando o stream termina sem `\\n`. Pode investigar e corrigir?'
-    }),
+    msg(
+      's1',
+      {
+        role: 'user',
+        content:
+          'O parser de SSE em `src/main/agent/llm.ts` está engolindo a última linha quando o stream termina sem `\\n`. Pode investigar e corrigir?'
+      },
+      {},
+      daysAgo(2, 9, 12, 4)
+    ),
     msg(
       's1',
       {
@@ -281,7 +298,8 @@ export function createMockApi(scenario: string): ClearApi {
         usage: { promptTokens: 4210, completionTokens: 96, cachedTokens: 3890, cost: 0.0021 },
         model: cfg.model,
         durationMs: 2300
-      }
+      },
+      daysAgo(2, 9, 12, 31)
     ),
     msg(
       's1',
@@ -291,8 +309,44 @@ export function createMockApi(scenario: string): ClearApi {
         content:
           '40\tfor await (const chunk of res.body) {\n41\t  buffer += decoder.decode(chunk, { stream: true })\n42\t  const lines = buffer.split("\\n")\n43\t  buffer = lines.pop() ?? ""\n44\t  for (const line of lines) handleLine(line)\n45\t}\n46\t// fim do stream\n47\treturn finish()'
       },
-      { toolStatus: 'ok' }
+      { toolStatus: 'ok' },
+      daysAgo(2, 9, 12, 33)
     ),
+    msg(
+      's1',
+      {
+        role: 'assistant',
+        content:
+          'Li o trecho: quando o loop termina, o resto do `buffer` não é processado. Quer que eu aplique a correção agora?'
+      },
+      {
+        usage: { promptTokens: 4380, completionTokens: 41, cachedTokens: 4210, cost: 0.0012 },
+        model: cfg.model,
+        durationMs: 1800
+      },
+      daysAgo(2, 9, 12, 52)
+    ),
+    msg(
+      's1',
+      { role: 'user', content: 'Amanhã eu vejo isso. Algum teste cobre esse caso hoje?' },
+      {},
+      daysAgo(1, 18, 40, 10)
+    ),
+    msg(
+      's1',
+      {
+        role: 'assistant',
+        content:
+          'Não — nenhum teste manda um stream que termina sem `\\n`. Vale incluir um junto com a correção.'
+      },
+      {
+        usage: { promptTokens: 4460, completionTokens: 33, cachedTokens: 4380, cost: 0.0009 },
+        model: cfg.model,
+        durationMs: 1500
+      },
+      daysAgo(1, 18, 40, 16)
+    ),
+    msg('s1', { role: 'user', content: 'Pode corrigir agora.' }, {}, minAgo(4)),
     msg(
       's1',
       {
@@ -326,7 +380,8 @@ export function createMockApi(scenario: string): ClearApi {
         },
         model: cfg.model,
         durationMs: 5100
-      }
+      },
+      minAgo(3)
     ),
     msg(
       's1',
@@ -336,7 +391,8 @@ export function createMockApi(scenario: string): ClearApi {
         content:
           'Encontrei 2 usos:\n- src/main/agent/runner.ts:88 — consome eventos delta e acumula tool_calls\n- src/main/agent/preview.ts:12 — apenas tipagem'
       },
-      { toolStatus: 'ok', subSessionId: 's1a' }
+      { toolStatus: 'ok', subSessionId: 's1a' },
+      minAgo(2)
     ),
     msg('s1a', {
       role: 'user',
@@ -354,6 +410,17 @@ export function createMockApi(scenario: string): ClearApi {
     )
   ]
 
+  let approvalSettings: ApprovalSettings = normalizeApprovalSettings(
+    { commands: 'lists', processes: 'lists', pages: 'lists', search: 'lists' },
+    {
+      commands: {
+        allow: ['git status', 'git diff *', 'ls *'],
+        deny: ['rm -rf *', 'git push --force *']
+      },
+      processes: { allow: ['npm run dev *'], deny: [] },
+      pages: { allow: ['*.github.com', 'https://developer.mozilla.org/'], deny: [] }
+    }
+  )
   const approvals: ApprovalRequest[] =
     scenario === 'onboarding'
       ? []
@@ -364,7 +431,12 @@ export function createMockApi(scenario: string): ClearApi {
             sessionId: 's1',
             toolCallId: 'tc2',
             toolName: 'shell',
-            args: { command: 'npm test -- --run src/main/agent' },
+            args: { command: 'git status && npm test -- --run src/main/agent | tee out.log' },
+            check: evaluateLists(
+              'commands',
+              { command: 'git status && npm test -- --run src/main/agent | tee out.log' },
+              approvalSettings.lists
+            ).check,
             createdAt: now
           },
           {
@@ -515,6 +587,202 @@ export function createMockApi(scenario: string): ClearApi {
     }
   }
 
+  // Falha de conexão aguardando decisão — cenários "retry" (principal s2) e "retry-sub" (subagente s1a)
+  const retries: RetryRequest[] = []
+  if (scenario === 'retry' || scenario === 'retry-sub') {
+    const sid = scenario === 'retry' ? 's2' : 's1a'
+    const s = sessions.find((x) => x.id === sid)
+    if (s) {
+      s.status = 'awaiting_retry'
+      if (scenario === 'retry')
+        messages.push(msg('s2', { role: 'user', content: 'Resuma o README.' }))
+      retries.push({
+        id: 'r1',
+        chatId: s.chatId,
+        sessionId: sid,
+        error:
+          'Falha de rede ao chamar https://openrouter.ai/api/v1/chat/completions: fetch failed (getaddrinfo ENOTFOUND openrouter.ai)',
+        model: s.model,
+        providerName: 'OpenRouter',
+        createdAt: now
+      })
+    }
+  }
+  // Cenário "subagents": no chat c3, 4 subagentes em segundo plano — 3 pedem aprovação ao mesmo
+  // tempo (dois shell no modo Listas, um web_search) e 1 falhou; conversa longa depois dos delegates
+  // (os cards ficam fora da tela → fila acima do composer). `subagents-other`: abre no chat c2
+  // (c3 fica âmbar/vermelho na sidebar).
+  if (scenario.startsWith('subagents')) {
+    const subs = [
+      ['s3a', 'Rodar os testes do parser', 'shell', { command: 'npm test -- --run src/parser' }],
+      [
+        's3b',
+        'Pesquisar CRDTs de texto',
+        'web_search',
+        { query: 'CRDT text editing Yjs vs Automerge' }
+      ],
+      [
+        's3c',
+        'Limpar artefatos de build',
+        'shell',
+        { command: 'rm -rf dist && git clean -fdX out' }
+      ],
+      ['s3d', 'Resumir o artigo', 'read_file', null]
+    ] as const
+    const calls = subs.map(([, title], i) => ({
+      id: `tcs${i}`,
+      type: 'function' as const,
+      function: {
+        name: 'delegate_task',
+        arguments: JSON.stringify({
+          title,
+          task: `${title} (tarefa de exemplo).`,
+          background: true
+        })
+      }
+    }))
+    messages.push(
+      msg('s3', { role: 'user', content: 'Divida o trabalho em 4 subagentes em paralelo.' }),
+      msg('s3', {
+        role: 'assistant',
+        content: 'Vou delegar 4 tarefas em segundo plano.',
+        tool_calls: calls
+      })
+    )
+    subs.forEach(([sid, title, tool, args], i) => {
+      messages.push(
+        msg(
+          's3',
+          {
+            role: 'tool',
+            tool_call_id: `tcs${i}`,
+            content: `Subagente iniciado em segundo plano (id ${sid}).`
+          },
+          { toolStatus: 'ok', subSessionId: sid, background: true }
+        )
+      )
+      sessions.push({
+        id: sid,
+        chatId: 'c3',
+        parentSessionId: 's3',
+        parentToolCallId: `tcs${i}`,
+        depth: 1,
+        model: 'anthropic/claude-haiku-4.5',
+        title,
+        task: `${title} (tarefa de exemplo).`,
+        status: tool === 'read_file' ? 'error' : 'awaiting_approval',
+        createdAt: now - 60_000
+      })
+      messages.push(
+        msg(sid, { role: 'user', content: `${title} (tarefa de exemplo).` }, { synthetic: true })
+      )
+      if (args) {
+        messages.push(
+          msg(sid, {
+            role: 'assistant',
+            content: '',
+            tool_calls: [
+              {
+                id: `tcsub${i}`,
+                type: 'function',
+                function: { name: tool, arguments: JSON.stringify(args) }
+              }
+            ]
+          })
+        )
+        approvals.push({
+          id: `as${i}`,
+          chatId: 'c3',
+          sessionId: sid,
+          toolCallId: `tcsub${i}`,
+          toolName: tool,
+          args,
+          ...(tool === 'shell'
+            ? { check: evaluateLists('commands', args, approvalSettings.lists).check }
+            : {}),
+          createdAt: now + i
+        })
+      }
+    })
+    for (let k = 0; k < 6; k++)
+      messages.push(
+        msg('s3', {
+          role: 'user',
+          content: `Enquanto isso, me explique o ponto ${k + 1} do artigo.`
+        }),
+        msg('s3', {
+          role: 'assistant',
+          content: `**Ponto ${k + 1}.** ${'CRDTs garantem convergência sem coordenação central: cada réplica aplica operações comutativas e, ao trocar estado, todas chegam ao mesmo resultado. '.repeat(3)}`
+        })
+      )
+    messages.push(
+      msg(
+        's3',
+        {
+          role: 'user',
+          content:
+            '[Subagente "Resumir o artigo" (id s3d) falhou]\nNão consegui ler o arquivo do artigo.'
+        },
+        { kind: 'subagent-callback', synthetic: true, subSessionId: 's3d' }
+      )
+    )
+  }
+  // `subagents-question`: a principal de c3 também tem um questionário aberto (precedência: a fila espera)
+  if (scenario === 'subagents-question') {
+    messages.push(
+      msg('s3', {
+        role: 'assistant',
+        content: 'Uma decisão antes de seguir.',
+        tool_calls: [
+          {
+            id: 'ask3',
+            type: 'function',
+            function: { name: 'ask_user', arguments: JSON.stringify(askArgs) }
+          }
+        ]
+      })
+    )
+    questions.push({
+      id: 'q3',
+      chatId: 'c3',
+      sessionId: 's3',
+      toolCallId: 'ask3',
+      createdAt: now,
+      questions: askArgs.questions.map((q) => ({
+        title: q.title,
+        multiple: !!q.multiple,
+        options: q.options.map((o) => ({ title: o.title }))
+      }))
+    })
+  }
+  const resolveRetryMock = (rid: string, retry: boolean): void => {
+    const r = retries.find((x) => x.id === rid)
+    if (!r) return
+    retries.splice(retries.indexOf(r), 1)
+    emit({ type: 'retry-resolved', id: rid })
+    const s = sessions.find((x) => x.id === r.sessionId)
+    if (!s) return
+    if (retry) {
+      const m = msg(r.sessionId, {
+        role: 'assistant',
+        content: 'Pronto — (resposta após tentar de novo, mock).'
+      })
+      messages.push(m)
+      emit({ type: 'message-added', message: m })
+      s.status = s.depth === 0 ? 'idle' : 'done'
+    } else {
+      const m = msg(
+        r.sessionId,
+        { role: 'assistant', content: r.error },
+        { synthetic: true, kind: 'error', error: r.error }
+      )
+      messages.push(m)
+      emit({ type: 'message-added', message: m })
+      s.status = 'error'
+    }
+    emit({ type: 'session-updated', session: { ...s } })
+  }
+
   return {
     providers: {
       list: () => delay(providers),
@@ -628,10 +896,33 @@ export function createMockApi(scenario: string): ClearApi {
         }
       },
       getQueue: (sid) => delay(queues[sid] ?? []),
-      stop: async () => {},
+      stop: async (sid) => {
+        // Parar com o card de falha de conexão aberto = Cancelar
+        for (const r of retries.filter((x) => x.sessionId === sid)) resolveRetryMock(r.id, false)
+      },
       regenerate: async () => {},
-      approve: async (rid) => {
+      approve: async (rid, _decision, items) => {
+        const req = approvals.find((a) => a.id === rid)
+        if (req?.check && req.check.item !== 'search' && items?.length) {
+          const item = req.check.item
+          const lists = structuredClone(approvalSettings.lists)
+          for (const d of items) {
+            if (!d.pattern) continue
+            const l = lists[item][d.allow ? 'allow' : 'deny']
+            if (!l.includes(d.pattern)) l.push(d.pattern)
+          }
+          approvalSettings = normalizeApprovalSettings(approvalSettings.modes, lists)
+          emit({ type: 'approval-settings-updated', settings: approvalSettings })
+        }
+        const i = approvals.findIndex((a) => a.id === rid)
+        if (i >= 0) approvals.splice(i, 1)
         emit({ type: 'approval-resolved', id: rid })
+        // subagente do cenário "subagents": conclui depois da decisão
+        const ss = req && sessions.find((x) => x.id === req.sessionId)
+        if (ss && ss.depth > 0) {
+          ss.status = 'done'
+          emit({ type: 'session-updated', session: { ...ss } })
+        }
       },
       pendingApprovals: () => delay(approvals),
       smartOverride: async () => {},
@@ -792,6 +1083,11 @@ export function createMockApi(scenario: string): ClearApi {
       },
       pending: () => delay(questions)
     },
+    retries: {
+      retry: async (rid) => resolveRetryMock(rid, true),
+      cancel: async (rid) => resolveRetryMock(rid, false),
+      pending: () => delay(retries)
+    },
     processes: {
       list: (chatId) => delay(processes.filter((p) => p.chatId === chatId)),
       stop: async (chatId, pid) => {
@@ -820,8 +1116,35 @@ export function createMockApi(scenario: string): ClearApi {
         return delay({ info: { ...p }, lines: all.slice(-tail) })
       }
     },
+    approvals: {
+      getSettings: () => delay(approvalSettings),
+      updateSettings: async (patch) => {
+        approvalSettings = normalizeApprovalSettings(
+          patch.modes ?? approvalSettings.modes,
+          patch.lists ?? approvalSettings.lists
+        )
+        emit({ type: 'approval-settings-updated', settings: approvalSettings })
+        return delay(approvalSettings)
+      }
+    },
     onEvent: (cb) => {
       listeners.add(cb)
+      if (scenario.startsWith('subagents')) {
+        // o subagente "Resumir o artigo" morre com erro do provider (vermelho na sidebar/composer)
+        const sd = sessions.find((x) => x.id === 's3d')
+        if (sd) {
+          sd.status = 'running'
+          setTimeout(() => {
+            sd.status = 'error'
+            emit({
+              type: 'error',
+              sessionId: 's3d',
+              error: 'Erro HTTP 402 Payment Required: Insufficient credits for this request.'
+            })
+            emit({ type: 'session-updated', session: { ...sd } })
+          }, 600)
+        }
+      }
       if (scenario === 'reasoning') {
         // Raciocínio longo: uma resposta já salva + um segundo turno ainda "pensando".
         const s2 = sessions.find((x) => x.id === 's2')!

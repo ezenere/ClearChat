@@ -13,6 +13,8 @@ import { ComposerAttachmentChip } from './Attachments'
 import { useAttachmentSupport } from './attachmentSupport'
 import { CompactBanner, ContextMeter } from './ContextMeter'
 import { QuestionForm } from './AskUser'
+import { RetryForm } from './RetryCard'
+import { PendingBar } from './PendingBar'
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
 function pastedName(file: File, i: number): File {
@@ -99,6 +101,9 @@ export function Composer({
   const busy = isBusy(session.status)
   /** Questionário (ask_user) pendente nesta sessão: substitui o campo de texto. */
   const question = useStore((s) => s.questions.find((q) => q.sessionId === session.id))
+  /** Falha de conexão aguardando decisão nesta sessão: card no lugar do campo de texto. */
+  const retry = useStore((s) => s.retries.find((r) => r.sessionId === session.id))
+  const blocked = !!question || !!retry
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
   const pending = useStore(selectPendingAttachments(session.id))
@@ -180,6 +185,7 @@ export function Composer({
             </div>
           </div>
         )}
+        <PendingBar session={session} blocked={blocked} />
         <div
           className={cn(
             'group relative rounded-2xl border border-border bg-surface shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7)] transition-[border-color,box-shadow] duration-150',
@@ -188,7 +194,8 @@ export function Composer({
           onClick={() => ref.current?.focus()}
         >
           {question && <QuestionForm key={question.id} request={question} />}
-          {!question && pending.length > 0 && (
+          {!question && retry && <RetryForm key={retry.id} request={retry} />}
+          {!blocked && pending.length > 0 && (
             <div className="flex flex-wrap gap-2 px-3 pt-3" onClick={(e) => e.stopPropagation()}>
               {pending.map((a) => (
                 <ComposerAttachmentChip
@@ -200,7 +207,7 @@ export function Composer({
               ))}
             </div>
           )}
-          {!question && warnings.length > 0 && (
+          {!blocked && warnings.length > 0 && (
             <div
               role="alert"
               onClick={(e) => e.stopPropagation()}
@@ -230,7 +237,7 @@ export function Composer({
               </button>
             </div>
           )}
-          {!question && (
+          {!blocked && (
             <AutoTextarea
               ref={ref}
               value={text}
@@ -260,7 +267,7 @@ export function Composer({
             />
           )}
           <div className="flex items-center gap-2 px-2.5 pb-2.5">
-            {!question && (
+            {!blocked && (
               <Tip label={attachTip}>
                 <button
                   type="button"
@@ -282,13 +289,15 @@ export function Composer({
                   <span className="size-1.5 animate-pulse-soft rounded-full bg-accent-strong" />
                   {question || session.status === 'awaiting_input'
                     ? 'Aguardando sua resposta'
-                    : session.status === 'awaiting_approval'
-                      ? 'Aguardando aprovação'
-                      : session.status === 'waiting'
-                        ? 'Aguardando subagentes'
-                        : compaction?.state === 'running'
-                          ? 'Compactando conversa…'
-                          : 'Trabalhando…'}
+                    : retry || session.status === 'awaiting_retry'
+                      ? 'Aguardando sua decisão (falha de conexão)'
+                      : session.status === 'awaiting_approval'
+                        ? 'Aguardando aprovação'
+                        : session.status === 'waiting'
+                          ? 'Aguardando subagentes'
+                          : compaction?.state === 'running'
+                            ? 'Compactando conversa…'
+                            : 'Trabalhando…'}
                 </span>
               ) : (
                 <span>
@@ -314,7 +323,7 @@ export function Composer({
                   </button>
                 </Tip>
               )}
-              {!question && (
+              {!blocked && (
                 <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
                   <button
                     type="button"

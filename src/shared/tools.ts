@@ -274,7 +274,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   web_search: def(
     'web_search',
-    `Pesquisa na web (DuckDuckGo) e retorna até ${L.webMaxResults} resultados com título, URL e trecho.`,
+    `Pesquisa na web (DuckDuckGo, com fallback automático para o Brave Search se o DuckDuckGo bloquear ou falhar) e retorna até ${L.webMaxResults} resultados com título, URL e trecho; a 1ª linha diz qual buscador respondeu. Há um intervalo mínimo global entre pesquisas (configurável; padrão 5 s): se preciso, a chamada espera a vez e a 1ª linha informa quanto aguardou.`,
     { query: { type: 'string', description: 'Termos de busca.' } },
     ['query']
   ),
@@ -346,9 +346,12 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   list_chats: def(
     'list_chats',
-    `Lista os chats do app (id, título, modelo, estado — ocioso, rodando ou aguardando aprovação — e última atualização), mais recentes primeiro; marca este chat. Padrão ${L.chatsDefaultResults} (máx. ${L.chatsMaxResults}).`,
+    `Lista os chats do app (id, título, modelo, estado — ocioso, rodando ou aguardando aprovação — e última atualização), mais recentes primeiro; marca este chat. Com query, filtra pelo título (sem acentos/maiúsculas, mais parecidos primeiro). Para achar um chat pelo que foi DISCUTIDO nele, use read_history com scope "all". Padrão ${L.chatsDefaultResults} (máx. ${L.chatsMaxResults}).`,
     {
-      query: { type: 'string', description: 'Filtra por parte do título ou do id.' },
+      query: {
+        type: 'string',
+        description: 'Filtra por palavras do título (ou início do id).'
+      },
       limit: {
         type: 'number',
         description: `Máximo de chats listados (padrão ${L.chatsDefaultResults}).`
@@ -374,14 +377,32 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   read_history: def(
     'read_history',
-    `Lê o histórico salvo desta sessão, inclusive mensagens anteriores a compactações (que não estão mais no seu contexto). Com query: busca o texto (sem diferenciar maiúsculas) em mensagens, argumentos e resultados de tools e retorna trechos com o número #seq. Sem query: retorna as mensagens de from_seq a to_seq (padrão ${L.historyDefaultMessages}). Mensagens longas são cortadas; para ler uma inteira, use from_seq = to_seq.`,
+    `Lê o histórico salvo desta sessão, inclusive mensagens anteriores a compactações (que não estão mais no seu contexto). Com query: busca o texto (sem diferenciar maiúsculas) em mensagens, argumentos e resultados de tools e retorna trechos com o número #seq. Sem query: retorna as mensagens de from_seq a to_seq (padrão ${L.historyDefaultMessages}). Mensagens longas são cortadas; para ler uma inteira, use from_seq = to_seq. OUTROS CHATS (só leitura): scope "all" + query busca em todos os chats menos este (por relevância, agrupado por chat, até ${L.historyAllPerChat} trechos cada) — use para achar algo discutido em outro chat ou o chat certo antes de send_to_chat; chat_id (id ou prefixo) busca ou lê a faixa naquele chat.`,
     {
-      query: { type: 'string', description: 'Texto a buscar.' },
+      query: {
+        type: 'string',
+        description:
+          'Texto a buscar (em outros chats: palavras, sem acentos/maiúsculas, prefixos casam).'
+      },
+      chat_id: {
+        type: 'string',
+        description:
+          'Outro chat (id ou prefixo único, via list_chats ou scope "all"): busca/faixa nele em vez desta sessão.'
+      },
+      scope: {
+        type: 'string',
+        enum: ['all'],
+        description: '"all": buscar a query em todos os outros chats.'
+      },
+      session_id: {
+        type: 'string',
+        description: 'Com chat_id: subsessão (subagente) daquele chat; padrão a principal.'
+      },
       from_seq: { type: 'number', description: 'Primeira mensagem (#seq).' },
       to_seq: { type: 'number', description: 'Última mensagem (#seq).' },
       limit: {
         type: 'number',
-        description: `Máximo de mensagens (faixa: padrão ${L.historyDefaultMessages}; busca: padrão ${L.historySearchDefault}).`
+        description: `Máximo de mensagens (faixa: padrão ${L.historyDefaultMessages}; busca: padrão ${L.historySearchDefault}); com scope "all", de chats (padrão ${L.historyAllChatsDefault}).`
       },
       include_tool_results: {
         type: 'boolean',

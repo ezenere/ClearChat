@@ -1,4 +1,4 @@
-import { Check, MessageSquarePlus, Pencil, Settings, Trash2, X } from 'lucide-react'
+import { Check, CircleX, Hand, MessageSquarePlus, Pencil, Settings, Trash2, X } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import type { Chat } from '@shared/types'
 import { cn, isMac, relativeTime } from '../lib/format'
@@ -15,19 +15,35 @@ export function Sidebar(): React.JSX.Element {
   const sessions = useStore((s) => s.sessions)
   const approvals = useStore((s) => s.approvals)
   const questions = useStore((s) => s.questions)
+  const retries = useStore((s) => s.retries)
+  const subFailures = useStore((s) => s.subFailures)
 
   const status = useMemo(() => {
-    const out: Record<string, 'running' | 'approval' | 'input' | undefined> = {}
+    const out: Record<string, 'running' | 'approval' | 'input' | 'retry' | undefined> = {}
     for (const ss of Object.values(sessions)) if (isBusy(ss.status)) out[ss.chatId] = 'running'
+    for (const r of retries) out[r.chatId] = 'retry'
     for (const q of questions) out[q.chatId] = 'input'
     for (const a of approvals) out[a.chatId] = 'approval'
     return out
-  }, [sessions, approvals, questions])
+  }, [sessions, approvals, questions, retries])
+
+  /** Pendências para o destaque do item: aprovações (âmbar) e falhas de subagente não vistas (vermelho). */
+  const marks = useMemo(() => {
+    const out: Record<string, { approvals: number; failures: string[] }> = {}
+    const get = (id: string): { approvals: number; failures: string[] } =>
+      (out[id] ??= { approvals: 0, failures: [] })
+    for (const a of approvals) get(a.chatId).approvals++
+    for (const f of Object.values(subFailures)) if (!f.seen) get(f.chatId).failures.push(f.title)
+    return out
+  }, [approvals, subFailures])
 
   return (
     <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-surface">
       <div
-        className={cn('drag flex h-titlebar shrink-0 items-center gap-2 px-4', isMac && 'pl-20')}
+        className={cn(
+          'drag flex h-titlebar shrink-0 items-center gap-2 px-4',
+          isMac && 'justify-end'
+        )}
       >
         <Logo className="size-[18px]" />
         <span className="text-[13px] font-semibold tracking-tight text-fg/90">ClearChat</span>
@@ -66,6 +82,8 @@ export function Sidebar(): React.JSX.Element {
             chat={c}
             active={view.kind === 'chat' && view.chatId === c.id}
             status={status[c.id]}
+            approvals={marks[c.id]?.approvals ?? 0}
+            failures={marks[c.id]?.failures}
           />
         ))}
       </nav>
@@ -91,12 +109,19 @@ export function Sidebar(): React.JSX.Element {
 function ChatItem({
   chat,
   active,
-  status
+  status,
+  approvals = 0,
+  failures
 }: {
   chat: Chat
   active: boolean
-  status: 'running' | 'approval' | 'input' | undefined
+  status: 'running' | 'approval' | 'input' | 'retry' | undefined
+  /** Aprovações pendentes no chat (qualquer sessão) → item âmbar. */
+  approvals?: number
+  /** Subagentes que falharam e o usuário ainda não viu → item vermelho. */
+  failures?: string[]
 }): React.JSX.Element {
+  const failed = !!failures?.length
   const openChat = useStore((s) => s.openChat)
   const renameChat = useStore((s) => s.renameChat)
   const deleteChat = useStore((s) => s.deleteChat)
@@ -142,12 +167,43 @@ function ChatItem({
         setTitle(chat.title)
         setEditing(true)
       }}
+      data-testid="chat-item"
+      data-approval={approvals > 0 || undefined}
+      data-failed={failed || undefined}
       className={cn(
         'group relative flex h-8 items-center gap-2 rounded-lg px-2.5 text-[13px] transition-colors',
-        active ? 'bg-active text-fg' : 'text-fg/75 hover:bg-hover hover:text-fg'
+        active ? 'bg-active text-fg' : 'text-fg/75 hover:bg-hover hover:text-fg',
+        // pendência de aprovação: âmbar (vale para subagentes também)
+        approvals > 0 &&
+          !failed &&
+          'bg-warning/[0.09] text-fg shadow-[inset_0_0_0_1px_rgb(245_181_68/0.3)] hover:bg-warning/[0.14]',
+        approvals > 0 && !failed && active && 'bg-warning/[0.16]',
+        // subagente falhou e o chat ainda não foi aberto: vermelho
+        failed &&
+          'bg-danger/[0.08] text-fg shadow-[inset_0_0_0_1px_rgb(248_113_113/0.32)] hover:bg-danger/[0.13]'
       )}
     >
+      {failed ? (
+        <Tip
+          label={`${failures!.length === 1 ? `Subagente “${failures![0]}” falhou` : `${failures!.length} subagentes falharam`} — abra o chat para ver`}
+        >
+          <CircleX data-testid="chat-sub-failed" className="size-3.5 shrink-0 text-danger" />
+        </Tip>
+      ) : approvals > 0 ? (
+        <Tip
+          label={
+            approvals === 1 ? 'Aguardando sua aprovação' : `${approvals} aprovações aguardando você`
+          }
+        >
+          <Hand data-testid="chat-awaiting-approval" className="size-3.5 shrink-0 text-warning" />
+        </Tip>
+      ) : null}
       <span className="min-w-0 flex-1 truncate">{chat.title || 'Novo chat'}</span>
+      {approvals > 1 && (
+        <span className="shrink-0 rounded-full bg-warning/20 px-1.5 text-[10.5px] font-semibold text-warning tabular-nums group-hover:hidden">
+          {approvals}
+        </span>
+      )}
       {status === 'running' && (
         <Tip label="Executando">
           <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent-strong" />
@@ -161,12 +217,15 @@ function ChatItem({
           />
         </Tip>
       )}
-      {status === 'approval' && (
-        <Tip label="Aguardando sua aprovação">
-          <span className="size-1.5 shrink-0 rounded-full bg-warning shadow-[0_0_0_3px_rgb(245_181_68/0.15)]" />
+      {status === 'retry' && (
+        <Tip label="Aguardando sua decisão (falha de conexão)">
+          <span
+            data-testid="chat-awaiting-retry"
+            className="size-1.5 shrink-0 rounded-full bg-warning shadow-[0_0_0_3px_rgb(245_181_68/0.15)]"
+          />
         </Tip>
       )}
-      {!status && (
+      {!status && !failed && (
         <span className="shrink-0 text-[11px] text-faint tabular-nums group-hover:hidden">
           {relativeTime(chat.updatedAt)}
         </span>

@@ -23,7 +23,8 @@ import {
 } from '../src/shared/askUser.ts'
 import { TOOL_DEFINITIONS, TOOL_NAMES } from '../src/shared/tools.ts'
 import { CONFIRM_TOOLS } from '../src/shared/types.ts'
-import { approvalRoute, SMART_APPROVE_EXTRA_TOOLS } from '../src/shared/smartApprove.ts'
+import { SMART_APPROVE_EXTRA_TOOLS } from '../src/shared/smartApprove.ts'
+import { approvalRoute } from '../src/shared/approvalPolicy.ts'
 import { DEFAULT_CHAT_CONFIG } from '../src/shared/defaults.ts'
 import { availableTools, buildRequest, sanitizeHistory } from '../src/main/agent/request.ts'
 import {
@@ -257,7 +258,7 @@ test('ask_user: só na sessão principal; sem confirmação nem Smart-Approve', 
   assert.ok(!availableTools(chat, { depth: 2 }).includes('ask_user'))
   assert.ok(!CONFIRM_TOOLS.includes('ask_user'))
   assert.ok(!SMART_APPROVE_EXTRA_TOOLS.includes('ask_user'))
-  assert.equal(approvalRoute(chat.config, 'ask_user'), 'run')
+  assert.equal(approvalRoute(chat.config, null, 'ask_user').kind, 'run')
   // na request: definição com o schema aninhado (array de objetos)
   const p = {
     id: 'p1',

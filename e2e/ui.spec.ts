@@ -129,6 +129,9 @@ const SHOTS = join(BASE, 'shots')
 const STOP_AFTER = process.argv[2] ?? ''
 const MODEL = process.env.E2E_MODEL || 'openai/gpt-4.1-nano'
 const ALT_MODEL = process.env.E2E_ALT_MODEL || 'openai/gpt-4o-mini'
+// Modo texto (<tool_call> no content): GLM (z-ai/*) trata <tool_call> como token especial e vários
+// provedores upstream o engolem (content vazio) — use outro modelo nesse passo.
+const TEXT_MODEL = process.env.E2E_TEXT_MODEL || MODEL
 
 let app: ElectronApplication
 let page: Page
@@ -435,11 +438,8 @@ async function main(): Promise<void> {
       await aside.getByRole('button', { name: 'Salvar como persona' }).waitFor()
       await shot('tab-chat')
       await ensurePanel('Tools')
-      for (const n of [
-        'Enviar tools nativas',
-        'Texto das tools no system prompt',
-        'Auto-aprovar tudo'
-      ])
+      // (o antigo "Auto-aprovar tudo" saiu: aprovações agora são por modo/listas globais)
+      for (const n of ['Enviar tools nativas', 'Texto das tools no system prompt'])
         await aside.getByRole('switch', { name: n }).waitFor({ timeout: 3000 })
       await aside.getByLabel('System prompt dos subagentes').waitFor()
       await aside
@@ -643,10 +643,10 @@ async function main(): Promise<void> {
 
   await step('bash → Permitir', async () => {
     await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-allow')
-    await page.getByRole('button', { name: 'Permitir' }).waitFor({ timeout: 60_000 })
+    await page.getByRole('button', { name: /^(Permitir|Sim)$/ }).waitFor({ timeout: 60_000 })
     await page.getByText('Aguardando aprovação').first().waitFor()
     await shot('approval-card')
-    await page.getByRole('button', { name: 'Permitir' }).click()
+    await page.getByRole('button', { name: /^(Permitir|Sim)$/ }).click()
     await waitIdle()
     const card = toolCards('Terminal (shell)').last()
     await card.getByText('ok', { exact: true }).waitFor({ timeout: 5000 })
@@ -660,8 +660,8 @@ async function main(): Promise<void> {
 
   await step('bash → Negar', async () => {
     await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-deny')
-    await page.getByRole('button', { name: 'Negar' }).waitFor({ timeout: 60_000 })
-    await page.getByRole('button', { name: 'Negar' }).click()
+    await page.getByRole('button', { name: /^(Negar|Não)$/ }).waitFor({ timeout: 60_000 })
+    await page.getByRole('button', { name: /^(Negar|Não)$/ }).click()
     await waitIdle()
     await toolCards('Terminal (shell)').last().getByText('negada').waitFor({ timeout: 5000 })
     const { msgs } = await currentState()
@@ -671,15 +671,21 @@ async function main(): Promise<void> {
     )
   })
 
-  await step('bash → Sempre neste chat', async () => {
+  await step('bash → Sim + whitelist (lista global) e a próxima roda sem card', async () => {
     await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-always')
-    await page.getByRole('button', { name: 'Sempre neste chat' }).waitFor({ timeout: 60_000 })
-    await page.getByRole('button', { name: 'Sempre neste chat' }).click()
+    const btn = page.getByRole('button', { name: 'Sim + whitelist' })
+    await btn.first().waitFor({ timeout: 60_000 })
+    await btn.first().click()
+    const input = page.getByRole('textbox', { name: 'Padrão da whitelist' })
+    assert((await input.inputValue()) === 'echo *', `sugestão ${await input.inputValue()}`)
+    await page.getByRole('button', { name: 'Salvar e permitir' }).click()
     await waitIdle()
-    await page.getByRole('button', { name: /Auto-aprovação/ }).waitFor({ timeout: 5000 })
-    const { chat } = await currentState()
-    assert(chat.config.autoApprove.includes('shell'), 'autoApprove bash')
+    const st = await read<any>('approvals.getSettings')
+    assert(st.lists.commands.allow.includes('echo *'), 'whitelist echo *')
     await shot('always')
+    // os passos seguintes assumem o shell liberado neste chat (antes: "Sempre neste chat")
+    const { chat } = await currentState()
+    await read('chats.update', chat.id, { config: { approvalModes: { commands: 'always' } } })
   })
 
   await step('fila: mensagem durante execução vira chip e é injetada depois', async () => {
@@ -800,27 +806,54 @@ async function main(): Promise<void> {
   })
 
   await step('modo texto (tools nativas off + texto no prompt) roda tool', async () => {
-    await ensurePanel('Tools')
     const aside = page.locator('aside')
+    if (TEXT_MODEL !== MODEL) {
+      await ensurePanel('Modelo')
+      await pickModel(aside.getByRole('combobox'), TEXT_MODEL)
+    }
+    await ensurePanel('Tools')
     await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
     await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
-    const { body } = await openPreview()
-    assert(!('tools' in body), 'sem campo tools')
-    assert(/<tool_call>/.test(body.messages[0].content[0].text), 'instruções <tool_call> no system')
-    await closeModal()
-    await sendMessage(
-      'Use the list_dir tool now on "." by writing a <tool_call> block exactly as instructed. After you get the result, reply with the file names.'
-    )
-    await waitIdle()
-    await page.getByText('Resultado de tool (texto)').last().waitFor({ timeout: 5000 })
-    const { msgs } = await currentState()
-    assert(
-      msgs.some((m) => m.meta.synthetic && /<tool_result name="list_dir">/.test(m.message.content)),
-      'tool_result em texto'
-    )
-    await shot('text-mode')
-    await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
-    await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
+    try {
+      const { body } = await openPreview()
+      assert(!('tools' in body), 'sem campo tools')
+      assert(
+        /<tool_call>/.test(body.messages[0].content[0].text),
+        'instruções <tool_call> no system'
+      )
+      await closeModal()
+      // o modelo às vezes responde de memória (a pasta já foi listada antes): até 2 tentativas
+      for (let i = 0; i < 2; i++) {
+        await sendMessage(
+          'Use the list_dir tool now on "." by writing a <tool_call> block exactly as instructed. After you get the result, reply with the file names.'
+        )
+        await waitIdle()
+        if (
+          (await currentState()).msgs.some(
+            (m) => m.meta.synthetic && /<tool_result name="list_dir">/.test(m.message.content)
+          )
+        )
+          break
+      }
+      await page.getByText('Resultado de tool (texto)').last().waitFor({ timeout: 5000 })
+      const { msgs } = await currentState()
+      assert(
+        msgs.some(
+          (m) => m.meta.synthetic && /<tool_result name="list_dir">/.test(m.message.content)
+        ),
+        'tool_result em texto'
+      )
+      await shot('text-mode')
+    } finally {
+      // restaura mesmo se falhar (senão os passos seguintes herdam o modo texto)
+      await ensurePanel('Tools')
+      await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
+      await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
+      if (TEXT_MODEL !== MODEL) {
+        await ensurePanel('Modelo')
+        await pickModel(aside.getByRole('combobox'), MODEL)
+      }
+    }
   })
 
   await step('assinatura do app none/cline nos headers do Ver request', async () => {
@@ -927,7 +960,8 @@ async function main(): Promise<void> {
         await dlg.locator('input.field').nth(1).fill(url)
         if (key) await dlg.locator('input[type="password"]').fill(key)
         await dlg.getByRole('button', { name: 'Adicionar', exact: true }).click()
-        await dlg.getByText(name, { exact: true }).waitFor({ timeout: 5000 })
+        // o rótulo agora traz o tipo ao lado ("Local Fake OpenAI-compatible (genérico)")
+        await dlg.getByText(name).first().waitFor({ timeout: 5000 })
       }
       assert(
         (await dlg.getByText('padrão', { exact: true }).count()) === 0,
@@ -979,7 +1013,7 @@ async function main(): Promise<void> {
       await shot('picker-collapsed')
       // a busca atravessa todos os grupos (inclusive o recolhido): o mesmo id nos dois
       const search = page.getByRole('textbox', { name: 'Buscar modelo' })
-      await search.fill('gpt-4.1-nano')
+      await search.fill(MODEL.split('/').pop()!)
       await opt('Local Fake', MODEL).waitFor({ timeout: 5000 })
       await opt('OpenRouter', MODEL).waitFor({ timeout: 5000 })
       await group('Local Fake').waitFor()
@@ -1068,7 +1102,10 @@ async function main(): Promise<void> {
       const before = fakeHits.length
       const nMsgs = (await read<any[]>('sessions.messages', sid)).length
       await sendMessage(
-        'Do exactly these two tool calls in order. 1) Call list_models with only query "nano" (no provider argument, so it lists every provider). ' +
+        // query = id do MODEL (antes "nano", que só casava com o gpt-4.1-nano)
+        'Do exactly these two tool calls in order. 1) Call list_models with only query "' +
+          MODEL.split('/').pop() +
+          '" (no provider argument, so it lists every provider). ' +
           '2) Call delegate_task with provider "Local Fake", model "' +
           MODEL +
           '", title "via fake" and task "Reply with the word PONG.". ' +
@@ -1180,7 +1217,9 @@ async function main(): Promise<void> {
       await page.getByRole('button', { name: 'Configurações' }).first().click()
       await dlg.getByRole('button', { name: 'Provedores', exact: true }).click()
       for (const name of ['Local Fake', 'Quebrado']) {
-        const row = dlg.locator('div.group').filter({ has: page.getByText(name, { exact: true }) })
+        const row = dlg
+          .locator('div.group')
+          .filter({ has: page.getByText(new RegExp(`^${name}OpenAI-compatible`)) })
         await row.hover()
         await row.getByRole('button', { name: 'Remover' }).click()
         await row.getByRole('button', { name: 'Remover?' }).click()
@@ -1271,8 +1310,9 @@ async function main(): Promise<void> {
       await shot('context-banner')
       const before = (await currentState()).msgs.length
       await banner.getByRole('button', { name: 'Compactar conversa' }).click()
-      await page.getByTestId('compaction-card').first().waitFor({ timeout: 90_000 })
-      await waitIdle(60_000)
+      // modelos com reasoning (ex.: glm-5.3-flash) podem levar minutos para resumir ~7k tokens
+      await page.getByTestId('compaction-card').first().waitFor({ timeout: 240_000 })
+      await waitIdle(240_000)
       await page.getByTestId('compaction-divider').waitFor({ timeout: 5000 })
       const div = await page.getByTestId('compaction-divider').innerText()
       assert(
@@ -1560,26 +1600,25 @@ async function main(): Promise<void> {
     await page.getByRole('button', { name: 'Começar' }).click()
     await composer().waitFor({ timeout: 10_000 })
     await sendMessage(
-      'Use the delegate_task tool to ask a subagent to run the bash command "echo sub-approval-ok" with its shell tool and report the output. Then tell me the output.'
+      // printf (não echo): `echo *` foi para a whitelist global no passo "Sim + whitelist"
+      'Use the delegate_task tool to ask a subagent to run the bash command "printf sub-approval-ok" with its shell tool and report the output. Then tell me the output.'
     )
-    const indicator = page.getByRole('button', { name: /Aprovação pendente/ })
-    await indicator.waitFor({ timeout: 90_000 })
-    await shot('global-approval-indicator')
-    // o card de delegate na principal também mostra a aprovação do subagente
-    await toolCards('Delegar a subagente')
-      .first()
-      .getByText('Permitir que o subagente execute')
-      .waitFor({ timeout: 5000 })
-    await indicator.click()
+    // o indicador do topo é só para OUTROS chats; aqui a aprovação do subagente fica no card do
+    // delegate (visível) — ou na fila acima do composer se o card estiver fora da tela
+    const indicator = page.getByTestId('approval-indicator')
+    const delegateCard = toolCards('Delegar a subagente').first()
+    await page.getByText('Permitir que o subagente execute').first().waitFor({ timeout: 90_000 })
+    await shot('subagent-approval-in-chat')
+    await delegateCard.getByRole('button', { name: 'Abrir subsessão' }).click()
     await page.getByText('Conversando com o subagente').waitFor({ timeout: 5000 })
     await shot('subagent-approval')
-    await page.getByRole('button', { name: 'Permitir' }).click()
+    await page.getByRole('button', { name: /^(Permitir|Sim)$/ }).click()
     await page.getByRole('button', { name: 'Voltar à principal' }).click()
     await composer().waitFor({ timeout: 5000 })
     // o modelo pode delegar mais de uma vez: aprova pelo card da principal
     const t0 = Date.now()
     while ((await stopBtn().count()) && Date.now() - t0 < 120_000) {
-      const allow = page.getByRole('button', { name: 'Permitir' })
+      const allow = page.getByRole('button', { name: /^(Permitir|Sim)$/ })
       if (await allow.count()) await allow.first().click()
       await sleep(500)
     }
@@ -1601,7 +1640,7 @@ async function main(): Promise<void> {
     const t1 = Date.now()
     await sleep(800)
     while ((await stopBtn().count()) && Date.now() - t1 < 120_000) {
-      const allow = page.getByRole('button', { name: 'Permitir' })
+      const allow = page.getByRole('button', { name: /^(Permitir|Sim)$/ })
       if (await allow.count()) await allow.first().click()
       await sleep(500)
     }

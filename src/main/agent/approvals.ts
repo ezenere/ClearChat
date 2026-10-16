@@ -1,9 +1,15 @@
-// Aprovações pendentes (memória). Resolve com 'allow' | 'deny' | 'cancel' (abort).
+// Aprovações pendentes (memória). Resolve com 'allow' | 'deny' | 'cancel' (abort) ou 'reeval'
+// (as listas globais mudaram enquanto o card estava aberto: o runner reavalia a chamada).
+// `items` = decisões por sub-comando do card do modo Listas (ver approvalPolicy.ts).
 import { randomUUID } from 'crypto'
+import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import type { ApprovalRequest } from '@shared/types'
 import { emit } from '../events'
 
-export type ApprovalOutcome = 'allow' | 'deny' | 'cancel'
+export interface ApprovalOutcome {
+  kind: 'allow' | 'deny' | 'cancel' | 'reeval'
+  items?: ApprovalItemDecision[]
+}
 
 interface Pending {
   request: ApprovalRequest
@@ -17,10 +23,10 @@ export function requestApproval(
   signal: AbortSignal
 ): Promise<ApprovalOutcome> {
   const request: ApprovalRequest = { ...input, id: randomUUID(), createdAt: Date.now() }
-  if (signal.aborted) return Promise.resolve('cancel')
+  if (signal.aborted) return Promise.resolve({ kind: 'cancel' })
   return new Promise<ApprovalOutcome>((resolve) => {
     const onAbort = (): void => {
-      resolveApproval(request.id, 'cancel')
+      resolveApproval(request.id, { kind: 'cancel' })
     }
     pending.set(request.id, {
       request,

@@ -522,5 +522,8 @@ test('alias de leitura: configs com "bash" viram "shell"', () => {
   ])
   const same = { enabledTools: ['shell'] } as any
   assert.equal(migrateConfigTools(same), same, 'sem mudança → mesmo objeto')
-  assert.deepEqual(sanitizePresetConfig({ autoApprove: ['bash'] }).autoApprove, ['shell'])
+  // alias de leitura nas personas: bash → shell → modo do item (autoApprove ≤ 0.3.0)
+  assert.deepEqual(sanitizePresetConfig({ autoApprove: ['bash'] } as any).approvalModes, {
+    commands: 'always'
+  })
 })

@@ -17,6 +17,8 @@ import { Modal } from './ui/layers'
 import { ModelPicker } from './ui/ModelPicker'
 import { Select } from './ui/Select'
 import { ModelInfoLine } from './panel/editors'
+import { ApprovalsSettings } from './approvals/ApprovalsSettings'
+import { WebSearchSettings } from './web/WebSearchSettings'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -316,7 +318,9 @@ export function SettingsModal(): React.JSX.Element {
           [
             ['providers', 'Provedores'],
             ['presets', 'Personas'],
-            ['defaults', 'Novos chats']
+            ['defaults', 'Novos chats'],
+            ['approvals', 'Aprovações'],
+            ['web', 'Pesquisa na web']
           ] as const
         ).map(([id, label]) => (
           <button
@@ -368,6 +372,10 @@ export function SettingsModal(): React.JSX.Element {
         ) : (
           <PresetsList onEdit={setEditingPreset} />
         )
+      ) : tab === 'approvals' ? (
+        <ApprovalsSettings />
+      ) : tab === 'web' ? (
+        <WebSearchSettings />
       ) : (
         <DefaultsSection />
       )}

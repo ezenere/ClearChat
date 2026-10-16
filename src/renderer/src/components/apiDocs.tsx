@@ -421,11 +421,18 @@ export function CacheInfo(): React.JSX.Element {
 
 export function AutoApproveInfo(): React.JSX.Element {
   return (
-    <ApiInfo title="Aprovação automática">
+    <ApiInfo title="Aprovações" side="left">
       <p>
         <strong className="text-fg">Não é enviado à API.</strong> Só controla se o app pede sua
-        confirmação antes de executar a tool localmente. Se você negar, o resultado enviado ao
-        modelo como <C>{'role: "tool"'}</C> é: <C>O usuário negou a execução desta ferramenta.</C>
+        confirmação antes de executar a tool localmente. Modos: <strong>Sempre permitir</strong>,{' '}
+        <strong>Smart-Approve</strong> (o juiz decide) e <strong>Listas</strong> (whitelist libera,
+        blacklist bloqueia, o resto pergunta).
+      </p>
+      <p>
+        Resultados enviados ao modelo como <C>{'role: "tool"'}</C>: negado →{' '}
+        <C>O usuário negou: &lt;sub-comando&gt;</C> (pergunta simples:{' '}
+        <C>O usuário negou a execução desta ferramenta.</C>); blacklist →{' '}
+        <C>{'Bloqueado pela blacklist (comandos): "<entrada>" casou com "<sub-comando>"'}</C>.
       </p>
     </ApiInfo>
   )

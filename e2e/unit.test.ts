@@ -1516,7 +1516,7 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
     ...DEFAULT_CHAT_CONFIG('/proj', { providerId: 'p1', model: 'm1', systemPrompt: 'SYS' }),
     params: { temperature: 0.2, top_p: null, extraBody: '{"a":1}' },
     enabledTools: ['read_file', 'shell'],
-    autoApprove: ['shell'],
+    approvalModes: { commands: 'always' },
     nativeTools: false,
     toolsInPrompt: true,
     toolsPromptText: 'TXT',
@@ -1542,7 +1542,7 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   assert.equal(snap.systemPrompt, 'SYS')
   assert.deepEqual(snap.params, { temperature: 0.2, extraBody: '{"a":1}' }) // null removido
   assert.deepEqual(snap.enabledTools, ['read_file', 'shell'])
-  assert.deepEqual(snap.autoApprove, ['shell'])
+  assert.deepEqual(snap.approvalModes, { commands: 'always' })
   assert.equal(snap.toolsPromptText, 'TXT')
   assert.deepEqual(snap.appSignatureCustom, { referer: 'https://x.dev', title: 'X' })
   assert.equal(snap.contextWindow, 64000)

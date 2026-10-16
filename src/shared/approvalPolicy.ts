@@ -1,0 +1,663 @@
+// Aprovações: modo por ITEM (always | smart | lists) + listas GLOBAIS de permissão/bloqueio.
+// Funções puras — main (runner) e renderer (Configurações → Aprovações, "Testar", card).
+// Ver SPEC.md → "Aprovações".
+//
+// Itens: commands (shell) · processes (process_start) · pages (browse_url) · search (web_search).
+// Modo efetivo = override do chat (ChatConfig.approvalModes[item]) ?? global (settings
+// `approvalModes`) ?? DEFAULT_APPROVAL_MODES.
+//   always → roda sem perguntar (blacklist NÃO vale).
+//   smart  → o juiz do Smart-Approve decide (config do chat). Sem juiz configurado/ligado →
+//            pergunta (fail-closed).
+//   lists  → commands/processes/pages: cada sub-comando (ou a URL) contra blacklist (bloqueia tudo,
+//            precede) e whitelist; o que sobrar → card com uma decisão por item.
+//            search: sem listas — pergunta sim/não.
+import { analyzeShell, shellQuote, type ShellCommand } from './shellParse'
+import {
+  CONFIRM_TOOLS,
+  type ApprovalCheck,
+  type ApprovalCheckItem,
+  type ApprovalItem,
+  type ApprovalList,
+  type ApprovalListItem,
+  type ApprovalMode,
+  type ApprovalSettings,
+  type ChatConfig,
+  type SmartApproveConfig,
+  type ToolName
+} from './types'
+
+export const APPROVAL_ITEMS: ApprovalItem[] = ['commands', 'processes', 'pages', 'search']
+export const APPROVAL_LIST_ITEMS: ApprovalListItem[] = ['commands', 'processes', 'pages']
+export const APPROVAL_MODES: ApprovalMode[] = ['always', 'smart', 'lists']
+
+export const APPROVAL_MODES_SETTING = 'approvalModes'
+export const APPROVAL_LISTS_SETTING = 'approvalLists'
+
+export const ITEM_TOOL: Record<ApprovalItem, ToolName> = {
+  commands: 'shell',
+  processes: 'process_start',
+  pages: 'browse_url',
+  search: 'web_search'
+}
+
+export const TOOL_ITEM: Partial<Record<ToolName, ApprovalItem>> = {
+  shell: 'commands',
+  process_start: 'processes',
+  browse_url: 'pages',
+  web_search: 'search'
+}
+
+export const ITEM_LABEL: Record<ApprovalItem, string> = {
+  commands: 'Comandos',
+  processes: 'Processos',
+  pages: 'Páginas',
+  search: 'Busca web'
+}
+
+/** Nome da lista no texto de bloqueio ("Bloqueado pela blacklist (comandos)…"). */
+export const ITEM_LIST_NAME: Record<ApprovalListItem, string> = {
+  commands: 'comandos',
+  processes: 'processos',
+  pages: 'páginas'
+}
+
+export const MODE_LABEL: Record<ApprovalMode, string> = {
+  always: 'Sempre permitir',
+  smart: 'Smart-Approve',
+  lists: 'Listas'
+}
+
+/** Rótulo do modo para um item (search não tem listas: "Perguntar"). */
+export function modeLabel(item: ApprovalItem, mode: ApprovalMode): string {
+  return item === 'search' && mode === 'lists' ? 'Perguntar' : MODE_LABEL[mode]
+}
+
+/**
+ * Padrão global: tudo em `lists` (com listas vazias = pergunta sempre — o mesmo comportamento
+ * das versões anteriores, e o usuário vai liberando com "+ whitelist"). Busca web também pergunta:
+ * a consulta sai para um serviço externo (DuckDuckGo) e pode vazar dados do contexto.
+ */
+export const DEFAULT_APPROVAL_MODES: Record<ApprovalItem, ApprovalMode> = {
+  commands: 'lists',
+  processes: 'lists',
+  pages: 'lists',
+  search: 'lists'
+}
+
+const isMode = (v: unknown): v is ApprovalMode =>
+  typeof v === 'string' && (APPROVAL_MODES as string[]).includes(v)
+
+export function normalizeApprovalModes(v: unknown): Record<ApprovalItem, ApprovalMode> {
+  const src = v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  const out = { ...DEFAULT_APPROVAL_MODES }
+  for (const k of APPROVAL_ITEMS) if (isMode(src[k])) out[k] = src[k]
+  return out
+}
+
+/** Override por chat: só itens/modos válidos (vazio = segue o global). */
+export function normalizeChatModes(v: unknown): Partial<Record<ApprovalItem, ApprovalMode>> {
+  const src = v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  const out: Partial<Record<ApprovalItem, ApprovalMode>> = {}
+  for (const k of APPROVAL_ITEMS) if (isMode(src[k])) out[k] = src[k]
+  return out
+}
+
+const cleanList = (v: unknown): string[] => {
+  if (!Array.isArray(v)) return []
+  const out: string[] = []
+  for (const x of v) {
+    if (typeof x !== 'string') continue
+    const t = x.replace(/\s+/g, ' ').trim()
+    if (t && !out.includes(t)) out.push(t)
+  }
+  return out
+}
+
+export function normalizeApprovalLists(v: unknown): Record<ApprovalListItem, ApprovalList> {
+  const src = v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  const out = {} as Record<ApprovalListItem, ApprovalList>
+  for (const k of APPROVAL_LIST_ITEMS) {
+    const l = src[k] && typeof src[k] === 'object' ? (src[k] as Record<string, unknown>) : {}
+    out[k] = { allow: cleanList(l.allow), deny: cleanList(l.deny) }
+  }
+  return out
+}
+
+export function normalizeApprovalSettings(modes: unknown, lists: unknown): ApprovalSettings {
+  return { modes: normalizeApprovalModes(modes), lists: normalizeApprovalLists(lists) }
+}
+
+/** Modo efetivo de um item num chat. */
+export function effectiveMode(
+  cfg: Pick<ChatConfig, 'approvalModes'> | null | undefined,
+  global: Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined,
+  item: ApprovalItem
+): ApprovalMode {
+  const c = cfg?.approvalModes?.[item]
+  if (isMode(c)) return c
+  const g = global?.[item]
+  return isMode(g) ? g : DEFAULT_APPROVAL_MODES[item]
+}
+
+// ---------------- padrões de comando ----------------
+// Casamento por TOKENS (mesmo tokenizer do comando: aspas removidas, espaços colapsados).
+// - `*` como token sozinho (sem aspas) casa ZERO ou mais tokens;
+// - `*` dentro de um token é glob dentro do token (`npm run test:*` casa `test:unit`);
+// - `\*`, `'*'` ou `"*"` = asterisco literal;
+// - sem `*` → casa EXATO (mesmos tokens, mesma quantidade).
+// Programa (1º token): na BLACKLIST, um padrão sem `/` também casa o basename do comando
+// (`rm *` bloqueia `/bin/rm -rf x`); na WHITELIST, não (`ls *` não libera `./ls` nem `/tmp/x/ls`).
+
+interface PatTok {
+  /** Partes literais separadas por wildcards (glob em token). */
+  parts: string[]
+  /** Token = `*` sozinho (multi-token). */
+  any: boolean
+}
+
+/** Tokeniza um padrão. null = inválido (aspas sem fechamento). */
+export function parsePattern(pattern: string): PatTok[] | null {
+  const toks: PatTok[] = []
+  let i = 0
+  const s = pattern
+  while (i < s.length) {
+    while (i < s.length && /\s/.test(s[i])) i++
+    if (i >= s.length) break
+    const parts: string[] = ['']
+    let wildcards = 0
+    let quotedOrEscaped = false
+    while (i < s.length && !/\s/.test(s[i])) {
+      const c = s[i]
+      if (c === '\\' && i + 1 < s.length) {
+        parts[parts.length - 1] += s[i + 1]
+        quotedOrEscaped = true
+        i += 2
+      } else if (c === "'" || c === '"') {
+        const end = s.indexOf(c, i + 1)
+        if (end < 0) return null
+        parts[parts.length - 1] += s.slice(i + 1, end)
+        quotedOrEscaped = true
+        i = end + 1
+      } else if (c === '*') {
+        parts.push('')
+        wildcards++
+        i++
+      } else {
+        parts[parts.length - 1] += c
+        i++
+      }
+    }
+    const any = wildcards === 1 && !quotedOrEscaped && parts.every((p) => p === '')
+    toks.push({ parts, any })
+  }
+  return toks
+}
+
+function globToken(parts: string[], tok: string): boolean {
+  if (parts.length === 1) return parts[0] === tok
+  const first = parts[0]
+  const last = parts[parts.length - 1]
+  if (!tok.startsWith(first)) return false
+  if (tok.length < first.length + last.length || !tok.endsWith(last)) return false
+  let pos = first.length
+  const end = tok.length - last.length
+  for (let k = 1; k < parts.length - 1; k++) {
+    const idx = tok.indexOf(parts[k], pos)
+    if (idx < 0 || idx + parts[k].length > end) return false
+    pos = idx + parts[k].length
+  }
+  return pos <= end
+}
+
+const baseName = (s: string): string => s.slice(s.lastIndexOf('/') + 1)
+
+/** Casa um padrão com as palavras de um comando. `basenameProgram`: ver acima (blacklist). */
+export function matchCommandPattern(
+  pattern: string,
+  tokens: string[],
+  opts: { basenameProgram?: boolean } = {}
+): boolean {
+  const pat = parsePattern(pattern)
+  if (!pat || !pat.length || !tokens.length) return false
+  const toks = [...tokens]
+  // programa: padrão sem "/" casa o basename (só na blacklist)
+  const p0 = pat[0]
+  if (opts.basenameProgram && !p0.any && !p0.parts.join('*').includes('/'))
+    toks[0] = baseName(toks[0])
+  // DP clássico de wildcard por tokens
+  const memo = new Map<string, boolean>()
+  const go = (i: number, j: number): boolean => {
+    const key = `${i},${j}`
+    const hit = memo.get(key)
+    if (hit !== undefined) return hit
+    let r: boolean
+    if (i === pat.length) r = j === toks.length
+    else if (pat[i].any) r = go(i + 1, j) || (j < toks.length && go(i, j + 1))
+    else r = j < toks.length && globToken(pat[i].parts, toks[j]) && go(i + 1, j + 1)
+    memo.set(key, r)
+    return r
+  }
+  return go(0, 0)
+}
+
+/** Erro de validação de um padrão de comando (null = ok). */
+export function validateCommandPattern(pattern: string): string | null {
+  const t = pattern.trim()
+  if (!t) return 'Padrão vazio.'
+  const p = parsePattern(t)
+  if (!p) return 'Aspas sem fechamento.'
+  if (p.length === 1 && p[0].any) return '"*" sozinho casaria qualquer comando.'
+  return null
+}
+
+/** Aviso suave: padrão que libera qualquer coisa do programa (`git *`). */
+export function broadPatternWarning(pattern: string): string | null {
+  const p = parsePattern(pattern.trim())
+  if (!p || p.length !== 2 || !p[1].any || p[0].any) return null
+  const prog = p[0].parts.join('*')
+  return `"${prog} *" libera QUALQUER uso de ${prog} (ex.: ${EXAMPLES[baseName(prog)] ?? `${prog} com qualquer argumento`}). Prefira um subcomando: "${prog} <sub> *".`
+}
+
+const EXAMPLES: Record<string, string> = {
+  git: 'git push --force, git reset --hard, git -c core.pager="…" (executa comandos)',
+  rm: 'rm -rf ~',
+  npm: 'npm publish, npm exec …',
+  npx: 'npx qualquer-pacote',
+  docker: 'docker run --privileged …',
+  curl: 'curl … -o arquivo',
+  python: 'python -c "…"',
+  python3: 'python3 -c "…"',
+  node: 'node -e "…"',
+  sudo: 'sudo qualquer coisa',
+  find: 'find … -delete',
+  sed: 'sed -i, sed "1e comando" (executa comandos)',
+  awk: 'awk \'BEGIN{system("…")}\' (executa comandos)',
+  tar: 'tar --to-command="…" (executa comandos)',
+  ssh: 'ssh host qualquer-comando',
+  rg: 'rg --pre "…" (executa comandos)',
+  vim: 'vim (pode executar comandos)',
+  less: 'less (pode executar comandos com !)'
+}
+
+/** Programas cujo 1º argumento costuma ser um subcomando (git push, npm run…). */
+const SUBCOMMAND_PROGRAMS = new Set([
+  'git',
+  'npm',
+  'pnpm',
+  'yarn',
+  'bun',
+  'deno',
+  'npx',
+  'cargo',
+  'go',
+  'docker',
+  'podman',
+  'kubectl',
+  'helm',
+  'gh',
+  'glab',
+  'pip',
+  'pip3',
+  'uv',
+  'poetry',
+  'brew',
+  'apt',
+  'apt-get',
+  'dnf',
+  'yum',
+  'pacman',
+  'systemctl',
+  'journalctl',
+  'adb',
+  'gradle',
+  'gradlew',
+  './gradlew',
+  'mvn',
+  'make',
+  'flutter',
+  'dart',
+  'dotnet',
+  'terraform',
+  'aws',
+  'gcloud',
+  'az',
+  'firebase',
+  'vercel',
+  'swift',
+  'xcrun',
+  'rustup',
+  'conda',
+  'mix',
+  'rails',
+  'composer',
+  'php',
+  'ng',
+  'nx',
+  'turbo',
+  'emulator',
+  'avdmanager',
+  'sdkmanager',
+  'supabase',
+  'heroku',
+  'tsc',
+  'eslint',
+  'prettier',
+  'jest',
+  'vitest',
+  'playwright'
+])
+
+/**
+ * Pré-preenchimento do "+ whitelist/blacklist": `programa subcomando *` quando o programa tem
+ * subcomandos conhecidos e o 1º argumento não-opção é alfabético (`git push origin main` →
+ * `git push *`); senão `programa *` (`ls -la` → `ls *`). `sudo x …` → `sudo <sugestão de x>`.
+ */
+export function suggestCommandPattern(tokens: string[]): string {
+  if (!tokens.length) return ''
+  const q = shellQuote
+  if ((tokens[0] === 'sudo' || tokens[0] === 'doas') && tokens.length > 1) {
+    const i = tokens.findIndex((t, k) => k > 0 && !t.startsWith('-'))
+    if (i > 0) return `${q(tokens[0])} ${suggestCommandPattern(tokens.slice(i))}`
+  }
+  const prog = tokens[0]
+  if (tokens.length === 1) return q(prog)
+  if (SUBCOMMAND_PROGRAMS.has(baseName(prog)) || SUBCOMMAND_PROGRAMS.has(prog)) {
+    const sub = tokens.slice(1).find((t) => !t.startsWith('-'))
+    const subIdx = sub ? tokens.indexOf(sub) : -1
+    // só se o subcomando vier logo depois do programa (não `git -C dir status`)
+    if (sub && subIdx === 1 && /^[a-z][a-z0-9:._-]*$/i.test(sub)) return `${q(prog)} ${q(sub)} *`
+  }
+  return `${q(prog)} *`
+}
+
+// ---------------- URLs ----------------
+
+/** URL como o browse_url abriria (sem esquema → https). null = inválida/não http(s). */
+export function normalizeUrl(raw: string): URL | null {
+  const t = String(raw ?? '').trim()
+  if (!t) return null
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(t) ? t : `https://${t}`)
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return null
+    // WHATWG URL já põe esquema/host em minúsculas, converte IDN → punycode e remove porta padrão
+    return u
+  } catch {
+    return null
+  }
+}
+
+/** Host (punycode, minúsculo) de um domínio digitado — null se inválido. */
+function normalizeHost(domain: string): { host: string; port: string } | null {
+  const u = normalizeUrl(`https://${domain}`)
+  if (!u || u.pathname !== '/' || u.search || u.hash || u.username) return null
+  return { host: u.hostname, port: u.port }
+}
+
+export type UrlEntry =
+  { kind: 'domain'; host: string; port: string; wildcard: boolean } | { kind: 'prefix'; url: URL }
+
+/**
+ * Entrada de lista de páginas:
+ * - domínio: `github.com` (só esse host), `*.github.com` (o domínio E qualquer subdomínio),
+ *   opcionalmente com porta (`localhost:3000`); vale para http e https;
+ * - prefixo de URL: `https://github.com/ezenere/` — mesmo esquema/host/porta e caminho com esse
+ *   prefixo em fronteira de segmento (`/ezenere` casa `/ezenere` e `/ezenere/x`, não
+ *   `/ezenere2`). Com `?`/`#` na entrada, compara a URL inteira por prefixo.
+ */
+export function parseUrlEntry(entry: string): UrlEntry | null {
+  const t = entry.trim()
+  if (!t) return null
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(t)) {
+    const u = normalizeUrl(t)
+    return u ? { kind: 'prefix', url: u } : null
+  }
+  const wildcard = t.startsWith('*.')
+  const h = normalizeHost(wildcard ? t.slice(2) : t)
+  if (!h || h.host.includes('*')) return null
+  // `*.com` / `*.localhost`-like curingas amplos demais: exige ao menos 2 rótulos com curinga
+  if (wildcard && !h.host.includes('.')) return null
+  return { kind: 'domain', ...h, wildcard }
+}
+
+export function validateUrlEntry(entry: string): string | null {
+  if (!entry.trim()) return 'Entrada vazia.'
+  if (entry.trim() === '*' || entry.trim() === '*.') return '"*" sozinho casaria qualquer página.'
+  return parseUrlEntry(entry)
+    ? null
+    : 'Use um domínio (github.com, *.github.com) ou uma URL http(s).'
+}
+
+export function matchUrlEntry(entry: string, url: URL): boolean {
+  const e = parseUrlEntry(entry)
+  if (!e) return false
+  if (e.kind === 'domain') {
+    if (e.port && e.port !== url.port) return false
+    const h = url.hostname
+    return h === e.host || (e.wildcard && h.endsWith(`.${e.host}`))
+  }
+  const p = e.url
+  if (p.protocol !== url.protocol || p.hostname !== url.hostname || p.port !== url.port)
+    return false
+  if (p.search || p.hash) return url.href.startsWith(p.href)
+  const pp = p.pathname
+  if (pp === '/' || pp === '') return true
+  const up = url.pathname
+  if (pp.endsWith('/')) return up.startsWith(pp) || up === pp.slice(0, -1)
+  return up === pp || up.startsWith(`${pp}/`)
+}
+
+// ---------------- avaliação contra as listas ----------------
+
+export interface ListEvaluation {
+  /** Bloqueado pela blacklist (comando inteiro / a URL). */
+  blocked?: { text: string; entry: string }
+  check: ApprovalCheck
+  /** Todos os itens liberados pela whitelist. */
+  allAllowed: boolean
+}
+
+function subItem(c: ShellCommand, list: ApprovalList): ApprovalCheckItem {
+  const text = c.tokens.length ? c.tokens.map(shellQuote).join(' ') : c.text
+  const base = {
+    text,
+    suggestion: suggestCommandPattern(c.tokens),
+    ...(c.note ? { note: c.note } : {})
+  }
+  if (c.unsafe) return { ...base, verdict: 'ask', reason: c.unsafe }
+  const entry = list.allow.find((p) => matchCommandPattern(p, c.tokens))
+  return entry ? { ...base, verdict: 'allow', entry } : { ...base, verdict: 'ask' }
+}
+
+/** Avalia um comando (shell / process_start) contra as listas de `item`. */
+export function evaluateCommand(
+  item: 'commands' | 'processes',
+  command: string,
+  list: ApprovalList
+): ListEvaluation {
+  const a = analyzeShell(command)
+  const cmds = a.commands.length
+    ? a.commands
+    : [{ tokens: [], text: command.trim() || '(vazio)', unsafe: 'comando vazio' } as ShellCommand]
+  for (const c of cmds) {
+    const entry = list.deny.find((p) => matchCommandPattern(p, c.tokens, { basenameProgram: true }))
+    if (entry) {
+      const items = cmds.map((x) => subItem(x, list))
+      return {
+        blocked: { text: c.tokens.map(shellQuote).join(' ') || c.text, entry },
+        check: { item, items },
+        allAllowed: false
+      }
+    }
+  }
+  const items = cmds.map((c) => subItem(c, list))
+  return { check: { item, items }, allAllowed: items.every((i) => i.verdict === 'allow') }
+}
+
+export function evaluateUrl(raw: string, list: ApprovalList): ListEvaluation {
+  const u = normalizeUrl(raw)
+  if (!u) {
+    return {
+      check: {
+        item: 'pages',
+        items: [
+          {
+            text: String(raw ?? ''),
+            verdict: 'ask',
+            reason: 'URL inválida ou não http(s)',
+            suggestion: ''
+          }
+        ]
+      },
+      allAllowed: false
+    }
+  }
+  const text = u.href
+  const suggestion = u.hostname
+  const deny = list.deny.find((e) => matchUrlEntry(e, u))
+  if (deny) {
+    return {
+      blocked: { text, entry: deny },
+      check: { item: 'pages', items: [{ text, verdict: 'ask', suggestion }] },
+      allAllowed: false
+    }
+  }
+  const allow = list.allow.find((e) => matchUrlEntry(e, u))
+  const it: ApprovalCheckItem = allow
+    ? { text, verdict: 'allow', entry: allow, suggestion }
+    : { text, verdict: 'ask', suggestion }
+  return { check: { item: 'pages', items: [it] }, allAllowed: !!allow }
+}
+
+/** Avalia os argumentos de uma tool no modo lists. `search` → sempre pergunta (sem listas). */
+export function evaluateLists(
+  item: ApprovalItem,
+  args: unknown,
+  lists: Record<ApprovalListItem, ApprovalList>
+): ListEvaluation {
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
+  const str = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '')
+  if (item === 'commands' || item === 'processes')
+    return evaluateCommand(item, str('command'), lists[item])
+  if (item === 'pages') return evaluateUrl(str('url'), lists.pages)
+  return {
+    check: { item, items: [{ text: str('query'), verdict: 'ask', suggestion: '' }] },
+    allAllowed: false
+  }
+}
+
+export function blockedText(item: ApprovalListItem, b: { text: string; entry: string }): string {
+  return `Bloqueado pela blacklist (${ITEM_LIST_NAME[item]}): "${b.entry}" casou com "${b.text}"`
+}
+
+export function userDeniedText(text: string): string {
+  return `O usuário negou: ${text}`
+}
+
+export function validateListEntry(item: ApprovalListItem, entry: string): string | null {
+  return item === 'pages' ? validateUrlEntry(entry) : validateCommandPattern(entry)
+}
+
+// ---------------- rota de decisão ----------------
+
+export type ApprovalRoute =
+  | { kind: 'run' }
+  | { kind: 'judge' }
+  /** pergunta simples (sim/não); smartMissing = modo smart sem juiz */
+  | { kind: 'user'; smartMissing?: boolean }
+  | { kind: 'lists' }
+
+/** Ligado E com um modelo escolhido (igual a smartApproveActive). */
+const judgeActive = (sa: Partial<SmartApproveConfig> | null | undefined): boolean =>
+  !!sa?.enabled && !!sa.providerId && !!sa.model?.trim()
+
+/** Tools extras que o usuário mandou ao juiz (fora de CONFIRM_TOOLS). */
+export function smartExtraTools(sa: Partial<SmartApproveConfig> | null | undefined): ToolName[] {
+  return Array.isArray(sa?.tools)
+    ? sa.tools.filter((t) => (SMART_EXTRA_ALLOWED as string[]).includes(t))
+    : []
+}
+
+/** Únicas tools fora de CONFIRM_TOOLS que podem ir ao juiz (= SMART_APPROVE_EXTRA_TOOLS). */
+const SMART_EXTRA_ALLOWED: ToolName[] = ['write_file', 'edit_file', 'send_to_chat', 'delegate_task']
+
+/**
+ * Rota de uma chamada. CONFIRM_TOOLS → pelo modo do item; extras do Smart-Approve → juiz (se
+ * ativo e marcadas) → usuário; demais → roda.
+ */
+export function approvalRoute(
+  cfg: Pick<ChatConfig, 'approvalModes'> & { smartApprove?: Partial<SmartApproveConfig> },
+  globalModes: Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined,
+  tool: ToolName
+): ApprovalRoute {
+  const item = TOOL_ITEM[tool]
+  if (!item) {
+    return judgeActive(cfg.smartApprove) && smartExtraTools(cfg.smartApprove).includes(tool)
+      ? { kind: 'judge' }
+      : { kind: 'run' }
+  }
+  const mode = effectiveMode(cfg, globalModes, item)
+  if (mode === 'always') return { kind: 'run' }
+  if (mode === 'smart')
+    return judgeActive(cfg.smartApprove) ? { kind: 'judge' } : { kind: 'user', smartMissing: true }
+  return item === 'search' ? { kind: 'user' } : { kind: 'lists' }
+}
+
+// ---------------- decisões do card ----------------
+
+/** Decisão de um item pendente do card (índice em check.items). */
+export interface ApprovalItemDecision {
+  index: number
+  allow: boolean
+  /** "+ whitelist" (allow) / "+ blacklist" (deny): padrão a salvar na lista global. */
+  pattern?: string
+}
+
+// ---------------- migração (≤ 0.3.0 → modos) ----------------
+
+/**
+ * Config antiga (chat/persona, parcial) → modos por item. Legado = tem a chave `autoApprove`:
+ * - tool em autoApprove → override `always` no item (shell→commands, process_start→processes,
+ *   browse_url→pages, web_search→search; process_stop é ignorada — não pede mais confirmação);
+ * - Smart-Approve ligado (enabled) avaliando a tool (tools ausente = todas) e não em autoApprove →
+ *   override `smart`;
+ * - smartApprove.tools perde as de CONFIRM_TOOLS (ficam só os extras) e extras que estavam em
+ *   autoApprove saem do juiz (rodavam direto);
+ * - `autoApprove` é removido. Sem a chave (e sem `assumeLegacy`) → retorna o MESMO objeto.
+ */
+export function migrateApprovalConfig<T extends Partial<ChatConfig>>(
+  cfg: T,
+  opts: { assumeLegacy?: boolean } = {}
+): T {
+  if (!cfg || typeof cfg !== 'object') return cfg
+  // `assumeLegacy` (migração única do banco: tudo lá é de ≤ 0.3.0): também converte configs sem
+  // `autoApprove` cujo smartApprove esteja no formato antigo (tools ausente = CONFIRM_TOOLS, ou com
+  // tools de CONFIRM_TOOLS). O alias de leitura só usa a presença da chave `autoApprove`.
+  const sa0 = cfg.smartApprove as Partial<SmartApproveConfig> | undefined
+  const legacySmart =
+    !!sa0 &&
+    typeof sa0 === 'object' &&
+    (!Array.isArray(sa0.tools) ||
+      sa0.tools.some((t) => CONFIRM_TOOLS.includes(t) || t === 'process_stop'))
+  if (!('autoApprove' in cfg) && !(opts.assumeLegacy && legacySmart)) return cfg
+  const out = { ...cfg } as T & { autoApprove?: unknown }
+  const aa = Array.isArray(cfg.autoApprove) ? (cfg.autoApprove as string[]) : []
+  delete out.autoApprove
+  const modes: Partial<Record<ApprovalItem, ApprovalMode>> = normalizeChatModes(cfg.approvalModes)
+  const sa = cfg.smartApprove
+  const saTools: string[] | null = sa && Array.isArray(sa.tools) ? (sa.tools as string[]) : null
+  for (const tool of CONFIRM_TOOLS) {
+    const item = TOOL_ITEM[tool]!
+    if (modes[item]) continue
+    if (aa.includes(tool)) modes[item] = 'always'
+    else if (sa?.enabled === true && (saTools === null || saTools.includes(tool)))
+      modes[item] = 'smart'
+  }
+  if (Object.keys(modes).length) out.approvalModes = modes
+  if (sa && typeof sa === 'object') {
+    const extras = (saTools ?? []).filter(
+      (t) => !CONFIRM_TOOLS.includes(t as ToolName) && t !== 'process_stop' && !aa.includes(t)
+    ) as ToolName[]
+    out.smartApprove = { ...sa, tools: extras }
+  }
+  return out
+}

@@ -6,8 +6,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { approvalRoute } from '../src/shared/approvalPolicy.ts'
 import {
-  approvalRoute,
   argsKey,
   buildJudgeBody,
   buildJudgeMessages,
@@ -120,7 +120,8 @@ test('validateLabels / normalizeSmartApprove', () => {
     template: null,
     labels: { approve: 'APPROVED', reject: 'REJECTED', ask: 'ASK-USER' },
     contextMessages: 6,
-    timeoutS: 30
+    timeoutS: 30,
+    tools: []
   })
   const n = normalizeSmartApprove({
     enabled: true,
@@ -135,7 +136,8 @@ test('validateLabels / normalizeSmartApprove', () => {
   assert.deepEqual(n.labels, { approve: 'SIM', reject: 'NAO', ask: 'TALVEZ' })
   assert.equal(n.contextMessages, 50)
   assert.equal(n.timeoutS, 3)
-  assert.deepEqual(n.tools, ['shell', 'write_file'])
+  // só os extras (as de CONFIRM_TOOLS vão pelo modo do item)
+  assert.deepEqual(n.tools, ['write_file'])
   assert.equal(smartApproveActive(n), true)
   assert.equal(smartApproveActive({ ...n, model: null }), false)
   assert.equal(smartApproveActive({ ...n, enabled: false }), false)
@@ -254,27 +256,47 @@ test('body do juiz: temperatura 0, poucos tokens, sem tools; usage só no OpenRo
 
 // ---------------- ordem de decisão ----------------
 
-test('ordem: autoApprove → juiz → usuário; tools extras só com o juiz ativo', () => {
+test('rota: modo do item (always/smart/lists) e extras do juiz', () => {
   const sa = { enabled: true, providerId: 'p', model: 'j' }
-  const r = (cfg: any, t: any): string => approvalRoute(cfg, t)
-  assert.equal(r({ autoApprove: [] }, 'shell'), 'user')
-  assert.equal(r({ autoApprove: [] }, 'read_file'), 'run')
-  assert.equal(r({ autoApprove: ['shell'] }, 'shell'), 'run')
-  assert.equal(r({ autoApprove: [], smartApprove: sa }, 'shell'), 'judge')
-  assert.equal(r({ autoApprove: ['shell'], smartApprove: sa }, 'shell'), 'run')
-  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, enabled: false } }, 'shell'), 'user')
-  assert.equal(r({ autoApprove: [], smartApprove: { ...sa, model: null } }, 'shell'), 'user')
-  // fora da lista do juiz → usuário (CONFIRM) ou roda (não-CONFIRM)
-  const only = { ...sa, tools: ['web_search', 'write_file'] }
-  assert.equal(r({ autoApprove: [], smartApprove: only }, 'shell'), 'user')
-  assert.equal(r({ autoApprove: [], smartApprove: only }, 'web_search'), 'judge')
-  assert.equal(r({ autoApprove: [], smartApprove: only }, 'write_file'), 'judge')
+  const r = (cfg: any, t: any, g: any = null): string => {
+    const x = approvalRoute(cfg, g, t)
+    return x.kind === 'user' && x.smartMissing ? 'user-nojudge' : x.kind
+  }
+  // padrão global: lists (search = perguntar)
+  assert.equal(r({}, 'shell'), 'lists')
+  assert.equal(r({}, 'process_start'), 'lists')
+  assert.equal(r({}, 'browse_url'), 'lists')
+  assert.equal(r({}, 'web_search'), 'user')
+  assert.equal(r({}, 'read_file'), 'run')
+  // process_stop nunca pede confirmação
+  assert.equal(r({ smartApprove: { ...sa, tools: ['process_stop'] } }, 'process_stop'), 'run')
+  // global e override por chat
+  assert.equal(r({}, 'shell', { commands: 'always' }), 'run')
   assert.equal(
-    r({ autoApprove: [], smartApprove: { ...only, enabled: false } }, 'write_file'),
-    'run'
+    r({ approvalModes: { commands: 'lists' } }, 'shell', { commands: 'always' }),
+    'lists'
   )
-  assert.equal(r({ autoApprove: ['write_file'], smartApprove: only }, 'write_file'), 'run')
-  assert.equal(r({ autoApprove: [], smartApprove: only }, 'edit_file'), 'run')
+  assert.equal(r({ approvalModes: { commands: 'always' } }, 'shell'), 'run')
+  // smart: juiz ativo → judge; sem juiz/desligado/sem modelo → pergunta (fail-closed)
+  assert.equal(r({ approvalModes: { commands: 'smart' }, smartApprove: sa }, 'shell'), 'judge')
+  assert.equal(r({ approvalModes: { commands: 'smart' } }, 'shell'), 'user-nojudge')
+  assert.equal(
+    r({ approvalModes: { commands: 'smart' }, smartApprove: { ...sa, enabled: false } }, 'shell'),
+    'user-nojudge'
+  )
+  assert.equal(
+    r({ approvalModes: { search: 'smart' }, smartApprove: { ...sa, model: null } }, 'web_search'),
+    'user-nojudge'
+  )
+  // juiz ligado NÃO afeta itens fora do modo smart
+  assert.equal(r({ smartApprove: sa }, 'shell'), 'lists')
+  // extras: só com o juiz ativo e marcadas
+  const only = { ...sa, tools: ['write_file'] }
+  assert.equal(r({ smartApprove: only }, 'write_file'), 'judge')
+  assert.equal(r({ smartApprove: { ...only, enabled: false } }, 'write_file'), 'run')
+  assert.equal(r({ smartApprove: only }, 'edit_file'), 'run')
+  // modo inválido salvo → padrão
+  assert.equal(r({ approvalModes: { commands: 'xx' } }, 'shell', { commands: 'yy' }), 'lists')
 })
 
 test('textos: rejeição e "Executar mesmo assim"', () => {
@@ -318,7 +340,7 @@ test('personas: smartApprove está em PRESET_FIELDS e sobrevive a snapshot/aplic
   assert.ok((PRESET_FIELDS as readonly string[]).includes('smartApprove'))
   const sa: SmartApproveConfig = {
     ...normalizeSmartApprove({ enabled: true, providerId: 'p', model: 'j' }),
-    tools: ['shell', 'write_file']
+    tools: ['write_file']
   }
   const base = DEFAULT_CHAT_CONFIG('/w', { providerId: 'p', model: 'm' })
   const snap = snapshotPreset({ ...base, smartApprove: sa })

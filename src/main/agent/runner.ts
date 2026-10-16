@@ -2,6 +2,7 @@
 // Ver SPEC.md → "Runner / fila / interrupção".
 import type {
   ApiMessage,
+  ApprovalRecord,
   Chat,
   ContentPart,
   MessageMeta,
@@ -14,12 +15,19 @@ import type {
   ToolName
 } from '@shared/types'
 import { TOOL_ALIASES } from '@shared/types'
+import { normalizeSmartApprove, overrideMessageText, smartRejectText } from '@shared/smartApprove'
 import {
   approvalRoute,
-  normalizeSmartApprove,
-  overrideMessageText,
-  smartRejectText
-} from '@shared/smartApprove'
+  blockedText,
+  effectiveMode,
+  evaluateLists,
+  TOOL_ITEM,
+  userDeniedText,
+  validateListEntry,
+  type ApprovalItemDecision
+} from '@shared/approvalPolicy'
+import type { ApprovalListItem } from '@shared/types'
+import { addListEntries, getApprovalSettings, onApprovalListsChanged } from '../approvalSettings'
 import type {
   ApprovalDecision,
   CompactOptions,
@@ -47,6 +55,8 @@ import {
 } from '@shared/context'
 import { emit } from '../events'
 import { chatsRepo, messagesRepo, providersRepo, sessionsRepo } from '../repo'
+import { getDb } from '../db'
+import { historyStore } from '../historyStore'
 import { parseToolArgs, runLocalTool, shellStateFor } from '../tools'
 import {
   abortError,
@@ -77,6 +87,16 @@ import { contentText } from '@shared/attachments'
 import { providerKind } from '@shared/providerKinds'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
 import { availableTools, buildRequest, maskRequest, setProviderNamesSource } from './request'
+import type { BuiltRequest } from './request'
+import { connectionErrorText, isConnectionFailure, retryAppClosedText } from '@shared/network'
+import {
+  callWithNetworkRetry,
+  getRetry,
+  listRetries,
+  requestRetry,
+  resolveRetry,
+  type RetryOutcome
+} from './retries'
 import {
   buildCompactionRequest,
   cleanSummary,
@@ -121,7 +141,8 @@ type StepResult =
   | { kind: 'final'; text: string }
   | { kind: 'continue' }
   | { kind: 'aborted'; partial: string }
-  | { kind: 'error'; error: string }
+  /** networkCancelled: falha de rede e o usuário cancelou o card (botão / Parar / ⚡). */
+  | { kind: 'error'; error: string; networkCancelled?: boolean }
 
 interface CompactRequest {
   reason: 'manual' | 'auto'
@@ -165,6 +186,8 @@ interface ToolOutcome {
   smartApprove?: SmartApproveRecord
   /** Rodou por "Executar mesmo assim" (liberação de uma vez só). */
   smartOverride?: boolean
+  /** Gate de aprovação: liberado pela whitelist / bloqueado pela blacklist / decisões do card. */
+  approval?: ApprovalRecord
   /** ask_user: perguntas mostradas + respostas (card do questionário). */
   askUser?: AskUserRecord
   durationMs: number
@@ -272,7 +295,8 @@ export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<voi
   }
   await Promise.all(live.map((st) => waitDone(st, 5000)))
   for (const s of doomed) {
-    for (const a of listApprovals()) if (a.sessionId === s.id) resolveApproval(a.id, 'cancel')
+    for (const a of listApprovals())
+      if (a.sessionId === s.id) resolveApproval(a.id, { kind: 'cancel' })
     clearQueue(s.id)
   }
   for (const id of roots) sessionsRepo.delete(id) // FK ON DELETE CASCADE leva descendentes e mensagens
@@ -482,6 +506,7 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
   try {
     let acc = newAccumulator()
     let toolChoiceNone = false
+    let emptyRetries = 0
     for (let i = 0; i < COMPACTION_MODES.length;) {
       let req
       try {
@@ -514,11 +539,27 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
       }
       tick.cancel()
       if (!acc.content.trim()) {
+        // 1ª: tool_choice 'none' (o modelo tentou chamar tool); 2ª: só repete (alguns provedores
+        // devolvem conteúdo vazio de forma intermitente); depois desiste com o diagnóstico.
         if (!toolChoiceNone) {
           toolChoiceNone = true
           continue
         }
-        return { kind: 'error', error: 'o modelo não retornou um resumo.' }
+        if (emptyRetries < 1) {
+          emptyRetries++
+          continue
+        }
+        const why = [
+          acc.finishReason ? `finish_reason=${acc.finishReason}` : '',
+          acc.reasoning.trim() ? `só raciocínio (${acc.reasoning.length} caracteres)` : '',
+          acc.toolCalls.length ? `tentou chamar ${acc.toolCalls.length} tool(s)` : ''
+        ]
+          .filter(Boolean)
+          .join(', ')
+        return {
+          kind: 'error',
+          error: `o modelo não retornou um resumo${why ? ` (${why})` : ''}.`
+        }
       }
       break
     }
@@ -640,6 +681,20 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
       if (runs.get(st.sessionId) === st) runs.delete(st.sessionId)
       return { kind: 'aborted', partial: '' }
     }
+    // Card "Falha de conexão" cancelado: o turno termina como erro (como antes). Via ⚡, depois do
+    // erro entra a mensagem forçada e o loop continua; Parar/botão Cancelar → status 'error'.
+    if (res.kind === 'error' && res.networkCancelled) {
+      repairTail(st.sessionId)
+      appendError(st.sessionId, res.error)
+      emit({ type: 'error', sessionId: st.sessionId, error: res.error })
+      if (signal.aborted && !st.stopRequested && st.forced.length) {
+        const r = onAborted(st, '')
+        if (r === 'continue') continue
+        return r
+      }
+      finish(st, 'error')
+      return { kind: 'error', error: res.error }
+    }
     if (signal.aborted || res.kind === 'aborted') {
       const r = onAborted(st, res.kind === 'aborted' ? res.partial : lastText)
       if (r === 'continue') continue
@@ -710,7 +765,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!session.model) return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
 
   const history = messagesRepo.list(session.id)
-  let req
+  let req: BuiltRequest
   try {
     req = buildRequest(chat, session, history, provider)
   } catch (e) {
@@ -718,19 +773,42 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   }
 
   dbg('step', session.id.slice(0, 8), 'model', session.model, 'msgs', history.length)
-  const acc = newAccumulator()
+  let acc = newAccumulator()
   const draft = throttle(
     () => emit({ type: 'draft', sessionId: session.id, draft: accToDraft(acc) }),
     40
   )
-  const t0 = Date.now()
-  try {
-    await streamChat(req, signal, acc, draft.call)
-  } catch (e) {
+  let t0 = Date.now()
+  let first = true
+  // Falha de REDE → card "Tentar de novo / Cancelar" (sessão 'awaiting_retry'); o parcial é
+  // descartado e a chamada refeita do zero (request reconstruída do histórico, que não mudou).
+  const r = await callWithNetworkRetry({
+    signal,
+    attempt: async () => {
+      if (!first) {
+        req = buildRequest(chat, session, messagesRepo.list(session.id), provider)
+        acc = newAccumulator()
+        t0 = Date.now()
+      }
+      first = false
+      await streamChat(req, signal, acc, draft.call)
+    },
+    isNetwork: isConnectionFailure,
+    onDiscard: () => {
+      draft.cancel()
+      emit({ type: 'draft', sessionId: session.id, draft: null })
+      acc = newAccumulator()
+    },
+    ask: (e) => awaitRetryDecision(st, session, chat, provider, e, signal)
+  })
+  if (r.kind !== 'ok') {
     draft.cancel()
     emit({ type: 'draft', sessionId: session.id, draft: null })
-    dbg('stream fail', session.id.slice(0, 8), signal.aborted ? 'aborted' : errMsg(e))
-    if (signal.aborted) {
+    dbg('stream fail', session.id.slice(0, 8), r.kind === 'error' ? errMsg(r.error) : 'aborted')
+    // card de falha de conexão cancelado (botão, Parar ou ⚡): nada parcial a salvar (já descartado)
+    if (r.kind === 'error' && r.network)
+      return { kind: 'error', error: errMsg(r.error), networkCancelled: true }
+    if (r.kind === 'aborted' || signal.aborted) {
       if (acc.content.trim()) {
         append(
           session.id,
@@ -744,7 +822,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       }
       return { kind: 'aborted', partial: acc.content }
     }
-    return { kind: 'error', error: errMsg(e) }
+    return { kind: 'error', error: errMsg(r.error) }
   }
   draft.cancel()
   emit({ type: 'draft', sessionId: session.id, draft: null })
@@ -792,6 +870,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       if (r.background) tmeta.background = true
       if (r.smartApprove) tmeta.smartApprove = r.smartApprove
       if (r.smartOverride) tmeta.smartOverride = true
+      if (r.approval) tmeta.approval = r.approval
       if (r.askUser) tmeta.askUser = r.askUser
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
@@ -848,6 +927,96 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   return { kind: 'final', text: acc.content }
 }
 
+/**
+ * Modo Listas (commands / processes / pages): blacklist bloqueia tudo (precede), whitelist libera;
+ * o resto vira UM card com todos os sub-comandos (os liberados marcados). Retorna `outcome` quando
+ * a chamada NÃO deve rodar (bloqueada, negada, cancelada); senão roda com `record`.
+ */
+async function listsGate(
+  chatId: string,
+  sessionId: string,
+  toolCallId: string,
+  name: ToolName,
+  item: ApprovalListItem,
+  args: Record<string, unknown>,
+  signal: AbortSignal
+): Promise<{ outcome?: Omit<ToolOutcome, 'durationMs'>; record: ApprovalRecord }> {
+  for (let round = 0; ; round++) {
+    const ev = evaluateLists(item, args, getApprovalSettings().lists)
+    const allowed = ev.check.items
+      .filter((i) => i.verdict === 'allow' && i.entry)
+      .map((i) => ({ text: i.text, entry: i.entry! }))
+    const record: ApprovalRecord = {
+      item,
+      mode: 'lists',
+      ...(allowed.length ? { allowed } : {})
+    }
+    if (ev.blocked) {
+      return {
+        record: { ...record, blocked: ev.blocked },
+        outcome: { content: blockedText(item, ev.blocked), status: 'denied' }
+      }
+    }
+    if (ev.allAllowed) return { record }
+    setStatus(sessionId, 'awaiting_approval')
+    const outcome = await requestApproval(
+      { chatId, sessionId, toolCallId, toolName: name, args, check: ev.check },
+      signal
+    )
+    if (!signal.aborted) setStatus(sessionId, 'running')
+    if (signal.aborted || outcome.kind === 'cancel')
+      return { record, outcome: { content: CANCELLED_TEXT, status: 'cancelled' } }
+    if (outcome.kind === 'reeval') {
+      if (round > 50) return { record, outcome: { content: CANCELLED_TEXT, status: 'cancelled' } }
+      continue
+    }
+    const pending = ev.check.items
+      .map((it, index) => ({ it, index }))
+      .filter(({ it }) => it.verdict !== 'allow')
+    const decisions = new Map((outcome.items ?? []).map((d) => [d.index, d]))
+    // sem decisões por item: 'allow' = sim para todos; 'deny' = não (o primeiro pendente)
+    const entries: { item: ApprovalListItem; list: 'allow' | 'deny'; entry: string }[] = []
+    let denied: string | undefined
+    const userAllowed: string[] = []
+    for (const { it, index } of pending) {
+      const d = decisions.get(index)
+      const allow = d ? d.allow : outcome.kind === 'allow'
+      if (d?.pattern?.trim())
+        entries.push({ item, list: allow ? 'allow' : 'deny', entry: d.pattern.trim() })
+      if (allow) userAllowed.push(it.text)
+      else denied ??= it.text
+    }
+    if (entries.length) {
+      try {
+        addListEntries(entries)
+      } catch (e) {
+        dbg('approval lists', errMsg(e))
+      }
+    }
+    if (denied !== undefined || outcome.kind === 'deny') {
+      const text = denied ?? pending[0]?.it.text ?? ''
+      return {
+        record: { ...record, denied: text, ...(userAllowed.length ? { userAllowed } : {}) },
+        outcome: { content: userDeniedText(text), status: 'denied' }
+      }
+    }
+    return { record: { ...record, ...(userAllowed.length ? { userAllowed } : {}) } }
+  }
+}
+
+// Listas globais mudaram ("+ whitelist" num card, Configurações): cards pendentes cujo veredito
+// mudou (algum sub-comando agora liberado/bloqueado) são reavaliados pelo runner.
+onApprovalListsChanged(() => {
+  const lists = getApprovalSettings().lists
+  for (const req of listApprovals()) {
+    if (!req.check || req.check.item === 'search') continue
+    const ev = evaluateLists(req.check.item, req.args, lists)
+    const before = req.check.items.map((i) => `${i.verdict}:${i.entry ?? ''}`).join('|')
+    const after = ev.check.items.map((i) => `${i.verdict}:${i.entry ?? ''}`).join('|')
+    if (ev.blocked || before !== after) resolveApproval(req.id, { kind: 'reeval' })
+  }
+})
+
 async function executeTool(
   st: RunState,
   session: Session,
@@ -859,10 +1028,12 @@ async function executeTool(
   const t0 = Date.now()
   let smart: SmartApproveRecord | undefined
   let smartOverride = false
+  let approval: ApprovalRecord | undefined
   const done = (o: Omit<ToolOutcome, 'durationMs'>): ToolOutcome => ({
     ...o,
     ...(smart ? { smartApprove: smart } : {}),
     ...(smartOverride ? { smartOverride: true } : {}),
+    ...(approval ? { approval } : {}),
     durationMs: Date.now() - t0
   })
   const chat = chatsRepo.get(session.chatId)
@@ -881,15 +1052,21 @@ async function executeTool(
     return done({ content: `Erro: ${errMsg(e)}`, status: 'error' })
   }
 
-  // Ordem: autoApprove → Smart-Approve (juiz) → usuário. Ver @shared/smartApprove.
-  // ask_user nunca pede confirmação (é o próprio usuário quem responde)
-  let route = name === 'ask_user' ? 'run' : approvalRoute(chat.config, name)
-  if (route !== 'run' && takeOverride(session.id, name, args)) {
+  // Gate de aprovação (ver @shared/approvalPolicy): modo do item (always | smart | lists) ou,
+  // para as tools extras do Smart-Approve, juiz → usuário. ask_user nunca pede confirmação.
+  const settings = getApprovalSettings()
+  let route =
+    name === 'ask_user'
+      ? { kind: 'run' as const }
+      : approvalRoute(chat.config, settings.modes, name)
+  const item = TOOL_ITEM[name]
+  const mode = item ? effectiveMode(chat.config, settings.modes, item) : null
+  if (route.kind !== 'run' && takeOverride(session.id, name, args)) {
     // "Executar mesmo assim": o usuário já liberou exatamente esta chamada (uma vez)
     smartOverride = true
-    route = 'run'
+    route = { kind: 'run' }
   }
-  if (route === 'judge') {
+  if (route.kind === 'judge') {
     const sa = normalizeSmartApprove(chat.config.smartApprove)
     emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: true, judging: true })
     try {
@@ -915,9 +1092,15 @@ async function executeTool(
     if (smart.decision === 'reject') {
       return done({ content: smartRejectText(smart.model, smart.reason), status: 'denied' })
     }
-    route = smart.decision === 'approve' ? 'run' : 'user'
+    route = smart.decision === 'approve' ? { kind: 'run' } : { kind: 'user' }
   }
-  if (route === 'user') {
+  // fail-closed: 'lists' sem item de lista (não deveria acontecer) vira pergunta simples
+  if (route.kind === 'lists' && (!item || item === 'search')) route = { kind: 'user' }
+  if (route.kind === 'lists' && item && item !== 'search') {
+    const r = await listsGate(chat.id, session.id, toolCallId, name, item, args, signal)
+    approval = r.record
+    if (r.outcome) return done(r.outcome)
+  } else if (route.kind === 'user') {
     setStatus(session.id, 'awaiting_approval')
     const outcome = await requestApproval(
       {
@@ -926,14 +1109,17 @@ async function executeTool(
         toolCallId,
         toolName: name,
         args,
-        ...(smart ? { smartApprove: smart } : {})
+        ...(smart ? { smartApprove: smart } : {}),
+        ...(route.smartMissing ? { smartMissing: true } : {})
       },
       signal
     )
     if (!signal.aborted) setStatus(session.id, 'running')
-    if (outcome === 'deny') return done({ content: DENIED_TEXT, status: 'denied' })
-    if (outcome === 'cancel' || signal.aborted)
+    if (outcome.kind === 'deny') return done({ content: DENIED_TEXT, status: 'denied' })
+    if (outcome.kind !== 'allow' || signal.aborted)
       return done({ content: CANCELLED_TEXT, status: 'cancelled' })
+  } else if (route.kind === 'run' && item && mode === 'always' && !smartOverride) {
+    approval = { item, mode: 'always' }
   }
   if (signal.aborted) return done({ content: CANCELLED_TEXT, status: 'cancelled' })
 
@@ -990,6 +1176,7 @@ async function executeTool(
       chats:
         name === 'get_chat_info' || name === 'list_chats' ? chatToolsCtx(chat, session) : undefined,
       history: name === 'read_history' ? () => messagesRepo.list(session.id) : undefined,
+      historyStore: name === 'read_history' ? historyStore(getDb()) : undefined,
       // read_file: imagens/PDF só se o modelo da sessão os lê (mesma regra dos anexos)
       media: sessionProvider
         ? {
@@ -1113,9 +1300,10 @@ async function runDelegate(
       subSessionId: child.id
     }
   }
+  // pai parado/⚡ (cascata) — inclusive com o card de falha de conexão aberto no subagente
+  if (signal.aborted)
+    return { content: CANCELLED_TEXT, status: 'cancelled', subSessionId: child.id }
   if (outcome.kind === 'aborted') {
-    if (signal.aborted)
-      return { content: CANCELLED_TEXT, status: 'cancelled', subSessionId: child.id }
     const partial = outcome.partial.trim()
     return {
       content: `[Subagente interrompido pelo usuário]${partial ? `\n\nResposta parcial:\n${truncate(partial)}` : ''}`,
@@ -1203,12 +1391,45 @@ async function runAskUser(
   }
 }
 
+// ---------------- falha de conexão (Tentar de novo / Cancelar) ----------------
+
+/**
+ * Chamada ao modelo falhou por erro de rede: sessão 'awaiting_retry' + card bloqueante até o
+ * usuário decidir. Subagentes também esperam aqui (o pai bloqueante continua esperando o delegate).
+ */
+async function awaitRetryDecision(
+  st: RunState,
+  session: Session,
+  chat: Chat,
+  provider: Provider,
+  error: unknown,
+  signal: AbortSignal
+): Promise<RetryOutcome> {
+  if (shuttingDown || signal.aborted) return 'cancel'
+  dbg('network fail → card', session.id.slice(0, 8), errMsg(error))
+  setStatus(session.id, 'awaiting_retry')
+  const outcome = await requestRetry(
+    {
+      chatId: chat.id,
+      sessionId: session.id,
+      error: connectionErrorText(error),
+      model: session.model,
+      providerName: provider.name
+    },
+    signal
+  )
+  if (outcome === 'retry' && !signal.aborted && runs.get(st.sessionId) === st)
+    setStatus(session.id, 'running')
+  return signal.aborted ? 'cancel' : outcome
+}
+
 // ---------------- chats: get_chat_info / list_chats / send_to_chat ----------------
 
 /** Estado de um chat para list_chats: aprovação pendente > alguma sessão rodando > ocioso. */
 function chatStatus(chatId: string): ChatListEntry['status'] {
   if (listApprovals().some((a) => a.chatId === chatId)) return 'awaiting_approval'
   if (listQuestions().some((q) => q.chatId === chatId)) return 'awaiting_input'
+  if (listRetries().some((q) => q.chatId === chatId)) return 'awaiting_retry'
   for (const st of runs.values()) if (st.chatId === chatId) return 'running'
   return 'idle'
 }
@@ -1963,26 +2184,29 @@ export async function regenerate(sessionId: string): Promise<void> {
   startLoop(session)
 }
 
-export function approve(requestId: string, decision: ApprovalDecision): void {
+/**
+ * Resposta ao card de aprovação. Pergunta simples: 'allow' | 'deny'. Card do modo Listas: `items`
+ * = decisão de cada sub-comando pendente (com padrão opcional para "+ whitelist"/"+ blacklist");
+ * sem `items`, 'allow' = sim para todos e 'deny' = não. Padrões inválidos → erro (nada é decidido).
+ */
+export function approve(
+  requestId: string,
+  decision: ApprovalDecision,
+  items?: ApprovalItemDecision[]
+): void {
   const req = getApproval(requestId)
   if (!req) return
-  if (decision === 'always') {
-    const chat = chatsRepo.get(req.chatId)
-    if (chat && !chat.config.autoApprove.includes(req.toolName)) {
-      const { chat: updated } = chatsRepo.update(chat.id, {
-        config: { autoApprove: [...chat.config.autoApprove, req.toolName] }
-      })
-      emit({ type: 'chat-updated', chat: updated })
+  if (items?.length && req.check) {
+    const list = req.check.item as ApprovalListItem
+    for (const d of items) {
+      if (!req.check.items[d.index]) throw new Error(`Item ${d.index} inexistente.`)
+      if (d.pattern != null) {
+        const err = validateListEntry(list, d.pattern)
+        if (err) throw new Error(`Padrão inválido "${d.pattern}": ${err}`)
+      }
     }
-    resolveApproval(requestId, 'allow')
-    // outras solicitações pendentes da mesma tool neste chat também são liberadas
-    for (const other of listApprovals()) {
-      if (other.chatId === req.chatId && other.toolName === req.toolName)
-        resolveApproval(other.id, 'allow')
-    }
-    return
   }
-  resolveApproval(requestId, decision === 'allow' ? 'allow' : 'deny')
+  resolveApproval(requestId, { kind: decision === 'allow' ? 'allow' : 'deny', items })
 }
 
 /**
@@ -2064,6 +2288,21 @@ export async function cancelQuestionRequest(id: string): Promise<void> {
   cancelQuestion(id) // sem loop (não deveria acontecer): só resolve
 }
 
+export function pendingRetries(): ReturnType<typeof listRetries> {
+  return listRetries()
+}
+
+/** "Tentar de novo" no card de falha de conexão: repete a mesma chamada do zero. */
+export function retryRequest(id: string): void {
+  if (!getRetry(id)) throw new Error('Esta falha de conexão não está mais pendente.')
+  resolveRetry(id, 'retry')
+}
+
+/** "Cancelar" no card de falha de conexão: o turno termina como erro (como antes do card). */
+export function cancelRetryRequest(id: string): void {
+  resolveRetry(id, 'cancel')
+}
+
 export function previewRequest(sessionId: string): RequestPreview {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
@@ -2080,6 +2319,7 @@ export function previewRequest(sessionId: string): RequestPreview {
     ...masked,
     body,
     notes: [
+      ...(masked.notes ?? []),
       `Base64 de ${truncated} anexo${truncated > 1 ? 's' : ''} encurtado nesta visualização (…(tamanho)); a request real envia o arquivo inteiro.`
     ]
   }
@@ -2109,7 +2349,17 @@ export async function stopChat(chatId: string): Promise<void> {
 
 /** Inicialização: sessões que ficaram rodando/aguardando → 'interrupted' (+ repara pareamento). */
 export function initRunner(): void {
-  const stale = sessionsRepo.markStaleInterrupted()
+  // card de falha de conexão aberto num fechamento abrupto: o turno vira erro (mensagem persistida)
+  const staleRetry = sessionsRepo.markStaleRetry()
+  for (const id of staleRetry) {
+    try {
+      repairTail(id, 'app-closed')
+      appendError(id, retryAppClosedText())
+    } catch (e) {
+      console.error('[clearchat] retry interrompido', id, e)
+    }
+  }
+  const stale = [...staleRetry, ...sessionsRepo.markStaleInterrupted()]
   for (const id of stale) {
     try {
       repairTail(id, 'app-closed')
@@ -2167,10 +2417,16 @@ export function shutdownRunner(): void {
       console.error('[clearchat] shutdown questionário', q.sessionId, e)
     }
   }
+  // falhas de conexão aguardando decisão: o turno vira erro "… (interrompido: o app foi fechado)"
+  const retrySessions = new Set<string>()
+  for (const r of listRetries()) {
+    retrySessions.add(r.sessionId)
+    appendError(r.sessionId, retryAppClosedText(r.error))
+  }
   for (const id of ids) {
     try {
       repairTail(id, 'app-closed')
-      const s = sessionsRepo.setStatus(id, 'interrupted')
+      const s = sessionsRepo.setStatus(id, retrySessions.has(id) ? 'error' : 'interrupted')
       if (s) emit({ type: 'session-updated', session: s })
     } catch (e) {
       console.error('[clearchat] shutdown', id, e)

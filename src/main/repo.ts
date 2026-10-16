@@ -2,10 +2,12 @@
 import { randomUUID } from 'crypto'
 import { homedir } from 'os'
 import { getDb } from './db'
+import { indexMessage } from './searchIndex'
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
 import { providerKind } from '@shared/providerKinds'
 import { migrateConfigTools } from '@shared/toolRename'
+import { migrateApprovalConfig } from '@shared/approvalPolicy'
 import type {
   ApiMessage,
   Chat,
@@ -252,6 +254,14 @@ export const sessionsRepo = {
       )
       .run()
     return rows.map((r) => r.id)
+  },
+  /** Na inicialização: card de falha de conexão que ficou aberto ('awaiting_retry') → 'error'. */
+  markStaleRetry(): string[] {
+    const rows = getDb()
+      .prepare("SELECT id FROM sessions WHERE status = 'awaiting_retry'")
+      .all() as { id: string }[]
+    getDb().prepare("UPDATE sessions SET status = 'error' WHERE status = 'awaiting_retry'").run()
+    return rows.map((r) => r.id)
   }
 }
 
@@ -311,6 +321,7 @@ export const messagesRepo = {
         JSON.stringify(meta),
         msg.createdAt
       )
+      indexMessage(db, msg.id, message, meta)
       return msg
     })
     return tx()
@@ -352,6 +363,7 @@ export const messagesRepo = {
         JSON.stringify(meta),
         msg.createdAt
       )
+      indexMessage(db, msg.id, message, meta)
       const shifted = (
         db
           .prepare('SELECT * FROM messages WHERE session_id = ? AND seq > ? ORDER BY seq')
@@ -365,9 +377,15 @@ export const messagesRepo = {
     const cur = messagesRepo.get(id)
     if (!cur) throw new Error(`Mensagem não encontrada: ${id}`)
     const nextMeta = meta ?? cur.meta
-    getDb()
-      .prepare('UPDATE messages SET message_json = ?, meta_json = ? WHERE id = ?')
-      .run(JSON.stringify(message), JSON.stringify(nextMeta), id)
+    const db = getDb()
+    db.transaction(() => {
+      db.prepare('UPDATE messages SET message_json = ?, meta_json = ? WHERE id = ?').run(
+        JSON.stringify(message),
+        JSON.stringify(nextMeta),
+        id
+      )
+      indexMessage(db, id, message, nextMeta)
+    })()
     return { ...cur, message, meta: nextMeta }
   },
   delete(id: string): StoredMessage | null {
@@ -392,7 +410,10 @@ interface ChatRow {
 const toChat = (r: ChatRow): Chat => {
   const fallback = DEFAULT_CHAT_CONFIG(homedir())
   // alias de leitura: nomes antigos de tools ('bash' → 'shell')
-  const cfg = migrateConfigTools(parse<Partial<ChatConfig>>(r.config_json, {}))
+  // e autoApprove (≤ 0.3.0) → approvalModes
+  const cfg = migrateApprovalConfig(
+    migrateConfigTools(parse<Partial<ChatConfig>>(r.config_json, {}))
+  )
   return {
     id: r.id,
     title: r.title,
@@ -445,10 +466,12 @@ export const chatsRepo = {
       baseUrl: provider?.baseUrl,
       kind: provider?.kind
     })
-    const definedCfg = migrateConfigTools(
-      Object.fromEntries(
-        Object.entries(inCfg).filter(([, v]) => v !== undefined)
-      ) as Partial<ChatConfig>
+    const definedCfg = migrateApprovalConfig(
+      migrateConfigTools(
+        Object.fromEntries(
+          Object.entries(inCfg).filter(([, v]) => v !== undefined)
+        ) as Partial<ChatConfig>
+      )
     )
     const config: ChatConfig = {
       ...base,
@@ -486,11 +509,15 @@ export const chatsRepo = {
     if (!cur) throw new Error(`Chat não encontrado: ${id}`)
     let config = cur.config
     if (patch?.config) {
-      const definedCfg = migrateConfigTools(
-        Object.fromEntries(
-          Object.entries(patch.config).filter(([k, v]) => v !== undefined && k !== 'params')
-        ) as Partial<ChatConfig>
-      )
+      const raw = Object.fromEntries(
+        Object.entries(patch.config).filter(([k, v]) => v !== undefined && k !== 'params')
+      ) as Partial<ChatConfig>
+      // patch legado { autoApprove: [...] } (ex.: scripts/testes antigos) → approvalModes por cima
+      const definedCfg = migrateApprovalConfig(migrateConfigTools(raw))
+      if ('autoApprove' in raw && definedCfg.approvalModes)
+        definedCfg.approvalModes = { ...cur.config.approvalModes, ...definedCfg.approvalModes }
+      if ('autoApprove' in raw && definedCfg.smartApprove && !raw.smartApprove)
+        delete definedCfg.smartApprove
       config = {
         ...cur.config,
         ...definedCfg,

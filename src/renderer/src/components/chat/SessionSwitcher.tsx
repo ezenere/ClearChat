@@ -13,6 +13,7 @@ const STATUS_LABEL: Record<SessionStatus, string> = {
   running: 'executando',
   awaiting_approval: 'aguardando aprovação',
   awaiting_input: 'aguardando sua resposta',
+  awaiting_retry: 'aguardando sua decisão (falha de conexão)',
   done: 'concluída',
   error: 'erro',
   interrupted: 'interrompida',
@@ -33,7 +34,10 @@ export function StatusDot({
         'inline-block size-1.5 shrink-0 rounded-full',
         status === 'running' && 'animate-pulse-soft bg-accent-strong',
         status === 'waiting' && 'bg-accent-strong/50 ring-2 ring-accent-strong/20',
-        (status === 'awaiting_approval' || status === 'awaiting_input') && 'bg-warning',
+        (status === 'awaiting_approval' ||
+          status === 'awaiting_input' ||
+          status === 'awaiting_retry') &&
+          'bg-warning',
         status === 'done' && 'bg-success/80',
         status === 'error' && 'bg-danger',
         status === 'interrupted' && 'bg-subtle',
@@ -86,6 +90,7 @@ export function SessionSwitcher({
       ['running', 'executando'],
       ['awaiting_approval', 'aprovação'],
       ['awaiting_input', 'aguardando resposta'],
+      ['awaiting_retry', 'falha de conexão'],
       ['waiting', 'aguardando'],
       ['done', 'concluídas'],
       ['error', 'erro'],

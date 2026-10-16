@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'pat
 import { LIMITS } from '@shared/limits'
 import type { ContentPart, ModelInfo, StoredMessage } from '@shared/types'
 import type { MediaContext } from './media'
+import type { HistoryStore } from '../historyStore'
 
 export const MAX_OUTPUT: number = LIMITS.maxToolOutputChars
 
@@ -51,6 +52,8 @@ export interface ToolContext {
   chats?: { self: () => ChatInfoData; list: () => ChatListEntry[] }
   /** read_history: mensagens persistidas da sessão chamadora (inclui as anteriores às fronteiras). */
   history?: () => StoredMessage[]
+  /** read_history com chat_id / scope "all": leitura de outros chats + índice FTS (fornecido pelo runner). */
+  historyStore?: HistoryStore
   /**
    * read_file: provider + modelo da sessão — decide se imagens/PDF podem ser devolvidos ao modelo
    * (mesma regra de capacidade dos anexos). Ausente = só texto.
@@ -78,7 +81,7 @@ export interface ChatListEntry {
   id: string
   title: string
   model: string
-  status: 'idle' | 'running' | 'awaiting_approval' | 'awaiting_input'
+  status: 'idle' | 'running' | 'awaiting_approval' | 'awaiting_input' | 'awaiting_retry'
   updatedAt: number
   self: boolean
 }

@@ -242,6 +242,7 @@ const STATUS_LABEL: Record<SessionStatus, string> = {
   running: 'rodando',
   awaiting_approval: 'aguardando aprovação',
   awaiting_input: 'aguardando resposta do usuário',
+  awaiting_retry: 'aguardando decisão do usuário (falha de conexão)',
   waiting: 'aguardando subagentes',
   done: 'concluído',
   error: 'erro',

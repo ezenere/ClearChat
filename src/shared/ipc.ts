@@ -14,6 +14,7 @@ import type {
   Provider,
   QuestionAnswer,
   QuestionRequest,
+  RetryRequest,
   QueuedMessage,
   Session,
   SmartApproveRecord,
@@ -91,10 +92,19 @@ export const IPC = {
     cancel: 'questions:cancel',
     pending: 'questions:pending'
   },
+  retries: {
+    retry: 'retries:retry',
+    cancel: 'retries:cancel',
+    pending: 'retries:pending'
+  },
   processes: {
     list: 'processes:list',
     stop: 'processes:stop',
     logs: 'processes:logs'
+  },
+  approvals: {
+    getSettings: 'approvals:getSettings',
+    updateSettings: 'approvals:updateSettings'
   }
 } as const
 
@@ -134,7 +144,7 @@ export interface ChatUpdateInput {
   config?: Partial<ChatConfig>
 }
 
-export type ApprovalDecision = 'allow' | 'deny' | 'always'
+export type ApprovalDecision = 'allow' | 'deny'
 
 /** "Testar" do Smart-Approve: a config (chat ou persona) + uma chamada de exemplo. */
 export interface SmartApproveTestInput {
@@ -253,8 +263,16 @@ export interface ClearApi {
     stop(sessionId: string): Promise<void>
     /** Remove mensagens após a última msg do usuário e roda de novo. */
     regenerate(sessionId: string): Promise<void>
-    /** 'always' adiciona a chat.config.autoApprove. */
-    approve(requestId: string, decision: ApprovalDecision): Promise<void>
+    /**
+     * Responde um card. Pergunta simples: 'allow' | 'deny'. Card do modo Listas: `items` = decisão
+     * por sub-comando pendente (`pattern` = "+ whitelist"/"+ blacklist", salvo na lista global);
+     * sem `items`, 'allow' = sim para todos.
+     */
+    approve(
+      requestId: string,
+      decision: ApprovalDecision,
+      items?: import('./approvalPolicy').ApprovalItemDecision[]
+    ): Promise<void>
     pendingApprovals(): Promise<ApprovalRequest[]>
     previewRequest(sessionId: string): Promise<RequestPreview>
     runningSessions(): Promise<string[]>
@@ -308,12 +326,28 @@ export interface ClearApi {
     cancel(id: string): Promise<void>
     pending(): Promise<QuestionRequest[]>
   }
+  /** Falhas de conexão com o provedor aguardando decisão (card "Tentar de novo / Cancelar"). */
+  retries: {
+    /** Repete a mesma chamada do zero (o parcial já foi descartado). */
+    retry(id: string): Promise<void>
+    /** Termina o turno como erro (como antes) — o mesmo que Parar no card. */
+    cancel(id: string): Promise<void>
+    pending(): Promise<RetryRequest[]>
+  }
   /** Processos em segundo plano (process_start) do chat. */
   processes: {
     list(chatId: string): Promise<ProcessInfo[]>
     /** SIGTERM no grupo; SIGKILL após ~3 s. */
     stop(chatId: string, id: string): Promise<void>
     logs(chatId: string, id: string, tail?: number): Promise<ProcessLogsResult>
+  }
+  /** Aprovações: modos globais por item + listas globais (settings approvalModes / approvalLists). */
+  approvals: {
+    getSettings(): Promise<import('./types').ApprovalSettings>
+    /** Substitui `modes` e/ou `lists` (inteiros). Entrada inválida → erro legível. */
+    updateSettings(
+      patch: Partial<import('./types').ApprovalSettings>
+    ): Promise<import('./types').ApprovalSettings>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

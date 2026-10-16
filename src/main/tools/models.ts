@@ -2,6 +2,7 @@
 // por provider). Formatação e resolução de provedor do delegate_task são puras — testadas em
 // e2e/unit.test.ts sem rede.
 import { LIMITS } from '@shared/limits'
+import { isNetworkError } from '@shared/network'
 import type { ModelInfo } from '@shared/types'
 import {
   abortError,
@@ -445,26 +446,20 @@ const shortError = (e: string): string => {
   return s.length > 400 ? s.slice(0, 400) + '…' : s
 }
 
-/**
- * Erro de conectividade (não do modelo): conexão cortada no meio do stream (undici "terminated" /
- * "other side closed"), DNS/rede indisponível, reset, suspensão do computador, timeout sem resposta.
- */
-export function isNetworkError(error: string): boolean {
-  return /\bterminated\b|fetch failed|Falha de rede|other side closed|socket hang up|ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ENETUNREACH|ENETDOWN|EHOSTUNREACH|EPIPE|UND_ERR_|network (?:error|changed)|Sem resposta do provider/i.test(
-    error
-  )
-}
+// movida para @shared/network (o runner também classifica); export mantido por compatibilidade
+export { isNetworkError }
 
 /**
  * Resultado de delegate_task quando a chamada ao modelo do subagente falha: erro acionável para o
  * agente pai. Falha de rede → retomar a subsessão (o trabalho até ali está salvo), não trocar de modelo.
+ * (Falha de rede só chega aqui se o usuário cancelou o card "Falha de conexão" na subsessão.)
  */
 export function delegateFailureText(model: string, error: string): string {
   const msg = shortError(error) || 'erro desconhecido'
   if (isNetworkError(error))
     return (
       `[falha de conexão com o provedor (modelo ${model}): ${msg}] A conexão caiu no meio da execução ` +
-      '(rede instável, Wi-Fi desconectado ou o computador entrou em suspensão) — não é um problema do modelo. ' +
+      '(rede instável, Wi-Fi desconectado ou o computador entrou em suspensão) e o usuário optou por não tentar de novo — não é um problema do modelo. ' +
       'O que o subagente fez até aqui está salvo na subsessão: retome-o com message_subagent pedindo para continuar ' +
       '(ou repita a tarefa); não é preciso trocar de modelo.'
     )

@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type {
   AgentEvent,
   ApprovalRequest,
+  ApprovalSettings,
   AttachmentInfo,
   Chat,
   ChatConfig,
@@ -12,6 +13,7 @@ import type {
   QueuedMessage,
   QuestionAnswer,
   QuestionRequest,
+  RetryRequest,
   Session,
   StoredMessage,
   StreamDraft
@@ -21,6 +23,7 @@ import { api, errorMessage } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { contentText, formatSize } from '@shared/attachments'
 import { setToolShellInfo } from '@shared/shellInfo'
+import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -52,7 +55,22 @@ export interface Toast {
   text: string
 }
 
-export type SettingsTab = 'providers' | 'presets' | 'defaults'
+/**
+ * Subagente que terminou em erro (status `error`), detectado pela transição em `session-updated`.
+ * Só em memória (não sobrevive a reiniciar o app). `seen`: o chat foi aberto depois da falha (o
+ * vermelho da sidebar some); `dismissed`: o aviso acima do composer foi dispensado / visto.
+ */
+export interface SubFailure {
+  chatId: string
+  sessionId: string
+  title: string
+  error?: string
+  at: number
+  seen: boolean
+  dismissed: boolean
+}
+
+export type SettingsTab = 'providers' | 'presets' | 'defaults' | 'approvals' | 'web'
 
 export type PanelTab = 'model' | 'chat' | 'tools' | 'files'
 
@@ -60,7 +78,11 @@ const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'files']
 const PANEL_TAB_KEY = 'clearchat.panelTab'
 
 /** Seção do painel → aba onde ela mora (focusConfig). */
-const SECTION_TAB: Record<string, PanelTab> = { contexto: 'chat' }
+const SECTION_TAB: Record<string, PanelTab> = {
+  contexto: 'chat',
+  'smart-approve': 'tools',
+  aprovacoes: 'tools'
+}
 
 function loadPanelTab(): PanelTab {
   try {
@@ -113,6 +135,8 @@ interface State {
   approvals: ApprovalRequest[]
   /** Questionários pendentes (ask_user). */
   questions: QuestionRequest[]
+  /** Falhas de conexão com o provedor aguardando "Tentar de novo" / "Cancelar". */
+  retries: RetryRequest[]
   errors: Record<string, string | undefined>
   models: Record<string, ModelsEntry>
   panelOpen: boolean
@@ -131,6 +155,12 @@ interface State {
   pendingAttachments: Record<string, PendingAttachment[]>
   /** Processos em segundo plano (process_start) por chat (evento `processes-updated`). */
   processes: Record<string, ProcessInfo[]>
+  /** Aprovações: modos globais por item + listas globais. */
+  approvalSettings: ApprovalSettings
+  /** Visibilidade dos cards-âncora do chat aberto (IntersectionObserver) — ver lib/approvalAnchors. */
+  anchorVis: Record<string, boolean | null>
+  /** Falhas de subagentes por subsessão (vermelho na sidebar / aviso acima do composer). */
+  subFailures: Record<string, SubFailure>
 }
 
 interface Actions {
@@ -160,11 +190,17 @@ interface Actions {
   pickFiles(sessionId: string): Promise<void>
   removeAttachment(sessionId: string, id: string): void
   clearAttachments(sessionId: string): void
-  approve(id: string, decision: ApprovalDecision): Promise<void>
+  /** `items`: decisões por sub-comando do card do modo Listas. false = falhou (card continua). */
+  approve(id: string, decision: ApprovalDecision, items?: ApprovalItemDecision[]): Promise<boolean>
+  /** Substitui modos e/ou listas globais de aprovação. false = erro (toast). */
+  updateApprovalSettings(patch: Partial<ApprovalSettings>): Promise<boolean>
   /** Envia as respostas do questionário; false se falhou (o formulário continua). */
   answerQuestion(id: string, answers: QuestionAnswer[]): Promise<boolean>
   /** Cancela o questionário (o agente para). */
   cancelQuestion(id: string): Promise<void>
+  /** Card de falha de conexão: repete a chamada / termina o turno como erro. */
+  retryConnection(id: string): Promise<void>
+  cancelRetry(id: string): Promise<void>
   loadModels(providerId: string, force?: boolean): Promise<void>
   setPanel(open: boolean, tab?: PanelTab): void
   setSettingsOpen(open: boolean, tab?: SettingsTab): void
@@ -178,6 +214,10 @@ interface Actions {
   /** Recarrega os processos em segundo plano do chat. */
   loadProcesses(chatId: string): Promise<void>
   stopProcess(chatId: string, id: string): Promise<void>
+  /** Aplica medidas de visibilidade dos cards-âncora (undefined = card desmontado). */
+  setAnchorVis(patch: Record<string, boolean | null | undefined>): void
+  /** Some o aviso de falha do subagente acima do composer. */
+  dismissSubFailure(sessionId: string): void
   /** Executa uma chamada de API; em caso de erro mostra um toast e retorna undefined. */
   run<T>(fn: () => Promise<T>, label?: string): Promise<T | undefined>
 }
@@ -244,6 +284,7 @@ export const useStore = create<Store>()((set, get) => ({
   queues: {},
   approvals: [],
   questions: [],
+  retries: [],
   errors: {},
   models: {},
   panelOpen: true,
@@ -258,6 +299,9 @@ export const useStore = create<Store>()((set, get) => ({
   configFocus: null,
   pendingAttachments: {},
   processes: {},
+  approvalSettings: normalizeApprovalSettings(null, null),
+  anchorVis: {},
+  subFailures: {},
 
   async run(fn, label) {
     try {
@@ -278,17 +322,29 @@ export const useStore = create<Store>()((set, get) => ({
         return fallback
       }
     }
-    const [providers, chats, presets, homeDir, approvals, questions, capabilities, ...values] =
-      await Promise.all([
-        safe(() => api.providers.list(), [] as Provider[]),
-        safe(() => api.chats.list(), [] as Chat[]),
-        safe(() => api.presets.list(), [] as Preset[]),
-        safe(() => api.fs.homeDir(), null as string | null),
-        safe(() => api.agent.pendingApprovals(), [] as ApprovalRequest[]),
-        safe(() => api.questions.pending(), [] as QuestionRequest[]),
-        safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
-        ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
-      ])
+    const [
+      providers,
+      chats,
+      presets,
+      homeDir,
+      approvals,
+      questions,
+      retries,
+      capabilities,
+      approvalSettings,
+      ...values
+    ] = await Promise.all([
+      safe(() => api.providers.list(), [] as Provider[]),
+      safe(() => api.chats.list(), [] as Chat[]),
+      safe(() => api.presets.list(), [] as Preset[]),
+      safe(() => api.fs.homeDir(), null as string | null),
+      safe(() => api.agent.pendingApprovals(), [] as ApprovalRequest[]),
+      safe(() => api.questions.pending(), [] as QuestionRequest[]),
+      safe(() => api.retries.pending(), [] as RetryRequest[]),
+      safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
+      safe(() => api.approvals.getSettings(), normalizeApprovalSettings(null, null)),
+      ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
+    ])
     const settings = Object.fromEntries(
       SETTINGS_KEYS.map((k, i) => [k, values[i] ?? null])
     ) as unknown as AppSettings
@@ -301,7 +357,9 @@ export const useStore = create<Store>()((set, get) => ({
       homeDir,
       approvals,
       questions,
+      retries,
       capabilities,
+      approvalSettings: approvalSettings as ApprovalSettings,
       settings,
       booted: true
     })
@@ -371,7 +429,10 @@ export const useStore = create<Store>()((set, get) => ({
     const chat = get().chats.find((c) => c.id === chatId)
     if (!chat) return
     const target = sessionId ?? chat.mainSessionId
-    set({ view: { kind: 'chat', chatId, sessionId: target } })
+    set((s) => ({
+      view: { kind: 'chat', chatId, sessionId: target },
+      subFailures: markFailures(s.subFailures, chatId, target)
+    }))
     const sessions = await get().run(() => api.sessions.list(chatId), 'Erro ao carregar sessões')
     if (sessions) {
       set((s) => {
@@ -400,7 +461,10 @@ export const useStore = create<Store>()((set, get) => ({
   async openSession(sessionId) {
     const session = get().sessions[sessionId]
     if (!session) return
-    set({ view: { kind: 'chat', chatId: session.chatId, sessionId } })
+    set((s) => ({
+      view: { kind: 'chat', chatId: session.chatId, sessionId },
+      subFailures: markFailures(s.subFailures, session.chatId, sessionId)
+    }))
     await get().loadMessages(sessionId)
   },
 
@@ -447,6 +511,10 @@ export const useStore = create<Store>()((set, get) => ({
         sessions,
         approvals: s.approvals.filter((a) => a.chatId !== chatId),
         questions: s.questions.filter((q) => q.chatId !== chatId),
+        retries: s.retries.filter((r) => r.chatId !== chatId),
+        subFailures: Object.fromEntries(
+          Object.entries(s.subFailures).filter(([, f]) => f.chatId !== chatId)
+        ),
         view
       }
     })
@@ -559,9 +627,24 @@ export const useStore = create<Store>()((set, get) => ({
     set((s) => ({ pendingAttachments: { ...s.pendingAttachments, [sessionId]: [] } }))
   },
 
-  async approve(id, decision) {
-    set((s) => ({ approvals: s.approvals.filter((a) => a.id !== id) }))
-    await get().run(() => api.agent.approve(id, decision), 'Falha ao responder aprovação')
+  async approve(id, decision, items) {
+    try {
+      await api.agent.approve(id, decision, items)
+      set((s) => ({ approvals: s.approvals.filter((a) => a.id !== id) }))
+      return true
+    } catch (err) {
+      get().toast(`Falha ao responder aprovação: ${errorMessage(err)}`, 'error')
+      return false
+    }
+  },
+
+  async updateApprovalSettings(patch) {
+    const r = await get().run(
+      () => api.approvals.updateSettings(patch),
+      'Erro ao salvar aprovações'
+    )
+    if (r) set({ approvalSettings: r })
+    return !!r
   },
 
   async answerQuestion(id, answers) {
@@ -575,6 +658,18 @@ export const useStore = create<Store>()((set, get) => ({
 
   async cancelQuestion(id) {
     await get().run(() => api.questions.cancel(id), 'Falha ao cancelar o questionário')
+  },
+
+  async retryConnection(id) {
+    const ok = await get().run(async () => {
+      await api.retries.retry(id)
+      return true
+    }, 'Falha ao tentar de novo')
+    if (ok) set((s) => ({ retries: s.retries.filter((r) => r.id !== id) }))
+  },
+
+  async cancelRetry(id) {
+    await get().run(() => api.retries.cancel(id), 'Falha ao cancelar')
   },
 
   async loadModels(providerId, force) {
@@ -631,6 +726,35 @@ export const useStore = create<Store>()((set, get) => ({
     if (r?.scheduled) get().toast('Compactação agendada para o próximo passo do agente.')
   },
 
+  setAnchorVis(patch) {
+    set((s) => {
+      let changed = false
+      const next = { ...s.anchorVis }
+      for (const [k, v] of Object.entries(patch)) {
+        if (v === undefined) {
+          if (k in next) {
+            delete next[k]
+            changed = true
+          }
+        } else if (next[k] !== v) {
+          next[k] = v
+          changed = true
+        }
+      }
+      return changed ? { anchorVis: next } : {}
+    })
+  },
+
+  dismissSubFailure(sessionId) {
+    set((s) => {
+      const f = s.subFailures[sessionId]
+      if (!f || f.dismissed) return {}
+      return {
+        subFailures: { ...s.subFailures, [sessionId]: { ...f, dismissed: true, seen: true } }
+      }
+    })
+  },
+
   focusConfig(section) {
     if (!section) return set({ configFocus: null })
     const panelTab = SECTION_TAB[section] ?? 'model'
@@ -639,12 +763,61 @@ export const useStore = create<Store>()((set, get) => ({
   }
 }))
 
+/** Abrir o chat marca as falhas dele como vistas (sidebar); abrir a subsessão que falhou a dispensa. */
+function markFailures(
+  list: Record<string, SubFailure>,
+  chatId: string,
+  sessionId: string
+): Record<string, SubFailure> {
+  let next: Record<string, SubFailure> | null = null
+  for (const [id, f] of Object.entries(list)) {
+    if (f.chatId !== chatId) continue
+    const dismissed = f.dismissed || id === sessionId
+    if (f.seen && dismissed === f.dismissed) continue
+    next ??= { ...list }
+    next[id] = { ...f, seen: true, dismissed }
+  }
+  return next ?? list
+}
+
+/** Subsessão entrou em `error` → registra a falha; voltou a rodar/concluiu → some. */
+function trackFailure(s: Store, session: Session): Record<string, SubFailure> {
+  const cur = s.subFailures[session.id]
+  if (session.depth === 0) return s.subFailures
+  if (session.status === 'error') {
+    if (cur) return s.subFailures
+    const open = s.view.kind === 'chat' && s.view.chatId === session.chatId
+    const viewing = open && s.view.kind === 'chat' && s.view.sessionId === session.id
+    return {
+      ...s.subFailures,
+      [session.id]: {
+        chatId: session.chatId,
+        sessionId: session.id,
+        title: session.title || session.task?.slice(0, 40) || 'Subagente',
+        error: s.errors[session.id],
+        at: Date.now(),
+        seen: open,
+        dismissed: viewing
+      }
+    }
+  }
+  if (!cur) return s.subFailures
+  const next = { ...s.subFailures }
+  delete next[session.id]
+  return next
+}
+
 function applyEvent(e: AgentEvent): void {
   const set = useStore.setState
   switch (e.type) {
     case 'session-created':
     case 'session-updated':
-      set((s) => ({ sessions: { ...s.sessions, [e.session.id]: e.session } }))
+      set((s) => {
+        const prev = s.sessions[e.session.id]
+        const subFailures =
+          prev?.status === e.session.status ? s.subFailures : trackFailure(s, e.session)
+        return { sessions: { ...s.sessions, [e.session.id]: e.session }, subFailures }
+      })
       break
     case 'session-deleted':
       set((s) => {
@@ -668,6 +841,8 @@ function applyEvent(e: AgentEvent): void {
           errors: drop(s.errors),
           approvals: s.approvals.filter((a) => a.sessionId !== e.sessionId),
           questions: s.questions.filter((q) => q.sessionId !== e.sessionId),
+          retries: s.retries.filter((r) => r.sessionId !== e.sessionId),
+          subFailures: drop(s.subFailures),
           view
         }
       })
@@ -742,6 +917,9 @@ function applyEvent(e: AgentEvent): void {
     case 'approval-resolved':
       set((s) => ({ approvals: s.approvals.filter((a) => a.id !== e.id) }))
       break
+    case 'approval-settings-updated':
+      set({ approvalSettings: e.settings })
+      break
     case 'question-requested':
       set((s) => ({
         questions: [...s.questions.filter((q) => q.id !== e.request.id), e.request]
@@ -749,6 +927,14 @@ function applyEvent(e: AgentEvent): void {
       break
     case 'question-resolved':
       set((s) => ({ questions: s.questions.filter((q) => q.id !== e.id) }))
+      break
+    case 'retry-requested':
+      set((s) => ({
+        retries: [...s.retries.filter((r) => r.id !== e.request.id), e.request]
+      }))
+      break
+    case 'retry-resolved':
+      set((s) => ({ retries: s.retries.filter((r) => r.id !== e.id) }))
       break
     case 'chat-updated':
       set((s) => {
@@ -762,7 +948,15 @@ function applyEvent(e: AgentEvent): void {
       })
       break
     case 'error':
-      set((s) => ({ errors: { ...s.errors, [e.sessionId]: e.error } }))
+      set((s) => {
+        const f = s.subFailures[e.sessionId]
+        return {
+          errors: { ...s.errors, [e.sessionId]: e.error },
+          ...(f
+            ? { subFailures: { ...s.subFailures, [e.sessionId]: { ...f, error: e.error } } }
+            : {})
+        }
+      })
       break
     case 'processes-updated':
       set((s) => ({ processes: { ...s.processes, [e.chatId]: e.processes } }))
@@ -799,6 +993,7 @@ export const isBusy = (status: Session['status'] | undefined): boolean =>
   status === 'running' ||
   status === 'awaiting_approval' ||
   status === 'awaiting_input' ||
+  status === 'awaiting_retry' ||
   status === 'waiting'
 
 export const currentChat = (s: Store): Chat | undefined =>

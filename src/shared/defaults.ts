@@ -63,7 +63,6 @@ export function DEFAULT_CHAT_CONFIG(
     autoCompact: false,
     compactPrompt: null,
     maxToolOutputChars: LIMITS.maxToolOutputChars,
-    autoApprove: [],
     appSignature: DEFAULT_APP_SIGNATURE
   }
 }

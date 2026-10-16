@@ -62,6 +62,10 @@ export const LIMITS = {
   historySearchMax: 100,
   /** read_history (busca): caracteres de contexto ao redor de cada ocorrência. */
   historySnippetChars: 220,
+  /** read_history scope "all": chats mostrados (padrão / máximo) e trechos por chat. */
+  historyAllChatsDefault: 5,
+  historyAllChatsMax: 20,
+  historyAllPerChat: 3,
 
   /** wait_subagents / message_subagent (wait_for_reply): espera padrão / máxima, em segundos. */
   subagentWaitDefaultS: 600,

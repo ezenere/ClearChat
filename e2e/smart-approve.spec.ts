@@ -12,7 +12,8 @@
 // Cobre: seção Smart-Approve da aba Tools (habilitar só com modelo, rótulos com validação, tempo),
 // juiz APPROVED → roda · REJECTED → resultado negado + "Executar mesmo assim" (liberação de uma vez)
 // · ASK-USER → card de aprovação com o motivo · resposta malformada e timeout → card de aprovação,
-// custo do juiz no rodapé, "Testar", popover do header (revogar uma / todas, desligar o Smart-Approve)
+// custo do juiz no rodapé, "Testar", popover do header (modos efetivos, revogar "Sempre", desligar o
+// Smart-Approve → modo smart sem juiz pergunta com aviso)
 // e a seção no editor de personas. Screenshots em $CLEARCHAT_E2E_DIR/shots.
 import {
   _electron as electron,
@@ -75,7 +76,7 @@ async function startFake(): Promise<void> {
               name: id === AGENT ? 'Fake Agent' : 'Fake Judge',
               context_length: 64_000,
               pricing: { prompt: '0.0000001', completion: '0.0000002' },
-              supported_parameters: ['tools']
+              supported_parameters: ['tools', 'temperature', 'max_tokens']
             }))
           })
         )
@@ -343,6 +344,18 @@ async function main(): Promise<void> {
     await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE)
     await sw.click()
     await sec.getByText('Ligado: o juiz decide antes de pedir sua confirmação.').waitFor()
+    // o juiz só decide itens no modo Smart-Approve: Comandos → Smart-Approve neste chat
+    await page
+      .getByTestId('chat-mode-commands')
+      .getByRole('radio', { name: 'Smart-Approve' })
+      .click()
+    await sec
+      .getByTestId('smart-items')
+      .getByText(/Comandos/)
+      .waitFor()
+    await sleep(700)
+    const cfg = (await chatState()).chat.config
+    assert(cfg.approvalModes?.commands === 'smart', `modo ${JSON.stringify(cfg.approvalModes)}`)
   })
 
   await step('rótulos: validação (vazio, repetido) e edição; tempo máximo', async () => {
@@ -375,7 +388,9 @@ async function main(): Promise<void> {
     await sec.getByRole('button', { name: /Prompt do juiz/ }).click()
     await sec.getByRole('textbox', { name: 'Template do Smart-Approve' }).waitFor()
     await sec.getByText('{{recent_context}}', { exact: true }).waitFor()
-    await shotOf(sec, 'smart-section')
+    // screenshot da página (o de um elemento mais alto que a janela redimensiona a janela do
+    // Electron, aciona o layout estreito e fecha o painel)
+    await shot('smart-section')
     await sec.getByRole('button', { name: /Prompt do juiz/ }).click()
   })
 
@@ -524,6 +539,7 @@ async function main(): Promise<void> {
   })
 
   await step('Testar (chamada de exemplo) no editor', async () => {
+    await openToolsTab()
     const sec = section()
     await sec.scrollIntoViewIfNeeded()
     await sec.getByRole('button', { name: /Testar com uma chamada de exemplo/ }).click()
@@ -540,33 +556,29 @@ async function main(): Promise<void> {
   })
 
   await step(
-    'header: popover de auto-aprovação — revogar uma, revogar tudo, desligar Smart',
+    'header: popover com os modos efetivos — revogar "Sempre", desligar Smart (sem juiz → pergunta)',
     async () => {
-      const sec = page.getByTestId('right-panel')
-      await sec.getByRole('switch', { name: 'Auto-aprovar tudo' }).click()
+      await openToolsTab()
+      const panel = page.getByTestId('right-panel')
+      await panel
+        .getByTestId('chat-mode-pages')
+        .getByRole('radio', { name: 'Sempre permitir' })
+        .click()
       const badge = page.getByTestId('auto-approve-badge')
-      await badge.getByText('Auto-aprovação · Smart').waitFor({ timeout: 5000 })
+      await badge.getByText('Sempre: Páginas · Smart').waitFor({ timeout: 5000 })
       await page.getByRole('button', { name: 'Fechar painel' }).first().click()
       await badge.click()
       const pop = page.getByTestId('auto-approve-popover')
       await pop.waitFor()
-      assert((await pop.getByTestId('auto-approve-item').count()) === 3, '3 tools')
+      assert((await pop.getByTestId('auto-approve-item').count()) === 4, '4 itens')
       await pop.getByText('fake/judge-1'.split('/').pop()!).waitFor()
       await sleep(400) // animação de entrada
       await shot('header-popover')
-      await pop.getByRole('button', { name: 'Revogar Terminal (shell)' }).click()
+      await pop.getByRole('button', { name: 'Revogar Páginas' }).click()
       await sleep(300)
       let cfg = (await chatState()).chat.config
-      assert(
-        !cfg.autoApprove.includes('shell') && cfg.autoApprove.length === 2,
-        `revogou ${cfg.autoApprove}`
-      )
-      assert((await pop.getByTestId('auto-approve-item').count()) === 2, '2 tools')
-      await pop.getByRole('button', { name: 'Revogar tudo' }).click()
-      await sleep(300)
-      cfg = (await chatState()).chat.config
-      assert(cfg.autoApprove.length === 0, 'revogou tudo')
-      await pop.getByText('Nenhuma tool roda sem confirmação.').waitFor()
+      assert(cfg.approvalModes?.pages === undefined, `revogou ${JSON.stringify(cfg.approvalModes)}`)
+      assert(cfg.approvalModes?.commands === 'smart', 'comandos continuam smart')
       await badge.getByText('Smart-Approve').waitFor()
       await pop.getByRole('switch', { name: 'Smart-Approve' }).click()
       await sleep(300)
@@ -575,14 +587,20 @@ async function main(): Promise<void> {
         cfg.smartApprove.enabled === false && cfg.smartApprove.model === JUDGE,
         'smart desligado'
       )
+      await pop.getByText('(sem juiz)').first().waitFor()
+      await pop.getByRole('button', { name: /Configurações → Aprovações/ }).waitFor()
       await page.keyboard.press('Escape')
-      await badge.waitFor({ state: 'detached', timeout: 3000 })
-      // sem Smart-Approve: bash volta a pedir confirmação ao usuário, sem chamar o juiz
+      // modo smart sem juiz: pergunta ao usuário (fail-closed), sem chamar o juiz, e avisa
       const before = judgeHits().length
       await sendMessage('rode: echo SA-SEM-JUIZ')
       const card = bashCards().last()
       await card.getByRole('button', { name: 'Negar', exact: true }).waitFor({ timeout: 15_000 })
+      await card
+        .getByTestId('smart-missing')
+        .getByText(/Configure o modelo do Smart-Approve/)
+        .waitFor()
       assert((await card.getByTestId('smart-approve-line').count()) === 0, 'sem linha do juiz')
+      await shotOf(card, 'card-smart-sem-juiz')
       await card.getByRole('button', { name: 'Negar', exact: true }).click()
       await waitIdle()
       assert(judgeHits().length === before, 'juiz não chamado')

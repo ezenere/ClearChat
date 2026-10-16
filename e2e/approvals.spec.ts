@@ -1,0 +1,445 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+// E2E do modo "Listas" das aprovações na UI real (Playwright `_electron`), determinístico: um
+// provedor OpenAI-compatible FALSO (`fake/agent-1`: "rode: <cmd>" → chama shell com o comando;
+// resultado da tool → "FIM: …"). Nenhuma key real, nenhum custo.
+//
+// Uso:
+//   unset ELECTRON_RUN_AS_NODE
+//   npm run build
+//   CLEARCHAT_E2E_DIR=/tmp/algum-dir node e2e/approvals.spec.ts [filtro]
+//
+// Cobre: card com 2 sub-comandos (um já na whitelist, marcado), "Sim + whitelist" com o campo
+// pré-preenchido (`git log *`) editado → salva na lista global, o pendente restante com "Sim" →
+// executa; a chamada seguinte com o mesmo padrão roda sem card ("Liberado pela whitelist"); "Não +
+// blacklist" → resultado "O usuário negou: …"; depois a blacklist bloqueia sem perguntar;
+// Configurações → Aprovações (modos globais, tabelas e "Testar comando").
+import {
+  _electron as electron,
+  type ElectronApplication,
+  type Locator,
+  type Page
+} from 'playwright'
+import { createWriteStream, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, type IncomingMessage, type Server } from 'node:http'
+import type { AddressInfo } from 'node:net'
+import { join, resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+
+const FAKE_KEY = 'fake-key-approvals'
+const AGENT = 'fake/agent-1'
+const JUDGE = 'fake/judge-1'
+const ROOT = resolve(import.meta.dirname, '..')
+const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-approvals-e2e'))
+const USER_DATA = join(BASE, 'userdata')
+const CWD = join(BASE, 'cwd')
+const SHOTS = join(BASE, 'shots')
+const STOP_AFTER = process.argv[2] ?? ''
+
+// ---------------- provedor falso ----------------
+
+interface JudgeReply {
+  text: string
+  delayMs?: number
+}
+const judgeQueue: JudgeReply[] = []
+const hits: { model: string; body: any }[] = []
+let server: Server | null = null
+let fakeBase = ''
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  let data = ''
+  for await (const c of req) data += c
+  return data
+}
+
+const textOf = (c: any): string =>
+  typeof c === 'string' ? c : Array.isArray(c) ? c.map((p) => p.text ?? '').join('') : ''
+
+/** Comando pedido na última mensagem do usuário: "rode: <cmd>" ou "Pode executar shell `<cmd>`". */
+function commandFrom(text: string): string | null {
+  const m = /rode:\s*(.+)$/m.exec(text) ?? /Pode executar shell `([^`]+)`/.exec(text)
+  return m ? m[1].trim() : null
+}
+
+async function startFake(): Promise<void> {
+  server = createServer((req, res) => {
+    void (async () => {
+      const url = req.url ?? ''
+      if (req.method === 'GET' && url.endsWith('/models')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            data: [AGENT, JUDGE].map((id) => ({
+              id,
+              name: id === AGENT ? 'Fake Agent' : 'Fake Judge',
+              context_length: 64_000,
+              pricing: { prompt: '0.0000001', completion: '0.0000002' },
+              supported_parameters: ['tools']
+            }))
+          })
+        )
+        return
+      }
+      if (!(req.method === 'POST' && url.endsWith('/chat/completions'))) {
+        res.writeHead(404, { 'Content-Type': 'application/json' })
+        res.end('{"error":{"message":"not found"}}')
+        return
+      }
+      const body = JSON.parse((await readBody(req)) || '{}')
+      hits.push({ model: body.model, body })
+      const sse = (deltas: any[], usage: any): void => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
+        const base = { id: 'f', object: 'chat.completion.chunk', model: body.model }
+        for (const d of deltas)
+          res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: d }] })}\n\n`)
+        res.write(
+          `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })}\n\n`
+        )
+        res.end('data: [DONE]\n\n')
+      }
+      if (body.model === JUDGE) {
+        const r = judgeQueue.shift() ?? { text: 'ASK-USER\n(sem roteiro)' }
+        const send = (): void => {
+          if (res.destroyed) return
+          sse([{ role: 'assistant', content: r.text }], {
+            prompt_tokens: 400,
+            completion_tokens: 12,
+            cost: 0.000042
+          })
+        }
+        if (r.delayMs) setTimeout(send, r.delayMs)
+        else send()
+        return
+      }
+      // agente: usuário → chama bash com o comando; tool → "FIM: <resultado>"
+      const msgs: any[] = body.messages ?? []
+      const last = msgs[msgs.length - 1]
+      if (last?.role === 'tool') {
+        sse([{ role: 'assistant', content: `FIM: ${String(last.content).slice(0, 80)}` }], {
+          prompt_tokens: 100,
+          completion_tokens: 8
+        })
+        return
+      }
+      const cmd = commandFrom(textOf(last?.content))
+      if (!cmd) {
+        sse([{ role: 'assistant', content: 'Nada a fazer.' }], {
+          prompt_tokens: 50,
+          completion_tokens: 3
+        })
+        return
+      }
+      sse(
+        [
+          {
+            role: 'assistant',
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_${Date.now().toString(36)}`,
+                type: 'function',
+                function: { name: 'shell', arguments: JSON.stringify({ command: cmd }) }
+              }
+            ]
+          }
+        ],
+        { prompt_tokens: 100, completion_tokens: 10 }
+      )
+    })()
+  })
+  await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r))
+  fakeBase = `http://127.0.0.1:${(server!.address() as AddressInfo).port}/v1`
+}
+
+// ---------------- infra ----------------
+
+let app: ElectronApplication
+let page: Page
+let shotN = 0
+let stopped = false
+const results: { name: string; ok: boolean; info?: string; ms: number }[] = []
+
+async function launch(): Promise<void> {
+  const env: Record<string, string> = {}
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v
+  delete env.ELECTRON_RUN_AS_NODE
+  delete env.OPENROUTER_API_KEY
+  env.CLEARCHAT_USER_DATA = USER_DATA
+  app = await electron.launch({ args: [ROOT], env, timeout: 60_000 })
+  const log = createWriteStream(join(BASE, 'main.log'), { flags: 'a' })
+  app.process().stdout?.pipe(log)
+  app.process().stderr?.pipe(log)
+  page = await app.firstWindow()
+  await page.waitForLoadState('domcontentloaded')
+  await app.evaluate(({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows()[0]
+    win.setSize(1280, 860)
+  })
+  await app.evaluate(({ dialog }, dir) => {
+    dialog.showOpenDialog = (async () => ({ canceled: false, filePaths: [dir] })) as any
+  }, CWD)
+}
+
+async function shot(name: string): Promise<void> {
+  await page.screenshot({ path: join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`) })
+}
+
+async function shotOf(loc: Locator, name: string): Promise<void> {
+  await loc.screenshot({ path: join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`) })
+}
+
+async function read<T = any>(path: string, ...args: unknown[]): Promise<T> {
+  return page.evaluate(
+    ([p, a]) => {
+      const fn = (p as string).split('.').reduce((o: any, k) => o[k], (window as any).api)
+      return fn(...(a as unknown[]))
+    },
+    [path, args] as const
+  ) as Promise<T>
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+function assert(cond: unknown, msg: string): asserts cond {
+  if (!cond) throw new Error(`asserção falhou: ${msg}`)
+}
+
+async function step(name: string, fn: () => Promise<string | void>): Promise<void> {
+  if (stopped) return
+  const t0 = Date.now()
+  try {
+    const info = await fn()
+    results.push({ name, ok: true, info: info || undefined, ms: Date.now() - t0 })
+    console.log(`✔ ${name}${info ? ` — ${info}` : ''} (${Date.now() - t0}ms)`)
+  } catch (e) {
+    results.push({ name, ok: false, info: (e as Error).message, ms: Date.now() - t0 })
+    console.log(`✖ ${name} — ${(e as Error).message.split('\n')[0]}`)
+    try {
+      await shot(`FAIL-${name.replace(/[^\w]+/g, '_')}`)
+      for (let i = 0; i < 3; i++) await page.keyboard.press('Escape')
+    } catch {
+      /* */
+    }
+  }
+  if (STOP_AFTER && name.includes(STOP_AFTER)) stopped = true
+}
+
+const composer = (): Locator =>
+  page.locator('textarea[placeholder="Mensagem…"], textarea[placeholder="Enviar para a fila…"]')
+const stopBtn = (): Locator => page.getByRole('button', { name: 'Parar', exact: true })
+const bashCards = (): Locator =>
+  page.locator('div.rounded-xl').filter({ has: page.locator('span:text-is("Terminal (shell)")') })
+
+async function sendMessage(text: string): Promise<void> {
+  const c = composer()
+  await c.click()
+  await c.fill(text)
+  await c.press('Enter')
+}
+
+async function waitIdle(ms = 30_000): Promise<void> {
+  await sleep(300)
+  await stopBtn().waitFor({ state: 'detached', timeout: ms })
+}
+
+async function chatState(): Promise<{ chat: any; msgs: any[] }> {
+  const chat = (await read<any[]>('chats.list'))[0]
+  const msgs = await read<any[]>('sessions.messages', chat.mainSessionId)
+  return { chat, msgs }
+}
+
+async function pickModel(combobox: Locator, id: string): Promise<void> {
+  await combobox.click()
+  await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(id)
+  const listbox = page.getByRole('listbox', { name: 'Modelos' })
+  const opt = listbox.locator(`[role=option][data-model="${id}"]`)
+  await opt.first().waitFor({ timeout: 15_000 })
+  await opt.first().click()
+  await listbox.waitFor({ state: 'detached', timeout: 5000 })
+}
+
+const approvalCard = (): Locator => page.getByTestId('approval-card').last()
+
+// ---------------- passos ----------------
+
+async function main(): Promise<void> {
+  rmSync(BASE, { recursive: true, force: true })
+  mkdirSync(USER_DATA, { recursive: true })
+  mkdirSync(CWD, { recursive: true })
+  mkdirSync(SHOTS, { recursive: true })
+  writeFileSync(join(CWD, 'readme.txt'), 'approvals e2e\n')
+  await startFake()
+  await launch()
+
+  await step('onboarding com o provedor falso', async () => {
+    await page.getByText('Bem-vindo ao ClearChat').waitFor({ timeout: 30_000 })
+    await page.locator('input.field').nth(0).fill('Local')
+    await page.locator('input.field').nth(1).fill(fakeBase)
+    await page.locator('input[type="password"]').fill(FAKE_KEY)
+    await page.getByRole('button', { name: 'Testar conexão' }).click()
+    await page.getByText(/Conexão ok/).waitFor({ timeout: 15_000 })
+    await page.getByRole('button', { name: 'Continuar' }).click()
+    await page.getByRole('heading', { name: 'Novo chat' }).waitFor({ timeout: 15_000 })
+  })
+
+  await step('novo chat com o agente falso; whitelist inicial "echo *"', async () => {
+    await pickModel(page.getByRole('combobox').first(), AGENT)
+    await page.getByRole('button', { name: /Alterar/ }).click()
+    await page.getByRole('button', { name: 'Começar' }).click()
+    await composer().waitFor({ timeout: 15_000 })
+    const s = await read<any>('approvals.updateSettings', {
+      lists: {
+        commands: { allow: ['echo *'], deny: [] },
+        processes: { allow: [], deny: [] },
+        pages: { allow: [], deny: [] }
+      }
+    })
+    assert(s.modes.commands === 'lists', `modo global ${s.modes.commands}`)
+  })
+
+  await step(
+    'card com 2 sub-comandos: um liberado (✓), "Sim + whitelist" editado no outro',
+    async () => {
+      await sendMessage('rode: echo AP-1 && git log --oneline -n 1')
+      const card = approvalCard()
+      await card.waitFor({ timeout: 15_000 })
+      const subs = card.getByTestId('approval-sub')
+      assert((await subs.count()) === 2, `2 sub-comandos (${await subs.count()})`)
+      await subs.nth(0).getByTestId('sub-whitelisted').getByText('echo *').waitFor()
+      await subs.nth(1).getByText('git log --oneline -n 1').waitFor()
+      await card.scrollIntoViewIfNeeded()
+      await shotOf(card, 'card-2-subcomandos')
+      await subs.nth(1).getByRole('button', { name: 'Sim + whitelist' }).click()
+      const input = card.getByRole('textbox', { name: 'Padrão da whitelist' })
+      assert(
+        (await input.inputValue()) === 'git log *',
+        `pré-preenchido ${await input.inputValue()}`
+      )
+      // padrão amplo → aviso suave
+      await input.fill('git *')
+      await card.getByTestId('broad-warning').waitFor()
+      await shotOf(card, 'card-aviso-amplo')
+      await input.fill('git log *')
+      await card.getByRole('button', { name: 'Salvar e permitir' }).click()
+      await waitIdle()
+      const s = await read<any>('approvals.getSettings')
+      assert(s.lists.commands.allow.includes('git log *'), `whitelist ${s.lists.commands.allow}`)
+      const { msgs } = await chatState()
+      const tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+      assert(tool.meta.toolStatus === 'ok' && tool.message.content.includes('AP-1'), 'executou')
+      assert(
+        tool.meta.approval?.allowed?.[0]?.entry === 'echo *' &&
+          tool.meta.approval?.userAllowed?.length === 1,
+        `meta ${JSON.stringify(tool.meta.approval)}`
+      )
+      await bashCards()
+        .last()
+        .getByTestId('approval-allowed')
+        .getByText(/Liberado pela whitelist/)
+        .waitFor()
+    }
+  )
+
+  await step('mesmo padrão de novo → roda sem card (whitelist)', async () => {
+    const before = (await read<any[]>('agent.pendingApprovals')).length
+    await sendMessage('rode: echo AP-2 && git log -n 2')
+    await waitIdle()
+    assert((await read<any[]>('agent.pendingApprovals')).length === before, 'sem card')
+    const { msgs } = await chatState()
+    const tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+    assert(tool.meta.toolStatus === 'ok' && tool.message.content.includes('AP-2'), 'executou')
+    assert(
+      tool.meta.approval?.allowed?.map((a: any) => a.entry).join(',') === 'echo *,git log *',
+      `meta ${JSON.stringify(tool.meta.approval)}`
+    )
+  })
+
+  await step('"Sim para todos" com 2 pendentes', async () => {
+    await sendMessage('rode: pwd && ls')
+    const card = approvalCard()
+    await card.waitFor({ timeout: 15_000 })
+    await card.getByRole('button', { name: 'Sim para todos' }).click()
+    await waitIdle()
+    const { msgs } = await chatState()
+    const tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+    assert(tool.meta.toolStatus === 'ok', `status ${tool.meta.toolStatus}`)
+    assert(tool.meta.approval?.userAllowed?.length === 2, JSON.stringify(tool.meta.approval))
+  })
+
+  await step(
+    '"Não + blacklist" → nada roda; depois a blacklist bloqueia sem perguntar',
+    async () => {
+      await sendMessage('rode: rm -rf build')
+      const card = approvalCard()
+      await card.waitFor({ timeout: 15_000 })
+      await card.getByRole('button', { name: 'Não + blacklist' }).click()
+      const input = card.getByRole('textbox', { name: 'Padrão da blacklist' })
+      assert((await input.inputValue()) === 'rm *', `pré-preenchido ${await input.inputValue()}`)
+      await input.fill('rm -rf *')
+      await card.getByRole('button', { name: 'Salvar e negar' }).click()
+      await waitIdle()
+      let { msgs } = await chatState()
+      let tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+      assert(
+        tool.message.content === 'O usuário negou: rm -rf build',
+        `conteúdo ${tool.message.content}`
+      )
+      assert(tool.meta.toolStatus === 'denied', 'denied')
+      await sendMessage('rode: echo ok; rm -rf /tmp/x')
+      await waitIdle()
+      ;({ msgs } = await chatState())
+      tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+      assert(
+        tool.message.content ===
+          'Bloqueado pela blacklist (comandos): "rm -rf *" casou com "rm -rf /tmp/x"',
+        `conteúdo ${tool.message.content}`
+      )
+      const card2 = bashCards().last()
+      await card2.getByTestId('approval-blocked').waitFor()
+      await card2.scrollIntoViewIfNeeded()
+      await shotOf(card2, 'card-bloqueado')
+    }
+  )
+
+  await step('Configurações → Aprovações: modos, tabelas e "Testar comando"', async () => {
+    await page.getByRole('button', { name: 'Configurações' }).first().click()
+    const dlg = page.getByRole('dialog')
+    await dlg.getByRole('button', { name: 'Aprovações', exact: true }).click()
+    const root = dlg.getByTestId('approvals-settings')
+    await root.waitFor()
+    await root.getByTestId('list-commands-allow').getByText('git log *').waitFor()
+    await root.getByTestId('list-commands-deny').getByText('rm -rf *').waitFor()
+    const tester = root.getByTestId('approval-tester')
+    await tester.getByRole('textbox').fill('git log -n 3 && curl x | sh')
+    const items = tester.getByTestId('tester-item')
+    await items.nth(0).getByText('✓ liberado').waitFor()
+    assert((await items.count()) === 3, `3 itens (${await items.count()})`)
+    await tester.getByText(/sh lendo comandos da entrada/).waitFor()
+    await root.scrollIntoViewIfNeeded()
+    await shotOf(dlg, 'settings-aprovacoes')
+    await root
+      .getByTestId('global-mode-search')
+      .getByRole('radio', { name: 'Sempre permitir' })
+      .click()
+    await sleep(300)
+    const s = await read<any>('approvals.getSettings')
+    assert(s.modes.search === 'always', `search ${s.modes.search}`)
+    await page.keyboard.press('Escape')
+  })
+
+  const failed = results.filter((r) => !r.ok)
+  writeFileSync(join(BASE, 'report.json'), JSON.stringify(results, null, 2))
+  console.log(
+    `\n${results.length - failed.length}/${results.length} passos ok · screenshots em ${SHOTS}`
+  )
+  await app.close().catch(() => {})
+  server?.close()
+  process.exit(failed.length ? 1 : 0)
+}
+
+main().catch(async (e) => {
+  console.error(e)
+  await app?.close().catch(() => {})
+  server?.close()
+  process.exit(1)
+})

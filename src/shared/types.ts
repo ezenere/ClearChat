@@ -20,6 +20,11 @@ export interface ModelInfo {
   supportsTools?: boolean
   /** Modalidades de entrada (OpenRouter `architecture.input_modalities`: text, image, file, audio, video). Ausente = desconhecido. */
   inputModalities?: string[]
+  /**
+   * Chaves de ChatParams que o modelo aceita (OpenRouter `supported_parameters`, mapeado em
+   * @shared/modelParams). Ausente = desconhecido → todas (Anthropic usa uma tabela por modelo).
+   */
+  supportedParams?: string[]
 }
 
 /** Só campos definidos (≠ undefined/null) vão para a request. */
@@ -64,13 +69,29 @@ export type ToolName =
   | 'process_stop'
   | 'ask_user'
 
-export const CONFIRM_TOOLS: ToolName[] = [
-  'shell',
-  'process_start',
-  'process_stop',
-  'web_search',
-  'browse_url'
-]
+/**
+ * Tools que passam pelo gate de aprovação (ver approvalPolicy.ts): cada uma é um ITEM com modo
+ * always | smart | lists. `process_stop` NÃO está aqui: o agente só enxerga/para processos do
+ * próprio chat (registro por chat em tools/processes.ts), então nunca pede confirmação.
+ */
+export const CONFIRM_TOOLS: ToolName[] = ['shell', 'process_start', 'web_search', 'browse_url']
+
+/** Item de aprovação (um por tool de CONFIRM_TOOLS). */
+export type ApprovalItem = 'commands' | 'processes' | 'pages' | 'search'
+/** always = sempre permitir · smart = Smart-Approve decide · lists = whitelist/blacklist (search: perguntar). */
+export type ApprovalMode = 'always' | 'smart' | 'lists'
+/** Listas globais (settings `approvalLists`): padrões de comando/processo ou domínios/prefixos de URL. */
+export interface ApprovalList {
+  allow: string[]
+  deny: string[]
+}
+export type ApprovalListItem = 'commands' | 'processes' | 'pages'
+export interface ApprovalSettings {
+  /** Modo global por item (settings `approvalModes`). */
+  modes: Record<ApprovalItem, ApprovalMode>
+  /** Listas globais (settings `approvalLists`) — nunca por chat. */
+  lists: Record<ApprovalListItem, ApprovalList>
+}
 
 /** Nomes antigos de tools → atuais (alias de leitura: configs/históricos antigos, modelos). */
 export const TOOL_ALIASES: Record<string, ToolName> = { bash: 'shell' }
@@ -121,8 +142,16 @@ export interface ChatConfig {
   compactPrompt: string | null
   /** Limite de caracteres do resultado de cada tool enviado ao modelo (padrão 30000). */
   maxToolOutputChars: number
-  /** Tools de CONFIRM_TOOLS que o usuário marcou "permitir sempre neste chat". */
-  autoApprove: ToolName[]
+  /**
+   * Ajuste por chat do modo de aprovação de cada item (ausente = padrão global, settings
+   * `approvalModes`). Ver approvalPolicy.ts.
+   */
+  approvalModes?: Partial<Record<ApprovalItem, ApprovalMode>>
+  /**
+   * @deprecated (≤ 0.3.0) tools "permitir sempre neste chat". Só alias de leitura: convertido em
+   * `approvalModes` (always) por migrateApprovalConfig e removido.
+   */
+  autoApprove?: ToolName[]
   /** Assinatura de app (headers HTTP-Referer/X-Title) — id de APP_SIGNATURES (padrão 'clearchat'; 'none' = nada). */
   appSignature: string
   /** Usada quando appSignature === 'custom'. */
@@ -157,7 +186,11 @@ export interface SmartApproveConfig {
   contextMessages: number
   /** Tempo máximo da chamada ao juiz, em segundos (padrão 30). Estourou → pergunta ao usuário. */
   timeoutS: number
-  /** Tools avaliadas pelo juiz (padrão CONFIRM_TOOLS). Outras incluídas aqui passam a pedir confirmação. */
+  /**
+   * Tools EXTRAS avaliadas pelo juiz (SMART_APPROVE_EXTRA_TOOLS: write_file, edit_file,
+   * send_to_chat, delegate_task; padrão nenhuma). As de CONFIRM_TOOLS usam o juiz quando o modo do
+   * item é `smart` (approvalModes). Nomes de CONFIRM_TOOLS aqui são ignorados (legado).
+   */
   tools?: ToolName[]
 }
 
@@ -175,7 +208,7 @@ export interface SmartApproveRecord {
   usage?: Usage
   durationMs: number
   /** Request exata enviada ao juiz (key mascarada) — para o (i). */
-  request?: { url: string; headers: Record<string, string>; body: unknown }
+  request?: { url: string; headers: Record<string, string>; body: unknown; notes?: string[] }
   /** Texto bruto da resposta do juiz (cortado). */
   response?: string
   /** O usuário clicou "Executar mesmo assim" depois de uma rejeição. */
@@ -217,6 +250,8 @@ export type SessionStatus =
   | 'waiting'
   /** Sessão principal esperando o usuário responder um questionário (tool ask_user). */
   | 'awaiting_input'
+  /** Chamada ao modelo falhou por erro de REDE: card "Tentar de novo / Cancelar" aberto (isBusy). */
+  | 'awaiting_retry'
 
 export interface Session {
   id: string
@@ -368,6 +403,8 @@ export interface MessageMeta {
   smartApprove?: SmartApproveRecord
   /** Executada por liberação explícita do usuário ("Executar mesmo assim") após uma rejeição. */
   smartOverride?: boolean
+  /** Gate de aprovação (modo lists/always): o que liberou ou bloqueou a chamada. */
+  approval?: ApprovalRecord
   // ---- questionário (mensagem tool de ask_user) ----
   /** Perguntas (com imagens já resolvidas no store) + respostas estruturadas, para o card. */
   askUser?: AskUserRecord
@@ -393,6 +430,41 @@ export interface QueuedMessage {
   meta?: MessageMeta
 }
 
+/** Um sub-comando (ou a URL) avaliado contra as listas, como o card mostra. */
+export interface ApprovalCheckItem {
+  /** Sub-comando normalizado (tokens) ou URL normalizada. */
+  text: string
+  /** allow = liberado pela whitelist; ask = precisa da sua decisão. */
+  verdict: 'allow' | 'ask'
+  /** Entrada da whitelist que casou (verdict allow). */
+  entry?: string
+  /** Por que nunca é liberado automaticamente (eval, redirecionamento para arquivo…). */
+  reason?: string
+  /** Contexto (ex.: "dentro de $(…)", "via bash -c", "prefixo env"). */
+  note?: string
+  /** Pré-preenchimento do "+ whitelist/blacklist" (prefixo `programa sub *` ou o domínio). */
+  suggestion: string
+}
+
+export interface ApprovalCheck {
+  item: ApprovalItem
+  items: ApprovalCheckItem[]
+}
+
+/** meta.approval da mensagem tool. */
+export interface ApprovalRecord {
+  item: ApprovalItem
+  mode: ApprovalMode
+  /** Sub-comandos/URL liberados pela whitelist. */
+  allowed?: { text: string; entry: string }[]
+  /** Bloqueado pela blacklist (nada rodou). */
+  blocked?: { text: string; entry: string }
+  /** Sub-comandos que você aprovou no card. */
+  userAllowed?: string[]
+  /** Sub-comando que você negou. */
+  denied?: string
+}
+
 export interface ApprovalRequest {
   id: string
   chatId: string
@@ -403,6 +475,10 @@ export interface ApprovalRequest {
   createdAt: number
   /** O Smart-Approve avaliou e pediu sua decisão (ou falhou) — o card mostra o motivo. */
   smartApprove?: SmartApproveRecord
+  /** Modo lists: sub-comandos (ou a URL) com o veredito de cada um — card com 4 botões por item. */
+  check?: ApprovalCheck
+  /** Modo smart sem juiz configurado/ligado → perguntou (o card avisa). */
+  smartMissing?: boolean
 }
 
 // ---- Questionário (tool ask_user) — ver SPEC.md → "Questionário (ask_user)" ----
@@ -446,6 +522,22 @@ export interface QuestionRequest {
   questions: AskUserQuestion[]
   /** Imagens/ícones que não puderam ser carregados (também vão no resultado ao modelo). */
   notes?: string[]
+  createdAt: number
+}
+
+/**
+ * Chamada ao modelo que falhou por erro de rede (memória do main; some ao decidir). Ver SPEC.md →
+ * "Falha de conexão (nova tentativa)".
+ */
+export interface RetryRequest {
+  id: string
+  chatId: string
+  sessionId: string
+  /** Erro curto (mensagem + causa). */
+  error: string
+  /** Modelo/provedor da chamada (para o card). */
+  model: string
+  providerName?: string
   createdAt: number
 }
 
@@ -520,6 +612,9 @@ export type AgentEvent =
   /** Questionário (ask_user) aguardando o usuário / respondido ou cancelado. */
   | { type: 'question-requested'; request: QuestionRequest }
   | { type: 'question-resolved'; id: string }
+  /** Falha de conexão com o provedor aguardando "Tentar de novo" / "Cancelar". */
+  | { type: 'retry-requested'; request: RetryRequest }
+  | { type: 'retry-resolved'; id: string }
   | { type: 'chat-updated'; chat: Chat }
   /** Compactação: agendada (próximo passo), rodando (com o texto parcial do resumo) ou null (fim). */
   | {
@@ -531,3 +626,5 @@ export type AgentEvent =
   | { type: 'error'; sessionId: string; error: string }
   /** Processos em segundo plano (process_start) do chat mudaram (início, saída, parada). */
   | { type: 'processes-updated'; chatId: string; processes: ProcessInfo[] }
+  /** Modos globais / listas de aprovação mudaram (Configurações → Aprovações ou "+ lista" no card). */
+  | { type: 'approval-settings-updated'; settings: ApprovalSettings }

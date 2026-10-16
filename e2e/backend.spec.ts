@@ -8,7 +8,8 @@
 //
 // - A key vem SOMENTE do ambiente (nunca grave em arquivo).
 // - Usa um userData isolado (CLEARCHAT_USER_DATA) e um cwd de rascunho dentro de CLEARCHAT_E2E_DIR.
-// - E2E_MODEL / E2E_CACHE_MODEL sobrescrevem os modelos escolhidos.
+// - E2E_MODEL / E2E_CACHE_MODEL / E2E_VISION_MODEL / E2E_AUDIO_MODEL / E2E_TEXT_MODEL sobrescrevem os
+//   modelos escolhidos.
 // - [filtro] (opcional): roda só os testes cujo nome contém algum dos textos (separados por vírgula).
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright'
 import {
@@ -307,7 +308,7 @@ async function main(): Promise<void> {
     )
     assert(
       ch.chat.config.cacheEnabled === true &&
-        ch.chat.config.enabledTools.length === 19 &&
+        ch.chat.config.enabledTools.length === 24 && // 19 + 4 de processo + ask_user
         ch.chat.config.enabledTools.includes('list_models') &&
         ch.chat.config.confineToRoot === true &&
         ch.chat.config.maxToolOutputChars === 30000,
@@ -507,19 +508,35 @@ async function main(): Promise<void> {
     addCost(msgs)
     assertPairing(msgs)
     const t = toolMsgs(msgs, 'shell').find((m) => m.message.tool_call_id === ap.toolCallId)
-    assert(t && t.message.content === DENIED_TEXT && t.meta.toolStatus === 'denied', 'tool negada')
+    // modo Listas (padrão): "O usuário negou: <sub-comando>"; pergunta simples: DENIED_TEXT
+    assert(
+      t &&
+        (t.message.content === DENIED_TEXT || t.message.content.startsWith('O usuário negou: ')) &&
+        t.meta.toolStatus === 'denied',
+      'tool negada'
+    )
   })
 
-  await test('approve always + fila (queue)', async () => {
+  await test('approve + whitelist + fila (queue)', async () => {
     await api(
       'agent.send',
       sid,
       'Use the shell tool to run: sleep 4; echo slept-ok. Then report the output.'
     )
     const ap = await waitApproval(sid)
-    await api('agent.approve', ap.id, 'always')
-    const chat = await api('chats.get', chatId)
-    assert(chat.config.autoApprove.includes('shell'), 'autoApprove atualizado')
+    // card do modo Listas: "Sim + whitelist" em cada sub-comando pendente (padrão sugerido)
+    assert(ap.check?.items?.length >= 1, `check ${JSON.stringify(ap.check)}`)
+    const items = ap.check.items
+      .map((it: any, index: number) => ({ it, index }))
+      .filter(({ it }: any) => it.verdict !== 'allow')
+      .map(({ it, index }: any) => ({
+        index,
+        allow: true,
+        pattern: it.reason ? undefined : it.suggestion
+      }))
+    await api('agent.approve', ap.id, 'allow', items)
+    const st = await api<any>('approvals.getSettings')
+    assert(st.lists.commands.allow.includes('sleep *'), `whitelist ${st.lists.commands.allow}`)
     await sleep(500)
     const q = await api('agent.send', sid, 'Also: what is 2+2? Answer with just the number.')
     assert(q.queued === true, 'deveria enfileirar')
@@ -604,6 +621,12 @@ async function main(): Promise<void> {
   })
 
   await test('forceSend durante stream + stop + regenerate', async () => {
+    // modelos com reasoning (ex.: glm-5.3-flash) podem pensar minutos antes do 1º token de content:
+    // esforço baixo neste teste (omitido com nota em modelos sem reasoning_effort)
+    const prevParams = ch0(await api('chats.get', chatId)).params ?? {}
+    await api('chats.update', chatId, {
+      config: { params: { ...prevParams, reasoning_effort: 'low' } }
+    })
     await clearEvents()
     await api(
       'agent.send',
@@ -612,7 +635,7 @@ async function main(): Promise<void> {
     )
     await waitFor(
       async () => (await events()).find((e) => e.type === 'draft' && e.draft?.content?.length > 40),
-      60_000,
+      150_000, // modelos com reasoning (ex.: glm-5.3-flash) pensam antes do 1º token de content
       'stream começar'
     )
     await api('agent.send', sid, 'Stop the story. Reply only "interrupted-ack".')
@@ -641,7 +664,7 @@ async function main(): Promise<void> {
     await api('agent.send', sid, 'Write a 600-word poem about the sea. Do not use tools.')
     await waitFor(
       async () => (await events()).find((e) => e.type === 'draft' && e.draft?.content?.length > 40),
-      60_000,
+      150_000, // modelos com reasoning (ex.: glm-5.3-flash) pensam antes do 1º token de content
       'stream começar'
     )
     await api('agent.stop', sid)
@@ -664,6 +687,7 @@ async function main(): Promise<void> {
         !msgs.at(-1).meta.interrupted,
       'regenerado'
     )
+    await api('chats.update', chatId, { config: { params: prevParams } })
   })
 
   await test('delegate_task (subsessão)', async () => {
@@ -806,7 +830,10 @@ async function main(): Promise<void> {
   })
 
   await test('modo texto (nativeTools=false)', async () => {
+    // E2E_TEXT_MODEL: GLM (z-ai/*) usa <tool_call> como token especial do template — vários
+    // provedores upstream o engolem e o content volta vazio; use outro modelo aqui.
     const { chat, sid: s2 } = await newChat({
+      model: process.env.E2E_TEXT_MODEL || model,
       nativeTools: false,
       toolsInPrompt: true,
       enabledTools: ['read_file']
@@ -816,20 +843,27 @@ async function main(): Promise<void> {
       !pr.body.tools && /<tool_call>/.test(pr.body.messages[0].content[0].text),
       'sem campo tools; texto no system'
     )
-    await api(
-      'agent.send',
-      s2,
-      'Call the read_file tool on input.txt, writing the call in the exact <tool_call>{"name": ..., "arguments": {...}}</tool_call> format described in your instructions. After you get the result, tell me the second line of the file.'
-    )
-    await waitIdle(chat.id, s2)
-    const msgs = await messages(s2)
+    const findTr = (ms: any[]): any =>
+      ms.find(
+        (m) =>
+          m.message.role === 'user' &&
+          m.meta.synthetic &&
+          /<tool_result name="read_file">/.test(m.message.content)
+      )
+    let msgs: any[] = []
+    // modelos baratos às vezes respondem vazio (só reasoning) no 1º turno: até 3 tentativas
+    for (let i = 0; i < 3; i++) {
+      await api(
+        'agent.send',
+        s2,
+        'Call the read_file tool on input.txt, writing the call in the exact <tool_call>{"name": ..., "arguments": {...}}</tool_call> format described in your instructions. After you get the result, tell me the second line of the file.'
+      )
+      await waitIdle(chat.id, s2)
+      msgs = await messages(s2)
+      if (findTr(msgs)) break
+    }
     addCost(msgs)
-    const tr = msgs.find(
-      (m) =>
-        m.message.role === 'user' &&
-        m.meta.synthetic &&
-        /<tool_result name="read_file">/.test(m.message.content)
-    )
+    const tr = findTr(msgs)
     assert(tr, 'tool_result sintético')
     assert(
       /second line/i.test(msgs.at(-1).message.content ?? ''),
@@ -951,7 +985,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       s5,
-      'Leia os arquivos a.txt, b.txt, c.txt e d.txt com read_file, UM POR RESPOSTA (nunca chame duas tools na mesma resposta), na ordem. Depois responda apenas "fim".'
+      'Leia os arquivos a.txt, b.txt, c.txt e d.txt com read_file, UM POR RESPOSTA (nunca chame duas tools na mesma resposta), na ordem, sem parar nem pedir confirmação entre eles (não escreva texto entre as chamadas). Só depois de ler os 4, responda apenas "fim".'
     )
     const s = await waitIdle(chat.id, s5, 180_000)
     assert(s.status === 'idle', `status ${s.status}`)

@@ -2,6 +2,7 @@
 // Funções puras — usadas pelo main (sanitizar ao salvar) e pelo renderer (snapshot/aplicar).
 import type { ChatConfig, ChatParams, Preset } from './types'
 import { migrateConfigTools } from './toolRename'
+import { migrateApprovalConfig, normalizeChatModes } from './approvalPolicy'
 
 export type PresetConfig = Partial<ChatConfig>
 
@@ -29,7 +30,7 @@ export const PRESET_FIELDS = [
   'envInPrompt',
   'cacheEnabled',
   'subagentSystemPrompt',
-  'autoApprove',
+  'approvalModes',
   'smartApprove',
   'appSignature',
   'appSignatureCustom',
@@ -61,15 +62,25 @@ function cleanParams(p: ChatParams | undefined): ChatParams {
  */
 export function sanitizePresetConfig(cfg: unknown): PresetConfig {
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return {}
-  const src = cfg as Record<string, unknown>
+  // alias de leitura: autoApprove (≤ 0.3.0) → approvalModes
+  const src = migrateApprovalConfig(migrateConfigTools(cfg as PresetConfig)) as Record<
+    string,
+    unknown
+  >
   const out: Record<string, unknown> = {}
   for (const k of PRESET_FIELDS) {
     if (src[k] === undefined) continue
-    out[k] = k === 'params' ? cleanParams(src[k] as ChatParams) : clone(src[k])
+    out[k] =
+      k === 'params'
+        ? cleanParams(src[k] as ChatParams)
+        : k === 'approvalModes'
+          ? normalizeChatModes(src[k])
+          : clone(src[k])
   }
+  if (out.approvalModes && !Object.keys(out.approvalModes as object).length)
+    delete out.approvalModes
   if (typeof src.cwd === 'string' && src.cwd.trim()) out.cwd = src.cwd
-  // alias de leitura: nomes antigos de tools ('bash' → 'shell')
-  return migrateConfigTools(out as PresetConfig)
+  return out as PresetConfig
 }
 
 /** Cópia sanitizada sem `cwd`. */
