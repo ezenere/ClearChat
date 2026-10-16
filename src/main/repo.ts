@@ -7,9 +7,16 @@ import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
 import { providerKind } from '@shared/providerKinds'
 import { migrateConfigTools } from '@shared/toolRename'
-import { migrateApprovalConfig } from '@shared/approvalPolicy'
+import {
+  APPROVAL_MODES_SETTING,
+  migrateApprovalConfig,
+  migrateLegacyApprovals,
+  migrateSmartApproveConfig
+} from '@shared/approvalPolicy'
 import type {
   ApiMessage,
+  ApprovalItem,
+  ApprovalMode,
   Chat,
   ChatConfig,
   ChatParams,
@@ -407,12 +414,17 @@ interface ChatRow {
   updated_at: number
 }
 
+/** Modos globais (só lidos quando uma config legada do Smart-Approve precisa ser migrada). */
+const legacyGlobalModes = (): Partial<Record<ApprovalItem, ApprovalMode>> | null =>
+  settingsRepo.get<Partial<Record<ApprovalItem, ApprovalMode>>>(APPROVAL_MODES_SETTING) ?? null
+
 const toChat = (r: ChatRow): Chat => {
   const fallback = DEFAULT_CHAT_CONFIG(homedir())
-  // alias de leitura: nomes antigos de tools ('bash' → 'shell')
-  // e autoApprove (≤ 0.3.0) → approvalModes
-  const cfg = migrateApprovalConfig(
-    migrateConfigTools(parse<Partial<ChatConfig>>(r.config_json, {}))
+  // alias de leitura: nomes antigos de tools ('bash' → 'shell'), autoApprove (≤ 0.3.0) e
+  // smartApprove.enabled/tools (≤ 0.4.0) → approvalModes
+  const cfg = migrateLegacyApprovals(
+    migrateConfigTools(parse<Partial<ChatConfig>>(r.config_json, {})),
+    { globalModes: legacyGlobalModes }
   )
   return {
     id: r.id,
@@ -466,12 +478,13 @@ export const chatsRepo = {
       baseUrl: provider?.baseUrl,
       kind: provider?.kind
     })
-    const definedCfg = migrateApprovalConfig(
+    const definedCfg = migrateLegacyApprovals(
       migrateConfigTools(
         Object.fromEntries(
           Object.entries(inCfg).filter(([, v]) => v !== undefined)
         ) as Partial<ChatConfig>
-      )
+      ),
+      { globalModes: legacyGlobalModes }
     )
     const config: ChatConfig = {
       ...base,
@@ -518,11 +531,16 @@ export const chatsRepo = {
         definedCfg.approvalModes = { ...cur.config.approvalModes, ...definedCfg.approvalModes }
       if ('autoApprove' in raw && definedCfg.smartApprove && !raw.smartApprove)
         delete definedCfg.smartApprove
-      config = {
-        ...cur.config,
-        ...definedCfg,
-        params: mergeParams(cur.config.params, patch.config.params)
-      }
+      // smartApprove legado (enabled/tools, ≤ 0.4.0) no patch → modos por item, sobre a config
+      // mesclada (os overrides existentes do chat entram no mapeamento)
+      config = migrateSmartApproveConfig(
+        {
+          ...cur.config,
+          ...definedCfg,
+          params: mergeParams(cur.config.params, patch.config.params)
+        },
+        { globalModes: legacyGlobalModes }
+      )
     }
     const title = patch?.title !== undefined ? patch.title : cur.title
     const now = Date.now()

@@ -19,9 +19,10 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
   leitura de imagens e PDFs, busca em outros chats.
 - **Subagentes**: em paralelo, com modelo próprio, em segundo plano — acordam o agente ao terminar.
   Mensagens entre chats.
-- **Aprovações sob controle**: por item (comandos, processos, páginas, busca), escolha **Sempre permitir**,
-  **Smart-Approve** (um modelo juiz decide) ou **Whitelist/Blacklist** — cada sub-comando de `a && b | c`
-  é avaliado separadamente, com um parser conservador ("na dúvida, pergunta").
+- **Aprovações sob controle**: por item (comandos, processos, páginas, busca, escrever/editar arquivo,
+  enviar para chat, delegar), escolha **Sempre permitir**, **Smart-Approve** (um modelo juiz decide) ou
+  **Whitelist/Blacklist** / **Perguntar** — cada sub-comando de `a && b | c` é avaliado separadamente, com um
+  parser conservador ("na dúvida, pergunta").
 - **Transparência total**: "Ver request" mostra o body exato enviado; cada mensagem e tool tem um (i) com o
   conteúdo real; custo, tokens e cache por resposta.
 - **Anexos**: imagens, PDF, áudio e arquivos de texto, conforme o que o modelo aceita.
@@ -176,10 +177,15 @@ npm run install:local -- --uninstall
 
 ## Aprovações
 
-- Cada item tem um modo: **Comandos** (`shell`), **Processos** (`process_start`), **Páginas** (`browse_url`)
-  e **Busca web** (`web_search`) — **Sempre permitir**, **Smart-Approve** (o juiz decide) ou **Listas**
-  (Busca: **Perguntar**). Padrão global em Configurações → **Aprovações** (todos em Listas); cada chat
-  (aba Tools) e persona pode ajustar. `process_stop` nunca pergunta (só para processos do próprio chat).
+- Cada item tem um modo: **Comandos** (`shell`), **Processos** (`process_start`), **Páginas** (`browse_url`),
+  **Busca web** (`web_search`), **Escrever arquivo** (`write_file`), **Editar arquivo** (`edit_file`),
+  **Enviar para chat** (`send_to_chat`) e **Delegar a subagente** (`delegate_task`) — **Sempre permitir**,
+  **Smart-Approve** (o juiz decide) ou **Listas** (nos itens sem listas: **Perguntar**). Padrão global em
+  Configurações → **Aprovações** (terminal/web em Listas/Perguntar; arquivos, chats e subagentes em Sempre
+  permitir). `process_stop` nunca pergunta (só para processos do próprio chat).
+- Cada chat (aba Tools) e persona pode ajustar: a opção igual ao padrão global tem uma **★**. Sem ajuste, o
+  chat segue o global (a opção ★ aparece marcada e acompanha se o global mudar); escolher a opção ★ volta a
+  seguir o global, escolher outra fixa o modo naquele chat.
 - **Listas** (globais): o comando é desmontado em sub-comandos (`|`, `&&`, `;`, `$(…)`, `bash -c`, `sudo`…);
   blacklist bloqueia tudo (precede), whitelist libera, o resto vira um card com **Sim / Sim + whitelist /
   Não / Não + blacklist** por sub-comando ("+ lista" sugere `git push *`, editável). `eval`, `xargs`,
@@ -188,18 +194,23 @@ npm run install:local -- --uninstall
 
 ## Smart-Approve
 
-- Aba Tools → **Smart-Approve**: um modelo "juiz" (qualquer provedor) avalia cada chamada que pediria
-  dos itens em modo Smart-Approve (opcionalmente também `write_file`/`edit_file`/`send_to_chat`/
-  `delegate_task`) e **aprova** (roda), **rejeita** (o agente recebe `Rejeitado pelo Smart-Approve (<modelo>):
+- Aba Tools → **Smart-Approve**: um modelo "juiz" (qualquer provedor) avalia cada chamada dos itens em modo
+  Smart-Approve e **aprova** (roda), **rejeita** (o agente recebe `Rejeitado pelo Smart-Approve (<modelo>):
   <motivo>`) ou **pergunta a você** (card de aprovação com o motivo). Erro, demora (tempo máximo) ou resposta
-  ambígua → pergunta a você; nunca libera por falha. Sem juiz configurado, o modo Smart-Approve pergunta.
+  ambígua → pergunta a você; nunca libera por falha. Não há liga/desliga: o juiz age exatamente nos itens em
+  modo Smart-Approve. Sem modelo escolhido, a opção Smart-Approve fica desabilitada; se o modelo for removido
+  com itens nesse modo, eles perguntam a você (com aviso).
 - A chamada ao juiz é separada (fora do histórico; `temperature: 0`, `max_tokens: 300`), com prompt + template
   editáveis (placeholders `{{tool}}`, `{{args}}`, `{{cwd}}`, `{{last_user_message}}`, `{{recent_context}}`…),
   rótulos configuráveis e "Testar". O (i) mostra a request exata; o custo aparece no rodapé ("juiz $…").
 - **Executar mesmo assim** (numa rejeição): manda "Pode executar … ; eu aprovo." e libera **uma vez** a
   próxima chamada idêntica (mesma tool + mesmos argumentos, 15 min) sem juiz nem confirmação.
-- O selo do header mostra os modos efetivos do chat (revogar "Sempre", ligar/desligar o Smart-Approve,
-  atalho para Configurações → Aprovações). Vale também para personas (campo `smartApprove`).
+- O selo do header aparece quando algo roda sem perguntar (Sempre permitir em terminal/web, ou itens em
+  Smart-Approve com modelo) e mostra os modos efetivos do chat (revogar "Sempre", atalho para Configurações →
+  Aprovações). Vale também para personas (campo `smartApprove`).
+- Configs de versões anteriores são migradas: Smart-Approve desligado com modelo → os itens que estavam em
+  Smart-Approve passam para Listas/Perguntar (como já se comportavam); ligado → os "extras" marcados viram os
+  novos itens em Smart-Approve.
 
 ## Anexos
 

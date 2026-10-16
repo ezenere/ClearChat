@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   ArrowLeft,
   Bot,
   ChevronRight,
@@ -14,8 +15,16 @@ import {
 import { useRef, useState } from 'react'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import type { ApprovalItem, ApprovalMode, Chat, ChatConfig, Session } from '@shared/types'
+import { CONFIRM_TOOLS } from '@shared/types'
 import { normalizeSmartApprove, smartApproveActive } from '@shared/smartApprove'
-import { APPROVAL_ITEMS, effectiveMode, ITEM_LABEL, modeLabel } from '@shared/approvalPolicy'
+import {
+  APPROVAL_ITEM_GROUPS,
+  APPROVAL_ITEMS,
+  effectiveMode,
+  ITEM_LABEL,
+  ITEM_TOOL,
+  modeLabel
+} from '@shared/approvalPolicy'
 import { sessionProviderId } from '@shared/models'
 import { providerKind } from '@shared/providerKinds'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
@@ -23,7 +32,7 @@ import { isBusy, useStore } from '../../store'
 import { api } from '../../lib/api'
 import { TaskInfo } from '../apiDocs'
 import { TopBar } from '../TopBar'
-import { IconButton, Switch } from '../ui/controls'
+import { IconButton } from '../ui/controls'
 import { Popover } from '../ui/layers'
 import { ModelLabel } from '../ui/ModelLabel'
 import { Tip } from '../ui/Tooltip'
@@ -133,15 +142,24 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
   const anchor = useRef<HTMLButtonElement>(null)
   const sa = normalizeSmartApprove(chat.config.smartApprove)
   const judge = smartApproveActive(sa)
-  const modes = APPROVAL_ITEMS.map((i) => ({
-    item: i,
-    mode: effectiveMode(chat.config, global, i),
-    own: !!chat.config.approvalModes?.[i]
-  }))
-  const always = modes.filter((m) => m.mode === 'always')
+  // "Sempre permitir" chama atenção quando foge do "perguntar": nos itens de terminal/web (padrão
+  // perguntar) ou num item cujo global pergunta. Arquivos/chats/subagentes no padrão "Sempre" (como
+  // sempre rodaram) não contam.
+  const modes = APPROVAL_ITEMS.map((i) => {
+    const mode = effectiveMode(chat.config, global, i)
+    return {
+      item: i,
+      mode,
+      own: !!chat.config.approvalModes?.[i],
+      risky:
+        mode === 'always' &&
+        (CONFIRM_TOOLS.includes(ITEM_TOOL[i]) || effectiveMode(null, global, i) !== 'always')
+    }
+  })
+  const always = modes.filter((m) => m.risky)
   const smart = modes.filter((m) => m.mode === 'smart')
-  // aparece quando algo foge do "pergunta/listas": sempre permitir ou Smart-Approve
-  if (!always.length && !smart.length && !open) return null
+  // aparece quando algo roda sem você: sempre permitir (itens acima) ou Smart-Approve com modelo
+  if (!always.length && !(smart.length && judge) && !open) return null
   // salva na hora (sem o debounce da config)
   const save = (p: Partial<ChatConfig>): void => {
     patchConfig(chat.id, p)
@@ -153,8 +171,9 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
     else delete next[item]
     save({ approvalModes: next })
   }
+  const smartOn = smart.length > 0 && judge
   const label = always.length
-    ? `Sempre: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}${smart.length ? ' · Smart' : ''}`
+    ? `Sempre: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}${smartOn ? ' · Smart' : ''}`
     : 'Smart-Approve'
   return (
     <>
@@ -165,8 +184,8 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
             {always.length
               ? `Rodam sem pedir confirmação: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}`
               : 'Smart-Approve decide as confirmações'}
-            {always.length > 0 && smart.length > 0 ? ' · Smart-Approve em outros itens' : ''} ·
-            clique para ver os modos
+            {always.length > 0 && smartOn ? ' · Smart-Approve em outros itens' : ''} · clique para
+            ver os modos
           </span>
         }
       >
@@ -196,7 +215,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
         open={open}
         onClose={() => setOpen(false)}
         anchor={anchor}
-        width={330}
+        width={350}
         align="end"
         maxHeight={460}
       >
@@ -204,13 +223,18 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
             Aprovações deste chat
           </div>
-          {modes.map(({ item, mode, own }) => (
+          {modes.map(({ item, mode, own, risky }, idx) => (
             <div
               key={item}
               data-testid="auto-approve-item"
-              className="flex h-8 items-center gap-2 px-3 hover:bg-hover/60"
+              className={cn(
+                'flex h-8 items-center gap-2 px-3 hover:bg-hover/60',
+                idx > 0 &&
+                  APPROVAL_ITEM_GROUPS.some((g) => g.items[0] === item) &&
+                  'mt-1 border-t border-border/50'
+              )}
             >
-              {mode === 'always' ? (
+              {risky ? (
                 <ShieldOff className="size-3.5 shrink-0 text-warning/80" />
               ) : (
                 <ShieldCheck
@@ -223,21 +247,18 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
               <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">
                 {ITEM_LABEL[item]}
               </span>
-              <span
-                className={cn(
-                  'text-[11.5px]',
-                  mode === 'always' ? 'text-warning/90' : 'text-subtle'
-                )}
-              >
+              <span className={cn('text-[11.5px]', risky ? 'text-warning/90' : 'text-subtle')}>
                 {modeLabel(item, mode)}
                 {!own && <span className="text-faint"> · global</span>}
-                {mode === 'smart' && !judge && <span className="text-warning/90"> (sem juiz)</span>}
+                {mode === 'smart' && !judge && (
+                  <span className="text-warning/90"> (sem modelo)</span>
+                )}
               </span>
-              {mode === 'always' && (
+              {risky && (
                 <button
                   type="button"
                   onClick={() =>
-                    // volta ao global; se o global também for "sempre", força Listas neste chat
+                    // volta ao global; se o global também for "sempre", força Listas/Perguntar
                     setMode(item, own && global[item] !== 'always' ? null : 'lists')
                   }
                   aria-label={`Revogar ${ITEM_LABEL[item]}`}
@@ -269,18 +290,14 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
                     </>
                   )}
                 </span>
-                <Switch
-                  size="sm"
-                  checked={judge}
-                  disabled={!sa.model}
-                  label="Smart-Approve"
-                  onChange={(enabled) => save({ smartApprove: { ...sa, enabled } })}
-                />
+                {!judge && (
+                  <AlertTriangle aria-hidden className="size-3.5 shrink-0 text-warning/90" />
+                )}
               </div>
               <p className="mt-1 pl-5.5 text-[11.5px] leading-snug text-subtle">
                 {judge
                   ? `Decide: ${smart.map((m) => ITEM_LABEL[m.item]).join(', ')}.`
-                  : 'Configure o modelo do Smart-Approve: sem juiz ligado, esses itens pedem sua confirmação.'}
+                  : 'Configure o modelo do Smart-Approve (aba Tools): sem modelo, esses itens pedem sua confirmação.'}
               </p>
             </div>
           )}

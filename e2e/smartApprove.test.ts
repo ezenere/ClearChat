@@ -113,15 +113,13 @@ test('validateLabels / normalizeSmartApprove', () => {
   assert.match(validateLabels({ approve: 'a\nb', reject: 'B', ask: 'C' })!, /quebra/)
   const d = normalizeSmartApprove(undefined)
   assert.deepEqual(d, {
-    enabled: false,
     providerId: null,
     model: null,
     prompt: null,
     template: null,
     labels: { approve: 'APPROVED', reject: 'REJECTED', ask: 'ASK-USER' },
     contextMessages: 6,
-    timeoutS: 30,
-    tools: []
+    timeoutS: 30
   })
   const n = normalizeSmartApprove({
     enabled: true,
@@ -136,11 +134,14 @@ test('validateLabels / normalizeSmartApprove', () => {
   assert.deepEqual(n.labels, { approve: 'SIM', reject: 'NAO', ask: 'TALVEZ' })
   assert.equal(n.contextMessages, 50)
   assert.equal(n.timeoutS, 3)
-  // só os extras (as de CONFIRM_TOOLS vão pelo modo do item)
-  assert.deepEqual(n.tools, ['write_file'])
+  // chaves legadas (≤ 0.4.0: enabled, tools) não entram — viraram modos por item
+  assert.equal('enabled' in n, false)
+  assert.equal('tools' in n, false)
+  // sem liga/desliga: pronto = provedor + modelo
   assert.equal(smartApproveActive(n), true)
   assert.equal(smartApproveActive({ ...n, model: null }), false)
-  assert.equal(smartApproveActive({ ...n, enabled: false }), false)
+  assert.equal(smartApproveActive({ ...n, providerId: null }), false)
+  assert.equal(smartApproveActive({ ...n, enabled: false } as any), true)
 })
 
 // ---------------- template ----------------
@@ -165,7 +166,6 @@ test('template: placeholders, desconhecidos intactos, sem reexpansão', () => {
 
 test('mensagens do juiz: system + user renderizados com contexto compacto', () => {
   const sa = normalizeSmartApprove({
-    enabled: true,
     providerId: 'p',
     model: 'j',
     contextMessages: 3
@@ -256,18 +256,20 @@ test('body do juiz: temperatura 0, poucos tokens, sem tools; usage só no OpenRo
 
 // ---------------- ordem de decisão ----------------
 
-test('rota: modo do item (always/smart/lists) e extras do juiz', () => {
-  const sa = { enabled: true, providerId: 'p', model: 'j' }
+test('rota: modo do item (always/smart/lists); o juiz só nos itens em smart', () => {
+  const sa = { providerId: 'p', model: 'j' }
   const r = (cfg: any, t: any, g: any = null): string => {
     const x = approvalRoute(cfg, g, t)
     return x.kind === 'user' && x.smartMissing ? 'user-nojudge' : x.kind
   }
-  // padrão global: lists (search = perguntar)
+  // padrão global: lists (search = perguntar); arquivos/chats/subagentes = sempre permitir
   assert.equal(r({}, 'shell'), 'lists')
   assert.equal(r({}, 'process_start'), 'lists')
   assert.equal(r({}, 'browse_url'), 'lists')
   assert.equal(r({}, 'web_search'), 'user')
   assert.equal(r({}, 'read_file'), 'run')
+  for (const t of ['write_file', 'edit_file', 'send_to_chat', 'delegate_task'])
+    assert.equal(r({ smartApprove: sa }, t), 'run', t)
   // process_stop nunca pede confirmação
   assert.equal(r({ smartApprove: { ...sa, tools: ['process_stop'] } }, 'process_stop'), 'run')
   // global e override por chat
@@ -277,24 +279,25 @@ test('rota: modo do item (always/smart/lists) e extras do juiz', () => {
     'lists'
   )
   assert.equal(r({ approvalModes: { commands: 'always' } }, 'shell'), 'run')
-  // smart: juiz ativo → judge; sem juiz/desligado/sem modelo → pergunta (fail-closed)
+  // smart: com modelo → judge; sem config/sem modelo → pergunta (fail-closed)
   assert.equal(r({ approvalModes: { commands: 'smart' }, smartApprove: sa }, 'shell'), 'judge')
   assert.equal(r({ approvalModes: { commands: 'smart' } }, 'shell'), 'user-nojudge')
-  assert.equal(
-    r({ approvalModes: { commands: 'smart' }, smartApprove: { ...sa, enabled: false } }, 'shell'),
-    'user-nojudge'
-  )
   assert.equal(
     r({ approvalModes: { search: 'smart' }, smartApprove: { ...sa, model: null } }, 'web_search'),
     'user-nojudge'
   )
-  // juiz ligado NÃO afeta itens fora do modo smart
+  // modelo escolhido NÃO afeta itens fora do modo smart
   assert.equal(r({ smartApprove: sa }, 'shell'), 'lists')
-  // extras: só com o juiz ativo e marcadas
-  const only = { ...sa, tools: ['write_file'] }
-  assert.equal(r({ smartApprove: only }, 'write_file'), 'judge')
-  assert.equal(r({ smartApprove: { ...only, enabled: false } }, 'write_file'), 'run')
-  assert.equal(r({ smartApprove: only }, 'edit_file'), 'run')
+  // itens de arquivo/agentes: smart → juiz; Perguntar → usuário
+  assert.equal(
+    r({ approvalModes: { writeFile: 'smart' }, smartApprove: sa }, 'write_file'),
+    'judge'
+  )
+  assert.equal(r({ approvalModes: { writeFile: 'smart' } }, 'write_file'), 'user-nojudge')
+  assert.equal(r({ approvalModes: { editFile: 'lists' } }, 'edit_file'), 'user')
+  assert.equal(r({ smartApprove: sa }, 'delegate_task', { delegate: 'smart' }), 'judge')
+  // `tools` legado não manda nada ao juiz (a migração converte em modo smart)
+  assert.equal(r({ smartApprove: { ...sa, tools: ['write_file'] } }, 'write_file'), 'run')
   // modo inválido salvo → padrão
   assert.equal(r({ approvalModes: { commands: 'xx' } }, 'shell', { commands: 'yy' }), 'lists')
 })
@@ -338,10 +341,7 @@ test('liberação de uma vez só: mesma tool + mesmos args (ordem das chaves nã
 
 test('personas: smartApprove está em PRESET_FIELDS e sobrevive a snapshot/aplicar', () => {
   assert.ok((PRESET_FIELDS as readonly string[]).includes('smartApprove'))
-  const sa: SmartApproveConfig = {
-    ...normalizeSmartApprove({ enabled: true, providerId: 'p', model: 'j' }),
-    tools: ['write_file']
-  }
+  const sa: SmartApproveConfig = normalizeSmartApprove({ providerId: 'p', model: 'j' })
   const base = DEFAULT_CHAT_CONFIG('/w', { providerId: 'p', model: 'm' })
   const snap = snapshotPreset({ ...base, smartApprove: sa })
   assert.deepEqual(snap.smartApprove, sa)
@@ -416,7 +416,7 @@ const judge = (
 ): Promise<SmartApproveRecord> =>
   runJudge({
     sa: {
-      ...normalizeSmartApprove({ enabled: true, providerId: 'pj', model: 'judge/1' }),
+      ...normalizeSmartApprove({ providerId: 'pj', model: 'judge/1' }),
       ...over
     },
     provider: p,

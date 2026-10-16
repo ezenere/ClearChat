@@ -2,15 +2,16 @@
 // Funções puras — main (runner) e renderer (Configurações → Aprovações, "Testar", card).
 // Ver SPEC.md → "Aprovações".
 //
-// Itens: commands (shell) · processes (process_start) · pages (browse_url) · search (web_search).
+// Itens: commands (shell) · processes (process_start) · pages (browse_url) · search (web_search) ·
+// writeFile (write_file) · editFile (edit_file) · sendToChat (send_to_chat) · delegate (delegate_task).
 // Modo efetivo = override do chat (ChatConfig.approvalModes[item]) ?? global (settings
 // `approvalModes`) ?? DEFAULT_APPROVAL_MODES.
 //   always → roda sem perguntar (blacklist NÃO vale).
-//   smart  → o juiz do Smart-Approve decide (config do chat). Sem juiz configurado/ligado →
-//            pergunta (fail-closed).
+//   smart  → o juiz do Smart-Approve decide (config do chat). Sem modelo escolhido → pergunta
+//            (fail-closed).
 //   lists  → commands/processes/pages: cada sub-comando (ou a URL) contra blacklist (bloqueia tudo,
 //            precede) e whitelist; o que sobrar → card com uma decisão por item.
-//            search: sem listas — pergunta sim/não.
+//            demais itens (search, arquivos, chats, subagentes): sem listas — pergunta sim/não.
 import { analyzeShell, shellQuote, type ShellCommand } from './shellParse'
 import {
   CONFIRM_TOOLS,
@@ -26,7 +27,21 @@ import {
   type ToolName
 } from './types'
 
-export const APPROVAL_ITEMS: ApprovalItem[] = ['commands', 'processes', 'pages', 'search']
+export const APPROVAL_ITEMS: ApprovalItem[] = [
+  'commands',
+  'processes',
+  'pages',
+  'search',
+  'writeFile',
+  'editFile',
+  'sendToChat',
+  'delegate'
+]
+/** Grupos da UI (Configurações → Aprovações e aba Tools). */
+export const APPROVAL_ITEM_GROUPS: { title: string; items: ApprovalItem[] }[] = [
+  { title: 'Terminal e web', items: ['commands', 'processes', 'pages', 'search'] },
+  { title: 'Arquivos e agentes', items: ['writeFile', 'editFile', 'sendToChat', 'delegate'] }
+]
 export const APPROVAL_LIST_ITEMS: ApprovalListItem[] = ['commands', 'processes', 'pages']
 export const APPROVAL_MODES: ApprovalMode[] = ['always', 'smart', 'lists']
 
@@ -37,21 +52,41 @@ export const ITEM_TOOL: Record<ApprovalItem, ToolName> = {
   commands: 'shell',
   processes: 'process_start',
   pages: 'browse_url',
-  search: 'web_search'
+  search: 'web_search',
+  writeFile: 'write_file',
+  editFile: 'edit_file',
+  sendToChat: 'send_to_chat',
+  delegate: 'delegate_task'
 }
 
 export const TOOL_ITEM: Partial<Record<ToolName, ApprovalItem>> = {
   shell: 'commands',
   process_start: 'processes',
   browse_url: 'pages',
-  web_search: 'search'
+  web_search: 'search',
+  write_file: 'writeFile',
+  edit_file: 'editFile',
+  send_to_chat: 'sendToChat',
+  delegate_task: 'delegate'
 }
+
+/** Tools que passam pelo gate de aprovação (uma por item). */
+export const APPROVAL_TOOLS: ToolName[] = APPROVAL_ITEMS.map((i) => ITEM_TOOL[i])
 
 export const ITEM_LABEL: Record<ApprovalItem, string> = {
   commands: 'Comandos',
   processes: 'Processos',
   pages: 'Páginas',
-  search: 'Busca web'
+  search: 'Busca web',
+  writeFile: 'Escrever arquivo',
+  editFile: 'Editar arquivo',
+  sendToChat: 'Enviar para chat',
+  delegate: 'Delegar a subagente'
+}
+
+/** Item com whitelist/blacklist (commands, processes, pages). Nos demais, `lists` = "Perguntar". */
+export function isListItem(item: ApprovalItem | null | undefined): item is ApprovalListItem {
+  return !!item && (APPROVAL_LIST_ITEMS as string[]).includes(item)
 }
 
 /** Nome da lista no texto de bloqueio ("Bloqueado pela blacklist (comandos)…"). */
@@ -67,21 +102,36 @@ export const MODE_LABEL: Record<ApprovalMode, string> = {
   lists: 'Listas'
 }
 
-/** Rótulo do modo para um item (search não tem listas: "Perguntar"). */
+/** Rótulo do modo para um item (itens sem listas: "Perguntar"). */
 export function modeLabel(item: ApprovalItem, mode: ApprovalMode): string {
-  return item === 'search' && mode === 'lists' ? 'Perguntar' : MODE_LABEL[mode]
+  return mode === 'lists' && !isListItem(item) ? 'Perguntar' : MODE_LABEL[mode]
+}
+
+/** Explicação curta de cada opção (tooltip do seletor). */
+export function modeHint(item: ApprovalItem, mode: ApprovalMode): string {
+  if (mode === 'always')
+    return isListItem(item) ? 'Roda sem perguntar (nem a blacklist vale)' : 'Roda sem perguntar'
+  if (mode === 'smart') return 'O modelo juiz do Smart-Approve decide (sem modelo → pergunta)'
+  return isListItem(item)
+    ? 'Whitelist libera, blacklist bloqueia; o resto pergunta'
+    : 'Pergunta a você a cada chamada'
 }
 
 /**
- * Padrão global: tudo em `lists` (com listas vazias = pergunta sempre — o mesmo comportamento
- * das versões anteriores, e o usuário vai liberando com "+ whitelist"). Busca web também pergunta:
- * a consulta sai para um serviço externo (DuckDuckGo) e pode vazar dados do contexto.
+ * Padrão global: Comandos/Processos/Páginas/Busca em `lists` (com listas vazias = pergunta sempre —
+ * o comportamento das versões anteriores; o usuário vai liberando com "+ whitelist"). Busca web
+ * também pergunta: a consulta sai para um serviço externo (DuckDuckGo) e pode vazar contexto.
+ * Arquivos, chats e subagentes: `always` (rodavam sem perguntar antes de virarem itens).
  */
 export const DEFAULT_APPROVAL_MODES: Record<ApprovalItem, ApprovalMode> = {
   commands: 'lists',
   processes: 'lists',
   pages: 'lists',
-  search: 'lists'
+  search: 'lists',
+  writeFile: 'always',
+  editFile: 'always',
+  sendToChat: 'always',
+  delegate: 'always'
 }
 
 const isMode = (v: unknown): v is ApprovalMode =>
@@ -137,6 +187,24 @@ export function effectiveMode(
   if (isMode(c)) return c
   const g = global?.[item]
   return isMode(g) ? g : DEFAULT_APPROVAL_MODES[item]
+}
+
+/**
+ * Aba Tools / personas (★ = padrão global): escolher a opção igual ao modo global grava "sem
+ * override" (o chat segue o global, inclusive se ele mudar depois); outra opção grava o override.
+ * `choice` null = voltar ao global. Retorna um objeto novo.
+ */
+export function withChatMode(
+  overrides: Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined,
+  item: ApprovalItem,
+  choice: ApprovalMode | null,
+  global: Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined
+): Partial<Record<ApprovalItem, ApprovalMode>> {
+  const next = normalizeChatModes(overrides)
+  const g = isMode(global?.[item]) ? global![item]! : DEFAULT_APPROVAL_MODES[item]
+  if (!choice || choice === g) delete next[item]
+  else next[item] = choice
+  return next
 }
 
 // ---------------- padrões de comando ----------------
@@ -562,27 +630,18 @@ export function validateListEntry(item: ApprovalListItem, entry: string): string
 export type ApprovalRoute =
   | { kind: 'run' }
   | { kind: 'judge' }
-  /** pergunta simples (sim/não); smartMissing = modo smart sem juiz */
+  /** pergunta simples (sim/não); smartMissing = modo smart sem modelo do juiz */
   | { kind: 'user'; smartMissing?: boolean }
   | { kind: 'lists' }
 
-/** Ligado E com um modelo escolhido (igual a smartApproveActive). */
-const judgeActive = (sa: Partial<SmartApproveConfig> | null | undefined): boolean =>
-  !!sa?.enabled && !!sa.providerId && !!sa.model?.trim()
-
-/** Tools extras que o usuário mandou ao juiz (fora de CONFIRM_TOOLS). */
-export function smartExtraTools(sa: Partial<SmartApproveConfig> | null | undefined): ToolName[] {
-  return Array.isArray(sa?.tools)
-    ? sa.tools.filter((t) => (SMART_EXTRA_ALLOWED as string[]).includes(t))
-    : []
-}
-
-/** Únicas tools fora de CONFIRM_TOOLS que podem ir ao juiz (= SMART_APPROVE_EXTRA_TOOLS). */
-const SMART_EXTRA_ALLOWED: ToolName[] = ['write_file', 'edit_file', 'send_to_chat', 'delegate_task']
+/** Juiz configurado = provedor + modelo escolhidos (igual a smartApproveActive). */
+export const judgeConfigured = (sa: Partial<SmartApproveConfig> | null | undefined): boolean =>
+  !!sa?.providerId && !!sa.model?.trim()
 
 /**
- * Rota de uma chamada. CONFIRM_TOOLS → pelo modo do item; extras do Smart-Approve → juiz (se
- * ativo e marcadas) → usuário; demais → roda.
+ * Rota de uma chamada pelo modo efetivo do item: always → roda; smart → juiz (sem modelo →
+ * usuário, fail-closed); lists → listas (commands/processes/pages) ou pergunta simples. Tools que
+ * não são itens (leitura, process_stop, ask_user…) → roda.
  */
 export function approvalRoute(
   cfg: Pick<ChatConfig, 'approvalModes'> & { smartApprove?: Partial<SmartApproveConfig> },
@@ -590,16 +649,23 @@ export function approvalRoute(
   tool: ToolName
 ): ApprovalRoute {
   const item = TOOL_ITEM[tool]
-  if (!item) {
-    return judgeActive(cfg.smartApprove) && smartExtraTools(cfg.smartApprove).includes(tool)
-      ? { kind: 'judge' }
-      : { kind: 'run' }
-  }
+  if (!item) return { kind: 'run' }
   const mode = effectiveMode(cfg, globalModes, item)
   if (mode === 'always') return { kind: 'run' }
   if (mode === 'smart')
-    return judgeActive(cfg.smartApprove) ? { kind: 'judge' } : { kind: 'user', smartMissing: true }
-  return item === 'search' ? { kind: 'user' } : { kind: 'lists' }
+    return judgeConfigured(cfg.smartApprove)
+      ? { kind: 'judge' }
+      : { kind: 'user', smartMissing: true }
+  return isListItem(item) ? { kind: 'lists' } : { kind: 'user' }
+}
+
+/** Itens em modo smart que, por falta de modelo, estão perguntando (aviso na UI). */
+export function smartItemsWithoutJudge(
+  cfg: Pick<ChatConfig, 'approvalModes'> & { smartApprove?: Partial<SmartApproveConfig> },
+  globalModes: Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined
+): ApprovalItem[] {
+  if (judgeConfigured(cfg.smartApprove)) return []
+  return APPROVAL_ITEMS.filter((i) => effectiveMode(cfg, globalModes, i) === 'smart')
 }
 
 // ---------------- decisões do card ----------------
@@ -612,7 +678,7 @@ export interface ApprovalItemDecision {
   pattern?: string
 }
 
-// ---------------- migração (≤ 0.3.0 → modos) ----------------
+// ---------------- migração (≤ 0.3.0 → modos; ≤ 0.4.0 → Smart-Approve por item) ----------------
 
 /**
  * Config antiga (chat/persona, parcial) → modos por item. Legado = tem a chave `autoApprove`:
@@ -636,6 +702,7 @@ export function migrateApprovalConfig<T extends Partial<ChatConfig>>(
   const legacySmart =
     !!sa0 &&
     typeof sa0 === 'object' &&
+    'enabled' in sa0 &&
     (!Array.isArray(sa0.tools) ||
       sa0.tools.some((t) => CONFIRM_TOOLS.includes(t) || t === 'process_stop'))
   if (!('autoApprove' in cfg) && !(opts.assumeLegacy && legacySmart)) return cfg
@@ -660,4 +727,61 @@ export function migrateApprovalConfig<T extends Partial<ChatConfig>>(
     out.smartApprove = { ...sa, tools: extras }
   }
   return out
+}
+
+/** Tools que eram "extras" do Smart-Approve (≤ 0.4.0) e hoje são itens. */
+const LEGACY_SMART_EXTRAS: ToolName[] = ['write_file', 'edit_file', 'send_to_chat', 'delegate_task']
+
+type ModesLike = Partial<Record<ApprovalItem, ApprovalMode>> | null | undefined
+
+/**
+ * Smart-Approve ≤ 0.4.0 (`smartApprove.enabled` + `smartApprove.tools` extras) → modos por item.
+ * Hoje o juiz age exatamente nos itens em modo `smart`, desde que haja modelo. Mapeamento
+ * (preserva o comportamento):
+ * - `enabled` true COM modelo (juiz ativo): itens em smart continuam smart; cada extra marcado
+ *   (write_file, edit_file, send_to_chat, delegate_task) vira override `smart` no item (antes: juiz
+ *   → usuário — igual). Extras não marcados seguem o padrão "Sempre permitir" (antes rodavam direto).
+ * - juiz INATIVO (`enabled` false, ou sem modelo) e COM modelo: os itens cujo modo efetivo era
+ *   `smart` (do chat ou do global — `globalModes`) perguntavam ao usuário → override `lists`
+ *   (Listas/Perguntar: com listas vazias = pergunta; whitelist/blacklist passam a valer). Extras
+ *   não rodavam pelo juiz (rodavam direto) → nada (padrão "Sempre permitir").
+ * - juiz inativo SEM modelo: nada muda (smart sem modelo já pergunta — fail-closed, com aviso).
+ * - `enabled` e `tools` são removidos. Override já existente vence (extras). Idempotente: sem
+ *   essas chaves → retorna o MESMO objeto.
+ */
+export function migrateSmartApproveConfig<T extends Partial<ChatConfig>>(
+  cfg: T,
+  opts: { globalModes?: ModesLike | (() => ModesLike) } = {}
+): T {
+  if (!cfg || typeof cfg !== 'object') return cfg
+  const sa = cfg.smartApprove as (Partial<SmartApproveConfig> & Record<string, unknown>) | undefined
+  if (!sa || typeof sa !== 'object' || (!('enabled' in sa) && !('tools' in sa))) return cfg
+  const { enabled, tools, ...rest } = sa
+  const hasModel = judgeConfigured(sa)
+  const wasActive = enabled === true && hasModel
+  const modes = normalizeChatModes(cfg.approvalModes)
+  if (wasActive) {
+    for (const t of Array.isArray(tools) ? tools : []) {
+      const item = (LEGACY_SMART_EXTRAS as string[]).includes(t) ? TOOL_ITEM[t] : undefined
+      if (item && !modes[item]) modes[item] = 'smart'
+    }
+  } else if (hasModel) {
+    const g = typeof opts.globalModes === 'function' ? opts.globalModes() : opts.globalModes
+    for (const item of APPROVAL_ITEMS)
+      if (effectiveMode({ approvalModes: modes }, g, item) === 'smart') modes[item] = 'lists'
+  }
+  const out = { ...cfg, smartApprove: rest as unknown as SmartApproveConfig } as T
+  if (Object.keys(modes).length) out.approvalModes = modes
+  return out
+}
+
+/**
+ * Os dois passos de migração de aprovações (≤ 0.3.0 e ≤ 0.4.0) em sequência — alias de leitura
+ * (repo, personas) e migração do banco. `assumeLegacy`: ver migrateApprovalConfig.
+ */
+export function migrateLegacyApprovals<T extends Partial<ChatConfig>>(
+  cfg: T,
+  opts: { assumeLegacy?: boolean; globalModes?: ModesLike | (() => ModesLike) } = {}
+): T {
+  return migrateSmartApproveConfig(migrateApprovalConfig(cfg, opts), opts)
 }

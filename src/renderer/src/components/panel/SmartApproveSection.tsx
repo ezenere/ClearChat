@@ -1,6 +1,8 @@
-// Seção "Smart-Approve" da aba Tools (painel do chat e editor de personas): modelo juiz, liga/desliga,
-// tools avaliadas, rótulos, contexto/tempo, prompt + template editáveis e "Testar".
-import { FlaskConical, RotateCcw, X } from 'lucide-react'
+// Seção "Smart-Approve" da aba Tools (painel do chat e editor de personas): modelo juiz, itens que
+// ele decide (os em modo Smart-Approve na seção Aprovações), rótulos, contexto/tempo, prompt +
+// template editáveis e "Testar". Sem liga/desliga: o juiz age nos itens em modo Smart-Approve
+// quando há modelo; sem modelo, esses itens perguntam a você.
+import { AlertTriangle, FlaskConical, RotateCcw, X } from 'lucide-react'
 import { useState } from 'react'
 import { DEFAULT_SMART_APPROVE_PROMPT, DEFAULT_SMART_APPROVE_TEMPLATE } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
@@ -9,17 +11,14 @@ import {
   buildJudgeMessages,
   normalizeSmartApprove,
   SMART_APPROVE_DEFAULTS,
-  SMART_APPROVE_EXTRA_TOOLS,
   SMART_APPROVE_PLACEHOLDERS,
   SMART_APPROVE_SAMPLE,
-  smartApproveActive,
-  smartApproveTools,
   validateLabels
 } from '@shared/smartApprove'
 import { TOOL_LABELS } from '@shared/tools'
-import { APPROVAL_ITEMS, effectiveMode, ITEM_LABEL } from '@shared/approvalPolicy'
+import { APPROVAL_ITEMS, APPROVAL_TOOLS, effectiveMode, ITEM_LABEL } from '@shared/approvalPolicy'
 import {
-  CONFIRM_TOOLS,
+  type ApprovalItem,
   type SmartApproveConfig,
   type SmartApproveLabels,
   type SmartApproveRecord,
@@ -29,7 +28,7 @@ import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { SmartApproveLine } from '../chat/SmartApprove'
-import { AutoTextarea, Button, Switch } from '../ui/controls'
+import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { Select } from '../ui/Select'
 import { ApiInfo, C, Tip } from '../ui/Tooltip'
@@ -42,7 +41,7 @@ const LABEL_FIELDS: { key: keyof SmartApproveLabels; caption: string }[] = [
   { key: 'ask', caption: 'Perguntar' }
 ]
 
-const TEST_TOOLS: ToolName[] = [...CONFIRM_TOOLS, ...SMART_APPROVE_EXTRA_TOOLS]
+const TEST_TOOLS: ToolName[] = APPROVAL_TOOLS
 
 function SmartRequestInfo({
   cfg,
@@ -79,6 +78,10 @@ function SmartRequestInfo({
       wide
     >
       <p>
+        O juiz decide só as chamadas dos itens em modo <strong>Smart-Approve</strong> (seção
+        Aprovações). Não há liga/desliga: sem modelo escolhido, esses itens pedem sua confirmação.
+      </p>
+      <p>
         Para cada chamada avaliada, o app faz uma request{' '}
         <strong className="text-fg">separada</strong> ao modelo escolhido (fora do histórico; o
         agente não a vê): <C>{'role: "system"'}</C> = o prompt, <C>{'role: "user"'}</C> = o template
@@ -95,11 +98,11 @@ function SmartRequestInfo({
   )
 }
 
+const joinItems = (items: ApprovalItem[]): string => items.map((i) => ITEM_LABEL[i]).join(', ')
+
 export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element {
   const sa = normalizeSmartApprove(cfg.smartApprove)
   const set = (p: Partial<SmartApproveConfig>): void => patch({ smartApprove: { ...sa, ...p } })
-  const active = smartApproveActive(sa)
-  const tools = smartApproveTools(sa)
   const hasModel = !!sa.providerId && !!sa.model
 
   // rótulos: rascunho local, só grava quando válido
@@ -126,10 +129,6 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
     argsError = (e as Error).message
   }
 
-  const toggleTool = (t: ToolName, on: boolean): void => {
-    const next = on ? [...tools.filter((x) => x !== t), t] : tools.filter((x) => x !== t)
-    set({ tools: SMART_APPROVE_EXTRA_TOOLS.filter((x) => next.includes(x)) })
-  }
   const global = useStore((s) => s.approvalSettings.modes)
   const smartItems = APPROVAL_ITEMS.filter((i) => effectiveMode(cfg, global, i) === 'smart')
 
@@ -183,11 +182,11 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
           onChange={(ref) => set({ providerId: ref.providerId, model: ref.model })}
         />
         {hasModel && (
-          <Tip label="Nenhum (desliga o Smart-Approve)">
+          <Tip label="Remover modelo (itens em Smart-Approve passam a perguntar)">
             <button
               type="button"
               aria-label="Remover modelo do Smart-Approve"
-              onClick={() => set({ providerId: null, model: null, enabled: false })}
+              onClick={() => set({ providerId: null, model: null })}
               className="grid size-8 shrink-0 place-items-center rounded-lg text-subtle hover:bg-hover hover:text-fg"
             >
               <X className="size-3.5" />
@@ -196,79 +195,28 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
         )}
       </div>
 
-      <div className="flex items-start gap-3">
-        <div className="min-w-0 flex-1">
-          <div className={cn('text-[13px]', hasModel ? 'text-fg/90' : 'text-subtle')}>
-            Habilitar
-          </div>
-          <p
-            data-testid="smart-approve-hint"
-            className="mt-0.5 text-[11.5px] leading-snug text-subtle"
-          >
-            {!hasModel
-              ? 'Escolha um modelo para habilitar'
-              : active
-                ? 'Ligado: o juiz decide antes de pedir sua confirmação.'
-                : 'Desligado: as confirmações são suas.'}
-          </p>
-        </div>
-        <div className="pt-0.5">
-          <Switch
-            checked={active}
-            disabled={!hasModel}
-            label="Habilitar Smart-Approve"
-            onChange={(enabled) => set({ enabled })}
-          />
-        </div>
+      <div
+        data-testid="smart-approve-hint"
+        className={cn(
+          'flex items-start gap-1.5 text-[11.5px] leading-snug',
+          !hasModel && smartItems.length ? 'text-warning/90' : 'text-subtle'
+        )}
+      >
+        {!hasModel && smartItems.length > 0 && (
+          <AlertTriangle className="mt-px size-3.5 shrink-0" />
+        )}
+        <span data-testid="smart-items">
+          {!hasModel
+            ? smartItems.length
+              ? `Escolha um modelo: sem ele, ${joinItems(smartItems)} ${smartItems.length > 1 ? 'pedem' : 'pede'} sua confirmação.`
+              : 'Escolha um modelo para poder usar o modo Smart-Approve nos itens acima.'
+            : smartItems.length
+              ? `Decide: ${joinItems(smartItems)}.`
+              : 'Nenhum item está no modo Smart-Approve (seção Aprovações acima).'}
+        </span>
       </div>
 
-      <div className={cn('space-y-3 transition-opacity', !active && 'opacity-60')}>
-        <div>
-          <div className="mb-1 text-[11px] text-subtle">Ferramentas avaliadas</div>
-          <p data-testid="smart-items" className="mb-1.5 text-[11.5px] leading-snug text-subtle">
-            {smartItems.length
-              ? `Pelo modo Smart-Approve: ${smartItems.map((i) => ITEM_LABEL[i]).join(', ')}.`
-              : 'Nenhum item está no modo Smart-Approve (seção Aprovações).'}
-          </p>
-          <div className="mb-0.5 text-[10.5px] text-faint">Extras (passam a pedir confirmação)</div>
-          <div className="-mx-1.5 space-y-px">
-            {SMART_APPROVE_EXTRA_TOOLS.map((t) => {
-              const on = tools.includes(t)
-              return (
-                <label
-                  key={t}
-                  className="flex h-7 cursor-pointer items-center gap-2.5 rounded-lg px-1.5 hover:bg-hover/50"
-                >
-                  <input
-                    type="checkbox"
-                    checked={on}
-                    aria-label={`Avaliar ${TOOL_LABELS[t]}`}
-                    onChange={(e) => toggleTool(t, e.target.checked)}
-                    className="size-3.5 accent-accent"
-                  />
-                  <span
-                    className={cn(
-                      'min-w-0 flex-1 truncate text-[12.5px]',
-                      on ? 'text-fg/90' : 'text-subtle'
-                    )}
-                  >
-                    {TOOL_LABELS[t]}
-                  </span>
-                  <span className="text-[10.5px] text-faint">
-                    {on ? 'passa a pedir confirmação' : ''}
-                  </span>
-                </label>
-              )
-            })}
-          </div>
-          {tools.length > 0 && (
-            <p className="mt-1 text-[11px] leading-snug text-subtle">
-              Com o Smart-Approve ligado, as tools extras marcadas passam pelo juiz e, se ele não
-              aprovar, pedem sua confirmação.
-            </p>
-          )}
-        </div>
-
+      <div className={cn('space-y-3 transition-opacity', !hasModel && 'opacity-60')}>
         <div>
           <div className="mb-1 text-[11px] text-subtle">Rótulos (1ª linha da resposta)</div>
           <div className="grid grid-cols-3 gap-1.5">

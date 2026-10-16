@@ -2,8 +2,8 @@
 // Funções puras (main: runner/juiz; renderer: editor, (i) com a request de exemplo). Ver SPEC.md →
 // "Smart-Approve".
 //
-// Quando o juiz é chamado: ver approvalRoute em approvalPolicy.ts (modo `smart` do item, ou tools
-// extras marcadas). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
+// Quando o juiz é chamado: ver approvalRoute em approvalPolicy.ts (itens em modo `smart`, com um
+// modelo escolhido). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
 // Qualquer erro, tempo esgotado ou resposta ambígua do juiz → pergunta ao usuário (nunca libera).
 import { contentText } from './attachments'
 import { activeHistory } from './context'
@@ -32,17 +32,6 @@ export const SMART_APPROVE_DEFAULTS = {
   temperature: 0,
   maxTokens: 300
 } as const
-
-/**
- * Tools fora de CONFIRM_TOOLS que o usuário pode mandar ao juiz (passam a pedir confirmação
- * enquanto o Smart-Approve estiver ligado).
- */
-export const SMART_APPROVE_EXTRA_TOOLS: ToolName[] = [
-  'write_file',
-  'edit_file',
-  'send_to_chat',
-  'delegate_task'
-]
 
 /** Placeholders aceitos no prompt e no template (cola na UI). */
 export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
@@ -77,7 +66,10 @@ export function validateLabels(labels: Partial<SmartApproveLabels> | undefined):
   return null
 }
 
-/** Config completa a partir do que estiver salvo (campos ausentes/inválidos → padrão). */
+/**
+ * Config completa a partir do que estiver salvo (campos ausentes/inválidos → padrão). Chaves
+ * legadas (`enabled`, `tools` — ≤ 0.4.0) não entram: ver migrateSmartApproveConfig.
+ */
 export function normalizeSmartApprove(
   sa: Partial<SmartApproveConfig> | null | undefined
 ): SmartApproveConfig {
@@ -92,7 +84,6 @@ export function normalizeSmartApprove(
       : { ...DEFAULT_SMART_APPROVE_LABELS }
   const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null)
   return {
-    enabled: s.enabled === true,
     providerId: str(s.providerId),
     model: str(s.model)?.trim() ?? null,
     prompt: typeof s.prompt === 'string' ? s.prompt : null,
@@ -109,24 +100,16 @@ export function normalizeSmartApprove(
       SMART_APPROVE_DEFAULTS.minTimeoutS,
       SMART_APPROVE_DEFAULTS.maxTimeoutS,
       SMART_APPROVE_DEFAULTS.timeoutS
-    ),
-    // só os extras (as de CONFIRM_TOOLS usam o juiz pelo modo do item — approvalPolicy.ts)
-    tools: Array.isArray(s.tools)
-      ? [...new Set(s.tools)].filter((t) => SMART_APPROVE_EXTRA_TOOLS.includes(t))
-      : []
+    )
   }
 }
 
-/** Tools EXTRAS avaliadas pelo juiz (fora de CONFIRM_TOOLS; padrão nenhuma). */
-export function smartApproveTools(sa: Partial<SmartApproveConfig> | null | undefined): ToolName[] {
-  return Array.isArray(sa?.tools)
-    ? sa.tools.filter((t) => SMART_APPROVE_EXTRA_TOOLS.includes(t))
-    : []
-}
-
-/** Ligado E com um modelo escolhido. */
+/**
+ * Juiz pronto = provedor + modelo escolhidos. Sem modelo, os itens em modo `smart` perguntam a
+ * você (fail-closed). Não há mais liga/desliga: o juiz age só nos itens em modo `smart`.
+ */
 export function smartApproveActive(sa: Partial<SmartApproveConfig> | null | undefined): boolean {
-  return !!sa?.enabled && !!sa.providerId && !!sa.model?.trim()
+  return !!sa?.providerId && !!sa.model?.trim()
 }
 
 // ---------------- parse da resposta ----------------

@@ -1,8 +1,9 @@
-// Configurações → Aprovações: modo GLOBAL por item (Sempre / Smart-Approve / Listas) e as listas
+// Configurações → Aprovações: modo GLOBAL por item (Sempre / Smart-Approve / Listas ou Perguntar)
+// — é aqui que se define o padrão (★ na aba Tools) — e as listas
 // globais (whitelist/blacklist) de comandos, processos e páginas, com busca, edição e "Testar".
 import { Ban, Check, CircleHelp, Pencil, Plus, Search, Trash2 } from 'lucide-react'
 import { useState } from 'react'
-import { APPROVAL_ITEMS, evaluateLists, ITEM_LABEL, ITEM_TOOL } from '@shared/approvalPolicy'
+import { APPROVAL_ITEM_GROUPS, evaluateLists, ITEM_LABEL, ITEM_TOOL } from '@shared/approvalPolicy'
 import { analyzeShell } from '@shared/shellParse'
 import type { ApprovalItem, ApprovalListItem, ApprovalMode } from '@shared/types'
 import { cn } from '../../lib/format'
@@ -14,7 +15,12 @@ const ITEM_DESC: Record<ApprovalItem, string> = {
   commands: 'Tool shell — cada comando é desmontado em sub-comandos (|, &&, ;, $(…), bash -c…).',
   processes: 'Tool process_start — mesma análise dos comandos, com listas próprias.',
   pages: 'Tool browse_url — domínio (github.com, *.github.com) ou prefixo de URL.',
-  search: 'Tool web_search — sem listas: no modo “Perguntar”, cada busca pede sua confirmação.'
+  search: 'Tool web_search — sem listas: no modo “Perguntar”, cada busca pede sua confirmação.',
+  writeFile: 'Tool write_file — cria ou sobrescreve arquivos.',
+  editFile: 'Tool edit_file — substitui trechos de um arquivo.',
+  sendToChat:
+    'Tool send_to_chat — manda uma mensagem a outro chat (que pode rodar o agente de lá).',
+  delegate: 'Tool delegate_task — cria um subagente (com as tools e aprovações deste chat).'
 }
 
 export function ApprovalsSettings(): React.JSX.Element {
@@ -26,35 +32,42 @@ export function ApprovalsSettings(): React.JSX.Element {
   return (
     <div className="space-y-5" data-testid="approvals-settings">
       <p className="text-xs leading-relaxed text-subtle">
-        Modo padrão de cada item em todos os chats (cada chat pode ajustar na aba Tools; personas
-        também). <strong className="text-fg/90">process_stop</strong> nunca pede confirmação: o
-        agente só enxerga e para processos do próprio chat.
+        Modo padrão de cada item em todos os chats. Cada chat (aba Tools) e cada persona pode
+        ajustar; lá a opção igual ao padrão daqui aparece com ★, e quem não ajustou segue este
+        padrão. <strong className="text-fg/90">process_stop</strong> nunca pede confirmação: o
+        agente só enxerga e para processos do próprio chat. As demais tools (leitura, histórico,
+        controle de subagentes, perguntas ao usuário) também nunca pedem.
       </p>
-      <div className="space-y-3">
-        {APPROVAL_ITEMS.map((item) => (
-          <div key={item}>
-            <div className="mb-1 flex items-baseline gap-2">
-              <span className="text-[13px] font-medium text-fg/90">{ITEM_LABEL[item]}</span>
-              <span className="font-mono text-[10.5px] text-faint">{ITEM_TOOL[item]}</span>
+      {APPROVAL_ITEM_GROUPS.map((g) => (
+        <div key={g.title} className="space-y-3">
+          <div className="border-b border-border/50 pb-1 text-[11.5px] text-subtle">{g.title}</div>
+          {g.items.map((item) => (
+            <div key={item}>
+              <div className="mb-1 flex items-baseline gap-2">
+                <span className="text-[13px] font-medium text-fg/90">{ITEM_LABEL[item]}</span>
+                <span className="font-mono text-[10.5px] text-faint">{ITEM_TOOL[item]}</span>
+              </div>
+              <ModeSelector
+                item={item}
+                value={settings.modes[item]}
+                onChange={(m) => setMode(item, m)}
+                label={`Modo global: ${ITEM_LABEL[item]}`}
+                testId={`global-mode-${item}`}
+              />
+              <p className="mt-1 text-[11px] leading-snug text-subtle">{ITEM_DESC[item]}</p>
             </div>
-            <ModeSelector
-              item={item}
-              value={settings.modes[item]}
-              onChange={(m) => m && setMode(item, m)}
-              label={`Modo global: ${ITEM_LABEL[item]}`}
-              testId={`global-mode-${item}`}
-            />
-            <p className="mt-1 text-[11px] leading-snug text-subtle">{ITEM_DESC[item]}</p>
-          </div>
-        ))}
-        <p className="text-[11px] leading-snug text-subtle">
-          <strong className="text-fg/80">Sempre permitir</strong>: roda sem perguntar (a blacklist
-          não vale). <strong className="text-fg/80">Smart-Approve</strong>: o juiz configurado no
-          chat (aba Tools) decide; sem juiz → pergunta.{' '}
-          <strong className="text-fg/80">Listas</strong>: blacklist bloqueia (tem precedência),
-          whitelist libera, o resto pergunta.
-        </p>
-      </div>
+          ))}
+        </div>
+      ))}
+      <p className="text-[11px] leading-snug text-subtle">
+        <strong className="text-fg/80">Sempre permitir</strong>: roda sem perguntar (a blacklist não
+        vale). <strong className="text-fg/80">Smart-Approve</strong>: o modelo juiz escolhido no
+        chat (aba Tools → Smart-Approve) decide; sem modelo → pergunta.{' '}
+        <strong className="text-fg/80">Listas</strong> (Comandos, Processos, Páginas): blacklist
+        bloqueia (tem precedência), whitelist libera, o resto pergunta.{' '}
+        <strong className="text-fg/80">Perguntar</strong> (demais itens): cada chamada pede sua
+        confirmação.
+      </p>
 
       <div className="border-t border-border pt-4">
         <div className="mb-3 flex items-center gap-1 border-b border-border">

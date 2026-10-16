@@ -9,12 +9,13 @@
 //   npm run build
 //   CLEARCHAT_E2E_DIR=/tmp/algum-dir node e2e/smart-approve.spec.ts [filtro]
 //
-// Cobre: seção Smart-Approve da aba Tools (habilitar só com modelo, rótulos com validação, tempo),
-// juiz APPROVED → roda · REJECTED → resultado negado + "Executar mesmo assim" (liberação de uma vez)
-// · ASK-USER → card de aprovação com o motivo · resposta malformada e timeout → card de aprovação,
-// custo do juiz no rodapé, "Testar", popover do header (modos efetivos, revogar "Sempre", desligar o
-// Smart-Approve → modo smart sem juiz pergunta com aviso)
-// e a seção no editor de personas. Screenshots em $CLEARCHAT_E2E_DIR/shots.
+// Cobre: aba Tools (opção Smart-Approve desabilitada sem modelo, ★ do padrão global — escolher a
+// opção ★ remove o override —, sem liga/desliga, remover o modelo → itens em smart avisam e
+// perguntam), rótulos com validação, tempo, juiz APPROVED → roda · REJECTED → resultado negado +
+// "Executar mesmo assim" (liberação de uma vez) · ASK-USER → card de aprovação com o motivo ·
+// resposta malformada e timeout → card de aprovação, custo do juiz no rodapé, "Testar", itens de
+// arquivo (Escrever arquivo em Smart-Approve → juiz; em Perguntar → card), popover do header (modos
+// efetivos, revogar "Sempre") e a seção no editor de personas. Screenshots em $CLEARCHAT_E2E_DIR/shots.
 import {
   _electron as electron,
   type ElectronApplication,
@@ -61,6 +62,12 @@ const textOf = (c: any): string =>
 function commandFrom(text: string): string | null {
   const m = /rode:\s*(.+)$/m.exec(text) ?? /Pode executar shell `([^`]+)`/.exec(text)
   return m ? m[1].trim() : null
+}
+
+/** "escreva: <arquivo>" → write_file (conteúdo fixo). */
+function writeFrom(text: string): string | null {
+  const m = /escreva:\s*(\S+)/.exec(text)
+  return m ? m[1] : null
 }
 
 async function startFake(): Promise<void> {
@@ -124,6 +131,29 @@ async function startFake(): Promise<void> {
         return
       }
       const cmd = commandFrom(textOf(last?.content))
+      const file = writeFrom(textOf(last?.content))
+      if (file) {
+        sse(
+          [
+            {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  index: 0,
+                  id: `call_${Date.now().toString(36)}`,
+                  type: 'function',
+                  function: {
+                    name: 'write_file',
+                    arguments: JSON.stringify({ path: file, content: 'escrito pelo e2e\n' })
+                  }
+                }
+              ]
+            }
+          ],
+          { prompt_tokens: 100, completion_tokens: 10 }
+        )
+        return
+      }
       if (!cmd) {
         sse([{ role: 'assistant', content: 'Nada a fazer.' }], {
           prompt_tokens: 50,
@@ -313,50 +343,119 @@ async function main(): Promise<void> {
     assert(chat.config.cwd === CWD, `cwd ${chat.config.cwd}`)
   })
 
-  await step('aba Tools: Smart-Approve só habilita com modelo', async () => {
-    await openToolsTab()
-    const sec = section()
-    await sec.scrollIntoViewIfNeeded()
-    await sec
-      .getByTestId('smart-approve-hint')
-      .getByText('Escolha um modelo para habilitar')
-      .waitFor()
-    const sw = sec.getByRole('switch', { name: 'Habilitar Smart-Approve' })
-    assert(await sw.isDisabled(), 'switch desabilitado sem modelo')
-    await shotOf(sec, 'smart-section-sem-modelo')
-    await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE)
-    await sec.getByTestId('model-picker-provider').getByText('Local').waitFor()
-    assert(!(await sw.isDisabled()), 'switch habilitado com modelo')
-    assert((await sw.getAttribute('aria-checked')) === 'false', 'ainda desligado')
-    await sw.click()
-    await sec.getByText('Ligado: o juiz decide antes de pedir sua confirmação.').waitFor()
-    await sleep(700) // debounce da config
-    const { chat } = await chatState()
-    const sa = chat.config.smartApprove
-    assert(
-      sa?.enabled === true && sa.model === JUDGE && sa.providerId,
-      `config ${JSON.stringify(sa)}`
-    )
-    // remover o modelo desliga; escolher de novo e religar
-    await sec.getByRole('button', { name: 'Remover modelo do Smart-Approve' }).click()
-    await sec.getByText('Escolha um modelo para habilitar').waitFor()
-    assert(await sw.isDisabled(), 'sem modelo → desabilitado')
-    await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE)
-    await sw.click()
-    await sec.getByText('Ligado: o juiz decide antes de pedir sua confirmação.').waitFor()
-    // o juiz só decide itens no modo Smart-Approve: Comandos → Smart-Approve neste chat
-    await page
-      .getByTestId('chat-mode-commands')
-      .getByRole('radio', { name: 'Smart-Approve' })
-      .click()
-    await sec
-      .getByTestId('smart-items')
-      .getByText(/Comandos/)
-      .waitFor()
-    await sleep(700)
-    const cfg = (await chatState()).chat.config
-    assert(cfg.approvalModes?.commands === 'smart', `modo ${JSON.stringify(cfg.approvalModes)}`)
-  })
+  await step(
+    'aba Tools: sem modelo a opção Smart-Approve fica desabilitada; ★ = padrão global',
+    async () => {
+      await openToolsTab()
+      const panel = page.getByTestId('right-panel')
+      const sec = section()
+      await sec.scrollIntoViewIfNeeded()
+      await sec
+        .getByTestId('smart-approve-hint')
+        .getByText(/Escolha um modelo para poder usar o modo Smart-Approve/)
+        .waitFor()
+      assert(
+        (await sec.getByRole('switch').count()) === 0,
+        'sem liga/desliga na seção Smart-Approve'
+      )
+      assert(
+        (await sec.getByText('Extras (passam a pedir confirmação)').count()) === 0,
+        'sem checkboxes de extras'
+      )
+      const cmd = panel.getByTestId('chat-mode-commands')
+      const smartOpt = cmd.getByRole('radio', { name: 'Smart-Approve' })
+      assert((await smartOpt.getAttribute('aria-disabled')) === 'true', 'Smart desabilitado')
+      // ★ no padrão global (Listas) e selecionado (sem override)
+      const starred = cmd.locator('[data-global]')
+      assert((await starred.getAttribute('data-mode')) === 'lists', 'estrela em Listas')
+      assert((await starred.getAttribute('aria-checked')) === 'true', 'global selecionado')
+      // tooltip explica por quê
+      await smartOpt.scrollIntoViewIfNeeded()
+      const tip = page
+        .getByRole('tooltip')
+        .filter({ hasText: 'Escolha um modelo de Smart-Approve abaixo' })
+        .first()
+      for (let i = 0; ; i++) {
+        // radix abre no pointermove: mexe o mouse dentro da opção até o tooltip aparecer
+        await smartOpt.hover({ position: { x: 12 + i * 6, y: 8 } })
+        const ok = await tip
+          .waitFor({ timeout: 1500 })
+          .then(() => true)
+          .catch(() => false)
+        if (ok) break
+        if (i >= 4) throw new Error('tooltip da opção Smart-Approve não apareceu')
+      }
+      await page.keyboard.press('Escape')
+      await smartOpt.click({ force: true })
+      await sleep(700)
+      assert(
+        !(await chatState()).chat.config.approvalModes?.commands,
+        'clicar no Smart desabilitado não grava'
+      )
+      // itens novos: Escrever/Editar arquivo, Enviar para chat, Delegar — padrão Sempre permitir (★)
+      for (const it of ['writeFile', 'editFile', 'sendToChat', 'delegate']) {
+        const st = panel.getByTestId(`chat-mode-${it}`).locator('[data-global]')
+        assert((await st.getAttribute('data-mode')) === 'always', `${it}: ★ em Sempre permitir`)
+        assert((await st.getAttribute('aria-checked')) === 'true', `${it}: selecionado`)
+      }
+      await page.mouse.move(0, 0)
+      await sleep(300)
+      await shot('tools-aprovacoes-sem-modelo')
+      await shotOf(sec, 'smart-section-sem-modelo')
+      // escolher o modelo habilita a opção (sem toggle)
+      await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE)
+      await sec.getByTestId('model-picker-provider').getByText('Local').waitFor()
+      assert((await smartOpt.getAttribute('aria-disabled')) === null, 'Smart habilitado com modelo')
+      await smartOpt.click()
+      await sec.getByTestId('smart-items').getByText('Decide: Comandos.').waitFor()
+      await sleep(700) // debounce da config
+      let cfg = (await chatState()).chat.config
+      assert(cfg.approvalModes?.commands === 'smart', `modo ${JSON.stringify(cfg.approvalModes)}`)
+      assert(
+        cfg.smartApprove?.model === JUDGE && cfg.smartApprove.providerId,
+        `config ${JSON.stringify(cfg.smartApprove)}`
+      )
+      assert(
+        !('enabled' in cfg.smartApprove) && !('tools' in cfg.smartApprove),
+        'sem chaves legadas'
+      )
+      // ★: override em Escrever arquivo e volta ao global clicando na opção com estrela
+      const wf = panel.getByTestId('chat-mode-writeFile')
+      await wf.getByRole('radio', { name: 'Perguntar' }).click()
+      await sleep(700)
+      cfg = (await chatState()).chat.config
+      assert(
+        cfg.approvalModes?.writeFile === 'lists',
+        `override ${JSON.stringify(cfg.approvalModes)}`
+      )
+      await wf.getByRole('radio', { name: 'Sempre permitir' }).click()
+      await sleep(700)
+      cfg = (await chatState()).chat.config
+      assert(
+        !('writeFile' in (cfg.approvalModes ?? {})),
+        `★ = segue o global ${JSON.stringify(cfg.approvalModes)}`
+      )
+      // remover o modelo: Comandos (em Smart) avisa e pergunta; escolher de novo volta
+      await sec.getByRole('button', { name: 'Remover modelo do Smart-Approve' }).click()
+      await panel.getByTestId('smart-missing-commands').waitFor()
+      await sec
+        .getByTestId('smart-items')
+        .getByText(/sem ele, Comandos pede sua confirmação/)
+        .waitFor()
+      assert((await smartOpt.getAttribute('aria-checked')) === 'true', 'continua em Smart')
+      assert((await smartOpt.getAttribute('aria-disabled')) === 'true', 'mas indisponível')
+      await page.mouse.move(0, 0)
+      await cmd.scrollIntoViewIfNeeded()
+      await sleep(300)
+      await shot('tools-smart-sem-modelo-aviso')
+      await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE)
+      await panel.getByTestId('smart-missing-commands').waitFor({ state: 'detached' })
+      await page.mouse.move(0, 0)
+      await panel.getByTestId('chat-mode-commands').scrollIntoViewIfNeeded()
+      await sleep(300)
+      await shot('tools-aprovacoes-com-modelo')
+    }
+  )
 
   await step('rótulos: validação (vazio, repetido) e edição; tempo máximo', async () => {
     const sec = section()
@@ -538,6 +637,46 @@ async function main(): Promise<void> {
     return `aprovação apareceu após ${waited}ms (timeout 3s)`
   })
 
+  await step('Escrever arquivo: Smart-Approve → juiz; Perguntar → card', async () => {
+    await openToolsTab()
+    const panel = page.getByTestId('right-panel')
+    const wf = panel.getByTestId('chat-mode-writeFile')
+    await wf.getByRole('radio', { name: 'Smart-Approve' }).click()
+    await section()
+      .getByTestId('smart-items')
+      .getByText('Decide: Comandos, Escrever arquivo.')
+      .waitFor()
+    await sleep(700)
+    judgeQueue.push({ text: 'APPROVED\nArquivo dentro da raiz.' })
+    const before = judgeHits().length
+    await sendMessage('escreva: sa-juiz.txt')
+    await waitIdle()
+    assert(judgeHits().length === before + 1, 'juiz chamado para write_file')
+    assert(judgeHits().at(-1)!.body.messages[1].content.includes('write_file'), 'tool no template')
+    const { msgs } = await chatState()
+    const res = msgs.filter((m) => m.message.role === 'tool').at(-1)
+    assert(
+      res.meta.toolStatus === 'ok' && res.meta.smartApprove?.decision === 'approve',
+      'escreveu'
+    )
+    // Perguntar → card simples (Permitir/Negar), sem juiz
+    await wf.getByRole('radio', { name: 'Perguntar' }).click()
+    await sleep(700)
+    await sendMessage('escreva: sa-pergunta.txt')
+    const card = page.getByTestId('approval-card').last()
+    await card.getByRole('button', { name: 'Negar', exact: true }).waitFor({ timeout: 15_000 })
+    await card.getByRole('button', { name: 'Negar', exact: true }).click()
+    await waitIdle()
+    assert(judgeHits().length === before + 1, 'Perguntar não chama o juiz')
+    const res2 = (await chatState()).msgs.filter((m) => m.message.role === 'tool').at(-1)
+    assert(res2.meta.toolStatus === 'denied', 'negado')
+    // volta ao padrão global (★ Sempre permitir)
+    await wf.getByRole('radio', { name: 'Sempre permitir' }).click()
+    await sleep(700)
+    const cfg = (await chatState()).chat.config
+    assert(!('writeFile' in (cfg.approvalModes ?? {})), 'voltou ao global')
+  })
+
   await step('Testar (chamada de exemplo) no editor', async () => {
     await openToolsTab()
     const sec = section()
@@ -556,7 +695,7 @@ async function main(): Promise<void> {
   })
 
   await step(
-    'header: popover com os modos efetivos — revogar "Sempre", desligar Smart (sem juiz → pergunta)',
+    'header: popover com os modos efetivos — revogar "Sempre"; sem modelo o selo some e pergunta',
     async () => {
       await openToolsTab()
       const panel = page.getByTestId('right-panel')
@@ -570,27 +709,24 @@ async function main(): Promise<void> {
       await badge.click()
       const pop = page.getByTestId('auto-approve-popover')
       await pop.waitFor()
-      assert((await pop.getByTestId('auto-approve-item').count()) === 4, '4 itens')
+      assert((await pop.getByTestId('auto-approve-item').count()) === 8, '8 itens')
       await pop.getByText('fake/judge-1'.split('/').pop()!).waitFor()
+      assert((await pop.getByRole('switch').count()) === 0, 'sem liga/desliga no popover')
       await sleep(400) // animação de entrada
       await shot('header-popover')
       await pop.getByRole('button', { name: 'Revogar Páginas' }).click()
       await sleep(300)
-      let cfg = (await chatState()).chat.config
+      const cfg = (await chatState()).chat.config
       assert(cfg.approvalModes?.pages === undefined, `revogou ${JSON.stringify(cfg.approvalModes)}`)
       assert(cfg.approvalModes?.commands === 'smart', 'comandos continuam smart')
       await badge.getByText('Smart-Approve').waitFor()
-      await pop.getByRole('switch', { name: 'Smart-Approve' }).click()
-      await sleep(300)
-      cfg = (await chatState()).chat.config
-      assert(
-        cfg.smartApprove.enabled === false && cfg.smartApprove.model === JUDGE,
-        'smart desligado'
-      )
-      await pop.getByText('(sem juiz)').first().waitFor()
       await pop.getByRole('button', { name: /Configurações → Aprovações/ }).waitFor()
       await page.keyboard.press('Escape')
-      // modo smart sem juiz: pergunta ao usuário (fail-closed), sem chamar o juiz, e avisa
+      // sem modelo: o selo some (nada roda sem você) e o modo smart pergunta (fail-closed)
+      await openToolsTab()
+      await section().getByRole('button', { name: 'Remover modelo do Smart-Approve' }).click()
+      await badge.waitFor({ state: 'detached', timeout: 5000 })
+      await page.getByRole('button', { name: 'Fechar painel' }).first().click()
       const before = judgeHits().length
       await sendMessage('rode: echo SA-SEM-JUIZ')
       const card = bashCards().last()
@@ -622,7 +758,15 @@ async function main(): Promise<void> {
       .click()
     const s = dlg.locator('section[data-section="smart-approve"]')
     await s.scrollIntoViewIfNeeded()
-    await s.getByText('Escolha um modelo para habilitar').waitFor()
+    await s.getByText(/Escolha um modelo para poder usar o modo Smart-Approve/).waitFor()
+    // mesmo seletor com ★ no editor de personas; Smart desabilitado sem modelo
+    const cmd = dlg.getByTestId('chat-mode-commands')
+    assert(
+      (await cmd.getByRole('radio', { name: 'Smart-Approve' }).getAttribute('aria-disabled')) ===
+        'true',
+      'persona: Smart desabilitado sem modelo'
+    )
+    assert((await cmd.locator('[data-global]').count()) === 1, 'persona: ★ no padrão global')
     await page.keyboard.press('Escape')
   })
 

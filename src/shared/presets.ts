@@ -2,7 +2,7 @@
 // Funções puras — usadas pelo main (sanitizar ao salvar) e pelo renderer (snapshot/aplicar).
 import type { ChatConfig, ChatParams, Preset } from './types'
 import { migrateConfigTools } from './toolRename'
-import { migrateApprovalConfig, normalizeChatModes } from './approvalPolicy'
+import { migrateLegacyApprovals, normalizeChatModes } from './approvalPolicy'
 
 export type PresetConfig = Partial<ChatConfig>
 
@@ -62,8 +62,8 @@ function cleanParams(p: ChatParams | undefined): ChatParams {
  */
 export function sanitizePresetConfig(cfg: unknown): PresetConfig {
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return {}
-  // alias de leitura: autoApprove (≤ 0.3.0) → approvalModes
-  const src = migrateApprovalConfig(migrateConfigTools(cfg as PresetConfig)) as Record<
+  // alias de leitura: autoApprove (≤ 0.3.0) e smartApprove.enabled/tools (≤ 0.4.0) → approvalModes
+  const src = migrateLegacyApprovals(migrateConfigTools(cfg as PresetConfig)) as Record<
     string,
     unknown
   >

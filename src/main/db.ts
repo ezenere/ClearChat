@@ -3,7 +3,7 @@ import { join } from 'path'
 import Database from 'better-sqlite3'
 import { DB_FILENAME } from './migrate'
 import { migrateToolShellRename } from './migrateTools'
-import { migrateApprovalModes } from './migrateApprovals'
+import { migrateApprovalModes, migrateSmartApproveItems } from './migrateApprovals'
 import { SCHEMA } from './dbSchema'
 import { ensureSearchIndex } from './searchIndex'
 
@@ -59,6 +59,14 @@ function migrate(conn: Database.Database): void {
       console.log(`[clearchat] migração de aprovações: ${r.chats} chats, ${r.presets} personas`)
   } catch (e) {
     console.error('[clearchat] migração de aprovações', e)
+  }
+  // Smart-Approve liga/desliga + extras (≤ 0.4.0) → modo smart por item — uma vez (depois da acima)
+  try {
+    const r = migrateSmartApproveItems(conn)
+    if (!r.skipped)
+      console.log(`[clearchat] migração do Smart-Approve: ${r.chats} chats, ${r.presets} personas`)
+  } catch (e) {
+    console.error('[clearchat] migração do Smart-Approve', e)
   }
   // índice FTS5 das mensagens (read_history em outros chats) — cria/popula uma vez; depois o repo mantém
   try {

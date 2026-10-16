@@ -425,8 +425,14 @@ export function AutoApproveInfo(): React.JSX.Element {
       <p>
         <strong className="text-fg">Não é enviado à API.</strong> Só controla se o app pede sua
         confirmação antes de executar a tool localmente. Modos: <strong>Sempre permitir</strong>,{' '}
-        <strong>Smart-Approve</strong> (o juiz decide) e <strong>Listas</strong> (whitelist libera,
-        blacklist bloqueia, o resto pergunta).
+        <strong>Smart-Approve</strong> (o modelo juiz da seção abaixo decide; sem modelo → pergunta)
+        e <strong>Listas</strong> (Comandos, Processos, Páginas: whitelist libera, blacklist
+        bloqueia, o resto pergunta) ou <strong>Perguntar</strong> (demais itens).
+      </p>
+      <p>
+        ★ marca o padrão global (Configurações → Aprovações). Escolher a opção com estrela segue o
+        padrão global (sem ajuste neste chat; acompanha se ele mudar); escolher outra fixa o modo
+        neste chat.
       </p>
       <p>
         Resultados enviados ao modelo como <C>{'role: "tool"'}</C>: negado →{' '}

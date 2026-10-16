@@ -4,7 +4,7 @@ import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
 import type { ClearApi } from '@shared/ipc'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
-import { evaluateLists, normalizeApprovalSettings } from '@shared/approvalPolicy'
+import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
 import type {
   ApprovalSettings,
   AgentEvent,
@@ -903,7 +903,7 @@ export function createMockApi(scenario: string): ClearApi {
       regenerate: async () => {},
       approve: async (rid, _decision, items) => {
         const req = approvals.find((a) => a.id === rid)
-        if (req?.check && req.check.item !== 'search' && items?.length) {
+        if (req?.check && isListItem(req.check.item) && items?.length) {
           const item = req.check.item
           const lists = structuredClone(approvalSettings.lists)
           for (const d of items) {

@@ -1,81 +1,123 @@
-// Peças da UI de aprovações: seletor de modo (3 vias), aviso do Smart-Approve sem juiz e o
-// campo editável "+ whitelist/blacklist" (com validação e aviso de padrão amplo).
-import { AlertTriangle } from 'lucide-react'
+// Peças da UI de aprovações: seletor de modo (3 vias, com ★ no padrão global), aviso do
+// Smart-Approve sem modelo e o campo editável "+ whitelist/blacklist" (com validação e aviso de
+// padrão amplo).
+import { AlertTriangle, Star } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import {
   APPROVAL_MODES,
   broadPatternWarning,
+  modeHint,
   modeLabel,
   validateListEntry
 } from '@shared/approvalPolicy'
 import type { ApprovalItem, ApprovalListItem, ApprovalMode } from '@shared/types'
 import { cn } from '../../lib/format'
 import { Button } from '../ui/controls'
+import { Tip } from '../ui/Tooltip'
 
-/** Segmented de 3 vias (+ opção "Padrão global (X)" quando `inherit` é passado). */
+export const SMART_NEEDS_MODEL = 'Escolha um modelo de Smart-Approve abaixo'
+export const STAR_HINT =
+  'A estrela marca o padrão global; escolher a opção com estrela segue o padrão global.'
+
+/**
+ * Segmented de 3 vias. Com `globalMode` (chat/persona): a opção igual ao padrão global ganha ★ e
+ * `value` null = segue o global (mostra a opção com ★ selecionada); quem usa grava com
+ * `withChatMode` (escolher a opção ★ = sem override). Sem `globalMode` (Configurações →
+ * Aprovações): sem estrela, valor sempre definido. `smartUnavailable`: sem modelo do juiz → a opção Smart-Approve fica desabilitada (se
+ * já estiver selecionada, fica em âmbar: esses itens perguntam a você).
+ */
 export function ModeSelector({
   item,
   value,
   onChange,
-  inherit,
+  globalMode,
+  smartUnavailable,
   label,
   testId
 }: {
   item: ApprovalItem
-  /** null = segue o padrão global (só com `inherit`). */
+  /** null = segue o padrão global (só com `globalMode`). */
   value: ApprovalMode | null
-  onChange: (v: ApprovalMode | null) => void
-  /** Modo global (mostra a opção "Padrão global (X)"). */
-  inherit?: ApprovalMode
+  onChange: (v: ApprovalMode) => void
+  /** Modo global do item (marca a opção com ★). */
+  globalMode?: ApprovalMode
+  smartUnavailable?: boolean
   label: string
   testId?: string
 }): React.JSX.Element {
-  const opts: { v: ApprovalMode | null; text: string; title: string }[] = [
-    ...(inherit
-      ? [
-          {
-            v: null,
-            text: `Padrão (${modeLabel(item, inherit)})`,
-            title: `Segue o padrão global (Configurações → Aprovações): ${modeLabel(item, inherit)}`
-          }
-        ]
-      : []),
-    ...APPROVAL_MODES.map((m) => ({
-      v: m as ApprovalMode | null,
-      text: modeLabel(item, m),
-      title:
-        m === 'always'
-          ? 'Roda sem perguntar (nem a blacklist vale)'
-          : m === 'smart'
-            ? 'O modelo juiz do Smart-Approve decide (sem juiz → pergunta)'
-            : item === 'search'
-              ? 'Pergunta a você a cada busca'
-              : 'Whitelist libera, blacklist bloqueia; o resto pergunta'
-    }))
-  ]
+  const shown = value ?? globalMode ?? null
   return (
     <div
       role="radiogroup"
       aria-label={label}
       data-testid={testId}
+      data-inherit={globalMode && value == null ? 'true' : undefined}
       className="flex rounded-lg border border-border bg-bg/60 p-0.5"
     >
-      {opts.map((o) => (
-        <button
-          key={o.v ?? 'inherit'}
-          type="button"
-          role="radio"
-          aria-checked={value === o.v}
-          title={o.title}
-          onClick={() => onChange(o.v)}
-          className={cn(
-            'min-w-0 flex-1 truncate rounded-md px-1.5 py-1 text-[11.5px] transition-colors',
-            value === o.v ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
-          )}
-        >
-          {o.text}
-        </button>
-      ))}
+      {APPROVAL_MODES.map((m) => {
+        const selected = shown === m
+        const star = globalMode === m
+        const disabled = m === 'smart' && !!smartUnavailable
+        const warn = disabled && selected
+        const hint = disabled ? SMART_NEEDS_MODEL : modeHint(item, m)
+        return (
+          <Tip
+            key={m}
+            label={
+              <span className="block max-w-[260px] leading-snug">
+                {hint}
+                {warn && (
+                  <span className="block text-warning/90">
+                    Sem modelo: este item pergunta a você.
+                  </span>
+                )}
+                {star && (
+                  <span className="mt-0.5 block text-subtle">
+                    ★ Padrão global
+                    {globalMode && value == null && selected ? ' (seguindo)' : ''}
+                  </span>
+                )}
+              </span>
+            }
+          >
+            <button
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              aria-disabled={disabled || undefined}
+              data-mode={m}
+              data-global={star || undefined}
+              onClick={() => {
+                if (disabled) return
+                onChange(m)
+              }}
+              className={cn(
+                'flex min-w-0 flex-1 items-center justify-center gap-1 rounded-md px-1.5 py-1 text-[11.5px] transition-colors',
+                warn
+                  ? 'bg-warning/[0.10] text-warning/90 shadow-sm'
+                  : selected
+                    ? 'bg-active text-fg shadow-sm'
+                    : disabled
+                      ? 'cursor-not-allowed text-faint/70'
+                      : 'text-subtle hover:text-fg'
+              )}
+            >
+              {warn && <AlertTriangle aria-hidden className="size-3 shrink-0" />}
+              <span className="truncate">{modeLabel(item, m)}</span>
+              {star && (
+                <Star
+                  aria-hidden
+                  data-testid="global-star"
+                  className={cn(
+                    'size-2.5 shrink-0 fill-current',
+                    selected && !warn ? 'text-accent-strong' : 'opacity-70'
+                  )}
+                />
+              )}
+            </button>
+          </Tip>
+        )
+      })}
     </div>
   )
 }
@@ -105,7 +147,7 @@ export function SmartMissingNote({
             )
           </>
         )}
-        . Sem juiz ligado, essas chamadas pedem sua confirmação.
+        . Sem modelo, essas chamadas pedem sua confirmação.
       </span>
     </p>
   )

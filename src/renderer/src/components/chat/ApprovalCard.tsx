@@ -5,7 +5,12 @@
 // qualquer "Não" responde na hora (nada roda). "Sim para todos" atalho.
 import { AlertTriangle, Ban, Check, Hand, ShieldCheck } from 'lucide-react'
 import { useState } from 'react'
-import { ITEM_LABEL, ITEM_TOOL, type ApprovalItemDecision } from '@shared/approvalPolicy'
+import {
+  isListItem,
+  ITEM_LABEL,
+  ITEM_TOOL,
+  type ApprovalItemDecision
+} from '@shared/approvalPolicy'
 import type { ApprovalCheckItem, ApprovalListItem, ApprovalRequest } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
@@ -29,7 +34,7 @@ export function ApprovalPrompt({
   const approve = useStore((s) => s.approve)
   const setPanel = useStore((s) => s.setPanel)
   const who = fromSubagent ? 'o subagente' : 'o agente'
-  if (request.check && request.check.item !== 'search')
+  if (request.check && isListItem(request.check.item))
     return (
       <ListsPrompt
         request={request}

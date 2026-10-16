@@ -415,15 +415,28 @@ async function main(): Promise<void> {
     await items.nth(0).getByText('✓ liberado').waitFor()
     assert((await items.count()) === 3, `3 itens (${await items.count()})`)
     await tester.getByText(/sh lendo comandos da entrada/).waitFor()
-    await root.scrollIntoViewIfNeeded()
+    // itens de arquivo/agentes no global, padrão Sempre permitir; sem ★ (é aqui que se define)
+    for (const it of ['writeFile', 'editFile', 'sendToChat', 'delegate']) {
+      const opt = root
+        .getByTestId(`global-mode-${it}`)
+        .getByRole('radio', { name: 'Sempre permitir' })
+      assert((await opt.getAttribute('aria-checked')) === 'true', `${it} padrão Sempre permitir`)
+    }
+    assert((await root.locator('[data-global]').count()) === 0, 'sem ★ nas Configurações')
+    await root.getByTestId('global-mode-commands').scrollIntoViewIfNeeded()
+    await sleep(300)
+    await shotOf(dlg, 'settings-aprovacoes-modos')
+    await root.getByTestId('approval-tester').scrollIntoViewIfNeeded()
     await shotOf(dlg, 'settings-aprovacoes')
     await root
       .getByTestId('global-mode-search')
       .getByRole('radio', { name: 'Sempre permitir' })
       .click()
+    await root.getByTestId('global-mode-editFile').getByRole('radio', { name: 'Perguntar' }).click()
     await sleep(300)
     const s = await read<any>('approvals.getSettings')
     assert(s.modes.search === 'always', `search ${s.modes.search}`)
+    assert(s.modes.editFile === 'lists', `editFile ${s.modes.editFile}`)
     await page.keyboard.press('Escape')
   })
 

@@ -18,7 +18,11 @@ import {
   matchCommandPattern,
   matchUrlEntry,
   migrateApprovalConfig,
+  migrateLegacyApprovals,
+  migrateSmartApproveConfig,
+  modeLabel,
   normalizeApprovalLists,
+  withChatMode,
   normalizeApprovalModes,
   normalizeUrl,
   suggestCommandPattern,
@@ -27,7 +31,9 @@ import {
 } from '../src/shared/approvalPolicy.ts'
 import {
   APPROVAL_MODES_MIGRATION_FLAG,
-  migrateApprovalModes
+  migrateApprovalModes,
+  migrateSmartApproveItems,
+  SMART_APPROVE_ITEMS_MIGRATION_FLAG
 } from '../src/main/migrateApprovals.ts'
 import { CONFIRM_TOOLS } from '../src/shared/types.ts'
 import { PRESET_FIELDS, sanitizePresetConfig } from '../src/shared/presets.ts'
@@ -426,7 +432,11 @@ test('modos: padrão global, override do chat, normalização', () => {
     commands: 'lists',
     processes: 'lists',
     pages: 'lists',
-    search: 'lists'
+    search: 'lists',
+    writeFile: 'always',
+    editFile: 'always',
+    sendToChat: 'always',
+    delegate: 'always'
   })
   assert.deepEqual(normalizeApprovalModes({ commands: 'always', pages: 'x' }), {
     ...DEFAULT_APPROVAL_MODES,
@@ -445,7 +455,7 @@ test('modos: padrão global, override do chat, normalização', () => {
     approvalRoute(
       {
         approvalModes: { commands: 'smart' },
-        smartApprove: { enabled: true, providerId: 'p', model: 'j' } as any
+        smartApprove: { providerId: 'p', model: 'j' } as any
       },
       null,
       'shell'
@@ -594,4 +604,218 @@ test('parser: aritmética/indireção sobre variáveis sempre pergunta (bash/zsh
     'echo $x'
   ])
     assert.ok(evaluateCommand('commands', c, list).allAllowed, `deveria liberar: ${c}`)
+})
+
+// ======================= itens de arquivo/agentes + Smart-Approve por item (0.5) =======================
+
+test('itens novos: write_file/edit_file/send_to_chat/delegate_task — padrão Sempre permitir', () => {
+  for (const t of ['write_file', 'edit_file', 'send_to_chat', 'delegate_task'] as const)
+    assert.equal(approvalRoute({}, null, t).kind, 'run', t)
+  // global salvo antes dos itens novos existirem → os novos ficam no padrão (always)
+  assert.equal(normalizeApprovalModes({ commands: 'always' }).writeFile, 'always')
+  // Perguntar (lists sem listas) → pergunta simples, nunca o card de listas
+  assert.equal(
+    approvalRoute({ approvalModes: { writeFile: 'lists' } }, null, 'write_file').kind,
+    'user'
+  )
+  assert.equal(approvalRoute({}, { delegate: 'lists' }, 'delegate_task').kind, 'user')
+  assert.equal(modeLabel('editFile', 'lists'), 'Perguntar')
+  assert.equal(modeLabel('search', 'lists'), 'Perguntar')
+  assert.equal(modeLabel('commands', 'lists'), 'Listas')
+  // smart: com modelo → juiz; sem modelo → usuário com aviso (fail-closed)
+  const judge = { providerId: 'p', model: 'j' } as any
+  assert.equal(
+    approvalRoute(
+      { approvalModes: { sendToChat: 'smart' }, smartApprove: judge },
+      null,
+      'send_to_chat'
+    ).kind,
+    'judge'
+  )
+  assert.deepEqual(approvalRoute({ approvalModes: { editFile: 'smart' } }, null, 'edit_file'), {
+    kind: 'user',
+    smartMissing: true
+  })
+  // leitura e afins nunca são itens
+  for (const t of ['read_file', 'list_dir', 'process_stop', 'ask_user', 'read_history'] as const)
+    assert.equal(approvalRoute({ smartApprove: judge }, { commands: 'smart' }, t).kind, 'run', t)
+})
+
+test('Smart-Approve sem liga/desliga: o juiz só decide itens em modo smart, se houver modelo', () => {
+  const judge = { providerId: 'p', model: 'j' } as any
+  // modelo escolhido mas nenhum item em smart → ninguém vai ao juiz
+  assert.equal(approvalRoute({ smartApprove: judge }, null, 'shell').kind, 'lists')
+  assert.equal(approvalRoute({ smartApprove: judge }, null, 'write_file').kind, 'run')
+  // smart via global
+  assert.equal(
+    approvalRoute({ smartApprove: judge }, { pages: 'smart' }, 'browse_url').kind,
+    'judge'
+  )
+  // `enabled: false` legado não desliga mais nada (a migração cuida dele)
+  assert.equal(
+    approvalRoute(
+      { approvalModes: { commands: 'smart' }, smartApprove: { ...judge, enabled: false } },
+      null,
+      'shell'
+    ).kind,
+    'judge'
+  )
+  // modelo removido → pergunta (smartMissing)
+  assert.equal(
+    (
+      approvalRoute(
+        { approvalModes: { commands: 'smart' }, smartApprove: { ...judge, model: '' } },
+        null,
+        'shell'
+      ) as any
+    ).smartMissing,
+    true
+  )
+})
+
+test('migração Smart-Approve ≤ 0.4.0: enabled/tools → modos por item (idempotente)', () => {
+  const sa = { providerId: 'p', model: 'j', labels: { approve: 'A', reject: 'R', ask: 'K' } }
+  // ligado com modelo: smart continua; extras viram itens em smart; chaves legadas somem
+  const a = migrateSmartApproveConfig({
+    approvalModes: { commands: 'smart', pages: 'always' },
+    smartApprove: { ...sa, enabled: true, tools: ['write_file', 'delegate_task', 'shell'] }
+  } as any)
+  assert.deepEqual(a.approvalModes, {
+    commands: 'smart',
+    pages: 'always',
+    writeFile: 'smart',
+    delegate: 'smart'
+  })
+  assert.deepEqual(a.smartApprove, sa)
+  // idempotente: sem enabled/tools → MESMO objeto
+  assert.equal(migrateSmartApproveConfig(a), a)
+  const plain = { smartApprove: sa } as any
+  assert.equal(migrateSmartApproveConfig(plain), plain)
+  // desligado COM modelo: o que era smart (chat ou global) perguntava → lists; extras não viram smart
+  const b = migrateSmartApproveConfig(
+    {
+      approvalModes: { commands: 'smart' },
+      smartApprove: { ...sa, enabled: false, tools: ['edit_file'] }
+    } as any,
+    { globalModes: { pages: 'smart', search: 'always' } }
+  )
+  assert.deepEqual(b.approvalModes, { commands: 'lists', pages: 'lists' })
+  assert.equal('enabled' in b.smartApprove!, false)
+  assert.equal('tools' in b.smartApprove!, false)
+  // globalModes também pode ser uma função (lida só quando precisa)
+  let calls = 0
+  const g = (): any => (calls++, { processes: 'smart' })
+  migrateSmartApproveConfig({ smartApprove: sa } as any, { globalModes: g })
+  assert.equal(calls, 0, 'config nova não lê o global')
+  const c = migrateSmartApproveConfig({ smartApprove: { ...sa, enabled: false } } as any, {
+    globalModes: g
+  })
+  assert.deepEqual(c.approvalModes, { processes: 'lists' })
+  // ligado SEM modelo (juiz inativo) e sem modelo: nada muda — smart sem modelo já pergunta
+  const d = migrateSmartApproveConfig({
+    approvalModes: { commands: 'smart' },
+    smartApprove: { enabled: true, providerId: null, model: null, tools: ['write_file'] }
+  } as any)
+  assert.deepEqual(d.approvalModes, { commands: 'smart' })
+  assert.deepEqual(d.smartApprove, { providerId: null, model: null })
+  // override existente vence nos extras
+  const e = migrateSmartApproveConfig({
+    approvalModes: { writeFile: 'lists' },
+    smartApprove: { ...sa, enabled: true, tools: ['write_file'] }
+  } as any)
+  assert.deepEqual(e.approvalModes, { writeFile: 'lists' })
+  // cadeia completa a partir do ≤ 0.3.0: autoApprove + smart antigo (tools ausente = todas)
+  const f = migrateLegacyApprovals(
+    { autoApprove: ['shell'], smartApprove: { ...sa, enabled: true } } as any,
+    { assumeLegacy: true }
+  )
+  assert.deepEqual(f.approvalModes, {
+    commands: 'always',
+    processes: 'smart',
+    search: 'smart',
+    pages: 'smart'
+  })
+  assert.deepEqual(f.smartApprove, sa)
+  assert.equal(migrateLegacyApprovals(f, { assumeLegacy: true }), f)
+  // personas: alias de leitura (sem global) no sanitize
+  assert.deepEqual(
+    sanitizePresetConfig({
+      smartApprove: { ...sa, enabled: true, tools: ['send_to_chat'] }
+    } as any),
+    { smartApprove: sa, approvalModes: { sendToChat: 'smart' } }
+  )
+})
+
+test('migração do banco (Smart-Approve por item): chats + personas, com o global, uma vez', () => {
+  const db = new Database(':memory:')
+  db.exec(`
+    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE chats (id TEXT PRIMARY KEY, config_json TEXT NOT NULL);
+    CREATE TABLE presets (id TEXT PRIMARY KEY, config_json TEXT NOT NULL DEFAULT '{}');
+  `)
+  db.prepare('INSERT INTO settings VALUES (?, ?)').run(
+    'approvalModes',
+    JSON.stringify({ commands: 'smart', processes: 'lists', pages: 'lists', search: 'lists' })
+  )
+  const sa = { providerId: 'p', model: 'j', contextMessages: 6 }
+  const insC = db.prepare('INSERT INTO chats VALUES (?, ?)')
+  insC.run('on', JSON.stringify({ smartApprove: { ...sa, enabled: true, tools: ['edit_file'] } }))
+  insC.run('off', JSON.stringify({ smartApprove: { ...sa, enabled: false, tools: ['edit_file'] } }))
+  insC.run(
+    'nomodel',
+    JSON.stringify({ smartApprove: { enabled: false, providerId: null, model: null, tools: [] } })
+  )
+  insC.run('new', JSON.stringify({ smartApprove: sa }))
+  insC.run('none', JSON.stringify({ model: 'm' }))
+  db.prepare('INSERT INTO presets VALUES (?, ?)').run(
+    'p1',
+    JSON.stringify({ approvalModes: { search: 'smart' }, smartApprove: { ...sa, enabled: false } })
+  )
+  const r = migrateSmartApproveItems(db)
+  assert.deepEqual(r, { skipped: false, chats: 3, presets: 1 })
+  const cfg = (t: string, id: string): any =>
+    JSON.parse((db.prepare(`SELECT config_json FROM ${t} WHERE id = ?`).get(id) as any).config_json)
+  assert.deepEqual(cfg('chats', 'on'), { smartApprove: sa, approvalModes: { editFile: 'smart' } })
+  // desligado com modelo: Comandos (smart pelo global) perguntava → lists neste chat
+  assert.deepEqual(cfg('chats', 'off'), { smartApprove: sa, approvalModes: { commands: 'lists' } })
+  assert.deepEqual(cfg('chats', 'nomodel'), { smartApprove: { providerId: null, model: null } })
+  assert.deepEqual(cfg('chats', 'new'), { smartApprove: sa })
+  assert.deepEqual(cfg('presets', 'p1'), {
+    approvalModes: { search: 'lists', commands: 'lists' },
+    smartApprove: sa
+  })
+  assert.ok(
+    db.prepare('SELECT value FROM settings WHERE key = ?').get(SMART_APPROVE_ITEMS_MIGRATION_FLAG)
+  )
+  assert.equal(migrateSmartApproveItems(db).skipped, true)
+  db.prepare('DELETE FROM settings').run()
+  assert.deepEqual(migrateSmartApproveItems(db), { skipped: false, chats: 0, presets: 0 })
+  db.close()
+})
+
+test('★ padrão global: escolher a opção do global = sem override (segue o global); outra = override', () => {
+  const global = { commands: 'lists', writeFile: 'always' } as const
+  // sem override → efetivo = global (a opção com ★ aparece selecionada)
+  assert.equal(effectiveMode({}, global, 'commands'), 'lists')
+  // escolher outra opção grava override
+  const a = withChatMode({}, 'commands', 'always', global)
+  assert.deepEqual(a, { commands: 'always' })
+  // escolher a opção com ★ remove o override (não grava 'lists')
+  assert.deepEqual(withChatMode(a, 'commands', 'lists', global), {})
+  // override igual ao global (ex.: global mudou depois) → clicar nele vira "segue o global"
+  assert.deepEqual(
+    withChatMode({ writeFile: 'always', editFile: 'smart' }, 'writeFile', 'always', global),
+    {
+      editFile: 'smart'
+    }
+  )
+  // sem global salvo → DEFAULT_APPROVAL_MODES é o padrão (★)
+  assert.deepEqual(withChatMode({}, 'delegate', 'always', null), {})
+  assert.deepEqual(withChatMode({}, 'delegate', 'lists', null), { delegate: 'lists' })
+  // null = voltar ao global; entrada não é mutada
+  const src = { pages: 'smart' } as const
+  assert.deepEqual(withChatMode(src, 'pages', null, global), {})
+  assert.deepEqual(src, { pages: 'smart' })
+  // seguindo o global, o chat acompanha quando o global muda
+  assert.equal(effectiveMode({}, { ...global, commands: 'always' }, 'commands'), 'always')
 })

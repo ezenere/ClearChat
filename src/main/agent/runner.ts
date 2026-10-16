@@ -21,6 +21,7 @@ import {
   blockedText,
   effectiveMode,
   evaluateLists,
+  isListItem,
   TOOL_ITEM,
   userDeniedText,
   validateListEntry,
@@ -1052,8 +1053,8 @@ async function executeTool(
     return done({ content: `Erro: ${errMsg(e)}`, status: 'error' })
   }
 
-  // Gate de aprovação (ver @shared/approvalPolicy): modo do item (always | smart | lists) ou,
-  // para as tools extras do Smart-Approve, juiz → usuário. ask_user nunca pede confirmação.
+  // Gate de aprovação (ver @shared/approvalPolicy): modo efetivo do item (always | smart | lists).
+  // Tools que não são itens (leitura, process_stop…) rodam direto; ask_user nunca pede confirmação.
   const settings = getApprovalSettings()
   let route =
     name === 'ask_user'
@@ -1095,8 +1096,8 @@ async function executeTool(
     route = smart.decision === 'approve' ? { kind: 'run' } : { kind: 'user' }
   }
   // fail-closed: 'lists' sem item de lista (não deveria acontecer) vira pergunta simples
-  if (route.kind === 'lists' && (!item || item === 'search')) route = { kind: 'user' }
-  if (route.kind === 'lists' && item && item !== 'search') {
+  if (route.kind === 'lists' && !isListItem(item)) route = { kind: 'user' }
+  if (route.kind === 'lists' && isListItem(item)) {
     const r = await listsGate(chat.id, session.id, toolCallId, name, item, args, signal)
     approval = r.record
     if (r.outcome) return done(r.outcome)
@@ -2250,7 +2251,7 @@ export function smartOverride(messageId: string): void {
 
 /** "Testar" do editor: roda o juiz numa chamada de exemplo (sem sessão; nada é salvo). */
 export async function smartApproveTest(input: SmartApproveTestInput): Promise<SmartApproveRecord> {
-  const sa = normalizeSmartApprove({ ...input.config.smartApprove, enabled: true })
+  const sa = normalizeSmartApprove(input.config.smartApprove)
   const ctx = {
     tool: input.tool,
     args: input.args,

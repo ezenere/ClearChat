@@ -70,15 +70,28 @@ export type ToolName =
   | 'ask_user'
 
 /**
- * Tools que passam pelo gate de aprovação (ver approvalPolicy.ts): cada uma é um ITEM com modo
- * always | smart | lists. `process_stop` NÃO está aqui: o agente só enxerga/para processos do
- * próprio chat (registro por chat em tools/processes.ts), então nunca pede confirmação.
+ * Tools cujo padrão global é PERGUNTAR (modo `lists`; ver approvalPolicy.ts) — os itens Comandos,
+ * Processos, Páginas e Busca web. `process_stop` NÃO está aqui: o agente só enxerga/para processos
+ * do próprio chat (registro por chat em tools/processes.ts), então nunca pede confirmação.
  */
 export const CONFIRM_TOOLS: ToolName[] = ['shell', 'process_start', 'web_search', 'browse_url']
-
-/** Item de aprovação (um por tool de CONFIRM_TOOLS). */
-export type ApprovalItem = 'commands' | 'processes' | 'pages' | 'search'
-/** always = sempre permitir · smart = Smart-Approve decide · lists = whitelist/blacklist (search: perguntar). */
+/**
+ * Item de aprovação (um por tool): shell · process_start · browse_url · web_search · write_file ·
+ * edit_file · send_to_chat · delegate_task.
+ */
+export type ApprovalItem =
+  | 'commands'
+  | 'processes'
+  | 'pages'
+  | 'search'
+  | 'writeFile'
+  | 'editFile'
+  | 'sendToChat'
+  | 'delegate'
+/**
+ * always = sempre permitir · smart = Smart-Approve decide · lists = whitelist/blacklist
+ * (commands/processes/pages; nos demais itens = "Perguntar").
+ */
 export type ApprovalMode = 'always' | 'smart' | 'lists'
 /** Listas globais (settings `approvalLists`): padrões de comando/processo ou domínios/prefixos de URL. */
 export interface ApprovalList {
@@ -157,8 +170,8 @@ export interface ChatConfig {
   /** Usada quando appSignature === 'custom'. */
   appSignatureCustom?: { referer: string; title: string }
   /**
-   * Smart-Approve: um modelo "juiz" decide se uma chamada de tool que pediria confirmação pode
-   * rodar (aprovar / rejeitar / perguntar ao usuário). Ausente = desligado. Ver smartApprove.ts.
+   * Smart-Approve: o modelo "juiz" que decide as chamadas dos itens em modo `smart` (aprovar /
+   * rejeitar / perguntar ao usuário). Ausente/sem modelo = esses itens perguntam. Ver smartApprove.ts.
    */
   smartApprove?: SmartApproveConfig
   /** Persona (preset) de onde o chat veio — só informativo (ver Preset). */
@@ -173,8 +186,10 @@ export interface SmartApproveLabels {
 }
 
 export interface SmartApproveConfig {
-  enabled: boolean
-  /** Par provedor + modelo do juiz (qualquer provedor). Sem modelo → não pode ser habilitado. */
+  /**
+   * Par provedor + modelo do juiz (qualquer provedor). O juiz decide os itens em modo `smart`
+   * (approvalModes); sem modelo esses itens perguntam a você (fail-closed).
+   */
   providerId: string | null
   model: string | null
   /** System prompt do juiz; null = DEFAULT_SMART_APPROVE_PROMPT. */
@@ -187,9 +202,13 @@ export interface SmartApproveConfig {
   /** Tempo máximo da chamada ao juiz, em segundos (padrão 30). Estourou → pergunta ao usuário. */
   timeoutS: number
   /**
-   * Tools EXTRAS avaliadas pelo juiz (SMART_APPROVE_EXTRA_TOOLS: write_file, edit_file,
-   * send_to_chat, delegate_task; padrão nenhuma). As de CONFIRM_TOOLS usam o juiz quando o modo do
-   * item é `smart` (approvalModes). Nomes de CONFIRM_TOOLS aqui são ignorados (legado).
+   * @deprecated (≤ 0.4.0) liga/desliga. Só alias de leitura: migrateSmartApproveConfig converte
+   * (ver approvalPolicy.ts) e remove. Hoje o juiz age nos itens em modo `smart` quando há modelo.
+   */
+  enabled?: boolean
+  /**
+   * @deprecated (≤ 0.4.0) tools "extras" avaliadas pelo juiz (write_file, edit_file, send_to_chat,
+   * delegate_task). Viraram itens de aprovação: migrateSmartApproveConfig converte em modo `smart`.
    */
   tools?: ToolName[]
 }
@@ -477,7 +496,7 @@ export interface ApprovalRequest {
   smartApprove?: SmartApproveRecord
   /** Modo lists: sub-comandos (ou a URL) com o veredito de cada um — card com 4 botões por item. */
   check?: ApprovalCheck
-  /** Modo smart sem juiz configurado/ligado → perguntou (o card avisa). */
+  /** Modo smart sem modelo do Smart-Approve → perguntou (o card avisa). */
   smartMissing?: boolean
 }
 
