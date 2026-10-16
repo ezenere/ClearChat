@@ -13,7 +13,9 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
 ## Destaques
 
 - **Qualquer provedor**: OpenAI-compatible genérico, OpenRouter e Anthropic nativa (PDF como documento,
-  prompt caching, thinking/effort). Parâmetros que o modelo não aceita somem do painel e não vão na request.
+  prompt caching, thinking/effort). Parâmetros que o modelo não aceita somem do painel e não vão na request;
+  os níveis de `reasoning_effort` vêm do `/models` do provedor (OpenRouter `supported_efforts`, Anthropic
+  `capabilities.effort`), com tabela conferida só onde a API não informa.
 - **Agente com ferramentas**: arquivos, shell do usuário (zsh/bash com o seu ambiente), processos em segundo
   plano (emuladores, dev servers, logs com busca), pesquisa na web (DuckDuckGo → Brave), navegador oculto,
   leitura de imagens e PDFs, busca em outros chats.

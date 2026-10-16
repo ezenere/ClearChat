@@ -14,7 +14,19 @@ import {
   parseClaudeId,
   PARAM_KEYS
 } from '../src/shared/modelParams.ts'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import {
+  clampEffort,
+  COMMON_EFFORTS,
+  effortSpec,
+  effortWire,
+  openAIEffortRule,
+  openRouterReasoning
+} from '../src/shared/modelParams.ts'
 import { mapModel } from '../src/main/providers.ts'
+import { mapAnthropicModel } from '../src/main/agent/adapters/anthropic.ts'
 import { buildRequest, setModelInfoSource } from '../src/main/agent/request.ts'
 import { buildCompactionRequest } from '../src/main/agent/compaction.ts'
 import { buildJudgeRequest } from '../src/main/agent/smartApprove.ts'
@@ -273,7 +285,11 @@ test('buildRequest: omite o não suportado, anota e preserva o valor salvo', () 
     env
   )
   assert.deepEqual((r4.body as any).output_config, { effort: 'low' })
-  assert.match(r4.notes!.join('\n'), /minimal enviado como output_config.effort "low"/)
+  assert.ok(
+    r4.notes!.includes(
+      'reasoning_effort ajustado: claude-sonnet-4-6 não aceita "minimal" (níveis: low, medium, high, max); enviado "low".'
+    )
+  )
   const r5 = buildRequest(
     chat({ reasoning_effort: 'high' }),
     { depth: 0, model: 'claude-haiku-4-5' },
@@ -364,4 +380,285 @@ test('juiz do Smart-Approve: temperature 0 omitido onde não é aceito', () => {
   assert.equal((j3.body as any).temperature, undefined)
   assert.equal((j3.body as any).max_tokens, 300)
   assert.deepEqual((j3.body as any).usage, { include: true })
+})
+
+// ---------------- reasoning_effort: níveis derivados do modelo ----------------
+// Fixture: recorte real do GET https://openrouter.ai/api/v1/models (público, sem key).
+
+const FIXTURE = JSON.parse(
+  readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), 'fixtures/openrouter-models.json'),
+    'utf8'
+  )
+) as { data: Record<string, unknown>[] }
+const orModel = (id: string): ModelInfo => {
+  const raw = FIXTURE.data.find((m) => m.id === id)
+  assert.ok(raw, `fixture sem ${id}`)
+  return mapModel(raw)!
+}
+const orRules = (id: string): ReturnType<typeof paramRules> =>
+  paramRules({ kind: 'openrouter', model: id, info: orModel(id) })
+
+test('OpenRouter (fixture real): reasoning_effort só onde supported_parameters tem reasoning', () => {
+  for (const id of ['openai/gpt-4o-mini', 'openai/gpt-5.2-chat', 'deepseek/deepseek-chat']) {
+    const r = orRules(id)
+    assert.ok(!r.supported.includes('reasoning_effort'), id)
+    assert.equal(r.effort, null, id)
+    assert.equal(orModel(id).reasoning, undefined, id)
+  }
+  assert.ok(orRules('openai/gpt-4o-mini').supported.includes('temperature'))
+  for (const id of ['openai/gpt-5', 'openai/o4-mini', 'anthropic/claude-sonnet-4.6'])
+    assert.ok(orRules(id).supported.includes('reasoning_effort'), id)
+})
+
+test('OpenRouter (fixture real): níveis = reasoning.supported_efforts (ordem crescente)', () => {
+  const expect: Record<string, string[]> = {
+    'openai/gpt-5': ['minimal', 'low', 'medium', 'high'],
+    'openai/gpt-5-pro': ['high'],
+    'openai/gpt-5.1': ['none', 'low', 'medium', 'high'],
+    'openai/gpt-5.5': ['none', 'low', 'medium', 'high', 'xhigh'],
+    'openai/gpt-5.5-pro': ['medium', 'high', 'xhigh'],
+    'openai/o3-mini-high': ['high'],
+    'openai/gpt-oss-120b': ['low', 'medium', 'high'],
+    'anthropic/claude-sonnet-4.6': ['none', 'low', 'medium', 'high', 'max'],
+    'anthropic/claude-sonnet-5.5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'anthropic/claude-haiku-5.5': ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+    'google/gemini-3-flash-preview': ['none', 'minimal', 'low', 'medium', 'high'],
+    'google/gemini-3.1-pro-preview': ['low', 'medium', 'high'],
+    'deepseek/deepseek-v4-pro': ['none', 'high', 'xhigh'],
+    'x-ai/grok-4.3': ['none', 'low', 'medium', 'high'],
+    'qwen/qwen3.8-max-prime': ['minimal', 'low', 'medium', 'high', 'xhigh']
+  }
+  for (const [id, levels] of Object.entries(expect)) {
+    const e = orRules(id).effort!
+    assert.deepEqual(e.levels, levels, id)
+    assert.equal(e.source, 'api', id)
+    assert.equal(e.known, true, id)
+    assert.match(e.origin, /reasoning\.supported_efforts/, id)
+    assert.equal(e.wire, 'reasoning: { effort: "<nível>" }')
+  }
+  // default_effort do /models vira o padrão ao ligar; mandatory é exposto
+  assert.equal(orRules('x-ai/grok-4.3').effort!.default, 'low')
+  assert.equal(orRules('qwen/qwen3.8-max-prime').effort!.default, 'xhigh')
+  assert.equal(orRules('anthropic/claude-sonnet-5.5').effort!.mandatory, true)
+  assert.equal(orRules('openai/gpt-5.1').effort!.mandatory, undefined)
+})
+
+test('OpenRouter (fixture real): reasoning sem supported_efforts → conjunto comum, "não informado"', () => {
+  for (const id of [
+    'openai/o4-mini',
+    'anthropic/claude-opus-4.5',
+    'anthropic/claude-haiku-4.5',
+    'google/gemini-2.5-flash',
+    'deepseek/deepseek-r1',
+    'qwen/qwen3-235b-a22b-thinking-2507'
+  ]) {
+    const e = orRules(id).effort!
+    assert.deepEqual(e.levels, COMMON_EFFORTS, id)
+    assert.equal(e.source, 'unknown', id)
+    assert.equal(e.known, false, id)
+    assert.match(e.origin, /a API não lista níveis/, id)
+  }
+  // nível desconhecido não é "corrigido" (o OpenRouter leva ao mais próximo)
+  const s = paramSupport({
+    kind: 'openrouter',
+    model: 'openai/o4-mini',
+    info: orModel('openai/o4-mini'),
+    params: { reasoning_effort: 'minimal' }
+  })
+  assert.equal(s.send.reasoning_effort, 'minimal')
+  assert.equal(s.effortAdjust, undefined)
+})
+
+test('openRouterReasoning: null = todos os níveis; ausente = não informado; níveis estranhos ignorados', () => {
+  assert.deepEqual(openRouterReasoning({ supported_efforts: null, mandatory: true }), {
+    efforts: null,
+    mandatory: true
+  })
+  assert.deepEqual(openRouterReasoning({ mandatory: false }), { mandatory: false })
+  assert.deepEqual(
+    openRouterReasoning({ supported_efforts: ['high', 'ultra', 'low'], default_effort: 'ultra' }),
+    { efforts: ['low', 'high'] }
+  )
+  assert.equal(openRouterReasoning(null), undefined)
+  const all = effortSpec({
+    kind: 'openrouter',
+    model: 'x',
+    info: { reasoning: { efforts: null, mandatory: true } }
+  })
+  assert.deepEqual(all.levels, ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+  assert.equal(all.source, 'api')
+})
+
+test('clamp: valor salvo fora dos níveis do modelo → mais próximo (ou omitido) + aviso', () => {
+  const cases: [string, ChatParams['reasoning_effort'], string | undefined][] = [
+    ['openai/o3-mini-high', 'minimal', 'high'],
+    ['openai/gpt-5.1', 'minimal', 'low'], // não vira "none" (desligaria o raciocínio)
+    ['openai/gpt-5.5', 'max', 'xhigh'],
+    ['openai/gpt-5-pro', 'low', 'high'],
+    ['google/gemini-3.1-pro-preview', 'minimal', 'low'],
+    ['deepseek/deepseek-v4-pro', 'medium', 'high'],
+    ['anthropic/claude-sonnet-4.6', 'xhigh', 'high'],
+    ['anthropic/claude-sonnet-5.5', 'none', undefined], // mandatory: "none" não existe
+    ['openai/gpt-5', 'minimal', 'minimal'] // válido: vai como está
+  ]
+  for (const [id, from, to] of cases) {
+    const s = paramSupport({
+      kind: 'openrouter',
+      model: id,
+      info: orModel(id),
+      params: { reasoning_effort: from }
+    })
+    assert.equal(s.send.reasoning_effort, to, `${id} ${from}`)
+    if (to === from) assert.equal(s.effortAdjust, undefined)
+    else {
+      assert.deepEqual(
+        { from: s.effortAdjust?.from, to: s.effortAdjust?.to },
+        { from, to },
+        `${id} ${from}`
+      )
+      assert.ok(
+        s.notes.some((n) => n.startsWith('reasoning_effort ')),
+        id
+      )
+    }
+  }
+  assert.equal(clampEffort('xhigh', { levels: COMMON_EFFORTS, known: false }), 'xhigh')
+  assert.equal(clampEffort('none', { levels: ['low', 'high'], known: true }), undefined)
+})
+
+test('buildRequest: formato no body por tipo de provider; desligado = omitido', () => {
+  models['po|openai/gpt-5.1'] = orModel('openai/gpt-5.1')
+  models['po|openai/gpt-4o-mini'] = orModel('openai/gpt-4o-mini')
+  const or = (model: string, params: ChatParams): any =>
+    buildRequest(chat(params, { providerId: 'po' }), { depth: 0, model }, [], orp, env)
+  // OpenRouter: reasoning: {effort}; nível inválido ajustado; modelo sem reasoning → omitido
+  assert.deepEqual(or('openai/gpt-5.1', { reasoning_effort: 'high' }).body.reasoning, {
+    effort: 'high'
+  })
+  const adj = or('openai/gpt-5.1', { reasoning_effort: 'minimal' })
+  assert.deepEqual(adj.body.reasoning, { effort: 'low' })
+  assert.equal(adj.body.reasoning_effort, undefined)
+  const no = or('openai/gpt-4o-mini', { reasoning_effort: 'high' })
+  assert.equal(no.body.reasoning, undefined)
+  assert.equal(no.body.reasoning_effort, undefined)
+  assert.ok(no.notes.some((n: string) => n.startsWith('reasoning_effort omitido')))
+  // openai genérico: reasoning_effort na raiz; gpt-4o-mini (tabela) → omitido; o3 minimal → low
+  const g = (model: string, params: ChatParams): any =>
+    buildRequest(chat(params), { depth: 0, model }, [], gen, env).body
+  assert.equal(g('gpt-5-mini', { reasoning_effort: 'minimal' }).reasoning_effort, 'minimal')
+  assert.equal(g('o3', { reasoning_effort: 'minimal' }).reasoning_effort, 'low')
+  assert.equal(g('gpt-4o-mini', { reasoning_effort: 'high' }).reasoning_effort, undefined)
+  assert.equal(g('gpt-5-mini', { reasoning_effort: 'low' }).reasoning, undefined)
+  // Anthropic nativa: output_config.effort; xhigh em sonnet-4-6 (tabela) → high
+  const a = (model: string, params: ChatParams): any =>
+    buildRequest(chat(params), { depth: 0, model }, [], anth, env).body
+  assert.deepEqual(a('claude-sonnet-5-5', { reasoning_effort: 'max' }).output_config, {
+    effort: 'max'
+  })
+  assert.deepEqual(a('claude-sonnet-4-6', { reasoning_effort: 'xhigh' }).output_config, {
+    effort: 'high'
+  })
+  // toggle desligado (ausente ou null) → nenhum campo de raciocínio em nenhum formato
+  for (const params of [{}, { reasoning_effort: null as any }]) {
+    assert.equal(or('openai/gpt-5.1', params).body.reasoning, undefined)
+    assert.equal(g('gpt-5-mini', params).reasoning_effort, undefined)
+    assert.equal(a('claude-sonnet-5-5', params).output_config, undefined)
+  }
+  assert.equal(effortWire('openai'), '"reasoning_effort": "<nível>"')
+  assert.equal(effortWire('anthropic'), 'output_config: { effort: "<nível>" }')
+})
+
+test('Anthropic nativa: capabilities.effort do /v1/models manda; tabela só sem capabilities', () => {
+  const lvl = (s: boolean): { supported: boolean } => ({ supported: s })
+  // formato da doc (api/models/list): effort.{low,medium,high,max,xhigh}.supported
+  const m46 = mapAnthropicModel({
+    id: 'claude-opus-4-6',
+    capabilities: {
+      image_input: lvl(true),
+      pdf_input: lvl(true),
+      effort: {
+        supported: true,
+        low: lvl(true),
+        medium: lvl(true),
+        high: lvl(true),
+        max: lvl(true),
+        xhigh: null
+      }
+    }
+  })!
+  assert.deepEqual(m46.reasoning, {
+    effortSupported: true,
+    efforts: ['low', 'medium', 'high', 'max']
+  })
+  const e = paramRules({ kind: 'anthropic', model: m46.id, info: m46 }).effort!
+  assert.deepEqual(e.levels, ['low', 'medium', 'high', 'max'])
+  assert.equal(e.source, 'api')
+  assert.match(e.origin, /capabilities\.effort/)
+  assert.equal(e.wire, 'output_config: { effort: "<nível>" }')
+  // API diz que não aceita → oculto, mesmo que a tabela dissesse o contrário
+  const off = mapAnthropicModel({
+    id: 'claude-sonnet-5-5',
+    capabilities: { effort: { supported: false } }
+  })!
+  const r = paramRules({ kind: 'anthropic', model: off.id, info: off })
+  assert.ok(!r.supported.includes('reasoning_effort'))
+  assert.equal(r.effort, null)
+  // sem capabilities → tabela (doc "Effort levels")
+  const table: Record<string, string[]> = {
+    'claude-opus-4-5-20251101': ['low', 'medium', 'high'],
+    'claude-opus-4-6': ['low', 'medium', 'high', 'max'],
+    'claude-sonnet-4-6': ['low', 'medium', 'high', 'max'],
+    'claude-mythos-preview': ['low', 'medium', 'high', 'max'],
+    'claude-opus-4-7': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'claude-sonnet-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'claude-haiku-5-5': ['low', 'medium', 'high', 'xhigh', 'max'],
+    'claude-fable-5-1': ['low', 'medium', 'high', 'xhigh', 'max']
+  }
+  for (const [id, levels] of Object.entries(table)) {
+    const t = paramRules({ kind: 'anthropic', model: id }).effort!
+    assert.deepEqual(t.levels, levels, id)
+    assert.equal(t.source, 'table', id)
+  }
+  assert.equal(paramRules({ kind: 'anthropic', model: 'claude-haiku-4-5' }).effort, null)
+})
+
+test('openai genérico: tabela por família (conferida contra o OpenRouter) e desconhecido', () => {
+  // a tabela bate com supported_efforts do OpenRouter para os mesmos modelos
+  for (const id of [
+    'openai/gpt-5',
+    'openai/gpt-5-pro',
+    'openai/gpt-5.1',
+    'openai/gpt-5.5',
+    'openai/gpt-5.5-pro',
+    'openai/gpt-oss-120b'
+  ])
+    assert.deepEqual(openAIEffortRule(id)?.efforts, orModel(id).reasoning!.efforts, id)
+  assert.equal(openAIEffortRule('openai/gpt-4o-mini')?.reasoning, false)
+  assert.equal(orModel('openai/gpt-4o-mini').reasoning, undefined)
+
+  const spec = (model: string): any => paramRules({ kind: 'openai', model }).effort
+  assert.deepEqual(spec('gpt-5-mini-2025-08-07').levels, ['minimal', 'low', 'medium', 'high'])
+  assert.deepEqual(spec('o4-mini').levels, ['low', 'medium', 'high'])
+  assert.deepEqual(spec('gpt-5.4-nano').levels, ['none', 'low', 'medium', 'high', 'xhigh'])
+  assert.equal(spec('o3').source, 'table')
+  assert.match(spec('o3').origin, /Tabela interna/)
+  assert.equal(spec('gpt-4o-mini'), null)
+  assert.ok(
+    !paramRules({ kind: 'openai', model: 'gpt-4.1' }).supported.includes('reasoning_effort')
+  )
+  for (const id of ['llama-3.3-70b', 'o1-mini', 'gpt-5-codex', 'gpt-5.6-luna', 'qwen3:32b']) {
+    assert.equal(spec(id).source, 'unknown', id)
+    assert.deepEqual(spec(id).levels, COMMON_EFFORTS, id)
+  }
+  // endpoint genérico que devolve supported_parameters/reasoning (ex.: proxy) → vale a API
+  const proxied = mapModel({
+    id: 'gpt-4o-mini',
+    supported_parameters: ['reasoning', 'max_tokens'],
+    reasoning: { supported_efforts: ['high', 'low'] }
+  })!
+  assert.deepEqual(
+    paramRules({ kind: 'openai', model: 'gpt-4o-mini', info: proxied }).effort!.levels,
+    ['low', 'high']
+  )
 })
