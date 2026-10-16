@@ -1,7 +1,7 @@
 // providers.listModels / providers.test — GET {baseUrl}/models pelo adaptador do provider
 // (OpenAI-compatible/OpenRouter: mapModel; Anthropic nativa: mapAnthropicModel, paginado).
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
-import { openRouterSupportedParams } from '@shared/modelParams'
+import { openRouterReasoning, openRouterSupportedParams } from '@shared/modelParams'
 import type { ProviderTestInput, ProviderTestResult } from '@shared/ipc'
 import type { ModelInfo, Provider } from '@shared/types'
 import { adapterFor } from './agent/adapters'
@@ -45,6 +45,9 @@ export function mapModel(m: Record<string, unknown>): ModelInfo | null {
     const params = openRouterSupportedParams(m.supported_parameters)
     if (params) info.supportedParams = params
   }
+  // OpenRouter: níveis de reasoning_effort aceitos (supported_efforts / default_effort / mandatory)
+  const reasoning = openRouterReasoning(m.reasoning)
+  if (reasoning) info.reasoning = reasoning
   return info
 }
 

@@ -25,6 +25,28 @@ export interface ModelInfo {
    * @shared/modelParams). Ausente = desconhecido → todas (Anthropic usa uma tabela por modelo).
    */
   supportedParams?: string[]
+  /**
+   * Raciocínio informado pela API (OpenRouter: objeto `reasoning` do /models; Anthropic nativa:
+   * `capabilities.effort`). Ausente = a API não informa (ver @shared/modelParams → effortSpec).
+   */
+  reasoning?: ModelReasoningInfo
+}
+
+/** Níveis de esforço conhecidos (ordem crescente). */
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+
+export interface ModelReasoningInfo {
+  /**
+   * Níveis aceitos (ordem crescente). `null` = a API diz que todos os níveis do gateway valem
+   * (OpenRouter `supported_efforts: null`); ausente = a API não lista níveis.
+   */
+  efforts?: ReasoningEffort[] | null
+  /** Nível padrão do modelo (OpenRouter `default_effort`). */
+  defaultEffort?: ReasoningEffort
+  /** Raciocínio obrigatório (OpenRouter `mandatory`: não aceita `effort: "none"`). */
+  mandatory?: boolean
+  /** Anthropic nativa: `capabilities.effort.supported` (false = não aceita effort). */
+  effortSupported?: boolean
 }
 
 /** Só campos definidos (≠ undefined/null) vão para a request. */
@@ -37,8 +59,11 @@ export interface ChatParams {
   presence_penalty?: number
   repetition_penalty?: number
   seed?: number
-  /** OpenRouter: vira `{ reasoning: { effort } }`; outros: `reasoning_effort`. */
-  reasoning_effort?: 'minimal' | 'low' | 'medium' | 'high'
+  /**
+   * OpenRouter: vira `{ reasoning: { effort } }`; openai genérico: `reasoning_effort`; Anthropic
+   * nativa: `output_config: { effort }`. Níveis válidos por modelo: @shared/modelParams → effortSpec.
+   */
+  reasoning_effort?: ReasoningEffort
   /** JSON livre, merge raso no body (último a ser aplicado). */
   extraBody?: string
 }

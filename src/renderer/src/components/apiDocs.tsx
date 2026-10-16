@@ -7,6 +7,7 @@ import { audioFormat, contentText, formatSize, messageAttachments } from '@share
 import type { ApiMessage, AttachmentMeta, ChatParams, StoredMessage, ToolName } from '@shared/types'
 import { api } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
+import type { EffortSpec } from '@shared/modelParams'
 import { ApiInfo, C } from './ui/Tooltip'
 
 type Side = 'top' | 'right' | 'bottom' | 'left'
@@ -76,28 +77,37 @@ const PARAM_DOCS: Record<Exclude<keyof ChatParams, 'extraBody'>, string> = {
 
 export function ParamInfo({
   name,
-  openRouter
+  openRouter,
+  effort
 }: {
   name: keyof typeof PARAM_DOCS
   openRouter: boolean
+  /** reasoning_effort: níveis do modelo, origem e formato no body (@shared/modelParams). */
+  effort?: EffortSpec | null
 }): React.JSX.Element {
   return (
     <ApiInfo title={<span className="font-mono text-[12px]">{name}</span>} side="left">
       <p>{PARAM_DOCS[name]}</p>
       {name === 'reasoning_effort' ? (
-        <p>
-          {openRouter ? (
-            <>
-              Este provedor é OpenRouter: enviado como <C>{'reasoning: { effort: "<valor>" }'}</C>{' '}
-              no body.
-            </>
-          ) : (
-            <>
-              Enviado como campo <C>reasoning_effort</C> no body (no OpenRouter seria{' '}
-              <C>{'reasoning: { effort }'}</C>).
-            </>
+        <>
+          <p>
+            Enviado como{' '}
+            <C>{effort?.wire ?? (openRouter ? 'reasoning: { effort }' : 'reasoning_effort')}</C> no
+            body.
+            {effort?.wire.startsWith('reasoning:') &&
+              ' O OpenRouter traduz para o provedor (OpenAI reasoning_effort, Anthropic effort/budget_tokens, Gemini thinkingLevel) e leva níveis não aceitos ao mais próximo.'}
+          </p>
+          {effort && (
+            <p data-testid="effort-origin">
+              Níveis: <C>{effort.levels.join(' · ')}</C>
+              {effort.source === 'unknown' && <b className="text-fg"> (não informado pela API)</b>}.
+              Origem: {effort.origin}
+              {effort.mandatory && ' Raciocínio obrigatório neste modelo (não aceita "none").'}
+              {effort.known &&
+                ' Um valor salvo fora desses níveis é ajustado para o mais próximo (ou omitido) na request.'}
+            </p>
           )}
-        </p>
+        </>
       ) : (
         <p>
           Enviado como <C>{`"${name}": <número>`}</C> na raiz do body.

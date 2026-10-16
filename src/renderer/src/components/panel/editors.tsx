@@ -7,11 +7,13 @@ import {
   DEFAULT_COMPACT_THRESHOLD,
   defaultToolsPrompt
 } from '@shared/defaults'
-import { providerKind } from '@shared/providerKinds'
+import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import {
   conflictOmitted,
+  effortSpec,
   paramSupport,
   safeExtraBody,
+  sortEfforts,
   type ParamKey,
   type ParamSupport
 } from '@shared/modelParams'
@@ -67,8 +69,6 @@ const NUM_PARAMS: {
   { key: 'repetition_penalty', def: 1, step: 0.05, min: 0, max: 2 },
   { key: 'seed', def: 0, step: 1, int: true }
 ]
-
-const EFFORTS = ['minimal', 'low', 'medium', 'high'] as const
 
 // Último valor usado de cada parâmetro (para religar o toggle sem perder o valor), por escopo.
 const remembered = new Map<string, Partial<Record<keyof ChatParams, unknown>>>()
@@ -166,9 +166,9 @@ export function SystemPromptSection({ cfg, patch }: CfgProps): React.JSX.Element
   )
 }
 
-function useOpenRouter(providerId: string): boolean {
+function useProviderKind(providerId: string): ProviderKind {
   const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
-  return provider ? providerKind(provider) === 'openrouter' : false
+  return provider ? providerKind(provider) : 'openai'
 }
 
 /**
@@ -195,10 +195,21 @@ export function ParamsSection({
   patch,
   scope
 }: CfgProps & { scope: string }): React.JSX.Element {
-  const openRouter = useOpenRouter(cfg.providerId)
+  const kind = useProviderKind(cfg.providerId)
+  const openRouter = kind === 'openrouter'
   const setParam = useSetParam(cfg, patch, scope)
   const mem = rememberedFor(scope)
   const support = useParamSupport(cfg)
+  // Níveis de reasoning_effort do modelo (API → tabela → conjunto comum). Sem modelo: conjunto comum.
+  const effort = support ? support.effort : effortSpec({ kind, model: cfg.model })
+  const effortValue = cfg.params.reasoning_effort ?? undefined
+  // Níveis desconhecidos: o valor salvo (de outro modelo) continua selecionável
+  const effortLevels = !effort
+    ? []
+    : effort.known || !effortValue || effort.levels.includes(effortValue)
+      ? effort.levels
+      : sortEfforts([...effort.levels, effortValue])
+  const effortAdjust = support?.effortAdjust
   const visible = (k: ParamKey): boolean => !support || support.supported.includes(k)
   const conflicts = support ? conflictOmitted(support) : new Set<ParamKey>()
   /** Liga um parâmetro; se ele tiver par exclusivo (ex.: temperature/top_p no Claude 4.x), desliga o outro. */
@@ -279,14 +290,14 @@ export function ParamsSection({
               size="sm"
               checked={cfg.params.reasoning_effort != null}
               label="Enviar reasoning_effort"
-              onChange={(v) =>
+              onChange={(v) => {
+                if (!v) return setParam('reasoning_effort', undefined)
+                const last = mem.reasoning_effort as ChatParams['reasoning_effort']
                 setParam(
                   'reasoning_effort',
-                  v
-                    ? ((mem.reasoning_effort as ChatParams['reasoning_effort']) ?? 'medium')
-                    : undefined
+                  last && effortLevels.includes(last) ? last : (effort?.default ?? 'medium')
                 )
-              }
+              }}
             />
             <span
               className={cn(
@@ -296,26 +307,38 @@ export function ParamsSection({
             >
               reasoning_effort
             </span>
-            <ParamInfo name="reasoning_effort" openRouter={openRouter} />
+            <ParamInfo name="reasoning_effort" openRouter={openRouter} effort={effort} />
           </div>
         )}
         {visible('reasoning_effort') && cfg.params.reasoning_effort != null && (
-          <div className="ml-[38px] flex animate-fade-in rounded-lg border border-border bg-bg/60 p-0.5">
-            {EFFORTS.map((e) => (
-              <button
-                key={e}
-                type="button"
-                onClick={() => setParam('reasoning_effort', e)}
-                className={cn(
-                  'flex-1 rounded-md py-1 text-[11.5px] transition-colors',
-                  cfg.params.reasoning_effort === e
-                    ? 'bg-active text-fg shadow-sm'
-                    : 'text-subtle hover:text-fg'
-                )}
-              >
-                {e}
-              </button>
-            ))}
+          <div className="ml-[38px] animate-fade-in">
+            <div
+              data-testid="effort-levels"
+              data-source={effort?.source}
+              className="flex rounded-lg border border-border bg-bg/60 p-0.5"
+            >
+              {effortLevels.map((e) => (
+                <button
+                  key={e}
+                  type="button"
+                  aria-pressed={cfg.params.reasoning_effort === e}
+                  onClick={() => setParam('reasoning_effort', e)}
+                  className={cn(
+                    'min-w-0 flex-1 truncate rounded-md px-0.5 py-1 text-[11px] transition-colors',
+                    cfg.params.reasoning_effort === e
+                      ? 'bg-active text-fg shadow-sm'
+                      : 'text-subtle hover:text-fg'
+                  )}
+                >
+                  {e}
+                </button>
+              ))}
+            </div>
+            {effortAdjust && (
+              <p data-testid="effort-adjust" className="mt-1 text-[11px] text-subtle">
+                {effortAdjust.to ? 'Ajustado' : 'Não enviado'}: {effortAdjust.reason}.
+              </p>
+            )}
           </div>
         )}
       </div>

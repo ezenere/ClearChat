@@ -1,6 +1,7 @@
 // Adaptador 'anthropic': API nativa da Anthropic (POST {baseUrl}/messages, GET {baseUrl}/models).
 // Ver SPEC.md → "Adaptadores de provider". Funções puras (sem rede), exceto quem chama fetch.
 // O histórico continua persistido no formato OpenAI; a conversão acontece só na cópia enviada.
+import { anthropicCapsReasoning } from '@shared/modelParams'
 import { ANTHROPIC_VERSION } from '@shared/providerKinds'
 import type { ApiMessage, ChatParams, ContentPart, ModelInfo, Provider, Usage } from '@shared/types'
 import type { ToolDefinition } from '@shared/tools'
@@ -251,12 +252,15 @@ export function anthropicTools(defs: ToolDefinition[]): Record<string, unknown>[
 
 /**
  * Body nativo de /messages. Params: max_tokens (obrigatório), temperature, top_p, top_k,
- * reasoning_effort → `output_config: {effort}` ('minimal' → 'low': a API só aceita
- * low/medium/high/xhigh/max) e stop → stop_sequences; penalties/seed/repetition_penalty ignorados
+ * reasoning_effort → `output_config: {effort}` (níveis já ajustados ao modelo pelo paramSupport;
+ * a API só aceita low/medium/high/xhigh/max) e stop → stop_sequences; penalties/seed/repetition_penalty ignorados
  * (não existem na API). Quem chama já filtrou os params pelo modelo (@shared/modelParams) — aqui
  * vai o que vier. extraBody é mesclado por último.
  */
-/** reasoning_effort do chat → `output_config.effort` (a API não tem 'minimal'). */
+/**
+ * reasoning_effort do chat → `output_config.effort`. O paramSupport já ajustou o valor para os
+ * níveis do modelo (capabilities.effort / tabela); 'minimal' → 'low' fica só como rede de segurança.
+ */
 export function anthropicEffort(e: NonNullable<ChatParams['reasoning_effort']>): string {
   return e === 'minimal' ? 'low' : e
 }
@@ -436,6 +440,9 @@ export function mapAnthropicModel(m: Record<string, unknown>): ModelInfo | null 
     if (supported(caps, 'image_input')) mods.push('image')
     if (supported(caps, 'pdf_input')) mods.push('file')
     info.inputModalities = mods
+    // effort: supported + níveis (low/medium/high/xhigh/max) direto da API
+    const reasoning = anthropicCapsReasoning(caps)
+    if (reasoning) info.reasoning = reasoning
   } else {
     // API sem capabilities (versões antigas): todos os Claude atuais aceitam imagem e PDF.
     info.inputModalities = ['text', 'image', 'file']
