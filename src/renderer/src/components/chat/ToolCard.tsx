@@ -33,11 +33,6 @@ import {
   Activity,
   MessageCircleQuestion,
   WifiOff,
-  Brain,
-  BookOpen,
-  BrainCircuit,
-  PenLine,
-  Eraser,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
@@ -65,11 +60,11 @@ import { ToolResultMedia } from './Attachments'
 import { toolContentText } from '@shared/attachments'
 import { isAnchorShown, shortFailure } from '../../lib/approvalAnchors'
 import { useAnchor } from '../../lib/useAnchor'
-import { isMemoryTool, MEMORY_TOOL_LABELS, memoryToolSummary } from '../../lib/memory'
+import { isMemoryTool, memoryToolSummary } from '../../lib/memory'
 import { MEMORY_TOOL_ICONS, MemoryToolBody } from '../memory/MemoryToolCard'
 
 // Partial + string: tools novas (ex.: memória, do contrato do backend) caem no Wrench/no mapa delas.
-const ICONS: Partial<Record<ToolName | string, LucideIcon>> = {
+const ICONS: Partial<Record<ToolName, LucideIcon>> = {
   ...MEMORY_TOOL_ICONS,
   list_dir: FolderTree,
   read_file: FileText,
@@ -94,12 +89,7 @@ const ICONS: Partial<Record<ToolName | string, LucideIcon>> = {
   wait_subagents: Hourglass,
   cancel_subagent: CircleStop,
   message_subagent: MessageSquareText,
-  ask_user: MessageCircleQuestion,
-  memory_search: Brain,
-  memory_read: BookOpen,
-  memory_write: BrainCircuit,
-  memory_rewrite: PenLine,
-  memory_delete: Eraser
+  ask_user: MessageCircleQuestion
 }
 
 const shortId = (id: string): string => (id.length > 12 ? `${id.slice(0, 8)}…` : id)
@@ -463,8 +453,7 @@ export function ToolCard({
 
   const expanded = open || !!approval
   const subId = result?.meta.subSessionId ?? subSession?.id
-  const label =
-    TOOL_LABELS[name] ?? (isMemoryTool(call.name) ? MEMORY_TOOL_LABELS[call.name] : call.name)
+  const label = TOOL_LABELS[name] ?? call.name
   let sum = summary(call.name, args)
   if (targetChat)
     sum = [

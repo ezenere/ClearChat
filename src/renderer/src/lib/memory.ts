@@ -2,8 +2,9 @@
 // personas, cards das tools e da extração). Sem React/store: testada em e2e/memoryUi.test.ts.
 // Contrato: src/shared/memory.ts e SPEC.md → "Memória".
 import {
-  defaultMemoryConfig,
+  isMemoryCategory as isCategory,
   MEMORY_CATEGORIES,
+  normalizeMemoryConfig,
   type Memory,
   type MemoryCategory,
   type MemoryCollection,
@@ -11,7 +12,11 @@ import {
   type MemoryExtractionResult,
   type MemoryUpdatedBy
 } from '@shared/memory'
-import type { ChatConfig, MessageMeta, Usage } from '@shared/types'
+import { MEMORY_LIMITS as SHARED_LIMITS } from '@shared/limits'
+import { MEMORY_TOOL_NAMES, TOOL_LABELS } from '@shared/tools'
+import type { ChatConfig, MessageMeta, ToolName } from '@shared/types'
+
+export { DEFAULT_MEMORY_EXTRACTION_PROMPT, DEFAULT_MEMORY_HELP_PROMPT } from '@shared/defaults'
 
 // ---------------- limites ----------------
 
@@ -19,7 +24,14 @@ import type { ChatConfig, MessageMeta, Usage } from '@shared/types'
  * Limites de conteúdo (SPEC: título ≤ 80, resumo ≤ 160, tópico ≤ 200, ≤ 15 tópicos). O main também
  * valida; aqui só para os contadores e para não deixar salvar acima do teto.
  */
-export const MEMORY_LIMITS = { title: 80, summary: 160, fact: 200, facts: 15 } as const
+export const MEMORY_LIMITS = {
+  title: SHARED_LIMITS.titleChars,
+  summary: SHARED_LIMITS.summaryChars,
+  fact: SHARED_LIMITS.factChars,
+  facts: SHARED_LIMITS.maxFacts,
+  collectionName: SHARED_LIMITS.collectionNameChars,
+  collectionDescription: SHARED_LIMITS.collectionDescriptionChars
+} as const
 
 export interface CounterState {
   len: number
@@ -67,31 +79,11 @@ export function removeFact(facts: readonly string[], i: number): string[] {
 
 // ---------------- config ----------------
 
-const isCategory = (v: unknown): v is MemoryCategory =>
-  typeof v === 'string' && (MEMORY_CATEGORIES as readonly string[]).includes(v)
-
-/** `ChatConfig.memory` completo (ausente/parcial → padrões). Nunca muta a entrada. */
+/** `ChatConfig.memory` completo (ausente/parcial → padrões; `normalizeMemoryConfig` do contrato). */
 export function memoryConfigOf(
   cfg: Partial<Pick<ChatConfig, 'memory'>> | null | undefined
 ): MemoryConfig {
-  const d = defaultMemoryConfig()
-  const m = cfg?.memory as Partial<MemoryConfig> | undefined
-  if (!m || typeof m !== 'object') return d
-  const writeTo: MemoryConfig['writeTo'] = {}
-  for (const [k, v] of Object.entries(m.writeTo ?? {}))
-    if (isCategory(k)) writeTo[k] = typeof v === 'string' ? v : null
-  return {
-    enabled: m.enabled === true,
-    collections: Array.isArray(m.collections)
-      ? [...new Set(m.collections.filter((x): x is string => typeof x === 'string'))]
-      : [],
-    writeTo,
-    categories: Array.isArray(m.categories) ? m.categories.filter(isCategory) : d.categories,
-    chatMemory: m.chatMemory === true,
-    helpPrompt: { ...d.helpPrompt, ...(m.helpPrompt ?? {}) },
-    extraction: { ...d.extraction, ...(m.extraction ?? {}) },
-    subagents: m.subagents === true
-  }
+  return normalizeMemoryConfig(cfg?.memory)
 }
 
 const byCategory = (cols: readonly MemoryCollection[], cat: MemoryCategory): MemoryCollection[] =>
@@ -327,10 +319,22 @@ export function splitMemoryLinks(text: string): LinkSegment[] {
   return out
 }
 
-/** Texto corrido sem a sintaxe de link (`[[slug|rótulo]]` → rótulo; `[[slug]]` → slug). */
-export function plainMemoryText(text: string): string {
+/**
+ * Texto corrido sem a sintaxe de link: `[[slug|rótulo]]` → rótulo; `[[slug]]` → título da memória
+ * (via `known`) ou o próprio slug.
+ */
+export function plainMemoryText(
+  text: string,
+  known: readonly Pick<Memory, 'slug' | 'title'>[] = []
+): string {
   return splitMemoryLinks(text)
-    .map((s) => ('text' in s ? s.text : s.label))
+    .map((s) =>
+      'text' in s
+        ? s.text
+        : s.label !== s.slug
+          ? s.label
+          : (known.find((m) => m.slug === s.slug)?.title ?? s.slug)
+    )
     .join('')
 }
 
@@ -378,43 +382,22 @@ export function matchesMemory(
 
 // ---------------- tools e mensagens ----------------
 
-export const MEMORY_TOOL_NAMES = [
-  'memory_search',
-  'memory_read',
-  'memory_write',
-  'memory_rewrite',
-  'memory_delete'
-] as const
-export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number]
+export type MemoryToolName = Extract<
+  ToolName,
+  'memory_search' | 'memory_read' | 'memory_write' | 'memory_rewrite' | 'memory_delete'
+>
 
-export const MEMORY_TOOL_LABELS: Record<MemoryToolName, string> = {
-  memory_search: 'Buscar memória',
-  memory_read: 'Ler memória',
-  memory_write: 'Gravar memória',
-  memory_rewrite: 'Reescrever memória',
-  memory_delete: 'Apagar memória'
-}
+/** Rótulos ("Buscar memória"…) — os mesmos de TOOL_LABELS. */
+export const MEMORY_TOOL_LABELS = TOOL_LABELS as Record<MemoryToolName, string>
 
 export const isMemoryTool = (name: string): name is MemoryToolName =>
   (MEMORY_TOOL_NAMES as readonly string[]).includes(name)
 
 /** Mudança feita por uma tool de memória ou pela extração (`meta.memoryChanges`). */
-export interface MemoryChange {
-  op: 'create' | 'update' | 'delete'
-  memoryId: string
-  title: string
-  collectionId: string
-}
+export type MemoryChange = MemoryExtractionResult['changes'][number]
 
 /** Meta da mensagem só de exibição `kind: 'memory-extraction'` (não vai à API). */
-export interface MemoryExtractionMeta extends MemoryExtractionResult {
-  model?: string
-  providerId?: string
-  usage?: Usage
-  /** Body exato da request de extração (para o (i)). */
-  request?: unknown
-  trigger: 'manual' | 'compaction'
-}
+export type MemoryExtractionMeta = NonNullable<MessageMeta['memoryExtraction']>
 
 const isChange = (v: unknown): v is MemoryChange => {
   const c = v as MemoryChange
@@ -427,16 +410,16 @@ const isChange = (v: unknown): v is MemoryChange => {
 }
 
 export function memoryChangesOf(meta: MessageMeta | undefined): MemoryChange[] {
-  const raw = (meta as { memoryChanges?: unknown } | undefined)?.memoryChanges
+  const raw: unknown = meta?.memoryChanges
   return Array.isArray(raw) ? raw.filter(isChange) : []
 }
 
 export const isExtractionMessage = (meta: MessageMeta | undefined): boolean =>
-  (meta as { kind?: string } | undefined)?.kind === 'memory-extraction'
+  meta?.kind === 'memory-extraction'
 
 export function extractionOf(meta: MessageMeta | undefined): MemoryExtractionMeta | null {
   if (!isExtractionMessage(meta)) return null
-  const r = (meta as { memoryExtraction?: Partial<MemoryExtractionMeta> }).memoryExtraction
+  const r = meta?.memoryExtraction as Partial<MemoryExtractionMeta> | undefined
   if (!r || typeof r !== 'object') return null
   return {
     ...r,
@@ -512,22 +495,3 @@ export function memoryIdsIn(text: string, known: readonly Pick<Memory, 'id'>[]):
   for (const m of known) if (text.includes(m.id) && !out.includes(m.id)) out.push(m.id)
   return out.sort((a, b) => text.indexOf(a) - text.indexOf(b))
 }
-
-// ---------------- textos padrão ----------------
-
-/**
- * Textos padrão do help prompt e da extração. O main (backend) é a fonte da verdade do que é
- * enviado — o (i) do chat mostra o texto exato via `memory.preview`. Estes servem de valor inicial
- * do campo editável (null = padrão) e para o (i) do editor de personas.
- */
-export const DEFAULT_MEMORY_HELP_PROMPT = `Você tem uma memória persistente sobre o usuário (índice acima, ferramentas memory_*).
-- ANTES de responder sobre o usuário, os projetos dele, pessoas ou preferências, consulte a memória (memory_search / memory_read) — não invente nem peça o que já está salvo.
-- Ao saber um fato novo e duradouro, grave-o (memory_write) na categoria certa, em tópicos curtos.
-- Se algo contradiz uma memória, corrija-a (replace/remove) em vez de criar outra.
-- O que só importa para esta conversa vai para a memória do chat (target: "chat").`
-
-export const DEFAULT_MEMORY_EXTRACTION_PROMPT = `Leia a conversa abaixo e extraia apenas fatos DURADOUROS sobre o usuário: quem é, interesses recorrentes, projetos em andamento, pessoas (e animais) da vida dele e como ele quer que o assistente se comporte.
-- Use memory_write para criar ou atualizar (prefira atualizar uma memória existente do índice a criar outra parecida).
-- Use memory_delete só para memórias claramente erradas ou obsoletas.
-- Ignore detalhes passageiros, dados sensíveis desnecessários e o que já está salvo igual.
-- Não responda com texto: só chame as ferramentas. Se não houver nada novo, não chame nenhuma.`

@@ -1006,7 +1006,7 @@ export function createMockApi(scenario: string): ClearApi {
       ),
       msg(
         's5',
-        { role: 'user', content: '[extração de memórias — só exibição]' },
+        { role: 'assistant', content: 'Extração de memórias: 2 criadas, 1 atualizada.' },
         {
           synthetic: true,
           kind: 'memory-extraction',
@@ -1049,7 +1049,7 @@ export function createMockApi(scenario: string): ClearApi {
       ),
       msg(
         's5',
-        { role: 'user', content: '[extração de memórias — só exibição]' },
+        { role: 'assistant', content: 'Extração de memórias: falhou.' },
         {
           synthetic: true,
           kind: 'memory-extraction',

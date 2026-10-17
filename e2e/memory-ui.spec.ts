@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 // E2E da UI da memória modular contra o MOCK de UI (Playwright `_electron`, sem backend, sem key):
 // builda o renderer com VITE_CLEAR_MOCK=1 numa pasta de rascunho (não mexe em out/), abre
 // `index.html?scenario=memory` numa janela Electron mínima e percorre:
@@ -12,7 +11,7 @@
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
-//   CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-e2e node e2e/memory-ui.spec.ts [filtro-para-parar]
+//   CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-ui-e2e node e2e/memory-ui.spec.ts [filtro-para-parar]
 //   (SKIP_BUILD=1 reaproveita o build anterior)
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright'
 import { execSync } from 'node:child_process'
@@ -22,7 +21,7 @@ import { tmpdir } from 'node:os'
 import assert from 'node:assert/strict'
 
 const ROOT = resolve(import.meta.dirname, '..')
-const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-memory-e2e'))
+const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-memory-ui-e2e'))
 const BUILD = join(BASE, 'build')
 const SHOTS = join(BASE, 'shots')
 const STOP_AFTER = process.argv[2] ?? ''
@@ -45,7 +44,12 @@ async function step(name: string, fn: () => Promise<string | void>): Promise<voi
     console.log(`✔ ${name}${info ? ` — ${info}` : ''}`)
   } catch (e) {
     results.push({ name, ok: false, info: (e as Error).message })
-    console.log(`✖ ${name} — ${(e as Error).message.split('\n')[0]}`)
+    console.log(
+      `✖ ${name} — ${(e as Error).message
+        .split('\n')
+        .slice(0, process.env.E2E_VERBOSE ? 30 : 1)
+        .join('\n')}`
+    )
     try {
       await shot(`FAIL-${name.replace(/[^\w]+/g, '_')}`)
       for (let i = 0; i < 3; i++) await page.keyboard.press('Escape')
@@ -68,7 +72,7 @@ const settings = (): ReturnType<Page['locator']> => page.locator('[role="dialog"
 const panel = (): ReturnType<Page['locator']> => page.getByTestId('right-panel')
 
 async function openSettingsMemory(): Promise<void> {
-  await page.getByRole('button', { name: 'Configurações', exact: true }).click()
+  await page.getByRole('button', { name: /^Configurações/ }).click()
   await settings().getByRole('button', { name: 'Memórias', exact: true }).click()
   await settings().getByTestId('memory-settings').waitFor()
 }
@@ -80,11 +84,20 @@ async function closeSettings(): Promise<void> {
 
 /** Abre o (i) (tooltip Radix) e devolve o texto. */
 async function infoText(trigger: ReturnType<Page['locator']>): Promise<string> {
-  await trigger.hover()
   const tip = page.locator('[data-radix-popper-content-wrapper]').last()
-  await tip.waitFor()
-  await page.waitForTimeout(200)
-  return (await tip.innerText()).trim()
+  for (let i = 0; ; i++) {
+    await page.mouse.move(2, 2)
+    await page.waitForTimeout(150)
+    await trigger.scrollIntoViewIfNeeded()
+    await trigger.hover()
+    try {
+      await tip.waitFor({ timeout: 2500 })
+      await page.waitForTimeout(200)
+      return (await tip.innerText()).trim()
+    } catch (e) {
+      if (i >= 2) throw e
+    }
+  }
 }
 
 async function main(): Promise<void> {
@@ -131,9 +144,14 @@ app.on('window-all-closed', () => app.quit())
     assert.ok(await page.getByText('Buscar memória').first().isVisible())
     assert.ok(await page.getByText('Gravar memória').first().isVisible())
     // card de extração: expandir e (i) com a request
-    await cards.first().getByRole('button', { name: /^Extração de memórias/ }).click()
+    await cards
+      .first()
+      .getByRole('button', { name: /^Extração de memórias/ })
+      .click()
     await cards.first().getByTestId('memory-changes').waitFor()
-    const info = await infoText(cards.first().getByRole('button', { name: 'O que é enviado para a API', exact: true }))
+    const info = await infoText(
+      cards.first().getByRole('button', { name: 'O que é enviado para a API', exact: true })
+    )
     assert.match(info, /não é enviado à API/)
     assert.match(info, /memory_write/)
     await page.mouse.move(10, 10)
@@ -151,47 +169,90 @@ app.on('window-all-closed', () => app.quit())
   })
 
   await step('aba Memória: herança da persona', async () => {
-    if (!(await panel().isVisible().catch(() => false)))
+    if (
+      !(await panel()
+        .isVisible()
+        .catch(() => false))
+    )
       await page.getByRole('button', { name: 'Abrir painel' }).click()
     await panel().getByRole('tab', { name: 'Memória' }).click()
     const p = panel().getByTestId('memory-panel')
     await p.waitFor()
-    assert.equal(await p.getByTestId('memory-col-col-tcc').getByTestId('memory-badge').getAttribute('data-badge'), 'added')
     assert.equal(
-      await p.getByTestId('memory-col-col-topics').getByTestId('memory-badge').getAttribute('data-badge'),
+      await p
+        .getByTestId('memory-col-col-tcc')
+        .getByTestId('memory-badge')
+        .getAttribute('data-badge'),
+      'added'
+    )
+    assert.equal(
+      await p
+        .getByTestId('memory-col-col-topics')
+        .getByTestId('memory-badge')
+        .getAttribute('data-badge'),
       'persona-off'
     )
     assert.equal(
-      await p.getByTestId('memory-col-col-profile').getByTestId('memory-badge').getAttribute('data-badge'),
+      await p
+        .getByTestId('memory-col-col-profile')
+        .getByTestId('memory-badge')
+        .getAttribute('data-badge'),
       'persona'
     )
-    assert.ok(await p.getByTestId('memory-col-col-tcc').getByTestId('memory-write-mark').isVisible())
+    assert.ok(
+      await p.getByTestId('memory-col-col-tcc').getByTestId('memory-write-mark').isVisible()
+    )
     assert.match(await p.getByTestId('memory-persona-line').innerText(), /Ajustada neste chat/)
     assert.equal(await p.getByTestId('memory-status').getAttribute('data-active'), 'true')
-    await p.getByTestId('memory-snapshot').getByText(/congelado desde/).waitFor({ timeout: 5000 })
+    await p
+      .getByTestId('memory-snapshot')
+      .getByText(/congelado desde/)
+      .waitFor({ timeout: 5000 })
     await shot('03-painel-memoria')
   })
 
   await step('aba Memória: ligar coleção, escrita, toggles', async () => {
     const p = panel().getByTestId('memory-panel')
     await p.getByTestId('memory-col-col-clearchat').click()
-    assert.equal(await p.getByTestId('memory-col-col-clearchat').getAttribute('data-checked'), 'true')
     assert.equal(
-      await p.getByTestId('memory-col-col-clearchat').getByTestId('memory-badge').getAttribute('data-badge'),
+      await p.getByTestId('memory-col-col-clearchat').getAttribute('data-checked'),
+      'true'
+    )
+    assert.equal(
+      await p
+        .getByTestId('memory-col-col-clearchat')
+        .getByTestId('memory-badge')
+        .getAttribute('data-badge'),
       'added'
     )
     // escrita de Áreas → ClearChat
     await p.getByRole('button', { name: 'Coleção de escrita: Áreas' }).click()
-    await page.locator('[role="dialog"], body').getByRole('button', { name: /ClearChat/ }).last().click()
+    await page
+      .locator('[role="dialog"], body')
+      .getByRole('button', { name: /ClearChat/ })
+      .last()
+      .click()
     await p.getByTestId('memory-col-col-clearchat').getByTestId('memory-write-mark').waitFor()
-    assert.equal(await p.getByTestId('memory-col-col-tcc').getByTestId('memory-write-mark').count(), 0)
+    assert.equal(
+      await p.getByTestId('memory-col-col-tcc').getByTestId('memory-write-mark').count(),
+      0
+    )
     // desligar a coleção de escrita limpa a escrita da categoria
     await p.getByTestId('memory-col-col-clearchat').click()
-    assert.equal(await p.getByTestId('memory-write-mark').filter({ visible: true }).count() >= 0, true)
-    assert.match(await p.getByRole('button', { name: 'Coleção de escrita: Áreas' }).innerText(), /Nenhuma/)
+    assert.equal(
+      (await p.getByTestId('memory-write-mark').filter({ visible: true }).count()) >= 0,
+      true
+    )
+    assert.match(
+      await p.getByRole('button', { name: 'Coleção de escrita: Áreas' }).innerText(),
+      /Nenhuma/
+    )
     // de volta: TCC como escrita
     await p.getByRole('button', { name: 'Coleção de escrita: Áreas' }).click()
-    await page.getByRole('button', { name: /Projeto TCC/ }).last().click()
+    await page
+      .getByRole('button', { name: /Projeto TCC/ })
+      .last()
+      .click()
     // categoria Tópicos: desligar some com as coleções
     await p.getByRole('switch', { name: 'Categoria Tópicos' }).click()
     assert.equal(await p.getByTestId('memory-col-col-topics').count(), 0)
@@ -199,7 +260,9 @@ app.on('window-all-closed', () => app.quit())
     // toggles
     await p.getByRole('switch', { name: 'Memória nos subagentes (só busca/leitura)' }).click()
     assert.equal(
-      await p.getByRole('switch', { name: 'Memória nos subagentes (só busca/leitura)' }).getAttribute('aria-checked'),
+      await p
+        .getByRole('switch', { name: 'Memória nos subagentes (só busca/leitura)' })
+        .getAttribute('aria-checked'),
       'true'
     )
     await shot('04-painel-escrita')
@@ -208,7 +271,12 @@ app.on('window-all-closed', () => app.quit())
   await step('aba Memória: (i) com o índice exato', async () => {
     const p = panel().getByTestId('memory-panel')
     await page.waitForTimeout(700) // preview depois do flush da config
-    const info = await infoText(p.locator('section').first().getByRole('button', { name: 'O que é enviado para a API', exact: true }))
+    const info = await infoText(
+      p
+        .locator('section')
+        .first()
+        .getByRole('button', { name: 'O que é enviado para a API', exact: true })
+    )
     assert.match(info, /Índice exato/)
     assert.match(info, /Projeto TCC \[escrita\]/)
     assert.match(info, /memory_search/)
@@ -240,7 +308,12 @@ app.on('window-all-closed', () => app.quit())
     assert.equal(await p.getByTestId('memory-status').getAttribute('data-active'), 'false')
     assert.match(await p.getByTestId('memory-status').innerText(), /Nada de memória vai para a API/)
     await page.waitForTimeout(700)
-    const info = await infoText(p.locator('section').first().getByRole('button', { name: 'O que é enviado para a API', exact: true }))
+    const info = await infoText(
+      p
+        .locator('section')
+        .first()
+        .getByRole('button', { name: 'O que é enviado para a API', exact: true })
+    )
     assert.match(info, /Nada de memória vai para a API/)
     await page.mouse.move(10, 10)
     assert.ok(await p.getByTestId('memory-extract-now').isDisabled())
@@ -272,7 +345,10 @@ app.on('window-all-closed', () => app.quit())
       ['areas', 'Viagem ao Japão', 'Roteiro, reservas e orçamento'],
       ['people', 'Trabalho', 'Colegas da Lumen']
     ]) {
-      await s.getByTestId(`memory-settings-cat-${cat}`).getByRole('button', { name: 'Nova coleção' }).click()
+      await s
+        .getByTestId(`memory-settings-cat-${cat}`)
+        .getByRole('button', { name: 'Nova coleção' })
+        .click()
       const form = s.getByTestId('memory-collection-form')
       await form.getByLabel('Nome da coleção').fill(name)
       await form.getByLabel('Descrição da coleção').fill(desc)
@@ -280,10 +356,15 @@ app.on('window-all-closed', () => app.quit())
       await s.getByTestId(`memory-settings-cat-${cat}`).getByText(name).waitFor()
     }
     // renomear
-    const row = s.getByTestId('memory-settings-cat-people').locator('[data-testid^="memory-collection-"]', { hasText: 'Trabalho' })
+    const row = s
+      .getByTestId('memory-settings-cat-people')
+      .locator('[data-testid^="memory-collection-"]', { hasText: 'Trabalho' })
     await row.hover()
     await row.getByRole('button', { name: 'Editar Trabalho' }).click()
-    await s.getByTestId('memory-collection-form').getByLabel('Nome da coleção').fill('Trabalho (Lumen)')
+    await s
+      .getByTestId('memory-collection-form')
+      .getByLabel('Nome da coleção')
+      .fill('Trabalho (Lumen)')
     await s.getByTestId('memory-collection-form').getByRole('button', { name: 'Salvar' }).click()
     await s.getByText('Trabalho (Lumen)').waitFor()
     await shot('11-config-colecoes-criadas')
@@ -302,10 +383,18 @@ app.on('window-all-closed', () => app.quit())
     const d = s.getByTestId('memory-detail')
     await d.waitFor()
     // detalhes: adicionar 3, reordenar, editar, remover
-    for (const fact of ['Hotel em Shinjuku', 'JR Pass de 7 dias', 'Visitar o [[marcos-orientador]]?']) {
+    for (const fact of [
+      'Hotel em Shinjuku',
+      'JR Pass de 7 dias',
+      'Visitar o [[marcos-orientador]]?'
+    ]) {
       await d.getByLabel('Novo detalhe').fill(fact)
       await d.getByLabel('Novo detalhe').press('Enter')
-      await d.getByTestId('memory-facts').getByText(fact.replace(/\[\[.*\]\]\?/, '').trim()).first().waitFor()
+      await d
+        .getByTestId('memory-facts')
+        .getByText(fact.replace(/\[\[.*\]\]\?/, '').trim())
+        .first()
+        .waitFor()
     }
     assert.match(await d.getByTestId('memory-facts-count').innerText(), /3\/15/)
     // link [[slug]] vira link para a memória
@@ -330,14 +419,17 @@ app.on('window-all-closed', () => app.quit())
     // fixar
     await d.getByRole('switch', { name: 'Sempre carregar' }).click()
     await page.waitForTimeout(200)
-    assert.equal(await d.getByRole('switch', { name: 'Sempre carregar' }).getAttribute('aria-checked'), 'true')
+    assert.equal(
+      await d.getByRole('switch', { name: 'Sempre carregar' }).getAttribute('aria-checked'),
+      'true'
+    )
     assert.match(await d.getByTestId('memory-updated').innerText(), /por você/)
     await shot('12-config-memoria-detalhe')
     // apagar
     await d.getByRole('button', { name: 'Apagar', exact: true }).click()
     await d.getByRole('button', { name: 'Apagar memória?' }).click()
     await s.getByTestId('memory-collection-view').waitFor()
-    assert.match(await s.getByTestId('memory-collection-view').innerText(), /Nenhuma memória nesta coleção/)
+    await s.getByText('Nenhuma memória nesta coleção.').waitFor()
   })
 
   await step('Configurações: lista da coleção, links e substituições', async () => {
@@ -348,9 +440,15 @@ app.on('window-all-closed', () => app.quit())
     await shot('13-config-colecao')
     await s.getByTestId('memory-row-m-prazo').click()
     const d = s.getByTestId('memory-detail')
-    assert.match(await d.getByTestId('memory-supersedes').innerText(), /Substitui: Prazos do semestre/)
+    assert.match(
+      await d.getByTestId('memory-supersedes').innerText(),
+      /Substitui: Prazos do semestre/
+    )
     await d.getByTestId('memory-supersedes').getByRole('button').click()
-    assert.match(await s.getByTestId('memory-detail').getByTestId('memory-superseded-by').innerText(), /Substituída por: Prazo de entrega/)
+    assert.match(
+      await s.getByTestId('memory-detail').getByTestId('memory-superseded-by').innerText(),
+      /Substituída por: Prazo de entrega/
+    )
     await shot('14-config-substituida')
     // busca global
     await s.getByTestId('memory-back').click()
@@ -360,20 +458,27 @@ app.on('window-all-closed', () => app.quit())
     assert.match(await s.getByTestId('memory-search-results').innerText(), /Marcos/)
     await s.getByLabel('Buscar em todas as memórias').fill('')
     // memórias de chats
-    await s.getByTestId('memory-chat-group-c5').getByRole('button', { name: /Pessoas/ }).click()
+    await s
+      .getByTestId('memory-chat-group-c5')
+      .getByRole('button', { name: /Pessoas/ })
+      .click()
     assert.match(await s.getByTestId('memory-collection-view').innerText(), /Banca: Profa. Helena/)
     await closeSettings()
   })
 
   await step('chip da tool abre a memória nas Configurações', async () => {
-    await page.getByTestId('memory-changes').locator('button', { hasText: 'Banca: Profa. Helena' }).first().click()
+    await page
+      .getByTestId('memory-changes')
+      .locator('button', { hasText: 'Banca: Profa. Helena' })
+      .first()
+      .click()
     await settings().getByTestId('memory-detail').waitFor()
     assert.match(await settings().getByTestId('memory-detail').innerText(), /Banca: Profa. Helena/)
     await closeSettings()
   })
 
   await step('editor de personas: seção de memória', async () => {
-    await page.getByRole('button', { name: 'Configurações', exact: true }).click()
+    await page.getByRole('button', { name: /^Configurações/ }).click()
     await settings().getByRole('button', { name: 'Personas', exact: true }).click()
     const row = settings().getByTestId('preset-row').filter({ hasText: 'Assistente pessoal' })
     await row.hover()
@@ -384,14 +489,20 @@ app.on('window-all-closed', () => app.quit())
     assert.equal(await sec.getByTestId('memory-extract-now').count(), 0)
     assert.equal(await sec.getByText('Atualizar memória').count(), 0)
     assert.equal(await sec.getByRole('switch', { name: 'Memória do chat' }).count(), 0)
-    assert.equal(await sec.getByTestId('memory-col-col-profile').getAttribute('data-checked'), 'true')
+    assert.equal(
+      await sec.getByTestId('memory-col-col-profile').getAttribute('data-checked'),
+      'true'
+    )
     await shot('15-persona-memoria')
     await closeSettings()
   })
 
   await step('900x600', async () => {
     await setSize(900, 600)
-    await page.getByRole('button', { name: 'Abrir painel' }).click().catch(() => {})
+    await page
+      .getByRole('button', { name: 'Abrir painel' })
+      .click()
+      .catch(() => {})
     const tab = panel().getByRole('tab', { name: 'Memória' })
     if (await tab.isVisible().catch(() => false)) await tab.click()
     await shot('16-900-painel')

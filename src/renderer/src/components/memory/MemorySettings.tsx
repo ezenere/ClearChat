@@ -495,7 +495,7 @@ function CollectionForm({
           }}
           placeholder={`Nome — ex.: ${category === 'areas' ? 'Projeto TCC' : category === 'people' ? 'Família' : 'Pessoal'}`}
           aria-label="Nome da coleção"
-          maxLength={60}
+          maxLength={MEMORY_LIMITS.collectionName}
           className="field h-8 min-w-0 flex-1 text-[13px]"
         />
       </div>
@@ -518,7 +518,7 @@ function CollectionForm({
         onChange={(e) => setDescription(e.target.value)}
         placeholder="Descrição — vai no índice para o modelo saber o que há aqui"
         aria-label="Descrição da coleção"
-        maxLength={200}
+        maxLength={MEMORY_LIMITS.collectionDescription}
         className="field mt-2 h-8 text-[12.5px]"
       />
       <div className="mt-2.5 flex justify-end gap-2">
@@ -774,7 +774,7 @@ function MemoryRows({
                 )}
               </span>
               <span className="mt-0.5 block truncate text-[12px] text-subtle">
-                {plainMemoryText(m.summary) || <span className="text-faint">Sem resumo</span>}
+                {plainMemoryText(m.summary, all) || <span className="text-faint">Sem resumo</span>}
               </span>
               {col && (
                 <span className="mt-0.5 block truncate text-[10.5px] text-faint">

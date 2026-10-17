@@ -401,7 +401,7 @@ function CategoryBlock({
                   key={c.id}
                   data-testid={`memory-col-${c.id}`}
                   data-checked={checked || undefined}
-                  className="flex h-8 cursor-pointer items-center gap-2 rounded-md px-1.5 hover:bg-hover/50"
+                  className="relative flex h-8 cursor-pointer items-center gap-2 rounded-md px-1.5 hover:bg-hover/50"
                 >
                   <input
                     type="checkbox"
@@ -633,7 +633,9 @@ function ExtractionSection({
     try {
       await flushConfig(chat.id)
       const r = await api.memory.extractNow(chat.mainSessionId)
-      if (r.error) toast(`Extração de memórias falhou: ${r.error}`, 'error')
+      // "nada novo desde a última extração" volta como error sem card: é informação, não falha
+      if (r.error && /^Nada novo/i.test(r.error)) toast(r.error, 'info')
+      else if (r.error) toast(`Extração de memórias falhou: ${r.error}`, 'error')
       else
         toast(
           r.created + r.updated + r.deleted

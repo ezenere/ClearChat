@@ -128,7 +128,7 @@ npm run install:local -- --uninstall
   define a padrão. Campos que a persona não define seguem "Novos chats"; a "Padrão" (criada na 1ª
   execução, apagável) não define nenhum. Provedor + modelo da persona andam juntos: sem modelo → o
   par padrão; provedor apagado → o par padrão, com aviso.
-- **Painel direito**: abas Modelo · Chat · Tools · Arquivos; "Ver request" ({ }) no cabeçalho.
+- **Painel direito**: abas Modelo · Chat · Tools · Memória · Arquivos; "Ver request" ({ }) no cabeçalho.
 
 ## Workspace, contexto e limites
 
@@ -240,6 +240,14 @@ npm run install:local -- --uninstall
 - **Extração**: "Extrair memórias agora" ou automática após a compactação — uma request à parte (modelo
   escolhido ou o do chat) com o índice completo e a conversa desde a última extração; o modelo grava com as
   mesmas ferramentas e o resultado vira um card no chat (fora do histórico enviado).
+- **UI**: Configurações → **Memórias** é o único lugar de criar/editar (coleções por categoria com ícone e
+  descrição; lista da coleção com busca; detalhe com título/resumo/detalhes editáveis no lugar, contadores dos
+  limites, reordenar, "Sempre carregar", mover, origem e "Substitui / Substituída por"; memórias de chats
+  agrupadas por chat). A aba **Memória** do painel e o editor de personas só **selecionam**: coleções por
+  categoria (selos *da persona* / *adicionada* / *desligada aqui*, ★ na escrita da persona, "Restaurar"),
+  coleção de escrita, memória do chat, instruções, extração ("Extrair memórias agora" só no chat), "Atualizar
+  memória" e subagentes — com (i) do índice exato (`memory.preview`) ou "Nada de memória vai para a API".
+  Cards das tools com chips das mudanças (abrem a memória nas Configurações) e card da extração.
 
 ## Anexos
 
@@ -261,7 +269,9 @@ npm run install:local -- --uninstall
 `subagents` — no chat "Resumo do artigo sobre CRDTs", 3 subagentes pedindo aprovação + 1 que falha (fila acima do
 composer); `subagents-other` — o mesmo, aberto em outro chat (sidebar âmbar/vermelha); `subagents-question` — com
 um questionário na principal (a fila espera);
-`markdown` — cercas aninhadas, LaTeX e um rascunho com fórmula incompleta, no chat "Ideias de nomes").
+`markdown` — cercas aninhadas, LaTeX e um rascunho com fórmula incompleta, no chat "Ideias de nomes";
+`memory` — chat "Planejamento do TCC" da persona "Assistente pessoal" com tools de memória, cards de extração e
+coleções/memórias de exemplo; a memória do mock funciona em todos os cenários).
 Rode `npm run build` depois para voltar ao bundle normal.
 
 ## Testes
@@ -282,7 +292,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # list_chats/get_chat_info, callbacks e posse de subagentes,
                     # detecção de contexto excedido (Node puro, sem Electron)
                     # memória (e2e/memory.test.ts: repositório/limites/FTS, config e personas, índice e snapshot,
-                    # tools, extração com modelo falso, runner com provedor falso),
+                    # tools, extração com modelo falso, runner com provedor falso), UI da memória (e2e/memoryUi.test.ts:
+                    # herança da persona, coleção de escrita, regra de envio, limites, [[slug]], resumos),
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
 # E2E do backend (Playwright `_electron`, chama window.api pelo renderer; faz chamadas reais e baratas ao OpenRouter)
@@ -299,6 +310,10 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-smart-e2e npm run test:e2e:smart
 
 # E2E da memória (app real via window.api, 100% local: provedor falso faz agente, extração e resumo — sem key)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-e2e npm run test:e2e:memory
+
+# E2E da UI da memória contra o mock (builda o renderer mock numa pasta de rascunho — não mexe em out/;
+# Configurações → Memórias, aba Memória, persona, cards; screenshots 1280x820 e 900x600 em $CLEARCHAT_E2E_DIR/shots)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-ui-e2e npm run test:e2e:memory-ui
 
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui

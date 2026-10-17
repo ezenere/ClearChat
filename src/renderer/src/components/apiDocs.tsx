@@ -37,7 +37,8 @@ export function SystemPromptInfo({
       )}
       <p>
         Ordem do conteúdo: este texto → <C>\n\n</C> + bloco <C>{'<environment>'}</C> (se ativo) →{' '}
-        <C>\n\n</C> + texto das tools (se ativo). Com token caching, o conteúdo vai como{' '}
+        <C>\n\n</C> + índice e instruções da memória (se ativa; só na principal) → <C>\n\n</C> +
+        texto das tools (se ativo). Com token caching, o conteúdo vai como{' '}
         <C>{'[{ type: "text", text, cache_control: { type: "ephemeral" } }]'}</C>. Se tudo ficar
         vazio, nenhuma mensagem system é enviada.
       </p>
@@ -880,8 +881,9 @@ export function ExtractionPromptInfo({
         Request <strong className="text-fg">separada</strong>, fora do histórico (nada dela é salvo
         na conversa){model ? <> — modelo: {model}</> : null}. Mensagens: este prompt como{' '}
         <C>{'role: "system"'}</C>, depois a conversa (ou o resumo da compactação + as mensagens
-        recentes) e o índice atual da memória. Tools: só <C>memory_write</C> e <C>memory_delete</C>,
-        executadas com as mesmas regras (coleção de escrita, categorias ligadas, memória do chat).
+        recentes) e o índice completo das coleções ativas. Tools: só <C>memory_write</C>,{' '}
+        <C>memory_rewrite</C> e <C>memory_delete</C>, executadas com as mesmas regras (coleção de
+        escrita, categorias ligadas, memória do chat), em até algumas rodadas.
       </p>
       <p className="text-subtle">
         Dispara após a compactação (se “automaticamente” estiver ligado) ou pelo botão “Extrair
@@ -941,7 +943,7 @@ export function ExtractionMessageInfo({
           ? 'automática, após a compactação'
           : 'manual, “Extrair memórias agora”'}
         ): o prompt de extração + a conversa + o índice da memória; as mudanças foram gravadas pelas
-        tools <C>memory_write</C>/<C>memory_delete</C>.
+        tools <C>memory_write</C>/<C>memory_rewrite</C>/<C>memory_delete</C>.
       </p>
       {extraction.request == null && (
         <p className="text-subtle">O body da request não foi registrado nesta extração.</p>

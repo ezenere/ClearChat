@@ -19,7 +19,7 @@ import {
   Zap
 } from 'lucide-react'
 import { splitInterChatText } from '@shared/interChat'
-import { isContextLengthError, latestBoundaryIndex } from '@shared/context'
+import { isContextLengthError, isDisplayOnly, latestBoundaryIndex } from '@shared/context'
 import { messageAttachments } from '@shared/attachments'
 import {
   Fragment,
@@ -1161,6 +1161,7 @@ export function MessageList({
     }
     let lastAssistantId: string | null = null
     for (let i = messages.length - 1; i >= 0; i--) {
+      if (isDisplayOnly(messages[i].meta)) continue
       if (messages[i].message.role === 'assistant') {
         lastAssistantId = messages[i].id
         break
@@ -1356,7 +1357,7 @@ export function MessageList({
   }
   const oldMsgs = boundary > 0 ? messages.slice(0, boundary) : []
   const activeMsgs = boundary > 0 ? messages.slice(boundary) : messages
-  const oldCount = oldMsgs.filter((m) => m.meta.kind !== 'error').length
+  const oldCount = oldMsgs.filter((m) => !isDisplayOnly(m.meta)).length
 
   // ---- separadores de dia (sobre as mensagens que de fato aparecem) ----
   const now = useToday()

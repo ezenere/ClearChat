@@ -141,7 +141,7 @@ function MemoryLinks({
             </span>
             {m && (
               <span className="min-w-0 flex-1 truncate text-[11px] text-subtle">
-                {plainMemoryText(m.summary)}
+                {plainMemoryText(m.summary, known)}
               </span>
             )}
             {m && (

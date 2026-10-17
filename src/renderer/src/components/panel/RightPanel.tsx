@@ -78,7 +78,7 @@ export function RightPanel({
               onClick={() => setPanel(true, t.id)}
               title={t.label}
               className={cn(
-                'flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-1 text-xs font-medium transition-colors',
+                'flex h-7 min-w-0 flex-auto items-center justify-center gap-1.5 rounded-md px-1 text-xs font-medium transition-colors',
                 tab === t.id ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
               )}
             >

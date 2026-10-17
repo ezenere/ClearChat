@@ -570,6 +570,16 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
           collectionId: orient.collectionId
         })
       }
+      if (!changes.length) {
+        await delay(undefined)
+        return {
+          created: 0,
+          updated: 0,
+          deleted: 0,
+          changes: [],
+          error: 'Nada novo na conversa desde a última extração.'
+        }
+      }
       const result: MemoryExtractionResult = {
         created: changes.filter((c) => c.op === 'create').length,
         updated: changes.filter((c) => c.op === 'update').length,
@@ -579,7 +589,7 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       const model = cfg.extraction.model ?? chat.config.model
       const card = deps.msg(
         sessionId,
-        { role: 'user', content: '[extração de memórias — só exibição]' },
+        { role: 'assistant', content: `Extração de memórias: ${extractionCountsShort(result)}.` },
         {
           synthetic: true,
           kind: 'memory-extraction',
@@ -620,3 +630,12 @@ export function extractionRequest(model: string, cfg: MemoryConfig, index: strin
     stream: false
   }
 }
+
+const extractionCountsShort = (r: MemoryExtractionResult): string =>
+  [
+    r.created && `${r.created} ${r.created === 1 ? 'criada' : 'criadas'}`,
+    r.updated && `${r.updated} ${r.updated === 1 ? 'atualizada' : 'atualizadas'}`,
+    r.deleted && `${r.deleted} ${r.deleted === 1 ? 'apagada' : 'apagadas'}`
+  ]
+    .filter(Boolean)
+    .join(', ') || 'nada novo'
