@@ -110,7 +110,9 @@ export function registerIpc(): void {
     [IPC.chats.delete]: async (id: string) => {
       await runner.stopChat(id)
       await stopChatProcesses(id)
-      chatsRepo.delete(id)
+      const hadMemory = memory.chatHasMemory(id)
+      chatsRepo.delete(id) // CASCADE: coleções de memória do chat (scope 'chat') vão junto
+      if (hadMemory) memory.notifyChanged()
     },
 
     // ---- sessions ----

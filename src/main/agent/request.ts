@@ -5,7 +5,7 @@ import { defaultToolsPrompt } from '@shared/defaults'
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
 import { TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
-import { activeHistory } from '@shared/context'
+import { activeHistory, isDisplayOnly } from '@shared/context'
 import { bwrapAvailable, shellLabel } from '../tools/bash'
 import { expandAttachments, hoistToolMedia } from '../attachments'
 import { paramSupport, type ParamSupport } from '@shared/modelParams'
@@ -152,7 +152,7 @@ export function availableTools(
     enabled.has('delegate_task') &&
     session.depth < 2 &&
     (!history || session.depth === 0 || hasDelegated(history))
-  return TOOL_NAMES.filter(
+  const base = TOOL_NAMES.filter(
     (n) =>
       enabled.has(n) &&
       (n !== 'delegate_task' || session.depth < 2) &&
@@ -160,6 +160,32 @@ export function availableTools(
       (n !== 'ask_user' || session.depth === 0) &&
       (!SUBAGENT_TOOLS.includes(n) || canDelegate)
   )
+  // memória: pela config de memória do chat (não por enabledTools), sempre no fim
+  const memory = memoryToolsSource(chat, session).filter((n) => !base.includes(n))
+  return memory.length ? [...base, ...memory] : base
+}
+
+// ---------------- memória (SPEC → Memória) ----------------
+// O main registra as fontes (main/memory/index.ts); sem registro (testes) = nada de memória.
+
+/** Blocos de memória do system prompt (índice congelado + help). null = nada vai. */
+export interface MemoryPromptBlocks {
+  index: string | null
+  help: string | null
+}
+type MemoryPromptSource = (
+  chat: Chat,
+  session: Pick<Session, 'depth'> & { id?: string }
+) => MemoryPromptBlocks | null
+type MemoryToolsSource = (chat: Chat, session: Pick<Session, 'depth'>) => ToolName[]
+let memoryPromptSource: MemoryPromptSource = () => null
+let memoryToolsSource: MemoryToolsSource = () => []
+export function setMemorySources(src: {
+  prompt: MemoryPromptSource
+  tools: MemoryToolsSource
+}): void {
+  memoryPromptSource = src.prompt
+  memoryToolsSource = src.tools
 }
 
 /** Nomes dos provedores configurados (o runner registra; sem registro = nenhum → sem `provider`). */
@@ -175,10 +201,13 @@ export function toolDefinitions(
   return names.map((n) => toolDefinitionFor(n, providerNames))
 }
 
-/** Conteúdo do system prompt (string; vazio = não envia). */
+/**
+ * Conteúdo do system prompt (string; vazio = não envia): system prompt → <environment> → memória
+ * (índice + help, só na principal com memória ativa) → texto das tools (modo texto).
+ */
 export function systemContent(
   chat: Chat,
-  session: Pick<Session, 'depth'>,
+  session: Pick<Session, 'depth'> & { id?: string },
   env: EnvInfo = defaultEnvInfo(),
   history?: StoredMessage[]
 ): string {
@@ -189,6 +218,11 @@ export function systemContent(
     s = s ? `${s}\n\n${block}` : block
   }
   if (cfg.envInPrompt) add(environmentBlock(cfg, env))
+  const memory = memoryPromptSource(chat, session)
+  if (memory) {
+    add(memory.index ?? '')
+    add(memory.help ?? '')
+  }
   if (cfg.toolsInPrompt) {
     const defs = toolDefinitions(availableTools(chat, session, history))
     add(cfg.toolsPromptText ?? defaultToolsPrompt(defs, cfg.nativeTools))
@@ -331,7 +365,7 @@ export function applyCacheBreakpoints(messages: ApiMessage[]): WireMessage[] {
  */
 export function buildRequest(
   chat: Chat,
-  session: Pick<Session, 'depth' | 'model'>,
+  session: Pick<Session, 'depth' | 'model'> & { id?: string },
   history: StoredMessage[],
   provider: Provider,
   env: EnvInfo = defaultEnvInfo()
@@ -343,7 +377,7 @@ export function buildRequest(
   const sys = systemContent(chat, session, env, history)
   const hist = sanitizeHistory(
     activeHistory(history)
-      .filter((m) => m.meta?.kind !== 'error')
+      .filter((m) => !isDisplayOnly(m.meta))
       .map((m) => m.message),
     openRouter
   )

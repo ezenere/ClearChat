@@ -6,7 +6,7 @@
 // modelo escolhido). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
 // Qualquer erro, tempo esgotado ou resposta ambígua do juiz → pergunta ao usuário (nunca libera).
 import { contentText } from './attachments'
-import { activeHistory } from './context'
+import { activeHistory, isDisplayOnly } from './context'
 import {
   DEFAULT_SMART_APPROVE_LABELS,
   DEFAULT_SMART_APPROVE_PROMPT,
@@ -205,7 +205,7 @@ export function lastUserMessage(history: StoredMessage[], max = 2000): string {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i]
     if (m.message.role !== 'user') continue
-    if (m.meta?.kind === 'compaction' || m.meta?.kind === 'error') continue
+    if (m.meta?.kind === 'compaction' || isDisplayOnly(m.meta)) continue
     if (m.meta?.kind === 'subagent-callback') continue
     const text = contentText(m.message.content).trim()
     if (!text || text.startsWith('<tool_result')) continue
@@ -235,7 +235,7 @@ function messageLine(m: ApiMessage, toolNames: Map<string, string>): string {
 /** As últimas `n` mensagens ativas da sessão em texto compacto (resultados de tool cortados). */
 export function recentContext(history: StoredMessage[], n: number): string {
   if (n <= 0) return '(omitted)'
-  const active = activeHistory(history).filter((m) => m.meta?.kind !== 'error')
+  const active = activeHistory(history).filter((m) => !isDisplayOnly(m.meta))
   const toolNames = new Map<string, string>()
   for (const m of active)
     if (m.message.role === 'assistant')

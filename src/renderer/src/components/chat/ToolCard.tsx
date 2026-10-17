@@ -33,6 +33,11 @@ import {
   Activity,
   MessageCircleQuestion,
   WifiOff,
+  Brain,
+  BookOpen,
+  BrainCircuit,
+  PenLine,
+  Eraser,
   type LucideIcon
 } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
@@ -85,7 +90,12 @@ const ICONS: Record<ToolName, LucideIcon> = {
   wait_subagents: Hourglass,
   cancel_subagent: CircleStop,
   message_subagent: MessageSquareText,
-  ask_user: MessageCircleQuestion
+  ask_user: MessageCircleQuestion,
+  memory_search: Brain,
+  memory_read: BookOpen,
+  memory_write: BrainCircuit,
+  memory_rewrite: PenLine,
+  memory_delete: Eraser
 }
 
 const shortId = (id: string): string => (id.length > 12 ? `${id.slice(0, 8)}…` : id)

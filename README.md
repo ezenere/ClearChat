@@ -28,6 +28,9 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
 - **Transparência total**: "Ver request" mostra o body exato enviado; cada mensagem e tool tem um (i) com o
   conteúdo real; custo, tokens e cache por resposta.
 - **Anexos**: imagens, PDF, áudio e arquivos de texto, conforme o que o modelo aceita.
+- **Memória modular**: coleções por categoria (perfil, tópicos, áreas, pessoas, preferências) que cada chat
+  ou persona ativa; o modelo consulta e grava com ferramentas próprias, e uma extração pode rodar após a
+  compactação. Desligada, nada de memória vai para a API.
 
 | | |
 |---|---|
@@ -214,6 +217,30 @@ npm run install:local -- --uninstall
   Smart-Approve passam para Listas/Perguntar (como já se comportavam); ligado → os "extras" marcados viram os
   novos itens em Smart-Approve.
 
+## Memória
+
+- **Coleções** (globais, Configurações → Memórias) pertencem a uma categoria fixa: **Perfil** (quem é o
+  usuário), **Tópicos** (hábitos e interesses), **Áreas** (projetos e tarefas em andamento), **Pessoas**
+  (e animais) e **Preferências** (como o chat deve se comportar). Cada memória tem título (≤ 80), resumo
+  (≤ 160) e até 15 tópicos curtos (≤ 200), pode ser fixada e cita outras com `[[slug]]`.
+- **Por chat/persona** (`ChatConfig.memory`, herdado da persona como os outros campos): liga/desliga,
+  coleções ativas para leitura (várias por categoria), **uma coleção de escrita por categoria**, categorias
+  desligáveis, **memória própria do chat** (coleções "Este chat", só no chat; apagar o chat apaga), help
+  prompt, extração e "Memória nos subagentes".
+- **O que vai para a API**: um índice no system prompt (depois do ambiente) — por categoria → coleção
+  (*escrita*/*leitura*) → `id · título — resumo`, fixadas com os tópicos, com teto de tamanho. O índice é
+  **congelado por sessão** (cache de prompt): tirado no 1º request e renovado só em sessão nova, compactação
+  ou "Atualizar memória". O "Ver request" mostra exatamente o que vai. Desligada ou sem nada ativo: nada de
+  índice, help ou ferramentas.
+- **Ferramentas**: `memory_search`, `memory_read`, `memory_write` (cria — sem duplicar: se já houver memória
+  parecida devolve as candidatas — ou atualiza com operações add/remove/replace), `memory_rewrite` (corrige
+  uma memória de coleção só de leitura criando uma versão na de escrita, que a substitui neste chat) e
+  `memory_delete`. Gravar/reescrever/apagar são itens de aprovação (padrão **Sempre permitir**; ou
+  Smart-Approve / Perguntar). Subagentes nunca veem o índice e só ganham busca/leitura se a opção estiver ligada.
+- **Extração**: "Extrair memórias agora" ou automática após a compactação — uma request à parte (modelo
+  escolhido ou o do chat) com o índice completo e a conversa desde a última extração; o modelo grava com as
+  mesmas ferramentas e o resultado vira um card no chat (fora do histórico enviado).
+
 ## Anexos
 
 - 📎 no composer (diálogo nativo), arrastar arquivos para o chat ou colar imagens. Imagens
@@ -254,6 +281,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # por tokens, domínio/prefixo de URL, blacklist > whitelist, rotas por modo, migração),
                     # list_chats/get_chat_info, callbacks e posse de subagentes,
                     # detecção de contexto excedido (Node puro, sem Electron)
+                    # memória (e2e/memory.test.ts: repositório/limites/FTS, config e personas, índice e snapshot,
+                    # tools, extração com modelo falso, runner com provedor falso),
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
 # E2E do backend (Playwright `_electron`, chama window.api pelo renderer; faz chamadas reais e baratas ao OpenRouter)
@@ -267,6 +296,9 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-approvals-e2e npm run test:e2e:approvals
 
 # E2E do Smart-Approve (UI real, 100% local: um provedor OpenAI-compatible falso faz o agente e o juiz — sem key)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-smart-e2e npm run test:e2e:smart
+
+# E2E da memória (app real via window.api, 100% local: provedor falso faz agente, extração e resumo — sem key)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-e2e npm run test:e2e:memory
 
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui

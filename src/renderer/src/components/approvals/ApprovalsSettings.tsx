@@ -20,7 +20,11 @@ const ITEM_DESC: Record<ApprovalItem, string> = {
   editFile: 'Tool edit_file — substitui trechos de um arquivo.',
   sendToChat:
     'Tool send_to_chat — manda uma mensagem a outro chat (que pode rodar o agente de lá).',
-  delegate: 'Tool delegate_task — cria um subagente (com as tools e aprovações deste chat).'
+  delegate: 'Tool delegate_task — cria um subagente (com as tools e aprovações deste chat).',
+  memory_write: 'Tool memory_write — cria ou atualiza uma memória na coleção de escrita.',
+  memory_rewrite:
+    'Tool memory_rewrite — cria uma versão corrigida de uma memória só de leitura (a substitui).',
+  memory_delete: 'Tool memory_delete — apaga uma memória de uma coleção gravável.'
 }
 
 export function ApprovalsSettings(): React.JSX.Element {
