@@ -604,3 +604,58 @@ Quando a chamada ao modelo do loop (`step`) falha por **erro de rede** (Wi-Fi ca
 - **App fechado** com o card aberto: `shutdownRunner` persiste o erro `Falha de conexão com o provedor: <erro> (interrompido: o app foi fechado)` e marca a sessão `error`; fechamento abrupto → na inicialização `sessionsRepo.markStaleRetry()` muda `awaiting_retry` → `error` e `initRunner` grava `Falha de conexão com o provedor (interrompido: o app foi fechado)` (+ `repairTail`).
 - **UI** (`RetryForm`, no lugar do campo de texto do composer, como o questionário; anexos/enviar escondidos, Parar continua): ícone Wi-Fi cortado, "Falha de conexão com o provedor", erro curto (mono), "<Provedor> · <modelo> · a resposta parcial foi descartada…", botões **Tentar de novo** (focado; Enter) e **Cancelar** (Esc; Enter com ele focado). Mock: `VITE_CLEAR_MOCK=retry` (principal) / `retry-sub` (subagente).
 - **Testes**: `e2e/networkRetry.test.ts` (classificação rede × provider; runner real com stub de `electron`, SQLite temporário e provedor falso que corta o socket: retry descarta o parcial e entrega a fila depois; Cancelar = erro; HTTP 500 sem card; Parar e ⚡; subagente bloqueante esperando; inicialização e encerramento) e `e2e/network-retry.spec.ts` (`npm run test:e2e:retry`: UI real — card, Enter/Esc, Parar, subagente com chip/card no pai → subsessão → retry).
+
+## Memória (contrato — `src/shared/memory.ts`, `src/main/memory/`, runner, UI)
+
+Memória modular: **coleções** (criadas pelo usuário, globais) contêm **memórias**; cada memória tem uma **categoria** de taxonomia fixa. Chats e personas **selecionam** coleções/categorias; criação e edição de conteúdo é global (Configurações → Memórias).
+
+### Taxonomia fixa (instruções padronizadas, na descrição de `memory_write`)
+`profile` (quem é o usuário) · `topics` (hábitos e interesses recorrentes) · `areas` (frentes ativas: projetos, tarefas em andamento) · `people` (pessoas — e animais) · `preferences` (como o usuário quer que o chat se comporte). Rótulos pt-BR: Perfil, Tópicos, Áreas, Pessoas, Preferências.
+
+### Dados (SQLite)
+```sql
+memory_collections(id TEXT PK, name TEXT, description TEXT, icon TEXT, scope TEXT /* 'shared' | 'chat' */,
+                   chat_id TEXT NULL /* scope chat → ON DELETE CASCADE */, created_at, updated_at)
+memories(id TEXT PK, collection_id TEXT /* FK CASCADE */, category TEXT, title TEXT, slug TEXT, summary TEXT,
+         facts_json TEXT /* string[] */, pinned INTEGER, created_at, updated_at,
+         updated_by_chat_id TEXT NULL, updated_by TEXT /* 'model' | 'extraction' | 'user' */)
+```
++ índice FTS5 sobre title/summary/facts (reaproveitar o padrão de `searchIndex.ts`). Limites em `src/shared/limits.ts`: título ≤ 80, resumo ≤ 160, tópico ≤ 200 caracteres, ≤ 15 tópicos por memória. Links `[[slug]]` entre memórias.
+A **memória do chat** é uma coleção `scope:'chat'` criada sob demanda quando o usuário a liga no chat.
+
+### Config (em `ChatConfig.memory?`, persona via `PRESET_FIELDS`; chat herda da persona como hoje)
+```ts
+interface MemoryConfig {
+  enabled: boolean                          // desligado → NADA de memória vai para a API (sem índice, sem help, sem tools)
+  collections: string[]                     // coleções compartilhadas ativas
+  categories: MemoryCategory[]              // categorias ativas (padrão: todas)
+  readOnly: string[]                        // coleções ativas em modo só leitura
+  chatMemory: boolean                       // memória própria do chat (só no chat; persona não tem)
+  helpPrompt: { enabled: boolean; text: string | null }       // null = padrão; anexado ao system prompt
+  extraction: { auto: boolean; prompt: string | null; providerId: string | null; model: string | null } // null = modelo do chat
+  subagents: boolean                        // memory_search/memory_read para subagentes (nunca escrita, nunca índice)
+}
+```
+Regra de envio: se `!enabled` ou (nenhuma coleção ativa e `!chatMemory`) → nenhum bloco de memória, nenhuma tool de memória.
+
+### Envio à API (controle total: tudo com (i))
+- **Índice** (no system prompt, após o system prompt/ambiente): por coleção ativa → nome, descrição, e por memória → `id · categoria · título — resumo`; memórias `pinned` vão com os tópicos completos. Teto de tamanho; se exceder, fixadas + mais recentes + "use memory_search para o resto".
+- **Congelado por sessão** (token caching): snapshot salvo na sessão no 1º request; renovado só em chat novo, compactação ou botão "Atualizar memória". O que o modelo grava durante a sessão chega pelos resultados das tools.
+- **Help prompt** (se ligado): texto padrão incisivo (consultar a memória antes de responder sobre o usuário/projetos, gravar fatos novos, corrigir discrepâncias), editável.
+- **Subagentes**: nunca recebem índice nem help; só `memory_search`/`memory_read` se `subagents` (e memória ligada no chat).
+
+### Tools (só quando a regra de envio permite; aprovações: itens `memory_write`/`memory_delete` com padrão "Sempre permitir")
+- `memory_search { query, collection?, category?, limit? }` → id, coleção, categoria, título, resumo, trecho.
+- `memory_read { ids[] }` → memória completa.
+- `memory_write { collection ('chat' ou nome/id), category, id?, title?, summary?, ops: [{add|remove|replace, fact, with?}] }` → cria (sem id) ou **atualiza** (com id). Ao criar, se houver memória parecida (FTS/slug) na mesma coleção, NÃO cria: retorna as candidatas pedindo `id`. Descrição traz a taxonomia e a regra de discrepância: ao receber informação que contradiz uma memória, atualizar (replace/remove) em vez de duplicar. Respeita `readOnly` e categorias ativas.
+- `memory_delete { id }`.
+- Regra global vs chat (na descrição): serve fora desta conversa → coleção compartilhada; só para a tarefa deste chat → `collection:'chat'`.
+
+### Extração automática
+Requisição separada (não persistida no histórico), com o prompt de extração (editável), a conversa (ou o resumo da compactação + mensagens recentes) e o índice atual; o modelo responde chamando `memory_write`/`memory_delete` (executados com as mesmas regras). Dispara **após a compactação** se `extraction.auto`, e pelo botão **"Extrair memórias agora"** (só no painel do chat). Resultado vira um card compacto no chat ("Extração: 2 criadas, 1 atualizada") com (i) da request e lista de mudanças; erros não quebram o chat.
+
+### UI
+- **Configurações → Memórias** (global): CRUD de coleções (nome, descrição, ícone) e de memórias (lista por categoria como "Você/Tópicos/Áreas/Pessoas", detalhe editável com resumo/tópicos, fixar, apagar, origem/última atualização); memórias de chat aparecem agrupadas por chat.
+- **Painel do chat** (aba Chat ou aba própria "Memória"): toggle geral; coleções (selos *da persona* / *adicionada*), ligar/desligar cada uma, só leitura; categorias; memória do chat; help prompt (toggle + texto + restaurar); extração (auto, modelo, prompt, "Extrair memórias agora"); "Atualizar memória" (renova o snapshot); toggle "Memória nos subagentes"; (i) com o índice exato.
+- **Editor de personas**: a mesma seção, sem "Extrair agora"/"Atualizar memória"/memória do chat.
+- **Seção de subagentes** (aba Tools): indicação se a memória está liberada para subagentes (e se está ligada no chat).
