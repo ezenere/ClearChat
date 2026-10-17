@@ -59,6 +59,8 @@ import { OrphanApproval, ToolCard } from './ToolCard'
 import { anchorFor, anchorId } from '../../lib/approvalAnchors'
 import { useAnchorRoot } from '../../lib/useAnchor'
 import { MessageAttachments } from './Attachments'
+import { ExtractionCard } from '../memory/ExtractionCard'
+import { isExtractionMessage } from '../../lib/memory'
 import {
   dayKey,
   dayLabel,
@@ -1323,6 +1325,8 @@ export function MessageList({
 
   const renderMessage = (m: StoredMessage, old: boolean): ReactNode => {
     const role = m.message.role
+    // extração de memórias: só exibição (não vai à API), qualquer role
+    if (isExtractionMessage(m.meta)) return <ExtractionCard key={m.id} msg={m} canEdit={canEdit} />
     if (m.meta.kind === 'compaction')
       return <CompactionCard key={m.id} msg={m} canEdit={canEdit} stale={old} />
     if (m.meta.kind === 'error') return <ErrorMessage key={m.id} msg={m} ctx={ctx} />

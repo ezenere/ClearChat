@@ -19,6 +19,7 @@ import type {
   StreamDraft
 } from '@shared/types'
 import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
+import type { MemoryCollection } from '@shared/memory'
 import { api, errorMessage } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { contentText, formatSize } from '@shared/attachments'
@@ -70,18 +71,26 @@ export interface SubFailure {
   dismissed: boolean
 }
 
-export type SettingsTab = 'providers' | 'presets' | 'defaults' | 'approvals' | 'web'
+export type SettingsTab = 'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'web'
 
-export type PanelTab = 'model' | 'chat' | 'tools' | 'files'
+export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'files'
 
-const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'files']
+const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'memory', 'files']
+
+/** Alvo de "abrir em Configurações → Memórias" (link de tool, card de extração, painel). */
+export interface MemoryFocus {
+  memoryId?: string
+  collectionId?: string
+}
 const PANEL_TAB_KEY = 'clearchat.panelTab'
 
 /** Seção do painel → aba onde ela mora (focusConfig). */
 const SECTION_TAB: Record<string, PanelTab> = {
   contexto: 'chat',
   'smart-approve': 'tools',
-  aprovacoes: 'tools'
+  aprovacoes: 'tools',
+  memoria: 'memory',
+  'memoria-subagentes': 'memory'
 }
 
 function loadPanelTab(): PanelTab {
@@ -161,6 +170,12 @@ interface State {
   anchorVis: Record<string, boolean | null>
   /** Falhas de subagentes por subsessão (vermelho na sidebar / aviso acima do composer). */
   subFailures: Record<string, SubFailure>
+  /** Coleções de memória (compartilhadas e de chats), com contagem. */
+  memoryCollections: MemoryCollection[]
+  /** Incrementado a cada `memory-changed` (listas e preview recarregam). */
+  memoryTick: number
+  /** Coleção/memória a abrir em Configurações → Memórias. */
+  memoryFocus: MemoryFocus | null
 }
 
 interface Actions {
@@ -218,6 +233,10 @@ interface Actions {
   setAnchorVis(patch: Record<string, boolean | null | undefined>): void
   /** Some o aviso de falha do subagente acima do composer. */
   dismissSubFailure(sessionId: string): void
+  /** Recarrega as coleções de memória. */
+  loadMemoryCollections(): Promise<void>
+  /** Abre Configurações → Memórias (opcionalmente numa coleção/memória). */
+  openMemory(focus?: MemoryFocus | null): void
   /** Executa uma chamada de API; em caso de erro mostra um toast e retorna undefined. */
   run<T>(fn: () => Promise<T>, label?: string): Promise<T | undefined>
 }
@@ -302,6 +321,9 @@ export const useStore = create<Store>()((set, get) => ({
   approvalSettings: normalizeApprovalSettings(null, null),
   anchorVis: {},
   subFailures: {},
+  memoryCollections: [],
+  memoryTick: 0,
+  memoryFocus: null,
 
   async run(fn, label) {
     try {
@@ -755,6 +777,19 @@ export const useStore = create<Store>()((set, get) => ({
     })
   },
 
+  async loadMemoryCollections() {
+    try {
+      const list = await api.memory.listCollections()
+      set({ memoryCollections: list })
+    } catch (err) {
+      console.warn('[clearchat] memória:', errorMessage(err))
+    }
+  },
+
+  openMemory(focus) {
+    set({ settingsOpen: true, settingsTab: 'memory', memoryFocus: focus ?? null })
+  },
+
   focusConfig(section) {
     if (!section) return set({ configFocus: null })
     const panelTab = SECTION_TAB[section] ?? 'model'
@@ -961,7 +996,21 @@ function applyEvent(e: AgentEvent): void {
     case 'processes-updated':
       set((s) => ({ processes: { ...s.processes, [e.chatId]: e.processes } }))
       break
+    case 'memory-changed':
+      set((s) => ({ memoryTick: s.memoryTick + 1 }))
+      scheduleMemoryReload()
+      break
   }
+}
+
+// Rajadas de `memory-changed` (extração grava várias) → uma recarga só das coleções.
+let memoryReload: ReturnType<typeof setTimeout> | null = null
+function scheduleMemoryReload(): void {
+  if (memoryReload) clearTimeout(memoryReload)
+  memoryReload = setTimeout(() => {
+    memoryReload = null
+    void useStore.getState().loadMemoryCollections()
+  }, 120)
 }
 
 // ---- Seletores ----

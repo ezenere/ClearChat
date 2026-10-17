@@ -1,6 +1,6 @@
 // Editores de ChatConfig independentes de onde a config mora: recebem `cfg` (config completa) e
 // `patch` (patch parcial). Usados pelas abas do painel (config do chat) e pelo editor de personas.
-import { RotateCcw } from 'lucide-react'
+import { ArrowUpRight, BrainCircuit, RotateCcw } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import {
   DEFAULT_COMPACT_PROMPT,
@@ -44,6 +44,8 @@ import { ModelPicker } from '../ui/ModelPicker'
 import { ExtraBodyEditor, NumberInput, Section, ToggleRow } from './fields'
 import { SmartApproveSection } from './SmartApproveSection'
 import { ChatApprovalSection } from '../approvals/ChatApprovalSection'
+import { memoryConfigOf, memoryWillSend } from '../../lib/memory'
+import { useMemoryCollections } from '../memory/hooks'
 
 export interface CfgProps {
   cfg: ChatConfig
@@ -650,9 +652,62 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
   )
 }
 
-export function SubagentSection({ cfg, patch }: CfgProps): React.JSX.Element {
+/** Aba Tools → Subagentes: memória liberada para subagentes? (link para a seção de memória). */
+function SubagentMemoryLine({
+  cfg,
+  chatScope,
+  onOpenMemory
+}: {
+  cfg: ChatConfig
+  chatScope?: boolean
+  onOpenMemory?: () => void
+}): React.JSX.Element {
+  const cols = useMemoryCollections()
+  const focusConfig = useStore((s) => s.focusConfig)
+  const mem = memoryConfigOf(cfg)
+  const active = memoryWillSend(mem, cols, { chat: !!chatScope })
+  const on = mem.subagents && active
+  const open = onOpenMemory ?? (() => focusConfig('memoria-subagentes'))
+  return (
+    <div
+      data-testid="subagent-memory"
+      data-on={on || undefined}
+      className="flex items-center gap-2 rounded-lg border border-border bg-bg/40 px-2.5 py-1.5 text-[12px]"
+    >
+      <BrainCircuit className={cn('size-3.5 shrink-0', on ? 'text-accent-strong' : 'text-faint')} />
+      <span className="min-w-0 flex-1 text-muted">
+        Memória para subagentes:{' '}
+        <span className={on ? 'text-fg/90' : 'text-subtle'}>
+          {mem.subagents ? 'ligada' : 'desligada'}
+        </span>
+        {mem.subagents && !active && (
+          <span className="text-warning/85">
+            {' '}
+            · memória desligada {chatScope ? 'neste chat' : 'nesta persona'}
+          </span>
+        )}
+        {on && <span className="text-subtle"> · só busca/leitura</span>}
+      </span>
+      <button
+        type="button"
+        onClick={open}
+        className="inline-flex shrink-0 items-center gap-0.5 text-[11.5px] text-accent-strong hover:underline"
+      >
+        Memória <ArrowUpRight className="size-3" />
+      </button>
+    </div>
+  )
+}
+
+export function SubagentSection({
+  cfg,
+  patch,
+  chatScope,
+  onOpenMemory
+}: CfgProps & { chatScope?: boolean; onOpenMemory?: () => void }): React.JSX.Element {
   return (
     <Section title="Subagentes" aside={<SystemPromptInfo subagent side="left" />}>
+      <SubagentMemoryLine cfg={cfg} chatScope={chatScope} onOpenMemory={onOpenMemory} />
       <AutoTextarea
         value={cfg.subagentSystemPrompt}
         aria-label="System prompt dos subagentes"
@@ -695,14 +750,23 @@ export function LimitsSection({ cfg, patch }: CfgProps): React.JSX.Element {
 }
 
 /** Aba Tools inteira (painel e editor de persona). */
-export function ToolsEditor(props: CfgProps): React.JSX.Element {
+export function ToolsEditor({
+  chatScope,
+  onOpenMemory,
+  ...props
+}: CfgProps & {
+  /** Painel do chat (a memória do chat conta para "memória ligada"). */
+  chatScope?: boolean
+  /** Link "Memória" da seção de subagentes (editor de persona: troca de aba). */
+  onOpenMemory?: () => void
+}): React.JSX.Element {
   return (
     <>
       <ToolsListSection {...props} />
       <ToolsPromptSection {...props} />
       <ChatApprovalSection {...props} />
       <SmartApproveSection {...props} />
-      <SubagentSection {...props} />
+      <SubagentSection {...props} chatScope={chatScope} onOpenMemory={onOpenMemory} />
       <LimitsSection {...props} />
     </>
   )

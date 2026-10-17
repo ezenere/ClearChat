@@ -1,10 +1,18 @@
-import { Braces, FolderTree, MessageSquareText, Sparkles, Wrench, X } from 'lucide-react'
+import {
+  Braces,
+  BrainCircuit,
+  FolderTree,
+  MessageSquareText,
+  Sparkles,
+  Wrench,
+  X
+} from 'lucide-react'
 import { useEffect, useRef } from 'react'
 import type { Chat } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore, type PanelTab } from '../../store'
 import { IconButton } from '../ui/controls'
-import { ChatTab, ModelTab, ToolsTab } from './ConfigTabs'
+import { ChatTab, MemoryTab, ModelTab, ToolsTab } from './ConfigTabs'
 import { Note } from './fields'
 import { ModelLabel } from '../ui/ModelLabel'
 import { sessionProviderId } from '@shared/models'
@@ -14,6 +22,7 @@ const TABS: { id: PanelTab; label: string; icon: typeof Sparkles }[] = [
   { id: 'model', label: 'Modelo', icon: Sparkles },
   { id: 'chat', label: 'Chat', icon: MessageSquareText },
   { id: 'tools', label: 'Tools', icon: Wrench },
+  { id: 'memory', label: 'Memória', icon: BrainCircuit },
   { id: 'files', label: 'Arquivos', icon: FolderTree }
 ]
 
@@ -38,9 +47,12 @@ export function RightPanel({
   const bodyRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     if (!configFocus) return
-    const el = bodyRef.current?.querySelector<HTMLElement>(`[data-section="${configFocus}"]`)
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    const body = bodyRef.current
+    const el = body?.querySelector<HTMLElement>(`[data-section="${configFocus}"]`)
+    if (body && el) {
+      // rola só o corpo do painel (scrollIntoView rolaria também a janela quando a seção está no fim)
+      const top = el.getBoundingClientRect().top - body.getBoundingClientRect().top + body.scrollTop
+      body.scrollTo({ top: Math.max(0, top - 4), behavior: 'smooth' })
       el.classList.add('animate-flash')
       setTimeout(() => el.classList.remove('animate-flash'), 1200)
     }
@@ -64,12 +76,14 @@ export function RightPanel({
               role="tab"
               aria-selected={tab === t.id}
               onClick={() => setPanel(true, t.id)}
+              title={t.label}
               className={cn(
-                'flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-1.5 text-xs font-medium transition-colors',
+                'flex h-7 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-1 text-xs font-medium transition-colors',
                 tab === t.id ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
               )}
             >
-              <t.icon className="size-3.5 shrink-0" />
+              {/* 5 abas em 384px: o ícone só aparece na aba ativa (o rótulo nunca corta) */}
+              {tab === t.id && <t.icon className="size-3.5 shrink-0" />}
               <span className="truncate">{t.label}</span>
             </button>
           ))}
@@ -112,6 +126,8 @@ export function RightPanel({
           <ChatTab chat={chat} />
         ) : tab === 'tools' ? (
           <ToolsTab chat={chat} />
+        ) : tab === 'memory' ? (
+          <MemoryTab chat={chat} />
         ) : (
           <FilesTab key={chat.id} chat={chat} />
         )}

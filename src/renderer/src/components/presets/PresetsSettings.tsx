@@ -2,6 +2,7 @@
 // definir a padrão do Novo chat.
 import {
   ArrowLeft,
+  BrainCircuit,
   Copy,
   FolderOpen,
   MessageSquareText,
@@ -32,6 +33,7 @@ import { Section, ToggleRow } from '../panel/fields'
 import { Button, IconButton, Label } from '../ui/controls'
 import { ModelLabel } from '../ui/ModelLabel'
 import { IconPicker, PresetIcon } from './PresetIcon'
+import { MemorySection } from '../memory/MemorySection'
 
 function useResolver(): (p: Pick<Preset, 'config'> | null) => ChatConfig {
   const providers = useStore((s) => s.providers)
@@ -150,11 +152,12 @@ export function PresetsList({
 
 // ---------------- editor ----------------
 
-type EditorTab = 'model' | 'chat' | 'tools'
+type EditorTab = 'model' | 'chat' | 'tools' | 'memory'
 const EDITOR_TABS: { id: EditorTab; label: string; icon: typeof Sparkles }[] = [
   { id: 'model', label: 'Modelo', icon: Sparkles },
   { id: 'chat', label: 'Chat', icon: MessageSquareText },
-  { id: 'tools', label: 'Tools', icon: Wrench }
+  { id: 'tools', label: 'Tools', icon: Wrench },
+  { id: 'memory', label: 'Memória', icon: BrainCircuit }
 ]
 
 function PresetChatEditor({
@@ -361,8 +364,10 @@ export function PresetEditor({
               })
             }
           />
+        ) : tab === 'tools' ? (
+          <ToolsEditor cfg={cfg} patch={patch} onOpenMemory={() => setTab('memory')} />
         ) : (
-          <ToolsEditor cfg={cfg} patch={patch} />
+          <MemorySection cfg={cfg} patch={patch} />
         )}
       </div>
 

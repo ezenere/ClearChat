@@ -15,7 +15,9 @@ export function Select<T extends string>({
   onChange,
   placeholder = 'Selecionar…',
   className,
-  disabled
+  disabled,
+  menuMinWidth,
+  label
 }: {
   value: T | null | undefined
   options: SelectOption<T>[]
@@ -23,6 +25,10 @@ export function Select<T extends string>({
   placeholder?: string
   className?: string
   disabled?: boolean
+  /** Largura mínima do menu (gatilho estreito). */
+  menuMinWidth?: number
+  /** aria-label do gatilho. */
+  label?: string
 }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const [hi, setHi] = useState(0)
@@ -41,6 +47,7 @@ export function Select<T extends string>({
         ref={anchor}
         type="button"
         disabled={disabled}
+        aria-label={label}
         onClick={() => {
           setHi(
             Math.max(
@@ -81,7 +88,13 @@ export function Select<T extends string>({
           className={cn('size-3.5 shrink-0 text-subtle transition-transform', open && 'rotate-180')}
         />
       </button>
-      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor}>
+      <Popover
+        open={open}
+        onClose={() => setOpen(false)}
+        anchor={anchor}
+        minWidth={menuMinWidth}
+        align={menuMinWidth ? 'end' : 'start'}
+      >
         <div className="overflow-y-auto p-1">
           {options.length === 0 && (
             <div className="px-2.5 py-2 text-xs text-subtle">Nenhuma opção</div>

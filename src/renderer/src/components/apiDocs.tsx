@@ -8,6 +8,8 @@ import type { ApiMessage, AttachmentMeta, ChatParams, StoredMessage, ToolName } 
 import { api } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import type { EffortSpec } from '@shared/modelParams'
+import type { MemoryPreview } from '@shared/memory'
+import { extractionOf, type MemoryExtractionMeta } from '../lib/memory'
 import { ApiInfo, C } from './ui/Tooltip'
 
 type Side = 'top' | 'right' | 'bottom' | 'left'
@@ -504,6 +506,8 @@ export function MessageInfo({
 }): React.JSX.Element {
   const m = msg.message
   if (msg.meta.kind === 'compaction') return <CompactionMessageInfo msg={msg} side={side} />
+  const extraction = extractionOf(msg.meta)
+  if (extraction) return <ExtractionMessageInfo extraction={extraction} side={side} />
   if (msg.meta.kind === 'error') {
     return (
       <ApiInfo title="Erro (só exibição)" side={side}>
@@ -731,6 +735,217 @@ export function AttachmentApiInfo({
         )}{' '}
         Os anexos vêm antes do texto no array <C>content</C>.
       </p>
+    </ApiInfo>
+  )
+}
+
+// ---------------- Memória (SPEC → Memória) ----------------
+
+function Block({ label, text }: { label: string; text: string | null }): React.JSX.Element {
+  return (
+    <div className="mt-2">
+      <div className="mb-1 text-[11px] text-subtle">{label}</div>
+      <pre className="max-h-60 overflow-auto rounded-lg border border-border bg-bg/80 p-2.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-fg/90">
+        {text ? text : <span className="text-subtle italic">(nada)</span>}
+      </pre>
+    </div>
+  )
+}
+
+/**
+ * (i) geral da memória: o índice + as instruções + as tools que vão na próxima request (via
+ * `memory.preview`, exatos). Inativa → "Nada de memória vai para a API".
+ */
+export function MemoryPreviewInfo({
+  preview,
+  willSend,
+  persona,
+  helpText,
+  side = 'left'
+}: {
+  /** null = ainda carregando / sem sessão. */
+  preview: MemoryPreview | null
+  /** Regra de envio calculada na UI (ligada + coleção ativa ou memória do chat). */
+  willSend: boolean
+  /** Editor de personas: sem sessão, sem índice real. */
+  persona?: boolean
+  helpText?: string | null
+  side?: Side
+}): React.JSX.Element {
+  const active = preview ? preview.active : willSend
+  return (
+    <ApiInfo title="Memória" side={side} wide>
+      {!active ? (
+        <p data-testid="memory-nothing-sent">
+          <strong className="text-fg">Nada de memória vai para a API</strong> — nenhum índice no
+          system prompt, nenhuma instrução e nenhuma tool <C>memory_*</C>. Para enviar: ligue a
+          memória e ative ao menos uma coleção{persona ? '' : ' (ou a memória do chat)'}.
+        </p>
+      ) : (
+        <>
+          <p>
+            <strong className="text-fg">Índice</strong>: anexado ao conteúdo da mensagem{' '}
+            <C>{'role: "system"'}</C>, precedido de <C>\n\n</C>, depois do system prompt e do bloco
+            de ambiente. Por categoria → coleção ativa (nome, descrição, <i>escrita</i> ou{' '}
+            <i>leitura</i>) → uma linha por memória (<C>id · categoria · título — resumo</C>);
+            memórias “Sempre carregar” vão com os tópicos completos; substituídas ficam ocultas.
+          </p>
+          <p>
+            <strong className="text-fg">Congelado por sessão</strong> (token caching): tirado na 1ª
+            request e renovado só em chat novo, compactação ou “Atualizar memória”. O que o modelo
+            grava durante a sessão chega pelos resultados das tools.
+          </p>
+          <p>
+            <strong className="text-fg">Tools</strong>: as definições de <C>memory_*</C> entram no
+            array <C>tools</C> (ou no texto das tools, se as nativas estiverem desligadas).
+          </p>
+          {persona || !preview ? (
+            <>
+              <p className="text-subtle">
+                {persona
+                  ? 'Persona: o índice exato depende das memórias no momento — abra o (i) da aba Memória de um chat para ver o texto enviado.'
+                  : 'Carregando o texto exato…'}
+              </p>
+              {helpText != null && <Block label="Instruções (help prompt):" text={helpText} />}
+            </>
+          ) : (
+            <>
+              <Block label="Índice exato:" text={preview.index} />
+              <Block label="Instruções (help prompt):" text={preview.help} />
+              <Block label="Tools:" text={preview.tools.join(', ')} />
+            </>
+          )}
+        </>
+      )}
+    </ApiInfo>
+  )
+}
+
+export function MemoryCollectionsInfo({ side = 'left' }: { side?: Side }): React.JSX.Element {
+  return (
+    <ApiInfo title="Coleções ativas" side={side}>
+      <p>
+        Cada coleção marcada entra no <strong className="text-fg">índice</strong> do system prompt
+        (nome, descrição e as memórias dela) e fica pesquisável por <C>memory_search</C> /{' '}
+        <C>memory_read</C>. Categoria desligada = as coleções dela são ignoradas (a seleção fica
+        guardada).
+      </p>
+      <p>
+        <strong className="text-fg">Escrita</strong>: no máximo uma coleção por categoria — é onde{' '}
+        <C>memory_write</C> cria/atualiza e para onde <C>memory_rewrite</C> copia versões novas de
+        memórias que estão em coleções só de leitura. “Nenhuma” = o modelo não grava naquela
+        categoria (a não ser na memória do chat). No índice, a coleção aparece marcada{' '}
+        <i>escrita</i> ou <i>leitura</i>.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ChatMemoryInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Memória do chat" side="left">
+      <p>
+        Uma coleção “Este chat” por categoria, criada na primeira gravação e apagada junto com o
+        chat. Ligada, <C>memory_write</C>/<C>memory_rewrite</C> aceitam <C>{'target: "chat"'}</C> e
+        a descrição das tools diz ao modelo: o que serve fora desta conversa → coleção
+        compartilhada; o que só importa para a tarefa deste chat → memória do chat. As memórias do
+        chat entram no índice deste chat.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function MemoryHelpInfo({ text }: { text: string }): React.JSX.Element {
+  return (
+    <ApiInfo title="Instruções de memória" code={text} codeLabel="Texto anexado:" side="left">
+      <p>
+        Ligado: anexado ao conteúdo da mensagem <C>{'role: "system"'}</C>, depois do índice da
+        memória, precedido de <C>\n\n</C>. Só na sessão principal (subagentes nunca recebem).
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function ExtractionPromptInfo({
+  prompt,
+  model
+}: {
+  prompt: string
+  /** Rótulo do modelo da extração ("Modelo do chat" se não definido). */
+  model?: string
+}): React.JSX.Element {
+  return (
+    <ApiInfo title="Extração de memórias" code={prompt} codeLabel="Prompt de extração:" side="left">
+      <p>
+        Request <strong className="text-fg">separada</strong>, fora do histórico (nada dela é salvo
+        na conversa){model ? <> — modelo: {model}</> : null}. Mensagens: este prompt como{' '}
+        <C>{'role: "system"'}</C>, depois a conversa (ou o resumo da compactação + as mensagens
+        recentes) e o índice atual da memória. Tools: só <C>memory_write</C> e <C>memory_delete</C>,
+        executadas com as mesmas regras (coleção de escrita, categorias ligadas, memória do chat).
+      </p>
+      <p className="text-subtle">
+        Dispara após a compactação (se “automaticamente” estiver ligado) ou pelo botão “Extrair
+        memórias agora”. O resultado vira um card no chat, que não é enviado à API.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function MemoryRefreshInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Atualizar memória" side="left">
+      <p>
+        O índice vai congelado na sessão (o prefixo do system prompt não muda, então o cache de
+        tokens continua valendo). “Atualizar memória” tira um snapshot novo agora: a próxima request
+        leva o índice atualizado — e paga uma escrita de cache do system prompt.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function MemorySubagentsInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Memória nos subagentes" side="left">
+      <p>
+        Ligado (e com a memória ativa no chat): as requests dos subagentes recebem só as tools{' '}
+        <C>memory_search</C> e <C>memory_read</C>. Subagentes{' '}
+        <strong className="text-fg">nunca</strong> recebem o índice, as instruções nem as tools de
+        escrita. Desligado: nenhuma tool de memória nos subagentes.
+      </p>
+    </ApiInfo>
+  )
+}
+
+/** (i) do card de extração: não vai à API; mostra a request exata da extração. */
+export function ExtractionMessageInfo({
+  extraction,
+  side = 'top'
+}: {
+  extraction: MemoryExtractionMeta
+  side?: Side
+}): React.JSX.Element {
+  return (
+    <ApiInfo
+      title="Extração de memórias (só exibição)"
+      side={side}
+      code={extraction.request != null ? JSON.stringify(extraction.request, null, 2) : undefined}
+      codeLabel="Body exato da request de extração:"
+    >
+      <p>
+        <strong className="text-fg">Este card não é enviado à API.</strong> Fica no histórico só
+        para exibição e é excluído do array <C>messages</C> de todas as requests.
+      </p>
+      <p>
+        A extração foi uma request separada (
+        {extraction.trigger === 'compaction'
+          ? 'automática, após a compactação'
+          : 'manual, “Extrair memórias agora”'}
+        ): o prompt de extração + a conversa + o índice da memória; as mudanças foram gravadas pelas
+        tools <C>memory_write</C>/<C>memory_delete</C>.
+      </p>
+      {extraction.request == null && (
+        <p className="text-subtle">O body da request não foi registrado nesta extração.</p>
+      )}
     </ApiInfo>
   )
 }

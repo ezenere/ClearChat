@@ -60,8 +60,12 @@ import { ToolResultMedia } from './Attachments'
 import { toolContentText } from '@shared/attachments'
 import { isAnchorShown, shortFailure } from '../../lib/approvalAnchors'
 import { useAnchor } from '../../lib/useAnchor'
+import { isMemoryTool, MEMORY_TOOL_LABELS, memoryToolSummary } from '../../lib/memory'
+import { MEMORY_TOOL_ICONS, MemoryToolBody } from '../memory/MemoryToolCard'
 
-const ICONS: Record<ToolName, LucideIcon> = {
+// Partial + string: tools novas (ex.: memória, do contrato do backend) caem no Wrench/no mapa delas.
+const ICONS: Partial<Record<ToolName | string, LucideIcon>> = {
+  ...MEMORY_TOOL_ICONS,
   list_dir: FolderTree,
   read_file: FileText,
   search_files: FileSearch,
@@ -107,6 +111,7 @@ function parseArgs(raw: string): Record<string, unknown> | null {
 
 function summary(name: string, args: Record<string, unknown> | null): string {
   if (!args) return ''
+  if (isMemoryTool(name)) return memoryToolSummary(name, args)
   const pick = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '')
   switch (name) {
     case 'shell':
@@ -448,7 +453,8 @@ export function ToolCard({
 
   const expanded = open || !!approval
   const subId = result?.meta.subSessionId ?? subSession?.id
-  const label = TOOL_LABELS[name] ?? call.name
+  const label =
+    TOOL_LABELS[name] ?? (isMemoryTool(call.name) ? MEMORY_TOOL_LABELS[call.name] : call.name)
   let sum = summary(call.name, args)
   if (targetChat)
     sum = [
@@ -634,6 +640,10 @@ export function ToolCard({
 
       {name === 'ask_user' && !streaming && (
         <AskUserCardBody args={args} result={result} pending={!!question && !result} />
+      )}
+
+      {isMemoryTool(call.name) && !streaming && (
+        <MemoryToolBody name={call.name} args={args} result={result} resultText={resultText} />
       )}
 
       {name === 'process_start' && !streaming && (

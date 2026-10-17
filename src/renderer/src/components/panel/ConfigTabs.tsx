@@ -13,6 +13,7 @@ import { SavePresetDialog } from '../presets/SavePresetDialog'
 import { Button } from '../ui/controls'
 import { ContextSettings, ModelEditor, RootOptions, SignatureSection, ToolsEditor } from './editors'
 import { Section } from './fields'
+import { MemorySection } from '../memory/MemorySection'
 
 function usePatch(chat: Chat): (p: Partial<ChatConfig>) => void {
   const patchConfig = useStore((s) => s.patchConfig)
@@ -24,7 +25,11 @@ export function ModelTab({ chat }: { chat: Chat }): React.JSX.Element {
 }
 
 export function ToolsTab({ chat }: { chat: Chat }): React.JSX.Element {
-  return <ToolsEditor cfg={chat.config} patch={usePatch(chat)} />
+  return <ToolsEditor cfg={chat.config} patch={usePatch(chat)} chatScope />
+}
+
+export function MemoryTab({ chat }: { chat: Chat }): React.JSX.Element {
+  return <MemorySection cfg={chat.config} patch={usePatch(chat)} chat={chat} />
 }
 
 export function ChatTab({ chat }: { chat: Chat }): React.JSX.Element {

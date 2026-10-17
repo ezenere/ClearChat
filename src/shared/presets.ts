@@ -40,7 +40,8 @@ export const PRESET_FIELDS = [
   'compactPrompt',
   'maxToolOutputChars',
   'confineToRoot',
-  'sandboxBash'
+  'sandboxBash',
+  'memory'
 ] as const satisfies readonly (keyof ChatConfig)[]
 
 export type PresetField = (typeof PRESET_FIELDS)[number]

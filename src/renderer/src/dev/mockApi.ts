@@ -5,6 +5,13 @@ import { providerKind } from '@shared/providerKinds'
 import type { ClearApi } from '@shared/ipc'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
 import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
+import {
+  createMemoryMock,
+  extractionRequest,
+  mockChatMemory,
+  mockPersonaMemory,
+  MOCK_COLS
+} from './mockMemory'
 import type {
   ApprovalSettings,
   AgentEvent,
@@ -783,22 +790,296 @@ export function createMockApi(scenario: string): ClearApi {
     emit({ type: 'session-updated', session: { ...s } })
   }
 
-  return {
-    // Memória: stub mínimo (o agente da UI implementa o mock completo).
-    memory: {
-      listCollections: () => delay([]),
-      createCollection: () => Promise.reject(new Error('mock: memória não implementada')),
-      updateCollection: () => Promise.reject(new Error('mock: memória não implementada')),
-      deleteCollection: () => delay(undefined),
-      list: () => delay([]),
-      create: () => Promise.reject(new Error('mock: memória não implementada')),
-      update: () => Promise.reject(new Error('mock: memória não implementada')),
-      delete: () => delay(undefined),
-      preview: () => delay({ active: false, index: null, help: null, tools: [], snapshotAt: null }),
-      refreshSnapshot: () =>
-        delay({ active: false, index: null, help: null, tools: [], snapshotAt: null }),
-      extractNow: () => Promise.reject(new Error('mock: memória não implementada'))
+  // Cenário "memory": persona com memória, chat c5 com tools de memória e cards de extração.
+  presets.push({
+    id: 'pr3',
+    name: 'Assistente pessoal',
+    description: 'Conhece você: lê e grava a memória (perfil, pessoas, preferências).',
+    icon: 'brain',
+    config: {
+      systemPrompt: 'Você é um assistente pessoal atencioso e direto.',
+      memory: mockPersonaMemory()
     },
+    createdAt: now,
+    updatedAt: now
+  })
+  if (scenario === 'memory') seedMemoryScenario()
+  function seedMemoryScenario(): void {
+    chats.unshift({
+      id: 'c5',
+      title: 'Planejamento do TCC',
+      config: { ...cfg, presetId: 'pr3', memory: mockChatMemory() },
+      mainSessionId: 's5',
+      createdAt: now - 2 * 3_600_000,
+      updatedAt: now
+    })
+    sessions.push({
+      id: 's5',
+      chatId: 'c5',
+      parentSessionId: null,
+      parentToolCallId: null,
+      depth: 0,
+      model: cfg.model,
+      title: 'Principal',
+      task: null,
+      status: 'idle',
+      createdAt: now - 2 * 3_600_000
+    })
+    const tc = (
+      tid: string,
+      name: string,
+      args: unknown
+    ): NonNullable<
+      Extract<StoredMessage['message'], { role: 'assistant' }>['tool_calls']
+    >[number] => ({
+      id: tid,
+      type: 'function',
+      function: { name, arguments: JSON.stringify(args) }
+    })
+    const tool = (
+      tid: string,
+      content: string,
+      meta: Record<string, unknown> = {},
+      at = minAgo(30)
+    ): StoredMessage =>
+      msg('s5', { role: 'tool', tool_call_id: tid, content }, { toolStatus: 'ok', ...meta }, at)
+    const usage = { promptTokens: 5400, completionTokens: 120, cachedTokens: 4900, cost: 0.0018 }
+    messages.push(
+      msg(
+        's5',
+        {
+          role: 'user',
+          content: 'Lembra do que o Marcos pediu para o capítulo 3? Quero fechar isso nesta semana.'
+        },
+        {},
+        minAgo(34)
+      ),
+      msg(
+        's5',
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            tc('tcm1', 'memory_search', { query: 'capítulo 3 orientador', category: 'areas' })
+          ]
+        },
+        { usage, model: cfg.model },
+        minAgo(33)
+      ),
+      tool(
+        'tcm1',
+        'Resultados para "capítulo 3 orientador" (2):\n- m-orientacao · Projeto TCC [escrita] · areas · Orientação do TCC — Reuniões quinzenais com o [[marcos-orientador]]\n  trecho: …Próxima entrega: capítulo 3 (implementação)\n- m-cap3 · Este chat [escrita] · areas · Capítulo 3 em revisão — Seções 3.2 e 3.4 precisam de figuras novas',
+        {},
+        minAgo(33)
+      ),
+      msg(
+        's5',
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [tc('tcm2', 'memory_read', { ids: ['m-orientacao', 'm-marcos'] })]
+        },
+        { usage, model: cfg.model },
+        minAgo(32)
+      ),
+      tool(
+        'tcm2',
+        '[m-orientacao] Orientação do TCC (Áreas · Projeto TCC, escrita)\nResumo: Reuniões quinzenais com o [[marcos-orientador]]\n- Reuniões às quintas, 14h, a cada 15 dias\n- Marcos prefere receber capítulos em PDF, com 3 dias de antecedência\n- Próxima entrega: capítulo 3 (implementação)\n\n[m-marcos] Marcos (orientador) (Pessoas · Padrão, escrita)\nResumo: Prof. Marcos Lima, sistemas distribuídos\n- Muito exigente com referências\n- Responde e-mails só à noite',
+        {},
+        minAgo(32)
+      ),
+      msg(
+        's5',
+        {
+          role: 'assistant',
+          content:
+            'O Marcos quer o **capítulo 3 em PDF com 3 dias de antecedência** da reunião de quinta. Vou registrar o novo prazo e a convidada da banca.',
+          tool_calls: [
+            tc('tcm3', 'memory_write', {
+              category: 'areas',
+              id: 'm-orientacao',
+              ops: [
+                {
+                  op: 'replace',
+                  fact: 'Próxima entrega: capítulo 3 (implementação)',
+                  with: 'Próxima entrega: capítulo 3 até 24/10 (PDF)'
+                }
+              ]
+            }),
+            tc('tcm4', 'memory_write', {
+              category: 'people',
+              target: 'chat',
+              title: 'Banca: Profa. Helena',
+              summary: 'Convidada para a banca do TCC',
+              ops: [{ op: 'add', fact: 'Especialista em sistemas distribuídos' }]
+            })
+          ]
+        },
+        { usage, model: cfg.model },
+        minAgo(31)
+      ),
+      tool(
+        'tcm3',
+        'Memória atualizada: m-orientacao "Orientação do TCC" (Projeto TCC).',
+        {
+          memoryChanges: [
+            {
+              op: 'update',
+              memoryId: 'm-orientacao',
+              title: 'Orientação do TCC',
+              collectionId: MOCK_COLS.tcc
+            }
+          ]
+        },
+        minAgo(31)
+      ),
+      tool(
+        'tcm4',
+        'Memória criada: m-helena "Banca: Profa. Helena" (Este chat).',
+        {
+          memoryChanges: [
+            {
+              op: 'create',
+              memoryId: 'm-helena',
+              title: 'Banca: Profa. Helena',
+              collectionId: MOCK_COLS.chatPeople
+            }
+          ]
+        },
+        minAgo(31)
+      ),
+      msg(
+        's5',
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            tc('tcm5', 'memory_rewrite', {
+              id: 'm-prazos-antigo',
+              title: 'Prazo de entrega',
+              summary: 'Entrega adiada para 14/12; banca em fevereiro',
+              facts: [
+                'Coordenação aprovou o adiamento em 10/10',
+                'Versão final: 14/12',
+                'Banca: 1ª quinzena de fevereiro'
+              ]
+            }),
+            tc('tcm6', 'memory_delete', { id: 'm-reuniao-cancelada' })
+          ]
+        },
+        { usage, model: cfg.model },
+        minAgo(30)
+      ),
+      tool(
+        'tcm5',
+        'Versão nova criada em Projeto TCC: m-prazo "Prazo de entrega" (substitui m-prazos-antigo).',
+        {
+          memoryChanges: [
+            {
+              op: 'create',
+              memoryId: 'm-prazo',
+              title: 'Prazo de entrega',
+              collectionId: MOCK_COLS.tcc
+            }
+          ]
+        }
+      ),
+      tool('tcm6', 'Memória apagada: m-reuniao-cancelada "Reunião de 17/10".', {
+        memoryChanges: [
+          {
+            op: 'delete',
+            memoryId: 'm-reuniao-cancelada',
+            title: 'Reunião de 17/10',
+            collectionId: MOCK_COLS.tcc
+          }
+        ]
+      }),
+      msg(
+        's5',
+        {
+          role: 'assistant',
+          content:
+            'Pronto: prazo do capítulo 3 atualizado (24/10, em PDF), a Profa. Helena anotada na memória deste chat e o prazo final corrigido para 14/12.'
+        },
+        { usage, model: cfg.model, durationMs: 3100 },
+        minAgo(29)
+      ),
+      msg(
+        's5',
+        { role: 'user', content: '[extração de memórias — só exibição]' },
+        {
+          synthetic: true,
+          kind: 'memory-extraction',
+          memoryExtraction: {
+            created: 2,
+            updated: 1,
+            deleted: 0,
+            changes: [
+              {
+                op: 'create',
+                memoryId: 'm-cap3',
+                title: 'Capítulo 3 em revisão',
+                collectionId: MOCK_COLS.chatAreas
+              },
+              {
+                op: 'create',
+                memoryId: 'm-corrida',
+                title: 'Corrida',
+                collectionId: MOCK_COLS.topics
+              },
+              {
+                op: 'update',
+                memoryId: 'm-orientacao',
+                title: 'Orientação do TCC',
+                collectionId: MOCK_COLS.tcc
+              }
+            ],
+            model: 'anthropic/claude-haiku-4.5',
+            providerId: 'p1',
+            usage: { promptTokens: 8120, completionTokens: 240, cachedTokens: 0, cost: 0.0093 },
+            request: extractionRequest(
+              'anthropic/claude-haiku-4.5',
+              mockChatMemory(),
+              '<memory>…</memory>'
+            ),
+            trigger: 'compaction'
+          }
+        } as unknown as StoredMessage['meta'],
+        minAgo(20)
+      ),
+      msg(
+        's5',
+        { role: 'user', content: '[extração de memórias — só exibição]' },
+        {
+          synthetic: true,
+          kind: 'memory-extraction',
+          memoryExtraction: {
+            created: 0,
+            updated: 0,
+            deleted: 0,
+            changes: [],
+            error:
+              'HTTP 429: Rate limit exceeded for anthropic/claude-haiku-4.5 — tente de novo em alguns segundos.',
+            model: 'anthropic/claude-haiku-4.5',
+            providerId: 'p1',
+            trigger: 'manual'
+          }
+        } as unknown as StoredMessage['meta'],
+        minAgo(12)
+      )
+    )
+  }
+
+  return {
+    memory: createMemoryMock({
+      emit,
+      chats,
+      sessions,
+      messages,
+      msg,
+      delay,
+      withChatData: scenario === 'memory'
+    }),
     providers: {
       list: () => delay(providers),
       create: async (p) => {
