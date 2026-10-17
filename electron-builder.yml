@@ -8,8 +8,9 @@ artifactName: ClearChat-${version}-${arch}.${ext}
 compression: maximum
 files:
   # Lista de inclusão: só o necessário em runtime — out/ (main/preload/renderer), resources/ e
-  # package.json. O electron-builder acrescenta sozinho os node_modules de produção. (Uma lista de
-  # exclusão deixava passar .git e .claude/worktrees, as cópias de trabalho dos agentes.)
+  # package.json. Repetida em linux/win/mac (o `files` da plataforma substitui esta). O
+  # electron-builder acrescenta sozinho os node_modules de produção. (Uma lista de exclusão
+  # deixava passar .git e .claude/worktrees, as cópias de trabalho dos agentes.)
   - out/**
   - resources/**
   - package.json
@@ -29,9 +30,17 @@ electronLanguages:
 
 linux:
   executableName: clearchat
-  # O `files` por plataforma se soma à lista acima (não a substitui): cada uma exclui só os
-  # binários das outras plataformas.
+  # ATENÇÃO: o `files` por plataforma SUBSTITUI a lista de cima (não se soma) — por isso cada
+  # plataforma repete a lista de inclusão inteira e exclui só os binários das outras.
+  # (Sem isso o pacote levava src/, e2e/, docs/, scripts/… — verificado no app.asar.)
   files:
+    - out/**
+    - resources/**
+    - package.json
+    - '!**/*.{map,ts,tsx,md,markdown}'
+    - '!**/{test,tests,__tests__,example,examples,docs,.github}{,/**}'
+    - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
+    - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
   # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
   # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
@@ -77,6 +86,13 @@ pacman:
 win:
   executableName: clearchat
   files:
+    - out/**
+    - resources/**
+    - package.json
+    - '!**/*.{map,ts,tsx,md,markdown}'
+    - '!**/{test,tests,__tests__,example,examples,docs,.github}{,/**}'
+    - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
+    - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{darwin,linux,linuxmusl}-*'
   icon: build/icon.ico
   target:
@@ -89,6 +105,13 @@ nsis:
 mac:
   icon: build/icon.icns
   files:
+    - out/**
+    - resources/**
+    - package.json
+    - '!**/*.{map,ts,tsx,md,markdown}'
+    - '!**/{test,tests,__tests__,example,examples,docs,.github}{,/**}'
+    - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
+    - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{win32,linux,linuxmusl}-*'
   category: public.app-category.developer-tools
   entitlementsInherit: build/entitlements.mac.plist
