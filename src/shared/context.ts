@@ -1,7 +1,18 @@
 // Janela de contexto, uso e fronteiras de compactação — funções puras usadas pelo main (runner /
 // buildRequest) e pelo renderer (medidor de contexto, divisor "Conversa compactada").
-import type { ChatConfig, ModelInfo, Session, StoredMessage, Usage } from './types'
+import type { ChatConfig, MessageMeta, ModelInfo, Session, StoredMessage, Usage } from './types'
 import { DEFAULT_COMPACT_THRESHOLD } from './defaults'
+
+/**
+ * Mensagens só de exibição (synthetic): erro persistido ('error') e card da extração de memórias
+ * ('memory-extraction'). NUNCA vão para a API nem contam como resposta do assistente.
+ */
+export const DISPLAY_ONLY_KINDS: readonly NonNullable<MessageMeta['kind']>[] = [
+  'error',
+  'memory-extraction'
+]
+export const isDisplayOnly = (meta: MessageMeta | null | undefined): boolean =>
+  !!meta?.kind && DISPLAY_ONLY_KINDS.includes(meta.kind)
 
 /** Índice da fronteira de compactação mais recente (-1 = nenhuma). */
 export function latestBoundaryIndex(history: StoredMessage[]): number {
@@ -34,7 +45,7 @@ export function contextUsage(history: StoredMessage[]): ContextUsage | null {
   for (let i = history.length - 1; i > start; i--) {
     const m = history[i]
     const u = m.meta?.usage
-    if (u && m.message.role === 'assistant' && m.meta.kind !== 'error') {
+    if (u && m.message.role === 'assistant' && !isDisplayOnly(m.meta)) {
       return { used: (u.promptTokens || 0) + (u.completionTokens || 0), estimated: false, usage: u }
     }
   }
@@ -71,7 +82,7 @@ export function hasCompactableHistory(history: StoredMessage[]): boolean {
   const start = latestBoundaryIndex(history)
   return history
     .slice(start + 1)
-    .some((m) => m.message.role === 'assistant' && m.meta.kind !== 'error')
+    .some((m) => m.message.role === 'assistant' && !isDisplayOnly(m.meta))
 }
 
 /** Erros de "contexto excedido" (OpenAI, OpenRouter, Anthropic, Gemini, vLLM, llama.cpp…). */

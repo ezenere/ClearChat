@@ -2,6 +2,7 @@
 // renderer (bolha "De: <chat>"). Testadas em e2e/unit.test.ts.
 import type { StoredMessage } from './types'
 import { LIMITS } from './limits'
+import { isDisplayOnly } from './context'
 
 /**
  * Cabeçalho da mensagem entregue ao chat de destino (primeira linha do `content` persistido).
@@ -44,7 +45,7 @@ export function currentInterChatHops(history: StoredMessage[]): number {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i]
     if (m.message.role !== 'user') continue
-    if (m.meta.kind === 'compaction' || m.meta.kind === 'error' || m.meta.synthetic) continue
+    if (m.meta.kind === 'compaction' || isDisplayOnly(m.meta) || m.meta.synthetic) continue
     if (m.meta.kind !== 'inter-chat') return 0
     const h = m.meta.interChatHops
     return typeof h === 'number' && h > 0 ? h : 1

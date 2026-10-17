@@ -108,3 +108,29 @@ export const ATTACHMENT_LIMITS = {
   /** Arquivos de texto: caracteres inseridos no prompt (o resto é cortado com aviso). */
   maxTextChars: 200_000
 } as const
+
+/** Memória modular (SPEC → Memória). */
+export const MEMORY_LIMITS = {
+  /** Título de uma memória (caracteres). */
+  titleChars: 80,
+  /** Resumo (uma frase; vai no índice). */
+  summaryChars: 160,
+  /** Cada tópico (fato) de uma memória. */
+  factChars: 200,
+  /** Tópicos por memória. */
+  maxFacts: 15,
+  /** Nome / descrição de uma coleção. */
+  collectionNameChars: 60,
+  collectionDescriptionChars: 300,
+  /** Teto do bloco de índice no system prompt (caracteres; acima disso: fixadas + recentes). */
+  indexMaxChars: 12_000,
+  /** memory_search: resultados padrão / máximo; memory_read: ids por chamada. */
+  searchDefaultResults: 10,
+  searchMaxResults: 30,
+  readMaxIds: 20,
+  /** Extração: rodadas de tool calls (request → tools → request…) e caracteres de conversa enviados. */
+  extractionMaxRounds: 4,
+  extractionConversationChars: 60_000,
+  /** Extração: índice completo enviado (caracteres). */
+  extractionIndexChars: 40_000
+} as const

@@ -1,4 +1,4 @@
-import type { MemoryConfig } from './memory'
+import type { MemoryConfig, MemoryExtractionResult } from './memory'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
 export interface Provider {
@@ -94,6 +94,12 @@ export type ToolName =
   | 'process_list'
   | 'process_stop'
   | 'ask_user'
+  // memória modular (SPEC → Memória): disponibilidade pela config de memória, não por enabledTools
+  | 'memory_search'
+  | 'memory_read'
+  | 'memory_write'
+  | 'memory_rewrite'
+  | 'memory_delete'
 
 /**
  * Tools cujo padrão global é PERGUNTAR (modo `lists`; ver approvalPolicy.ts) — os itens Comandos,
@@ -114,6 +120,10 @@ export type ApprovalItem =
   | 'editFile'
   | 'sendToChat'
   | 'delegate'
+  // memória: ids iguais aos nomes das tools (padrão global "Sempre permitir")
+  | 'memory_write'
+  | 'memory_rewrite'
+  | 'memory_delete'
 /**
  * always = sempre permitir · smart = Smart-Approve decide · lists = whitelist/blacklist
  * (commands/processes/pages; nos demais itens = "Perguntar").
@@ -407,6 +417,8 @@ export interface MessageMeta {
     | 'inter-chat'
     | 'subagent-callback'
     | 'parent-message'
+    /** Card da extração de memórias (synthetic, só exibição — NUNCA enviado à API, como 'error'). */
+    | 'memory-extraction'
   /** Resposta do assistente cortada pelo usuário. */
   interrupted?: boolean
   usage?: Usage
@@ -455,6 +467,17 @@ export interface MessageMeta {
   // ---- questionário (mensagem tool de ask_user) ----
   /** Perguntas (com imagens já resolvidas no store) + respostas estruturadas, para o card. */
   askUser?: AskUserRecord
+  // ---- memória (SPEC → Memória) ----
+  /** kind 'memory-extraction': resultado da extração (mudanças, custo, request exata). */
+  memoryExtraction?: MemoryExtractionResult & {
+    model?: string
+    providerId?: string
+    usage?: Usage
+    request?: unknown
+    trigger: 'manual' | 'compaction'
+  }
+  /** Mensagem tool de memory_write/memory_rewrite/memory_delete: o que mudou. */
+  memoryChanges?: MemoryExtractionResult['changes']
 }
 
 export interface StoredMessage {

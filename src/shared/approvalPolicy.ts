@@ -3,7 +3,8 @@
 // Ver SPEC.md → "Aprovações".
 //
 // Itens: commands (shell) · processes (process_start) · pages (browse_url) · search (web_search) ·
-// writeFile (write_file) · editFile (edit_file) · sendToChat (send_to_chat) · delegate (delegate_task).
+// writeFile (write_file) · editFile (edit_file) · sendToChat (send_to_chat) · delegate (delegate_task) ·
+// memory_write · memory_rewrite · memory_delete (tools de memória — mesmos nomes).
 // Modo efetivo = override do chat (ChatConfig.approvalModes[item]) ?? global (settings
 // `approvalModes`) ?? DEFAULT_APPROVAL_MODES.
 //   always → roda sem perguntar (blacklist NÃO vale).
@@ -35,12 +36,16 @@ export const APPROVAL_ITEMS: ApprovalItem[] = [
   'writeFile',
   'editFile',
   'sendToChat',
-  'delegate'
+  'delegate',
+  'memory_write',
+  'memory_rewrite',
+  'memory_delete'
 ]
 /** Grupos da UI (Configurações → Aprovações e aba Tools). */
 export const APPROVAL_ITEM_GROUPS: { title: string; items: ApprovalItem[] }[] = [
   { title: 'Terminal e web', items: ['commands', 'processes', 'pages', 'search'] },
-  { title: 'Arquivos e agentes', items: ['writeFile', 'editFile', 'sendToChat', 'delegate'] }
+  { title: 'Arquivos e agentes', items: ['writeFile', 'editFile', 'sendToChat', 'delegate'] },
+  { title: 'Memória', items: ['memory_write', 'memory_rewrite', 'memory_delete'] }
 ]
 export const APPROVAL_LIST_ITEMS: ApprovalListItem[] = ['commands', 'processes', 'pages']
 export const APPROVAL_MODES: ApprovalMode[] = ['always', 'smart', 'lists']
@@ -56,7 +61,10 @@ export const ITEM_TOOL: Record<ApprovalItem, ToolName> = {
   writeFile: 'write_file',
   editFile: 'edit_file',
   sendToChat: 'send_to_chat',
-  delegate: 'delegate_task'
+  delegate: 'delegate_task',
+  memory_write: 'memory_write',
+  memory_rewrite: 'memory_rewrite',
+  memory_delete: 'memory_delete'
 }
 
 export const TOOL_ITEM: Partial<Record<ToolName, ApprovalItem>> = {
@@ -67,7 +75,10 @@ export const TOOL_ITEM: Partial<Record<ToolName, ApprovalItem>> = {
   write_file: 'writeFile',
   edit_file: 'editFile',
   send_to_chat: 'sendToChat',
-  delegate_task: 'delegate'
+  delegate_task: 'delegate',
+  memory_write: 'memory_write',
+  memory_rewrite: 'memory_rewrite',
+  memory_delete: 'memory_delete'
 }
 
 /** Tools que passam pelo gate de aprovação (uma por item). */
@@ -81,7 +92,10 @@ export const ITEM_LABEL: Record<ApprovalItem, string> = {
   writeFile: 'Escrever arquivo',
   editFile: 'Editar arquivo',
   sendToChat: 'Enviar para chat',
-  delegate: 'Delegar a subagente'
+  delegate: 'Delegar a subagente',
+  memory_write: 'Gravar memória',
+  memory_rewrite: 'Reescrever memória',
+  memory_delete: 'Apagar memória'
 }
 
 /** Item com whitelist/blacklist (commands, processes, pages). Nos demais, `lists` = "Perguntar". */
@@ -122,6 +136,7 @@ export function modeHint(item: ApprovalItem, mode: ApprovalMode): string {
  * o comportamento das versões anteriores; o usuário vai liberando com "+ whitelist"). Busca web
  * também pergunta: a consulta sai para um serviço externo (DuckDuckGo) e pode vazar contexto.
  * Arquivos, chats e subagentes: `always` (rodavam sem perguntar antes de virarem itens).
+ * Memória (gravar/reescrever/apagar): `always` — a terceira opção é "Perguntar".
  */
 export const DEFAULT_APPROVAL_MODES: Record<ApprovalItem, ApprovalMode> = {
   commands: 'lists',
@@ -131,7 +146,10 @@ export const DEFAULT_APPROVAL_MODES: Record<ApprovalItem, ApprovalMode> = {
   writeFile: 'always',
   editFile: 'always',
   sendToChat: 'always',
-  delegate: 'always'
+  delegate: 'always',
+  memory_write: 'always',
+  memory_rewrite: 'always',
+  memory_delete: 'always'
 }
 
 const isMode = (v: unknown): v is ApprovalMode =>

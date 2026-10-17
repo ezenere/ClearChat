@@ -6,7 +6,7 @@
 // `role: user` com o prompt de compactação. Nada dessa request (nem a resposta) entra no histórico:
 // só o resumo, dentro da mensagem de fronteira `role: user` (meta.kind 'compaction').
 import { compactionMessageText, COMPACTION_NOTE } from '@shared/defaults'
-import { activeHistory } from '@shared/context'
+import { activeHistory, isDisplayOnly } from '@shared/context'
 import { attachmentPlaceholder } from '@shared/attachments'
 import type {
   ApiMessage,
@@ -94,7 +94,7 @@ export function splitPending(history: StoredMessage[]): {
   summarized: StoredMessage[]
   pending: StoredMessage[]
 } {
-  const active = activeHistory(history).filter((m) => m.meta?.kind !== 'error')
+  const active = activeHistory(history).filter((m) => !isDisplayOnly(m.meta))
   let i = active.length
   while (i > 0 && active[i - 1].message.role === 'user' && active[i - 1].meta.kind !== 'compaction')
     i--
@@ -187,7 +187,7 @@ export function compactionMeta(
   const summaryOf = { fromSeq: active[0]?.seq ?? 0, toSeq: active[active.length - 1]?.seq ?? 0 }
   const tools = availableTools(chat, session, history)
   // read_history habilitada ao compactar → a nota diz que o original (seq X–Y) é consultável.
-  const firstSeq = history.find((m) => m.meta?.kind !== 'error')?.seq ?? summaryOf.fromSeq
+  const firstSeq = history.find((m) => !isDisplayOnly(m.meta))?.seq ?? summaryOf.fromSeq
   const text = compactionMessageText(
     summary,
     tools.includes('read_history') ? { fromSeq: firstSeq, toSeq: summaryOf.toSeq } : undefined

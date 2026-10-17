@@ -14,6 +14,7 @@
 import type Database from 'better-sqlite3'
 import { contentText, messageAttachments } from '@shared/attachments'
 import type { ApiMessage, MessageMeta } from '@shared/types'
+import { isDisplayOnly } from '@shared/context'
 
 export const SEARCH_INDEX_FLAG = 'migration.searchIndex'
 /** Suba quando mudar as regras de searchableText (a migração reindexa tudo). */
@@ -55,7 +56,7 @@ export function searchableText(
   message: ApiMessage,
   meta: MessageMeta = {}
 ): { body: string; tool: string } {
-  if (meta.kind === 'error') return { body: '', tool: '' } // erro só de exibição
+  if (isDisplayOnly(meta)) return { body: '', tool: '' } // erro / extração: só exibição
   if (message.role === 'assistant') {
     const calls = (message.tool_calls ?? [])
       .filter((tc) => tc.function.name !== 'read_history')

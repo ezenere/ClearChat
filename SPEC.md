@@ -30,8 +30,9 @@ messages(id TEXT PK, session_id TEXT, seq INTEGER, message_json TEXT, meta_json 
 presets(id TEXT PK, name TEXT, description TEXT, icon TEXT, config_json TEXT, created_at INTEGER, updated_at INTEGER)  -- personas (ver "Personas")
 message_search(docid INTEGER PK, message_id TEXT UNIQUE)   -- índice de busca (ver "Histórico → Índice FTS5")
 messages_fts USING fts5(body, tool, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2')  -- rowid = docid
+memory_collections(…) / memories(…) / memories_fts(…)  -- memória modular (ver "Memória → Dados"); sessions.memory_json = snapshot do índice + última extração
 ```
-IDs: `crypto.randomUUID()`. Timestamps: `Date.now()`. Deletar chat apaga sessions/messages (cascade manual ou FK ON DELETE CASCADE).
+IDs: `crypto.randomUUID()` (exceto memórias: `m` + 7 caracteres base36 — ver "Memória"). Timestamps: `Date.now()`. Deletar chat apaga sessions/messages (cascade manual ou FK ON DELETE CASCADE).
 
 **Migração do nome antigo** (`src/main/migrate.ts`, `migrateLegacyData(userData)`): o app se chamava "CleartChat" (typo). No `ready`, antes de abrir o banco e só no userData padrão (não com `CLEARCHAT_USER_DATA`): se `<userData>/clearchat.db` não existe e `<irmão>/CleartChat/cleartchat.db` existe, copia com `VACUUM INTO` numa conexão somente leitura (cópia consistente, já com o WAL) para um temporário e renomeia; fallback: cópia crua de `.db` + `-wal`/`-shm` validada ao abrir. O diretório antigo fica intacto. Testado em `e2e/unit.test.ts`.
 
@@ -56,9 +57,11 @@ export type ToolName = 'list_dir' | 'read_file' | 'search_files' | 'find_files' 
   | 'get_chat_info' | 'list_chats' | 'send_to_chat' | 'read_history'                              // chats / histórico
   | 'check_subagents' | 'wait_subagents' | 'cancel_subagent' | 'message_subagent'                  // só com delegate_task disponível
   | 'ask_user'                                                                                     // questionário — só na sessão principal
+  | 'memory_search' | 'memory_read' | 'memory_write' | 'memory_rewrite' | 'memory_delete'           // memória (fora de enabledTools; ver "Memória")
 export const CONFIRM_TOOLS: ToolName[] = ['shell', 'process_start', 'web_search', 'browse_url']   // itens cujo padrão global pergunta; process_stop NÃO (ver "Aprovações")
 export type ApprovalItem = 'commands' | 'processes' | 'pages' | 'search'      // shell · process_start · browse_url · web_search
   | 'writeFile' | 'editFile' | 'sendToChat' | 'delegate'                       // write_file · edit_file · send_to_chat · delegate_task (padrão always)
+  | 'memory_write' | 'memory_rewrite' | 'memory_delete'                        // tools de memória de mesmo nome (padrão always)
 export type ApprovalMode = 'always' | 'smart' | 'lists'
 export interface ApprovalSettings { modes: Record<ApprovalItem, ApprovalMode>; lists: Record<'commands'|'processes'|'pages', { allow: string[]; deny: string[] }> }
 export const TOOL_ALIASES = { bash: 'shell' }   // nome antigo → atual (alias de leitura; ver "Migração bash → shell")
@@ -126,6 +129,7 @@ export interface MessageMeta {
   synthetic?: boolean            // criado pelo app (não pelo usuário nem pelo modelo) — UI mostra (i) com o texto exato
   kind?: 'queued' | 'forced' | 'interrupt-notice' | 'tool-cancelled' | 'error' | 'compaction'
        | 'inter-chat' | 'subagent-callback' | 'parent-message'
+       | 'memory-extraction'     // card da extração de memórias: só exibição, como 'error' (isDisplayOnly) — nunca vai à API
   interrupted?: boolean          // resposta do assistente cortada pelo usuário
   usage?: Usage; model?: string; durationMs?: number; error?: string
   subSessionId?: string          // em mensagens tool de delegate_task
@@ -144,6 +148,8 @@ export interface MessageMeta {
   smartOverride?: boolean        // mensagem tool: rodou por "Executar mesmo assim"
   approval?: ApprovalRecord      // mensagem tool: { item, mode, allowed?: {text, entry}[], blocked?: {text, entry}, userAllowed?: string[], denied?: string }
   askUser?: AskUserRecord        // mensagem tool de ask_user: { questions (resolvidas), outcome: 'answered'|'cancelled'|'app-closed', answers?, notes? }
+  memoryExtraction?: MemoryExtractionResult & { model?; providerId?; usage?: Usage; request?: unknown; trigger: 'manual' | 'compaction' } // kind 'memory-extraction'
+  memoryChanges?: MemoryExtractionResult['changes'] // mensagem tool de memory_write/rewrite/delete
 }
 export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number }
 
@@ -387,7 +393,7 @@ Um modelo "juiz" (qualquer par provedor + modelo) decide as chamadas dos itens e
 
 ## Aprovações (`src/shared/approvalPolicy.ts`, `src/shared/shellParse.ts`, `src/main/approvalSettings.ts`, runner)
 
-Gate de toda chamada de tool. **Itens** (`APPROVAL_ITEMS`, um por tool — `ITEM_TOOL`/`TOOL_ITEM`/`APPROVAL_TOOLS`; grupos da UI em `APPROVAL_ITEM_GROUPS`): *Terminal e web* — **Comandos** (`shell`), **Processos** (`process_start`), **Páginas** (`browse_url`), **Busca web** (`web_search`); *Arquivos e agentes* — **Escrever arquivo** (`write_file`), **Editar arquivo** (`edit_file`), **Enviar para chat** (`send_to_chat`), **Delegar a subagente** (`delegate_task`). `process_stop` **nunca** pede aprovação (só alcança processos do próprio chat). As demais tools (leitura, histórico, `list_models`, controle de subagentes, `ask_user`) rodam direto.
+Gate de toda chamada de tool. **Itens** (`APPROVAL_ITEMS`, um por tool — `ITEM_TOOL`/`TOOL_ITEM`/`APPROVAL_TOOLS`; grupos da UI em `APPROVAL_ITEM_GROUPS`): *Terminal e web* — **Comandos** (`shell`), **Processos** (`process_start`), **Páginas** (`browse_url`), **Busca web** (`web_search`); *Arquivos e agentes* — **Escrever arquivo** (`write_file`), **Editar arquivo** (`edit_file`), **Enviar para chat** (`send_to_chat`), **Delegar a subagente** (`delegate_task`); *Memória* — **Gravar memória** (`memory_write`), **Reescrever memória** (`memory_rewrite`), **Apagar memória** (`memory_delete`) — ids de item iguais aos nomes das tools, padrão global `always` e terceira opção "Perguntar" (como os de arquivo). `process_stop` **nunca** pede aprovação (só alcança processos do próprio chat). As demais tools (leitura, histórico, `list_models`, controle de subagentes, `ask_user`) rodam direto.
 
 **Modos** (por item): `always` (Sempre permitir — roda sem perguntar; a blacklist NÃO vale) · `smart` (o juiz do Smart-Approve decide, com a config do chat; sem modelo → pergunta, fail-closed) · `lists` (Whitelist/Blacklist em Comandos/Processos/Páginas — `isListItem`; nos demais itens = **Perguntar** sim/não, sem listas — decisão: buscas não têm um "alvo" útil para listar e a consulta pode vazar contexto; para arquivos/chats/subagentes "Perguntar" é a terceira opção natural). `modeLabel`/`modeHint` dão o rótulo e o tooltip por item.
 - **Escopo**: modo **global** por item (settings `approvalModes`, Configurações → Aprovações) + **ajuste por chat** (`ChatConfig.approvalModes[item]`; aba Tools e personas via `PRESET_FIELDS`). Modo efetivo = chat ?? global ?? `DEFAULT_APPROVAL_MODES` (`effectiveMode`). Subagentes usam o modo efetivo do chat. As **listas são sempre globais** (settings `approvalLists` = `{ commands, processes, pages }` × `{ allow, deny }`), nunca por chat.
@@ -612,17 +618,23 @@ Memória modular: cada **coleção** (criada pelo usuário, global) pertence a *
 ### Taxonomia fixa (instruções padronizadas, na descrição de `memory_write`)
 `profile` (quem é o usuário) · `topics` (hábitos e interesses recorrentes) · `areas` (frentes ativas: projetos, tarefas em andamento) · `people` (pessoas — e animais) · `preferences` (como o usuário quer que o chat se comporte). Rótulos pt-BR: Perfil, Tópicos, Áreas, Pessoas, Preferências.
 
-### Dados (SQLite)
+### Dados (SQLite — `src/main/memory/schema.ts`, `ensureMemorySchema` idempotente, chamado em `db.ts`)
 ```sql
-memory_collections(id TEXT PK, category TEXT /* fixa */, name TEXT, description TEXT, icon TEXT, scope TEXT /* 'shared' | 'chat' */,
-                   chat_id TEXT NULL /* scope chat → ON DELETE CASCADE */, created_at, updated_at)
-memories(id TEXT PK, collection_id TEXT /* FK CASCADE */, category TEXT, title TEXT, slug TEXT, summary TEXT,
-         facts_json TEXT /* string[] */, pinned INTEGER, created_at, updated_at,
-         updated_by_chat_id TEXT NULL, updated_by TEXT /* 'model' | 'extraction' | 'user' */,
-         supersedes_id TEXT NULL /* memory_rewrite: substitui esta memória de outra coleção */)
+memory_collections(id TEXT PK /* randomUUID */, category TEXT /* fixa */, name TEXT, description TEXT, icon TEXT NULL,
+                   scope TEXT /* 'shared' | 'chat' */, chat_id TEXT NULL REFERENCES chats ON DELETE CASCADE, created_at, updated_at)
+memories(id TEXT PK /* 'm' + 7 base36 — curto: vai no índice de toda request */, collection_id TEXT REFERENCES memory_collections ON DELETE CASCADE,
+         category TEXT /* = da coleção */, title TEXT, slug TEXT UNIQUE, summary TEXT, facts_json TEXT /* string[] */, pinned INTEGER,
+         created_at, updated_at, updated_by_chat_id TEXT NULL, updated_by TEXT /* 'model' | 'extraction' | 'user' */,
+         supersedes_id TEXT NULL /* memory_rewrite; sem FK — trigger zera quando a original é apagada */)
+memories_fts USING fts5(title, summary, facts, memory_id UNINDEXED, tokenize='unicode61 remove_diacritics 2')  -- triggers ai/au/ad (cobrem CASCADE)
+sessions.memory_json TEXT NULL  -- { snapshot?: { at, key, index }, lastExtractedSeq? }
 ```
-+ índice FTS5 sobre title/summary/facts (reaproveitar o padrão de `searchIndex.ts`). Limites em `src/shared/limits.ts`: título ≤ 80, resumo ≤ 160, tópico ≤ 200 caracteres, ≤ 15 tópicos por memória. Links `[[slug]]` entre memórias.
-`memories.category` = categoria da coleção (denormalizada). A **memória do chat** são coleções `scope:'chat'` (uma por categoria, nome "Este chat"), criadas sob demanda na primeira gravação.
+- **Repositório** (`src/main/memory/store.ts`, `MemoryStore(conn, { onChange })`; erros de regra = `MemoryError` com texto legível): CRUD de coleções (categoria imutável; apagar coleção apaga as memórias) e memórias (categoria vem da coleção; **mover só para coleção da mesma categoria**). Cada mudança chama `onChange` → evento `memory-changed` (apagar um chat com memória própria também emite).
+- **Limites** (`MEMORY_LIMITS` em `limits.ts`): título ≤ 80, resumo ≤ 160, tópico ≤ 200, ≤ 15 tópicos (erro: `Título longo demais (81/80 caracteres)…`, `Tópicos demais (16/15)…`); nome de coleção ≤ 60, descrição ≤ 300. Espaços colapsados, tópicos vazios/duplicados (sem caixa/acento) removidos.
+- **Slug** = título sem acentos/pontuação com hífens (≤ 60), **único global** (`-2`, `-3`…), **estável** (não muda ao renomear: links `[[slug]]` nos tópicos continuam valendo). `findMemory` aceita id, slug ou `[[slug]]`.
+- **Busca**: FTS5 com prefixo por palavra (`"pal"*` OR …), bm25 título 5 · resumo 2 · tópicos 1; trecho = 1º tópico (ou resumo) com a palavra. Sem FTS5 → LIKE.
+- **Semelhança** (antes de criar): mesma coleção, mesmo slug-base, ou FTS no título + palavras significativas (sem stopwords) com sobreposição ≥ 60% da menor lista (ex.: "Projeto do TCC" × "TCC").
+- **Memória do chat**: coleções `scope:'chat'` (uma por categoria, nome "Este chat"), criadas sob demanda na 1ª gravação com `target:'chat'`; apagar o chat apaga (CASCADE).
 
 ### Config (em `ChatConfig.memory?`, persona via `PRESET_FIELDS`; chat herda da persona como hoje)
 ```ts
@@ -637,24 +649,35 @@ interface MemoryConfig {
   subagents: boolean                        // memory_search/memory_read para subagentes (nunca escrita, nunca índice)
 }
 ```
-Regra de envio: se `!enabled` ou (nenhuma coleção ativa e `!chatMemory`) → nenhum bloco de memória, nenhuma tool de memória.
+- `normalizeMemoryConfig` (shared) completa/limpa qualquer valor salvo (ausente = `defaultMemoryConfig()` = desligada). **Persona**: `sanitizePresetConfig` grava `memory` com `chatMemory: false`; `applyPreset` mantém o `chatMemory` da base (a persona nunca liga/desliga a memória do chat). Herança = snapshot na criação do chat, como os demais campos.
+- **Resolução** (`activeMemory(store, chat, session)` em `src/main/memory/config.ts`): categorias ligadas (`enabled` ? `categories` : nenhuma); coleções ativas por categoria = compartilhadas selecionadas que existem e estão em categoria ligada (+ as "Este chat" do chat, com `chatMemory`); `writeTo[cat]` só vale se for uma das ativas daquela categoria (senão null); `canWrite` = algum `writeTo` válido ou `chatMemory`.
+- **Regra de envio**: se `!enabled` ou (nenhuma compartilhada ativa e (`!chatMemory` ou nenhuma categoria)) → nenhum bloco, nenhuma tool. Tools: principal → `memory_search`, `memory_read` + (`canWrite` ? `memory_write`, `memory_rewrite`, `memory_delete`); subagente → `memory_search`/`memory_read` só com `subagents` (e memória ativa no chat). As tools de memória **não** entram em `TOOL_NAMES`/`enabledTools` (`MEMORY_TOOL_NAMES` em `tools.ts`); `availableTools` as acrescenta no fim (ordem fixa). Definições estáticas (sem dados da sessão) → prefixo estável.
 
 ### Envio à API (controle total: tudo com (i))
-- **Índice** (no system prompt, após o system prompt/ambiente): agrupado por categoria → coleção ativa (nome, descrição, marcada *escrita* ou *leitura*) → por memória (substituídas ocultas) → `id · categoria · título — resumo`; memórias `pinned` vão com os tópicos completos. Teto de tamanho; se exceder, fixadas + mais recentes + "use memory_search para o resto".
-- **Congelado por sessão** (token caching): snapshot salvo na sessão no 1º request; renovado só em chat novo, compactação ou botão "Atualizar memória". O que o modelo grava durante a sessão chega pelos resultados das tools.
-- **Help prompt** (se ligado): texto padrão incisivo (consultar a memória antes de responder sobre o usuário/projetos, gravar fatos novos, corrigir discrepâncias), editável.
+- **Ordem do system prompt** (`systemContent`): system prompt → `<environment>` → **índice** → **help** → texto das tools (modo texto). Fontes registradas pelo main (`setMemorySources` em `request.ts`; sem registro = nada, testes puros). `previewRequest` ("Ver request") e `memory.preview` → `{ active, index, help, tools, snapshotAt }` mostram o mesmo.
+- **Índice** (`src/main/memory/render.ts`): `<memory>` + cabeçalho (congelado; memory_read/memory_search; escrita × leitura) → `## Rótulo (categoria: o que guarda)` → `### Coleção — escrita|leitura[ · memória deste chat (target "chat")]` + descrição → `- id · título — resumo`; fixadas com os tópicos numerados; coleção vazia `(vazia)`; com `chatMemory`, categoria sem coleção mostra como gravar. Ordem: fixadas, depois mais recentes. **Substituídas ocultas** onde a substituta (supersedes_id) também está ativa. **Teto** `MEMORY_LIMITS.indexMaxChars` (12.000): ficam fixadas + mais recentes que cabem, `(+N não listadas)` por coleção e `[N memórias fora do índice por tamanho — use memory_search…]`.
+- **Congelado por sessão** (`MemoryService`, `src/main/memory/service.ts`): o runner chama `ensureSnapshot` antes de cada chamada da principal — sem snapshot válido, grava `{ at, key, index }` em `sessions.memory_json`. `key` = coleções compartilhadas ativas + escrita + categorias + chatMemory (memórias novas e coleções "Este chat" criadas no meio da sessão NÃO mudam a chave → o cache não quebra; mudar a config muda → índice novo). Renovado em: sessão nova, compactação (`afterCompaction` limpa; o próximo request tira outro), `memory.refreshSnapshot` ("Atualizar memória"). Antes do 1º request o preview mostra o índice atual com `snapshotAt: null`. O que o modelo grava durante a sessão chega pelos resultados das tools.
+- **Help prompt** (se ligado): `text ?? DEFAULT_MEMORY_HELP_PROMPT` (`defaults.ts`).
 - **Subagentes**: nunca recebem índice nem help; só `memory_search`/`memory_read` se `subagents` (e memória ligada no chat).
 
-### Tools (só quando a regra de envio permite; aprovações: itens `memory_write`/`memory_delete` com padrão "Sempre permitir")
-- `memory_search { query, collection?, category?, limit? }` → id, coleção (escrita/leitura), categoria, título, resumo, trecho.
-- `memory_read { ids[] }` → memória completa.
-- `memory_write { category, target? ('shared' = coleção de escrita da categoria [padrão] | 'chat' = memória do chat), id?, title?, summary?, ops: [{add|remove|replace, fact, with?}] }` → cria (sem id) ou **atualiza** (com id; só memórias de coleções graváveis: a de escrita da categoria ou a do chat). Sem coleção de escrita na categoria e sem memória do chat → erro claro. Ao criar, se houver memória parecida (FTS/slug) na mesma coleção, NÃO cria: retorna as candidatas pedindo `id`. Descrição traz a taxonomia e a regra de discrepância: ao receber informação que contradiz uma memória, atualizar (replace/remove) em vez de duplicar. Respeita a coleção de escrita e as categorias ligadas.
-- `memory_rewrite { id, target?, title?, summary?, facts? | ops? }` → para memórias em coleções **só de leitura**: cria na coleção de escrita (ou do chat) uma versão atualizada com `supersedes_id = id`. Onde as duas coleções estiverem ativas, o índice/busca mostram só a substituta (a original fica intacta na coleção dela). Rewrite de uma substituta que já está gravável = update.
-- `memory_delete { id }` (só coleções graváveis).
-- Regra global vs chat (na descrição): serve fora desta conversa → coleção compartilhada; só para a tarefa deste chat → `collection:'chat'`.
+### Tools (`src/main/tools/memory.ts`, `runMemoryTool(name, args, { store, am, by })` — mesmas regras para agente e extração; nunca lança: erro de regra/limite → resultado `Erro: …`)
+- Aprovações: itens `memory_write`, `memory_rewrite`, `memory_delete` (padrão "Sempre permitir"; também Smart-Approve e "Perguntar"). Busca e leitura nunca perguntam. A mensagem tool leva `meta.memoryChanges` (`{ op, memoryId, title, collectionId }[]`).
+- `memory_search { query, category?, collection? (id ou nome de coleção ATIVA), limit? (10, máx. 30) }` → `[busca na memória: "q" · N resultados]` + `- id · Categoria · Coleção (escrita|leitura[, deste chat]) · título — resumo` + `trecho:`. Só coleções ativas; substituídas ocultas.
+- `memory_read { ids[] (até 20; id ou slug) }` → cabeçalho, categoria, coleção, `[[slug]]`, atualização (data, por modelo/extração/usuário), `substitui:`, resumo, tópicos numerados; fora das ativas → "(não está numa coleção ativa deste chat)"; substituída → aponta a substituta.
+- `memory_write { category?, target? ('shared' padrão | 'chat'), id?, title?, summary?, ops?: [{ op: 'add'|'remove'|'replace', fact, with? }], force_new? }` → **sem id cria** (category + title obrigatórios; só `add`) na coleção de escrita da categoria ou, com `target:'chat'`, na "Este chat" daquela categoria (criada sob demanda). Sem destino → `não há coleção de escrita para Perfil neste chat — use target "chat"…` (ou "o usuário escolhe…" sem chatMemory). Categoria desligada → erro. **Semelhante** na coleção → NÃO cria: `Nada foi criado: já existe memória parecida…` + candidatas (id, título, tópicos) pedindo `id` (ou `force_new: true` se for outro assunto). **Com id atualiza** (só graváveis; só leitura → "use memory_rewrite"; a categoria não muda). `remove`/`replace` acham o tópico por `#n`, texto exato (sem caixa/acento) ou trecho único; não achou/ambíguo → erro com a lista atual. O resultado mostra a memória final (id, título, tópicos).
+- `memory_rewrite { id, target?, title?, summary?, facts? (lista completa nova) | ops? }` → origem em coleção ativa **só de leitura**: cria na coleção de escrita da categoria (ou "Este chat" com target chat) uma cópia atualizada com `supersedes_id = id` (herda título/resumo/fixada se omitidos). Já existe substituta dessa origem na coleção de destino → atualiza ela. Origem gravável → update no lugar.
+- `memory_delete { id }` → só graváveis.
+- Descrições curtas, com a taxonomia, a regra global × chat e a de discrepância (`MEMORY_TOOL_DEFINITIONS` em `tools.ts`).
 
-### Extração automática
-Requisição separada (não persistida no histórico), com o prompt de extração (editável), a conversa (ou o resumo da compactação + mensagens recentes) e o índice atual; o modelo responde chamando `memory_write`/`memory_delete` (executados com as mesmas regras). Dispara **após a compactação** se `extraction.auto`, e pelo botão **"Extrair memórias agora"** (só no painel do chat). Resultado vira um card compacto no chat ("Extração: 2 criadas, 1 atualizada") com (i) da request e lista de mudanças; erros não quebram o chat.
+### Extração (`src/main/memory/extraction.ts`, `extractNow`/`afterCompaction` em `src/main/memory/index.ts`)
+- **Gatilhos**: `memory.extractNow(sessionId)` ("Extrair memórias agora"; só sessão principal; uma por sessão de cada vez — chamada concorrente recebe a mesma promise) e, com `extraction.auto`, **após toda compactação bem-sucedida** da principal (em segundo plano; o turno não espera).
+- **Request separada** (nunca no histórico), ao provedor/modelo de `extraction` (`model` null → modelo da sessão/chat; `providerId` só vale com `model`), no formato do adaptador (OpenAI-compatible ou Anthropic), assinatura de app do chat, **tools nativas** = só as de escrita disponíveis. Mensagens: system = `extraction.prompt ?? DEFAULT_MEMORY_EXTRACTION_PROMPT`; user = **índice completo** das coleções ativas (todos os tópicos, teto 40.000) + `<conversation>` + instrução final.
+- **Conversa**: só o histórico ativo (da última fronteira); mensagens com `seq > lastExtractedSeq` ("Usuário:", "Assistente:" com as chamadas resumidas, resultados de tool encurtados, sintéticas como "[app]"); a fronteira de compactação entra como `[Resumo da conversa anterior]` (texto limpo) se resumir algo não extraído — ou sempre, quando o gatilho é a compactação (= resumo + mensagens recentes). Corte pelo início em 60.000 caracteres. Sem fala nova → nada é enviado: `extractNow` devolve `error: 'Nada novo na conversa desde a última extração.'` e não grava card.
+- **Loop**: até `MEMORY_LIMITS.extractionMaxRounds` (4) requests; cada tool call roda com `runMemoryTool` (`updatedBy: 'extraction'`, mesmas regras; a extração não passa pelo gate de aprovação — foi o usuário que a disparou/ligou); resultados voltam como mensagens `tool`; para quando o modelo não chama mais tools.
+- **Resultado**: `MemoryExtractionResult` (+ model, providerId, usage somado, request mascarada da 1ª chamada, trigger) persistido como mensagem `role: 'assistant'` "Extração de memórias: 2 criadas, 1 atualizada." com `meta: { synthetic: true, kind: 'memory-extraction', memoryExtraction }` — **só de exibição** (`isDisplayOnly` em `context.ts`, como `kind:'error'`): fora da API, do contexto, da compactação, do FTS, de `read_history`, do `repairTail`. Sucesso → `lastExtractedSeq` = maior seq considerado. Erros (provedor, sem destino de escrita, memória inativa) → `result.error` no card; nunca quebram o chat.
+
+### Testes
+`e2e/memory.test.ts` (em `npm run test:unit`): repositório, limites, slug/FTS/semelhança, CASCADE, config/herança, tools e aprovações, índice, snapshot + request + preview, exclusão das mensagens só de exibição, tools (write/rewrite/delete/read/search/subagente), extração com modelo falso; e o runner real (stub de `electron` + provedor falso): índice na request → `memory_write` persiste → sessão nova vê, "Perguntar", extração agora, compactação → extração automática, subagentes. `e2e/memory.spec.ts` (`npm run test:e2e:memory`): o mesmo no app real via `window.api`, 100% local (sem key).
 
 ### UI
 - **Configurações → Memórias** (global): por categoria, CRUD de coleções (nome, descrição, ícone) e de memórias (detalhe editável com resumo/tópicos, fixar, apagar, origem/última atualização, "substitui X" / "substituída por Y"); memórias de chat aparecem agrupadas por chat.
