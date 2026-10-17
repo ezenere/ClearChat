@@ -1549,6 +1549,8 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   assert.equal(snap.contextWindow, 64000)
   assert.equal(snap.compactPrompt, 'RESUMA')
   assert.equal(snap.sandboxBash, true)
+  assert.deepEqual(snap.memory?.collections, ['c1'])
+  assert.ok(!('chatMemory' in snap.memory!), 'chatMemory legado descartado')
   assert.ok(!('cwd' in snap) && !('presetId' in snap))
   // cópia profunda: mexer no snapshot não altera o chat
   ;(snap.enabledTools as string[]).push('write_file')

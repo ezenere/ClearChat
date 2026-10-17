@@ -188,9 +188,7 @@ export async function runExtraction(input: ExtractionInput): Promise<ExtractionO
     const am = service.active(chat, { depth: 0 })
     if (!am.active) return fail('A memória está desligada ou sem coleções ativas neste chat.')
     if (!am.canWrite)
-      return fail(
-        'Nenhuma coleção de escrita (nem memória do chat) neste chat — a extração não tem onde gravar.'
-      )
+      return fail('Nenhuma coleção de escrita neste chat — a extração não tem onde gravar.')
     if (!provider) return fail('Nenhum provedor configurado para a extração.')
     if (!model) return fail('Nenhum modelo escolhido para a extração.')
     if (!conv.text) return { record: record(), empty: true, maxSeq: conv.maxSeq }
@@ -229,7 +227,7 @@ export async function runExtraction(input: ExtractionInput): Promise<ExtractionO
       }))
       if (!calls.length) break
       messages.push({ role: 'assistant', content: acc.content || null, tool_calls: calls })
-      // a cada rodada a memória ativa é relida (coleção do chat criada na rodada anterior etc.)
+      // a cada rodada a memória ativa é relida (config/coleções podem ter mudado)
       const cur = service.active(chat, { depth: 0 })
       for (const c of calls) {
         let args: Record<string, unknown> = {}

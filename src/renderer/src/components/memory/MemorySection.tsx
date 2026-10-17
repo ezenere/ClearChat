@@ -1,7 +1,7 @@
 // Seção de memória da config (aba Memória do painel do chat e editor de personas): só SELECIONA e
 // ATIVA coleções — criar/editar conteúdo é em Configurações → Memórias (global). No chat, mostra o
 // que veio da persona de origem (selos *da persona* / *adicionada*, ★ na escrita da persona) e
-// permite ajustar; na persona, sem "Extrair agora", "Atualizar memória" e memória do chat.
+// permite ajustar; na persona, sem "Extrair agora" e "Atualizar memória".
 import {
   ArrowUpRight,
   BrainCircuit,
@@ -46,7 +46,6 @@ import {
 } from '../../lib/memory'
 import { useStore } from '../../store'
 import {
-  ChatMemoryInfo,
   ExtractionPromptInfo,
   MemoryCollectionsInfo,
   MemoryHelpInfo,
@@ -72,7 +71,7 @@ export function MemorySection({
   patch,
   chat
 }: CfgProps & {
-  /** Presente = painel do chat (com extração agora, snapshot e memória do chat). */
+  /** Presente = painel do chat (com extração agora e snapshot). */
   chat?: Chat
 }): React.JSX.Element {
   const isChat = !!chat
@@ -83,7 +82,7 @@ export function MemorySection({
 
   const preset = isChat && cfg.presetId ? presets.find((p) => p.id === cfg.presetId) : undefined
   const persona = preset?.config.memory ? memoryConfigOf(preset.config) : null
-  const willSend = memoryWillSend(mem, cols, { chat: isChat })
+  const willSend = memoryWillSend(mem, cols)
   const { preview, reload, setPreview } = useMemoryPreview(
     chat?.id ?? null,
     chat?.mainSessionId ?? null,
@@ -116,10 +115,10 @@ export function MemorySection({
             name={preset.name}
             icon={preset.icon}
             differs={differsFromPersona(mem, persona)}
-            onRestore={() => set(restoreFromPersona(mem, persona))}
+            onRestore={() => set(restoreFromPersona(persona))}
           />
         )}
-        <SendStatus mem={mem} cols={cols} willSend={willSend} isChat={isChat} />
+        <SendStatus mem={mem} cols={cols} willSend={willSend} />
       </Section>
 
       <Section title="Coleções" aside={<MemoryCollectionsInfo />}>
@@ -147,8 +146,6 @@ export function MemorySection({
         </div>
         <ManageLink />
       </Section>
-
-      {isChat && chat && <ChatMemorySection chat={chat} mem={mem} cols={cols} onChange={set} />}
 
       <HelpSection mem={mem} text={helpText} onChange={set} />
 
@@ -210,7 +207,7 @@ function PersonaLine({
         </span>
       </span>
       {differs && (
-        <Tip label="Voltar à memória da persona (a memória do chat fica como está)">
+        <Tip label="Voltar à memória da persona">
           <Button
             size="sm"
             variant="ghost"
@@ -230,13 +227,11 @@ function PersonaLine({
 function SendStatus({
   mem,
   cols,
-  willSend,
-  isChat
+  willSend
 }: {
   mem: MemoryConfig
   cols: MemoryCollection[]
   willSend: boolean
-  isChat: boolean
 }): React.JSX.Element {
   if (!willSend)
     return (
@@ -248,7 +243,7 @@ function SendStatus({
         <strong className="font-medium text-fg/85">Nada de memória vai para a API.</strong>{' '}
         {!mem.enabled
           ? 'A memória está desligada.'
-          : `Ative ao menos uma coleção${isChat ? ' ou a memória do chat' : ''}.`}
+          : 'Ative ao menos uma coleção numa categoria ligada.'}
       </p>
     )
   const active = mem.categories.flatMap((c) => activeInCategory(mem, cols, c))
@@ -260,7 +255,6 @@ function SendStatus({
     writes
       ? `grava em ${writes} ${writes === 1 ? 'categoria' : 'categorias'}`
       : 'sem coleção de escrita',
-    isChat && mem.chatMemory ? 'memória do chat' : '',
     mem.helpPrompt.enabled ? 'instruções' : ''
   ].filter(Boolean)
   return (
@@ -480,43 +474,6 @@ function ManageLink(): React.JSX.Element {
     >
       <Settings2 className="size-3.5" /> Criar e editar memórias (Configurações → Memórias)
     </button>
-  )
-}
-
-function ChatMemorySection({
-  chat,
-  mem,
-  cols,
-  onChange
-}: {
-  chat: Chat
-  mem: MemoryConfig
-  cols: MemoryCollection[]
-  onChange: (m: MemoryConfig) => void
-}): React.JSX.Element {
-  const openMemory = useStore((s) => s.openMemory)
-  const own = cols.filter((c) => c.scope === 'chat' && c.chatId === chat.id)
-  const count = own.reduce((s, c) => s + (c.count ?? 0), 0)
-  return (
-    <Section title="Memória do chat" aside={<ChatMemoryInfo />}>
-      <ToggleRow
-        label="Memória do chat"
-        description="O modelo decide: o que serve fora desta conversa vai para a coleção de escrita; o que só importa a esta tarefa fica em “Este chat”."
-        checked={mem.chatMemory}
-        onChange={(chatMemory) => onChange({ ...mem, chatMemory })}
-      />
-      {own.length > 0 && (
-        <button
-          type="button"
-          data-testid="chat-memory-link"
-          onClick={() => openMemory({ collectionId: own[0].id })}
-          className="inline-flex items-center gap-1.5 text-[11.5px] text-subtle hover:text-fg"
-        >
-          {count} {count === 1 ? 'memória' : 'memórias'} neste chat
-          <ArrowUpRight className="size-3" />
-        </button>
-      )}
-    </Section>
   )
 }
 

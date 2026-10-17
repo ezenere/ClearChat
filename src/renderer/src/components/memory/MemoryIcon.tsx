@@ -2,7 +2,6 @@
 import {
   FolderKanban,
   Lightbulb,
-  MessageSquare,
   SlidersHorizontal,
   UserRound,
   UsersRound,
@@ -25,11 +24,11 @@ export function CollectionIcon({
   size = 'sm',
   className
 }: {
-  collection: Pick<MemoryCollection, 'icon' | 'category' | 'scope'>
+  collection: Pick<MemoryCollection, 'icon' | 'category'>
   size?: 'xs' | 'sm' | 'md'
   className?: string
 }): React.JSX.Element {
-  if (collection.icon && collection.scope === 'shared')
+  if (collection.icon)
     return (
       <PresetIcon
         icon={collection.icon}
@@ -37,7 +36,7 @@ export function CollectionIcon({
         className={cn(size === 'xs' && 'size-5 text-[11px] [&_svg]:size-3', className)}
       />
     )
-  const Icon = collection.scope === 'chat' ? MessageSquare : CATEGORY_ICON[collection.category]
+  const Icon = CATEGORY_ICON[collection.category]
   return (
     <span
       aria-hidden

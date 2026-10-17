@@ -87,9 +87,9 @@ export function memoryConfigOf(
 }
 
 const byCategory = (cols: readonly MemoryCollection[], cat: MemoryCategory): MemoryCollection[] =>
-  cols.filter((c) => c.scope === 'shared' && c.category === cat)
+  cols.filter((c) => c.category === cat)
 
-/** Coleções compartilhadas de uma categoria, "Padrão" primeiro e o resto por nome. */
+/** Coleções de uma categoria, "Padrão" primeiro e o resto por nome. */
 export function sharedCollections(
   cols: readonly MemoryCollection[],
   cat: MemoryCategory
@@ -111,16 +111,14 @@ export function activeInCategory(
 }
 
 /**
- * Regra de envio (SPEC): ligado E (alguma coleção ativa numa categoria ligada OU memória do chat).
- * `chat` false (persona): a memória do chat não conta. Sem a lista de coleções, conta os ids.
+ * Regra de envio (SPEC): ligado E alguma coleção ativa numa categoria ligada. Sem a lista de
+ * coleções, conta os ids.
  */
 export function memoryWillSend(
   mem: MemoryConfig,
-  cols: readonly MemoryCollection[] | null,
-  opts: { chat: boolean }
+  cols: readonly MemoryCollection[] | null
 ): boolean {
   if (!mem.enabled) return false
-  if (opts.chat && mem.chatMemory) return true
   if (!cols) return mem.collections.length > 0 && mem.categories.length > 0
   return mem.categories.some((cat) => activeInCategory(mem, cols, cat).length > 0)
 }
@@ -163,8 +161,6 @@ export function writeTargetError(
   if (id === null) return null
   const c = cols.find((x) => x.id === id)
   if (!c) return 'A coleção não existe mais.'
-  if (c.scope !== 'shared')
-    return 'A memória do chat não é escolhida aqui (toggle “Memória do chat”).'
   if (c.category !== cat) return 'A coleção é de outra categoria.'
   if (!mem.collections.includes(id)) return 'Ative a coleção para leitura antes de gravar nela.'
   return null
@@ -226,7 +222,7 @@ export function collectionBadge(
   return on ? 'added' : null
 }
 
-/** Campos comparados com a persona (a memória do chat é só do chat). */
+/** Campos comparados com a persona. */
 function comparable(m: MemoryConfig): unknown {
   return {
     enabled: m.enabled,
@@ -246,14 +242,13 @@ export function differsFromPersona(mem: MemoryConfig, persona: MemoryConfig): bo
   return JSON.stringify(comparable(mem)) !== JSON.stringify(comparable(persona))
 }
 
-/** Volta à config de memória da persona, mantendo a memória do chat (que a persona não tem). */
-export function restoreFromPersona(mem: MemoryConfig, persona: MemoryConfig): MemoryConfig {
+/** Volta à config de memória da persona (cópia). */
+export function restoreFromPersona(persona: MemoryConfig): MemoryConfig {
   return {
     ...persona,
     collections: [...persona.collections],
     writeTo: { ...persona.writeTo },
-    categories: [...persona.categories],
-    chatMemory: mem.chatMemory
+    categories: [...persona.categories]
   }
 }
 
@@ -338,28 +333,7 @@ export function plainMemoryText(
     .join('')
 }
 
-/** Memórias de chat (scope 'chat') agrupadas pelo chat dono; chats mais recentes primeiro. */
-export function chatMemoryGroups(
-  cols: readonly MemoryCollection[],
-  chats: readonly { id: string; title: string; updatedAt: number }[]
-): { chatId: string; title: string; collections: MemoryCollection[]; count: number }[] {
-  const by = new Map<string, MemoryCollection[]>()
-  for (const c of cols)
-    if (c.scope === 'chat' && c.chatId) by.set(c.chatId, [...(by.get(c.chatId) ?? []), c])
-  const order = (id: string): number => chats.find((c) => c.id === id)?.updatedAt ?? 0
-  return [...by.entries()]
-    .map(([chatId, list]) => ({
-      chatId,
-      title: chats.find((c) => c.id === chatId)?.title || 'Chat sem título',
-      collections: list.sort(
-        (a, b) => MEMORY_CATEGORIES.indexOf(a.category) - MEMORY_CATEGORIES.indexOf(b.category)
-      ),
-      count: list.reduce((s, c) => s + (c.count ?? 0), 0)
-    }))
-    .sort((a, b) => order(b.chatId) - order(a.chatId))
-}
-
-/** Destinos de "Mover para": coleções compartilhadas da mesma categoria, exceto a atual. */
+/** Destinos de "Mover para": coleções da mesma categoria, exceto a atual. */
 export function moveTargets(
   memory: Pick<Memory, 'collectionId' | 'category'>,
   cols: readonly MemoryCollection[]
@@ -467,7 +441,6 @@ export function memoryToolSummary(name: string, args: Record<string, unknown> | 
       const facts = Array.isArray(args.facts) ? `${args.facts.length} tópicos` : ''
       return [
         name === 'memory_write' ? cat() : '',
-        s('target') === 'chat' ? 'este chat' : '',
         s('title') || (s('id') && shortId(s('id'))) || (name === 'memory_write' ? 'nova' : ''),
         opsText || facts
       ]

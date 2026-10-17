@@ -868,7 +868,7 @@ export function createMockApi(scenario: string): ClearApi {
       ),
       tool(
         'tcm1',
-        'Resultados para "capítulo 3 orientador" (2):\n- m-orientacao · Projeto TCC [escrita] · areas · Orientação do TCC — Reuniões quinzenais com o [[marcos-orientador]]\n  trecho: …Próxima entrega: capítulo 3 (implementação)\n- m-cap3 · Este chat [escrita] · areas · Capítulo 3 em revisão — Seções 3.2 e 3.4 precisam de figuras novas',
+        'Resultados para "capítulo 3 orientador" (2):\n- m-orientacao · Projeto TCC [escrita] · areas · Orientação do TCC — Reuniões quinzenais com o [[marcos-orientador]]\n  trecho: …Próxima entrega: capítulo 3 (implementação)\n- m-cap3 · Projeto TCC [escrita] · areas · Capítulo 3 em revisão — Seções 3.2 e 3.4 precisam de figuras novas',
         {},
         minAgo(33)
       ),
@@ -908,7 +908,6 @@ export function createMockApi(scenario: string): ClearApi {
             }),
             tc('tcm4', 'memory_write', {
               category: 'people',
-              target: 'chat',
               title: 'Banca: Profa. Helena',
               summary: 'Convidada para a banca do TCC',
               ops: [{ op: 'add', fact: 'Especialista em sistemas distribuídos' }]
@@ -935,14 +934,14 @@ export function createMockApi(scenario: string): ClearApi {
       ),
       tool(
         'tcm4',
-        'Memória criada: m-helena "Banca: Profa. Helena" (Este chat).',
+        'Memória criada: m-helena "Banca: Profa. Helena" (Pessoas · Padrão).',
         {
           memoryChanges: [
             {
               op: 'create',
               memoryId: 'm-helena',
               title: 'Banca: Profa. Helena',
-              collectionId: MOCK_COLS.chatPeople
+              collectionId: MOCK_COLS.people
             }
           ]
         },
@@ -999,7 +998,7 @@ export function createMockApi(scenario: string): ClearApi {
         {
           role: 'assistant',
           content:
-            'Pronto: prazo do capítulo 3 atualizado (24/10, em PDF), a Profa. Helena anotada na memória deste chat e o prazo final corrigido para 14/12.'
+            'Pronto: prazo do capítulo 3 atualizado (24/10, em PDF), a Profa. Helena anotada em Pessoas e o prazo final corrigido para 14/12.'
         },
         { usage, model: cfg.model, durationMs: 3100 },
         minAgo(29)
@@ -1019,7 +1018,7 @@ export function createMockApi(scenario: string): ClearApi {
                 op: 'create',
                 memoryId: 'm-cap3',
                 title: 'Capítulo 3 em revisão',
-                collectionId: MOCK_COLS.chatAreas
+                collectionId: MOCK_COLS.tcc
               },
               {
                 op: 'create',
@@ -1078,7 +1077,7 @@ export function createMockApi(scenario: string): ClearApi {
       messages,
       msg,
       delay,
-      withChatData: scenario === 'memory'
+      withScenario: scenario === 'memory'
     }),
     providers: {
       list: () => delay(providers),

@@ -156,13 +156,6 @@ const MEMORY_OPS_PROP: JsonSchemaProp = {
   }
 }
 
-const MEMORY_TARGET_PROP: JsonSchemaProp = {
-  type: 'string',
-  enum: ['shared', 'chat'],
-  description:
-    'shared (padrão) = coleção de escrita da categoria (vale para outros chats); chat = memória só deste chat.'
-}
-
 export const MEMORY_TOOL_DEFINITIONS = {
   memory_search: def(
     'memory_search',
@@ -193,14 +186,13 @@ export const MEMORY_TOOL_DEFINITIONS = {
   ),
   memory_write: def(
     'memory_write',
-    `Grava um fato durável sobre o usuário. ${MEMORY_TAXONOMY} Sem id → cria na coleção de escrita da categoria; se já existir memória parecida, nada é criado e as candidatas voltam: repita com o id (ou force_new se for outro assunto). Com id → atualiza (só memórias graváveis; memória de coleção só de leitura → memory_rewrite). Global × chat: o que serve fora desta conversa → target "shared" (padrão); o que só importa para a tarefa deste chat → target "chat". Discrepância: se o usuário disser algo que contradiz uma memória, corrija-a (replace/remove) em vez de criar outra. Tópicos curtos e factuais (≤ ${ML.factChars} caracteres, ≤ ${ML.maxFacts} por memória); título ≤ ${ML.titleChars}; resumo ≤ ${ML.summaryChars} (uma frase). Cite outra memória com [[slug]].`,
+    `Grava um fato durável sobre o usuário. ${MEMORY_TAXONOMY} Sem id → cria na coleção de escrita da categoria; se já existir memória parecida, nada é criado e as candidatas voltam: repita com o id (ou force_new se for outro assunto). Com id → atualiza (só memórias graváveis; memória de coleção só de leitura → memory_rewrite). Discrepância: se o usuário disser algo que contradiz uma memória, corrija-a (replace/remove) em vez de criar outra. Tópicos curtos e factuais (≤ ${ML.factChars} caracteres, ≤ ${ML.maxFacts} por memória); título ≤ ${ML.titleChars}; resumo ≤ ${ML.summaryChars} (uma frase). Cite outra memória com [[slug]].`,
     {
       category: {
         type: 'string',
         enum: MEMORY_CATEGORY_ENUM,
         description: 'Categoria (obrigatória ao criar; ao atualizar vem da memória).'
       },
-      target: MEMORY_TARGET_PROP,
       id: { type: 'string', description: 'Memória a atualizar (omita para criar).' },
       title: { type: 'string', description: 'Título curto (assunto da memória).' },
       summary: { type: 'string', description: 'Resumo de uma frase (aparece no índice).' },
@@ -213,10 +205,9 @@ export const MEMORY_TOOL_DEFINITIONS = {
   ),
   memory_rewrite: def(
     'memory_rewrite',
-    'Corrige uma memória de coleção SÓ DE LEITURA: cria uma versão atualizada na coleção de escrita da categoria (ou na memória do chat, target "chat") que a substitui neste chat; a original fica intacta na coleção dela. Em memória gravável equivale a memory_write com id. Passe facts (lista completa nova) ou ops (alterações sobre os tópicos atuais).',
+    'Corrige uma memória de coleção SÓ DE LEITURA: cria uma versão atualizada na coleção de escrita da categoria que a substitui neste chat; a original fica intacta na coleção dela. Em memória gravável equivale a memory_write com id. Passe facts (lista completa nova) ou ops (alterações sobre os tópicos atuais).',
     {
       id: { type: 'string', description: 'Memória a reescrever.' },
-      target: MEMORY_TARGET_PROP,
       title: { type: 'string', description: 'Novo título (padrão: o atual).' },
       summary: { type: 'string', description: 'Novo resumo (padrão: o atual).' },
       facts: {
@@ -230,7 +221,7 @@ export const MEMORY_TOOL_DEFINITIONS = {
   ),
   memory_delete: def(
     'memory_delete',
-    'Apaga uma memória gravável (da coleção de escrita da categoria ou da memória deste chat) que ficou errada ou obsoleta. Para corrigir parte dela, prefira memory_write com ops.',
+    'Apaga uma memória gravável (da coleção de escrita da categoria) que ficou errada ou obsoleta. Para corrigir parte dela, prefira memory_write com ops.',
     { id: { type: 'string', description: 'Memória a apagar.' } },
     ['id']
   )

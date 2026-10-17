@@ -14,7 +14,8 @@
 // memory-changed → sessão nova vê no índice (a mesma sessão segue congelada); preview/"Ver request";
 // "Atualizar memória"; memória desligada → nada vai; "Extrair memórias agora" (card fora da API);
 // compactação → extração automática; subagente só com memory_search/memory_read quando ligado;
-// apagar o chat apaga a memória dele.
+// categoria sem coleção de escrita → erro claro (sem nenhuma → sem tools de escrita); `chatMemory`
+// legado não ativa nada e some da config ao reabrir o app (migração); apagar coleção apaga as memórias.
 import { _electron as electron, type ElectronApplication, type Page } from 'playwright'
 import { createWriteStream, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server } from 'node:http'
@@ -209,7 +210,6 @@ const mem = (over: any = {}): any => ({
   collections: [],
   writeTo: {},
   categories: ['profile', 'topics', 'areas', 'people', 'preferences'],
-  chatMemory: false,
   helpPrompt: { enabled: true, text: null },
   extraction: { auto: false, prompt: null, providerId: null, model: EXTRACT },
   subagents: false,
@@ -375,11 +375,57 @@ async function main(): Promise<void> {
   })
 
   await step(
-    'memória do chat sozinha já ativa; apagar coleção/chat apaga as memórias',
+    'sem coleção de escrita: erro claro na categoria; sem nenhuma, sem tools de escrita',
     async () => {
-      const chat = await newChat(mem({ chatMemory: true }))
+      // Perfil sem escrita (só Pessoas): o agente tenta gravar em profile → erro, nada criado
+      const chat = await newChat(mem({ collections: [profile, people], writeTo: { people } }))
+      await api('agent.send', chat.mainSessionId, 'lembre: Mora em Curitiba')
+      await waitIdle(chat.id, chat.mainSessionId)
+      const msgs = await api<any[]>('sessions.messages', chat.mainSessionId)
+      const tool = msgs.find((m) => m.message.role === 'tool')
+      assert(
+        /^Erro: Sem coleção de escrita para Perfil \(profile\) neste chat/.test(
+          textOf(tool?.message.content)
+        ),
+        `erro claro: ${textOf(tool?.message.content)}`
+      )
+      assert((await api<any[]>('memory.list', { query: 'curitiba' })).length === 0, 'nada criado')
+      assert(
+        (await api<any[]>('memory.listCollections')).length === 2,
+        'nenhuma coleção criada sob demanda'
+      )
+      // nenhuma coleção de escrita → só leitura na request
+      const ro = await newChat(mem({ collections: [profile] }))
+      const pv = await api('memory.preview', ro.mainSessionId)
+      assert(
+        JSON.stringify(pv.tools) === JSON.stringify(['memory_search', 'memory_read']),
+        `tools do preview: ${pv.tools}`
+      )
+      const n0 = hits.length
+      await api('agent.send', ro.mainSessionId, 'oi')
+      await waitIdle(ro.id, ro.mainSessionId)
+      const names = hits[n0].tools.map((t: any) => t.function.name)
+      assert(
+        !names.some((n: string) => ['memory_write', 'memory_rewrite', 'memory_delete'].includes(n)),
+        `sem tools de escrita: ${names}`
+      )
+      assert(!JSON.stringify(hits[n0].tools).includes('"target"'), 'definições sem target')
+    }
+  )
+
+  await step(
+    'chatMemory legado: nada ativo; some da config ao reabrir (migração); apagar coleção apaga',
+    async () => {
+      const chat = await newChat({ ...mem(), chatMemory: true })
       const pv = await api('memory.preview', chat.mainSessionId)
-      assert(pv.active && pv.tools.includes('memory_write'), 'só memória do chat já ativa')
+      assert(!pv.active && pv.tools.length === 0, 'chatMemory sozinho não ativa nada')
+      const before = await api('chats.get', chat.id)
+      assert(before.config.memory.chatMemory === true, 'gravado como veio (legado)')
+      await app.close()
+      await launch()
+      const after = await api('chats.get', chat.id)
+      assert(after && !('chatMemory' in after.config.memory), 'chatMemory retirado na migração')
+      assert(after.config.memory.enabled === true, 'resto da config intacto')
       const col = await api('memory.createCollection', { category: 'areas', name: 'Tmp' })
       await api('memory.create', { collectionId: col.id, title: 'Projeto X' })
       await api('memory.deleteCollection', col.id)

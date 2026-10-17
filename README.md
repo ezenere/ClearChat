@@ -225,28 +225,28 @@ npm run install:local -- --uninstall
   (≤ 160) e até 15 tópicos curtos (≤ 200), pode ser fixada e cita outras com `[[slug]]`.
 - **Por chat/persona** (`ChatConfig.memory`, herdado da persona como os outros campos): liga/desliga,
   coleções ativas para leitura (várias por categoria), **uma coleção de escrita por categoria**, categorias
-  desligáveis, **memória própria do chat** (coleções "Este chat", só no chat; apagar o chat apaga), help
-  prompt, extração e "Memória nos subagentes".
+  desligáveis, help prompt, extração e "Memória nos subagentes". Não há memória "do chat": o contexto do
+  chat já é a memória dele (a antiga memória do chat é removida na migração ao abrir o app).
 - **O que vai para a API**: um índice no system prompt (depois do ambiente) — por categoria → coleção
   (*escrita*/*leitura*) → `id · título — resumo`, fixadas com os tópicos, com teto de tamanho. O índice é
   **congelado por sessão** (cache de prompt): tirado no 1º request e renovado só em sessão nova, compactação
-  ou "Atualizar memória". O "Ver request" mostra exatamente o que vai. Desligada ou sem nada ativo: nada de
-  índice, help ou ferramentas.
+  ou "Atualizar memória". O "Ver request" mostra exatamente o que vai. Desligada ou sem nenhuma coleção ativa
+  numa categoria ligada: nada de índice, help ou ferramentas.
 - **Ferramentas**: `memory_search`, `memory_read`, `memory_write` (cria — sem duplicar: se já houver memória
   parecida devolve as candidatas — ou atualiza com operações add/remove/replace), `memory_rewrite` (corrige
   uma memória de coleção só de leitura criando uma versão na de escrita, que a substitui neste chat) e
-  `memory_delete`. Gravar/reescrever/apagar são itens de aprovação (padrão **Sempre permitir**; ou
+  `memory_delete`. Gravar vai sempre para a coleção de escrita da categoria; sem ela, erro claro — e sem
+  coleção de escrita em nenhuma categoria as ferramentas de escrita nem são enviadas. Gravar/reescrever/apagar são itens de aprovação (padrão **Sempre permitir**; ou
   Smart-Approve / Perguntar). Subagentes nunca veem o índice e só ganham busca/leitura se a opção estiver ligada.
 - **Extração**: "Extrair memórias agora" ou automática após a compactação — uma request à parte (modelo
   escolhido ou o do chat) com o índice completo e a conversa desde a última extração; o modelo grava com as
   mesmas ferramentas e o resultado vira um card no chat (fora do histórico enviado).
 - **UI**: Configurações → **Memórias** é o único lugar de criar/editar (coleções por categoria com ícone e
   descrição; lista da coleção com busca; detalhe com título/resumo/detalhes editáveis no lugar, contadores dos
-  limites, reordenar, "Sempre carregar", mover, origem e "Substitui / Substituída por"; memórias de chats
-  agrupadas por chat). A aba **Memória** do painel e o editor de personas só **selecionam**: coleções por
-  categoria (selos *da persona* / *adicionada* / *desligada aqui*, ★ na escrita da persona, "Restaurar"),
-  coleção de escrita, memória do chat, instruções, extração ("Extrair memórias agora" só no chat), "Atualizar
-  memória" e subagentes — com (i) do índice exato (`memory.preview`) ou "Nada de memória vai para a API".
+  limites, reordenar, "Sempre carregar", mover, origem e "Substitui / Substituída por"). A aba **Memória**
+  do painel e o editor de personas só **selecionam**: coleções por categoria (selos *da persona* /
+  *adicionada* / *desligada aqui*, ★ na escrita da persona, "Restaurar"), coleção de escrita, instruções,
+  extração ("Extrair memórias agora" só no chat), "Atualizar memória" e subagentes — com (i) do índice exato (`memory.preview`) ou "Nada de memória vai para a API".
   Cards das tools com chips das mudanças (abrem a memória nas Configurações) e card da extração.
 
 ## Anexos

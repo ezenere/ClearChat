@@ -236,7 +236,6 @@ Answer now: first line {{labels}}, second line the reason.`
 export const DEFAULT_MEMORY_HELP_PROMPT = `Você tem uma memória persistente sobre o usuário (índice acima; ferramentas memory_*). Use-a ativamente:
 - Antes de responder qualquer coisa sobre o usuário, as pessoas da vida dele, os projetos ou as preferências dele, consulte o índice; se ele não bastar, use memory_search / memory_read. Nunca diga que não sabe algo que pode estar na memória sem procurar.
 - Quando o usuário revelar um fato durável (quem ele é, pessoas, projetos em andamento, hábitos, como quer ser atendido), grave-o com memory_write sem pedir permissão. Não grave trivialidades nem o que só vale para esta mensagem.
-- Global × chat: o que serve fora desta conversa vai para a memória compartilhada (padrão); o que só importa para a tarefa deste chat vai para target "chat".
 - Discrepâncias: se algo que o usuário disser contradizer a memória, acredite no usuário e corrija na hora — memory_write com id (replace/remove) numa memória gravável, ou memory_rewrite numa memória só de leitura. Nunca crie uma memória duplicada.
 - Tópicos curtos e factuais, um fato por tópico; atualize a memória existente do assunto em vez de criar outra.`
 
@@ -252,7 +251,6 @@ Regras:
 - Use só as ferramentas memory_write, memory_rewrite e memory_delete. Não responda com texto.
 - Antes de criar, procure no índice uma memória do mesmo assunto: atualize-a (memory_write com id e ops) em vez de duplicar. Memória de coleção só de leitura → memory_rewrite.
 - Se a conversa contradiz uma memória, corrija-a (replace/remove). Apague só o que ficou comprovadamente falso ou obsoleto.
-- Global × chat: o que serve fora desta conversa → target "shared" (padrão); o que só importa para a tarefa deste chat → target "chat" (se disponível).
 - Ignore trivialidades, pedidos pontuais, conteúdo de arquivos/código e o que o próprio assistente disse sem confirmação do usuário.
 - Tópicos curtos e factuais (um fato por tópico), no idioma do usuário.
 - Se não houver nada novo, não chame nenhuma ferramenta.`

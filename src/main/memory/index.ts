@@ -89,20 +89,6 @@ export function deleteMemory(id: string): void {
   memoryService().store.deleteMemory(id)
 }
 
-/** O chat tem coleções de memória próprias (scope 'chat')? */
-export function chatHasMemory(chatId: string): boolean {
-  try {
-    return memoryService().store.chatCollections(chatId).length > 0
-  } catch {
-    return false
-  }
-}
-
-/** Avisa a UI de uma mudança feita fora do repositório (ex.: CASCADE ao apagar um chat). */
-export function notifyChanged(): void {
-  emit({ type: 'memory-changed', collectionId: null, memoryId: null })
-}
-
 // ---------------- request / snapshot ----------------
 
 export function previewMemory(sessionId: string): MemoryPreview {

@@ -13,7 +13,6 @@ import {
   type MemoryCollection,
   type MemoryCollectionInput,
   type MemoryCollectionPatch,
-  type MemoryCollectionScope,
   type MemoryInput,
   type MemoryListQuery,
   type MemoryPatch,
@@ -23,9 +22,6 @@ import { isMemoryFtsReady } from './schema'
 
 /** Erro de validação/regra com mensagem legível (vira o resultado da tool / erro do IPC). */
 export class MemoryError extends Error {}
-
-/** Nome da coleção de memória de um chat (uma por categoria, criada sob demanda). */
-export const CHAT_COLLECTION_NAME = 'Este chat'
 
 export interface ChangeBy {
   updatedBy: MemoryUpdatedBy
@@ -137,8 +133,6 @@ interface CollectionRow {
   name: string
   description: string
   icon: string | null
-  scope: string
-  chat_id: string | null
   created_at: number
   updated_at: number
   count?: number
@@ -166,8 +160,6 @@ const toCollection = (r: CollectionRow): MemoryCollection => ({
   description: r.description,
   icon: r.icon ?? null,
   category: (isMemoryCategory(r.category) ? r.category : 'topics') as MemoryCategory,
-  scope: (r.scope === 'chat' ? 'chat' : 'shared') as MemoryCollectionScope,
-  chatId: r.chat_id ?? null,
   createdAt: r.created_at,
   updatedAt: r.updated_at,
   ...(typeof r.count === 'number' ? { count: r.count } : {})
@@ -201,6 +193,9 @@ const toMemory = (r: MemoryRow): Memory => ({
 })
 
 const placeholders = (n: number): string => Array(n).fill('?').join(', ')
+
+/** Só coleções globais (as colunas scope/chat_id são legadas; ver schema.ts). */
+const SHARED = "scope = 'shared'"
 
 const CATEGORY_ORDER = `CASE category ${MEMORY_CATEGORIES.map((c, i) => `WHEN '${c}' THEN ${i}`).join(' ')} ELSE 9 END`
 
@@ -239,44 +234,42 @@ export class MemoryStore {
 
   // ---------------- coleções ----------------
 
-  /** Todas as coleções (inclusive as de chat), com a contagem de memórias. */
+  /** Todas as coleções, com a contagem de memórias. */
   listCollections(): MemoryCollection[] {
     const rows = this.conn
       .prepare(
         `SELECT c.*, (SELECT COUNT(*) FROM memories m WHERE m.collection_id = c.id) AS count
-         FROM memory_collections c
-         ORDER BY ${CATEGORY_ORDER}, CASE scope WHEN 'shared' THEN 0 ELSE 1 END, created_at, rowid`
+         FROM memory_collections c WHERE ${SHARED}
+         ORDER BY ${CATEGORY_ORDER}, created_at, rowid`
       )
       .all() as CollectionRow[]
     return rows.map(toCollection)
   }
 
   getCollection(id: string): MemoryCollection | null {
-    const r = this.conn.prepare('SELECT * FROM memory_collections WHERE id = ?').get(id) as
-      CollectionRow | undefined
+    const r = this.conn
+      .prepare(`SELECT * FROM memory_collections WHERE id = ? AND ${SHARED}`)
+      .get(id) as CollectionRow | undefined
     return r ? toCollection(r) : null
   }
 
   getCollections(ids: string[]): MemoryCollection[] {
     if (!ids.length) return []
     const rows = this.conn
-      .prepare(`SELECT * FROM memory_collections WHERE id IN (${placeholders(ids.length)})`)
+      .prepare(
+        `SELECT * FROM memory_collections WHERE id IN (${placeholders(ids.length)}) AND ${SHARED}`
+      )
       .all(...ids) as CollectionRow[]
     const byId = new Map(rows.map((r) => [r.id, toCollection(r)]))
     return ids.map((id) => byId.get(id)).filter((c): c is MemoryCollection => !!c)
   }
 
-  createCollection(
-    input: MemoryCollectionInput,
-    opts: { scope?: MemoryCollectionScope; chatId?: string | null } = {}
-  ): MemoryCollection {
+  createCollection(input: MemoryCollectionInput): MemoryCollection {
     if (!input || !isMemoryCategory(input.category))
       throw new MemoryError(
         `Categoria inválida: ${String(input?.category)} (use ${MEMORY_CATEGORIES.join(', ')}).`
       )
     const { name, description } = validateCollection(input.name, input.description)
-    const scope: MemoryCollectionScope = opts.scope === 'chat' ? 'chat' : 'shared'
-    if (scope === 'chat' && !opts.chatId) throw new MemoryError('Coleção de chat sem chat.')
     const now = this.now()
     const c: MemoryCollection = {
       id: randomUUID(),
@@ -284,16 +277,14 @@ export class MemoryStore {
       description,
       icon: typeof input.icon === 'string' && input.icon.trim() ? input.icon.trim() : null,
       category: input.category,
-      scope,
-      chatId: scope === 'chat' ? (opts.chatId ?? null) : null,
       createdAt: now,
       updatedAt: now
     }
     this.conn
       .prepare(
-        'INSERT INTO memory_collections (id, category, name, description, icon, scope, chat_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+        'INSERT INTO memory_collections (id, category, name, description, icon, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
       )
-      .run(c.id, c.category, c.name, c.description, c.icon, c.scope, c.chatId, now, now)
+      .run(c.id, c.category, c.name, c.description, c.icon, now, now)
     this.changed(c.id, null)
     return { ...c, count: 0 }
   }
@@ -327,40 +318,6 @@ export class MemoryStore {
   deleteCollection(id: string): void {
     const r = this.conn.prepare('DELETE FROM memory_collections WHERE id = ?').run(id)
     if (r.changes) this.changed(id, null)
-  }
-
-  /** Coleção de memória do chat para a categoria ("Este chat"); `create` = cria sob demanda. */
-  chatCollection(
-    chatId: string,
-    category: MemoryCategory,
-    create: boolean
-  ): MemoryCollection | null {
-    const r = this.conn
-      .prepare(
-        "SELECT * FROM memory_collections WHERE scope = 'chat' AND chat_id = ? AND category = ? ORDER BY created_at, rowid LIMIT 1"
-      )
-      .get(chatId, category) as CollectionRow | undefined
-    if (r) return toCollection(r)
-    if (!create) return null
-    return this.createCollection(
-      {
-        category,
-        name: CHAT_COLLECTION_NAME,
-        description: `Memória própria deste chat (${MEMORY_CATEGORY_LABELS[category]}).`
-      },
-      { scope: 'chat', chatId }
-    )
-  }
-
-  /** Coleções de memória de um chat (todas as categorias). */
-  chatCollections(chatId: string): MemoryCollection[] {
-    return (
-      this.conn
-        .prepare(
-          `SELECT * FROM memory_collections WHERE scope = 'chat' AND chat_id = ? ORDER BY ${CATEGORY_ORDER}, created_at, rowid`
-        )
-        .all(chatId) as CollectionRow[]
-    ).map(toCollection)
   }
 
   // ---------------- memórias ----------------
@@ -408,14 +365,9 @@ export class MemoryStore {
     ).map(toMemory)
   }
 
-  /** IPC memory.list: filtros por coleção / chat (coleções de chat) / categoria / texto. */
+  /** IPC memory.list: filtros por coleção / categoria / texto. */
   listMemories(q: MemoryListQuery = {}): Memory[] {
-    let ids: string[] | null = null
-    if (q.collectionId) ids = [q.collectionId]
-    if (q.chatId) {
-      const own = this.chatCollections(q.chatId).map((c) => c.id)
-      ids = ids ? ids.filter((i) => own.includes(i)) : own
-    }
+    const ids: string[] | null = q.collectionId ? [q.collectionId] : null
     if (q.query?.trim()) {
       const scope = ids ?? this.listCollections().map((c) => c.id)
       return this.search(q.query, {

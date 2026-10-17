@@ -42,7 +42,7 @@ export class MemoryService {
 
   /** Índice atual (sem snapshot) das coleções ativas. */
   renderIndex(am: ActiveMemory, opts: RenderOptions = {}): string {
-    return renderIndex(indexGroups(this.store, am), { chatMemory: am.chatMemory, ...opts })
+    return renderIndex(indexGroups(this.store, am), opts)
   }
 
   // ---------------- estado por sessão ----------------

@@ -665,7 +665,7 @@ function SubagentMemoryLine({
   const cols = useMemoryCollections()
   const focusConfig = useStore((s) => s.focusConfig)
   const mem = memoryConfigOf(cfg)
-  const active = memoryWillSend(mem, cols, { chat: !!chatScope })
+  const active = memoryWillSend(mem, cols)
   const on = mem.subagents && active
   const open = onOpenMemory ?? (() => focusConfig('memoria-subagentes'))
   return (
@@ -755,7 +755,7 @@ export function ToolsEditor({
   onOpenMemory,
   ...props
 }: CfgProps & {
-  /** Painel do chat (a memória do chat conta para "memória ligada"). */
+  /** Painel do chat (textos "neste chat" × "nesta persona"). */
   chatScope?: boolean
   /** Link "Memória" da seção de subagentes (editor de persona: troca de aba). */
   onOpenMemory?: () => void

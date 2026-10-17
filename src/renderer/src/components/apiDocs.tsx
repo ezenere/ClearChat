@@ -766,7 +766,7 @@ export function MemoryPreviewInfo({
 }: {
   /** null = ainda carregando / sem sessão. */
   preview: MemoryPreview | null
-  /** Regra de envio calculada na UI (ligada + coleção ativa ou memória do chat). */
+  /** Regra de envio calculada na UI (ligada + alguma coleção ativa numa categoria ligada). */
   willSend: boolean
   /** Editor de personas: sem sessão, sem índice real. */
   persona?: boolean
@@ -780,7 +780,7 @@ export function MemoryPreviewInfo({
         <p data-testid="memory-nothing-sent">
           <strong className="text-fg">Nada de memória vai para a API</strong> — nenhum índice no
           system prompt, nenhuma instrução e nenhuma tool <C>memory_*</C>. Para enviar: ligue a
-          memória e ative ao menos uma coleção{persona ? '' : ' (ou a memória do chat)'}.
+          memória e ative ao menos uma coleção numa categoria ligada.
         </p>
       ) : (
         <>
@@ -835,22 +835,8 @@ export function MemoryCollectionsInfo({ side = 'left' }: { side?: Side }): React
         <strong className="text-fg">Escrita</strong>: no máximo uma coleção por categoria — é onde{' '}
         <C>memory_write</C> cria/atualiza e para onde <C>memory_rewrite</C> copia versões novas de
         memórias que estão em coleções só de leitura. “Nenhuma” = o modelo não grava naquela
-        categoria (a não ser na memória do chat). No índice, a coleção aparece marcada{' '}
-        <i>escrita</i> ou <i>leitura</i>.
-      </p>
-    </ApiInfo>
-  )
-}
-
-export function ChatMemoryInfo(): React.JSX.Element {
-  return (
-    <ApiInfo title="Memória do chat" side="left">
-      <p>
-        Uma coleção “Este chat” por categoria, criada na primeira gravação e apagada junto com o
-        chat. Ligada, <C>memory_write</C>/<C>memory_rewrite</C> aceitam <C>{'target: "chat"'}</C> e
-        a descrição das tools diz ao modelo: o que serve fora desta conversa → coleção
-        compartilhada; o que só importa para a tarefa deste chat → memória do chat. As memórias do
-        chat entram no índice deste chat.
+        categoria; sem coleção de escrita em nenhuma categoria, as tools de escrita nem são
+        enviadas. No índice, a coleção aparece marcada <i>escrita</i> ou <i>leitura</i>.
       </p>
     </ApiInfo>
   )
@@ -883,7 +869,7 @@ export function ExtractionPromptInfo({
         <C>{'role: "system"'}</C>, depois a conversa (ou o resumo da compactação + as mensagens
         recentes) e o índice completo das coleções ativas. Tools: só <C>memory_write</C>,{' '}
         <C>memory_rewrite</C> e <C>memory_delete</C>, executadas com as mesmas regras (coleção de
-        escrita, categorias ligadas, memória do chat), em até algumas rodadas.
+        escrita, categorias ligadas), em até algumas rodadas.
       </p>
       <p className="text-subtle">
         Dispara após a compactação (se “automaticamente” estiver ligado) ou pelo botão “Extrair

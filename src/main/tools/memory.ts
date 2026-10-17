@@ -56,7 +56,7 @@ function fmtDate(ms: number): string {
 
 function colLabel(am: ActiveMemory, c: MemoryCollection | null): string {
   if (!c) return '?'
-  return `${c.name} (${isWritable(am, c) ? 'escrita' : 'leitura'}${c.scope === 'chat' ? ', deste chat' : ''})`
+  return `${c.name} (${isWritable(am, c) ? 'escrita' : 'leitura'})`
 }
 
 /** Memória em texto: cabeçalho + resumo + tópicos numerados. */
@@ -158,25 +158,18 @@ function resolveCollectionRef(am: ActiveMemory, ref: string): MemoryCollection |
   return `coleção "${ref}" não está ativa neste chat. Ativas: ${am.collections.map((c) => `${c.name} (${MEMORY_CATEGORY_LABELS[c.category]})`).join(', ') || '(nenhuma)'}.`
 }
 
-/** Coleção de destino de uma gravação nova (target shared/chat) ou mensagem de erro. */
-function targetCollection(
-  ctx: MemoryToolContext,
-  category: Memory['category'],
-  target: string
+/** Coleção de destino de uma gravação nova (a de escrita da categoria) ou mensagem de erro. */
+function writeCollection(
+  am: ActiveMemory,
+  category: Memory['category']
 ): MemoryCollection | string {
-  const { am, store } = ctx
   const label = MEMORY_CATEGORY_LABELS[category]
   if (!am.categories.includes(category))
     return `a categoria ${label} (${category}) está desligada neste chat.`
-  if (target === 'chat') {
-    if (!am.chatMemory)
-      return `a memória deste chat está desligada; grave na coleção compartilhada (target "shared").`
-    return store.chatCollection(am.chatId, category, true)!
-  }
-  if (target && target !== 'shared') return `target deve ser "shared" ou "chat".`
-  const w = am.writeTo[category]
-  if (w) return w
-  return `não há coleção de escrita para ${label} neste chat${am.chatMemory ? ' — use target "chat" para gravar na memória deste chat' : ' (o usuário escolhe nas configurações de memória do chat)'}.`
+  return (
+    am.writeTo[category] ??
+    `Sem coleção de escrita para ${label} (${category}) neste chat — o usuário escolhe nas configurações de memória do chat.`
+  )
 }
 
 const change = (op: MemoryChange['op'], m: Memory): MemoryChange => ({
@@ -322,9 +315,8 @@ function memoryWrite(args: Record<string, unknown>, ctx: MemoryToolContext): Mem
   const bad = ops.find((o) => o.op !== 'add')
   if (bad) return err(`"${bad.op}" só vale para memórias existentes (informe "id").`)
   const facts = ops.map((o) => o.fact)
-  // limites antes de resolver o destino (que pode criar a coleção do chat)
   validateMemoryFields({ title, summary, facts })
-  const target = targetCollection(ctx, cat as Memory['category'], str(args.target))
+  const target = writeCollection(am, cat as Memory['category'])
   if (typeof target === 'string') return err(target)
   if (args.force_new !== true && args.force_new !== 'true') {
     const similar = store.similar(target.id, title)
@@ -342,7 +334,7 @@ function memoryWrite(args: Record<string, unknown>, ctx: MemoryToolContext): Mem
     by
   )
   return {
-    content: `Memória criada na coleção ${target.name}${target.scope === 'chat' ? ' (memória deste chat)' : ''}:\n${brief(m)}`,
+    content: `Memória criada na coleção ${target.name}:\n${brief(m)}`,
     status: 'ok',
     changes: [change('create', m)]
   }
@@ -378,7 +370,7 @@ function memoryRewrite(args: Record<string, unknown>, ctx: MemoryToolContext): M
       changes: [change('update', next)]
     }
   }
-  const target = targetCollection(ctx, src.category, str(args.target))
+  const target = writeCollection(am, src.category)
   if (typeof target === 'string') return err(target)
   // já existe uma substituta nesta coleção de destino → atualiza ela
   const prev = store.supersedersOf([src.id]).find((m) => m.collectionId === target.id)

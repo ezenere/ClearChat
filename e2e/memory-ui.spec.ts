@@ -2,11 +2,11 @@
 // builda o renderer com VITE_CLEAR_MOCK=1 numa pasta de rascunho (não mexe em out/), abre
 // `index.html?scenario=memory` numa janela Electron mínima e percorre:
 //   Configurações → Memórias (criar coleções em duas categorias, criar/editar/fixar/reordenar/
-//   apagar memórias, detalhe, links [[slug]], substitui/substituída, memórias de chats);
+//   apagar memórias, detalhe, links [[slug]], substitui/substituída; sem "memórias de chats");
 //   aba Memória do painel (selos da persona, ligar coleções, escrita, toggles, extrair agora,
-//   (i) com o índice exato e o estado "Nada de memória vai para a API");
-//   editor de personas (seção sem extrair/atualizar/memória do chat); aba Tools (subagentes);
-//   cards das tools de memória (chips → abre a memória) e card da extração.
+//   (i) com o índice exato e o estado "Nada de memória vai para a API"; sem "Memória do chat");
+//   editor de personas (seção sem extrair/atualizar); aba Tools (subagentes);
+//   cards das tools de memória (chips → abre a memória; sem "Este chat") e card da extração.
 // Screenshots em $CLEARCHAT_E2E_DIR/shots (1280x820 e 900x600).
 //
 // Uso:
@@ -143,6 +143,7 @@ app.on('window-all-closed', () => app.quit())
     assert.ok((await chips.count()) >= 3)
     assert.ok(await page.getByText('Buscar memória').first().isVisible())
     assert.ok(await page.getByText('Gravar memória').first().isVisible())
+    for (const t of await chips.allInnerTexts()) assert.doesNotMatch(t, /Este chat/)
     // card de extração: expandir e (i) com a request
     await cards
       .first()
@@ -204,6 +205,10 @@ app.on('window-all-closed', () => app.quit())
     )
     assert.match(await p.getByTestId('memory-persona-line').innerText(), /Ajustada neste chat/)
     assert.equal(await p.getByTestId('memory-status').getAttribute('data-active'), 'true')
+    // não há memória "do chat": nem toggle, nem seção, nem link
+    assert.equal(await p.getByRole('switch', { name: 'Memória do chat' }).count(), 0)
+    assert.equal(await p.getByTestId('chat-memory-link').count(), 0)
+    assert.doesNotMatch(await p.innerText(), /Memória do chat|Este chat/)
     await p
       .getByTestId('memory-snapshot')
       .getByText(/congelado desde/)
@@ -335,7 +340,12 @@ app.on('window-all-closed', () => app.quit())
     await openSettingsMemory()
     const s = settings()
     assert.match(await s.getByTestId('memory-settings-cat-areas').innerText(), /Projeto TCC/)
-    assert.match(await s.getByTestId('memory-chat-groups').innerText(), /Planejamento do TCC/)
+    // sem a área "Memórias de chats": só as coleções das cinco categorias
+    assert.equal(await s.getByTestId('memory-chat-groups').count(), 0)
+    assert.doesNotMatch(
+      await s.getByTestId('memory-settings').innerText(),
+      /Memórias de chats|Este chat/
+    )
     await shot('10-config-memorias')
   })
 
@@ -457,11 +467,8 @@ app.on('window-all-closed', () => app.quit())
     await s.getByTestId('memory-search-results').waitFor()
     assert.match(await s.getByTestId('memory-search-results').innerText(), /Marcos/)
     await s.getByLabel('Buscar em todas as memórias').fill('')
-    // memórias de chats
-    await s
-      .getByTestId('memory-chat-group-c5')
-      .getByRole('button', { name: /Pessoas/ })
-      .click()
+    // o que o modelo gravou no chat fica na coleção de escrita da categoria (Pessoas → Padrão)
+    await s.getByTestId('memory-collection-col-people').getByRole('button').first().click()
     assert.match(await s.getByTestId('memory-collection-view').innerText(), /Banca: Profa. Helena/)
     await closeSettings()
   })

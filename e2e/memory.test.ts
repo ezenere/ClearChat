@@ -17,6 +17,7 @@ import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { SCHEMA } from '../src/main/dbSchema.ts'
 import { MemoryService } from '../src/main/memory/service.ts'
+import { removeChatMemory } from '../src/main/memory/schema.ts'
 import { MemoryError, slugify, validateMemoryFields } from '../src/main/memory/store.ts'
 import { activeMemory } from '../src/main/memory/config.ts'
 import { hideSuperseded, indexGroups, renderIndex } from '../src/main/memory/render.ts'
@@ -27,7 +28,11 @@ import {
 } from '../src/main/memory/extraction.ts'
 import { applyOps, runMemoryTool } from '../src/main/tools/memory.ts'
 import { buildRequest, setMemorySources } from '../src/main/agent/request.ts'
-import { DEFAULT_CHAT_CONFIG, DEFAULT_MEMORY_HELP_PROMPT } from '../src/shared/defaults.ts'
+import {
+  DEFAULT_CHAT_CONFIG,
+  DEFAULT_MEMORY_EXTRACTION_PROMPT,
+  DEFAULT_MEMORY_HELP_PROMPT
+} from '../src/shared/defaults.ts'
 import { defaultMemoryConfig, normalizeMemoryConfig } from '../src/shared/memory.ts'
 import { applyPreset, PRESET_FIELDS, sanitizePresetConfig } from '../src/shared/presets.ts'
 import { contextUsage, hasCompactableHistory, isDisplayOnly } from '../src/shared/context.ts'
@@ -186,30 +191,109 @@ test('repositório: CRUD, limites legíveis, slug único e [[slug]] preservado, 
   conn.close()
 })
 
-test('coleção do chat: criada sob demanda ("Este chat"), apagar o chat apaga (CASCADE); migração idempotente', () => {
+test('migração: remove a antiga memória do chat (coleções scope chat + memórias, chatMemory nas configs); idempotente', () => {
   const conn = openDb('chat.db')
   const svc = new MemoryService(conn)
-  new MemoryService(conn) // idempotente
-  const { chat } = insertChat(conn, mem({ chatMemory: true }))
-  assert.equal(svc.store.chatCollection(chat.id, 'areas', false), null)
-  const c = svc.store.chatCollection(chat.id, 'areas', true)!
-  assert.equal(c.name, 'Este chat')
-  assert.equal(c.scope, 'chat')
-  assert.equal(c.chatId, chat.id)
-  assert.equal(svc.store.chatCollection(chat.id, 'areas', true)!.id, c.id, 'reaproveita')
-  svc.store.createMemory({ collectionId: c.id, title: 'Tarefa X' })
-  assert.equal(svc.store.listMemories({ chatId: chat.id }).length, 1)
-  conn.prepare('DELETE FROM chats WHERE id = ?').run(chat.id)
-  assert.equal(svc.store.getCollection(c.id), null)
-  assert.equal(svc.store.listMemories({}).length, 0)
+  const shared = svc.store.createCollection({ category: 'areas', name: 'TCC' })
+  const keep = svc.store.createMemory({ collectionId: shared.id, title: 'Fica' })
+  // estado legado: chat com chatMemory + coleções "Este chat" com memórias; persona com chatMemory
+  const { chat } = insertChat(conn, { ...mem({ collections: [shared.id] }), chatMemory: true })
+  const legacy = (id: string, category: string): void => {
+    conn
+      .prepare(
+        "INSERT INTO memory_collections (id, category, name, description, scope, chat_id, created_at, updated_at) VALUES (?, ?, 'Este chat', '', 'chat', ?, 0, 0)"
+      )
+      .run(id, category, chat.id)
+  }
+  const legacyMemory = (id: string, collectionId: string, category: string): void => {
+    conn
+      .prepare(
+        'INSERT INTO memories (id, collection_id, category, title, slug, facts_json, created_at, updated_at, supersedes_id) VALUES (?, ?, ?, ?, ?, \'["x"]\', 0, 0, ?)'
+      )
+      .run(id, collectionId, category, `T ${id}`, `t-${id}`, id === 'mlx' ? keep.id : null)
+  }
+  legacy('legacy-areas', 'areas')
+  legacy('legacy-people', 'people')
+  legacyMemory('mlx', 'legacy-areas', 'areas') // substituía uma memória compartilhada
+  legacyMemory('mly', 'legacy-areas', 'areas')
+  legacyMemory('mlz', 'legacy-people', 'people')
+  const m1 = { id: 'mlx' }
+  conn
+    .prepare(
+      "INSERT INTO presets (id, name, config_json, created_at, updated_at) VALUES ('pr', 'P', ?, 0, 0)"
+    )
+    .run(JSON.stringify({ memory: { ...mem({ collections: [shared.id] }), chatMemory: false } }))
+  conn
+    .prepare(
+      "INSERT INTO presets (id, name, config_json, created_at, updated_at) VALUES ('pr2', 'Q', ?, 0, 0)"
+    )
+    .run(JSON.stringify({ model: 'x' }))
+  // coleções legadas nunca são lidas pela API pública
+  assert.equal(svc.store.getCollection('legacy-areas'), null)
+  assert.deepEqual(
+    svc.store.listCollections().map((c) => c.id),
+    [shared.id]
+  )
+
+  const r = removeChatMemory(conn)
+  assert.deepEqual(r, { collections: 2, memories: 3, chats: 1, presets: 1 })
+  const n = (sql: string): number => (conn.prepare(sql).get() as { n: number }).n
+  assert.equal(n("SELECT COUNT(*) AS n FROM memory_collections WHERE scope = 'chat'"), 0)
+  assert.equal(n('SELECT COUNT(*) AS n FROM memories'), 1)
+  assert.equal(svc.store.getMemory(m1.id), null)
+  assert.equal(svc.store.getMemory(keep.id)?.title, 'Fica')
+  assert.equal(n('SELECT COUNT(*) AS n FROM memories_fts'), 1, 'FTS sem as apagadas')
+  const cfgOf = (table: string, id: string): any =>
+    JSON.parse(
+      (conn.prepare(`SELECT config_json FROM ${table} WHERE id = ?`).get(id) as any).config_json
+    )
+  const chatCfg = cfgOf('chats', chat.id)
+  assert.ok(!('chatMemory' in chatCfg.memory))
+  assert.deepEqual(chatCfg.memory.collections, [shared.id], 'resto da config intacto')
+  assert.ok(!('chatMemory' in cfgOf('presets', 'pr').memory))
+  assert.deepEqual(cfgOf('presets', 'pr2'), { model: 'x' })
+
+  // idempotente: de novo (e ao reabrir o schema) nada muda
+  assert.deepEqual(removeChatMemory(conn), { collections: 0, memories: 0, chats: 0, presets: 0 })
+  new MemoryService(conn)
+  assert.equal(n('SELECT COUNT(*) AS n FROM memories'), 1)
+  // sem tabelas de chats/personas (banco só com a memória) não quebra
+  const bare = new Database(join(TMP, 'bare.db'))
+  new MemoryService(bare)
+  assert.deepEqual(removeChatMemory(bare), { collections: 0, memories: 0, chats: 0, presets: 0 })
+  bare.close()
   const cols = (conn.prepare('PRAGMA table_info(sessions)').all() as any[]).map((x) => x.name)
   assert.ok(cols.includes('memory_json'))
   conn.close()
 })
 
+test('migração ao abrir: ensureMemorySchema apaga coleções scope chat já existentes', () => {
+  const conn = openDb('chat-open.db')
+  new MemoryService(conn)
+  const { chat } = insertChat(conn, { ...mem(), chatMemory: true })
+  conn
+    .prepare(
+      "INSERT INTO memory_collections (id, category, name, scope, chat_id, created_at, updated_at) VALUES ('lc', 'areas', 'Este chat', 'chat', ?, 0, 0)"
+    )
+    .run(chat.id)
+  conn
+    .prepare(
+      "INSERT INTO memories (id, collection_id, category, title, slug, created_at, updated_at) VALUES ('mlc', 'lc', 'areas', 'T', 't', 0, 0)"
+    )
+    .run()
+  const svc = new MemoryService(conn) // reabre: migração roda
+  assert.equal(svc.store.listMemories({}).length, 0)
+  assert.equal((conn.prepare('SELECT COUNT(*) AS n FROM memory_collections').get() as any).n, 0)
+  const cfg = JSON.parse(
+    (conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(chat.id) as any).config_json
+  )
+  assert.equal(cfg.memory.chatMemory, undefined)
+  conn.close()
+})
+
 // ---------------- config / herança ----------------
 
-test('config: regra de envio, categorias, writeTo validado, chatMemory, subagentes', () => {
+test('config: regra de envio, categorias, writeTo validado, subagentes', () => {
   const conn = openDb('config.db')
   const svc = new MemoryService(conn)
   const s = svc.store
@@ -252,9 +336,11 @@ test('config: regra de envio, categorias, writeTo validado, chatMemory, subagent
   assert.equal(off.canWrite, false)
   assert.equal(am(mem({ collections: [p.id], categories: [] })).active, false)
 
-  const cm = am(mem({ chatMemory: true }))
-  assert.equal(cm.active, true, 'só memória do chat já é algo ativo')
-  assert.equal(cm.canWrite, true)
+  // chatMemory legado não ativa nada: sem coleção ativa → nada vai
+  const legacy = am({ ...mem(), chatMemory: true })
+  assert.equal(legacy.active, false, 'chatMemory legado é ignorado')
+  assert.deepEqual(legacy.tools, [])
+  assert.equal(am({ ...mem({ collections: [p.id] }), chatMemory: true }).canWrite, false)
 
   // subagentes: só leitura, só com a opção; nunca escrita
   assert.equal(am(mem({ collections: [p.id], writeTo: { profile: p.id } }), 1).active, false)
@@ -274,7 +360,7 @@ test('config: regra de envio, categorias, writeTo validado, chatMemory, subagent
   conn.close()
 })
 
-test('config: normalização e herança de persona (chatMemory é do chat)', () => {
+test('config: normalização (chatMemory legado descartado) e herança de persona', () => {
   assert.ok((PRESET_FIELDS as readonly string[]).includes('memory'))
   const n = normalizeMemoryConfig({
     enabled: true,
@@ -286,17 +372,18 @@ test('config: normalização e herança de persona (chatMemory é do chat)', () 
   assert.deepEqual(n.collections, ['a'])
   assert.deepEqual(n.writeTo, { areas: 'a', people: null })
   assert.deepEqual(n.categories, ['areas'])
+  assert.ok(!('chatMemory' in n), 'chatMemory legado descartado')
+  assert.ok(!('chatMemory' in defaultMemoryConfig()))
   assert.equal(normalizeMemoryConfig(null).enabled, false)
   const preset = sanitizePresetConfig({
     memory: { ...mem({ collections: ['x'] }), chatMemory: true }
   })
-  assert.equal(preset.memory!.chatMemory, false, 'persona não tem memória do chat')
+  assert.ok(!('chatMemory' in preset.memory!), 'persona salva sem chatMemory')
   assert.deepEqual(preset.memory!.collections, ['x'])
-  const base = { ...DEFAULT_CHAT_CONFIG('/tmp'), memory: mem({ chatMemory: true }) }
+  const base = { ...DEFAULT_CHAT_CONFIG('/tmp'), memory: mem({ collections: ['y'] }) }
   const applied = applyPreset(base, preset)
   assert.deepEqual(applied.memory!.collections, ['x'], 'chat herda a seleção da persona')
-  assert.equal(applied.memory!.chatMemory, true, 'aplicar persona mantém o chatMemory do chat')
-  assert.equal(applyPreset(DEFAULT_CHAT_CONFIG('/tmp'), preset).memory!.chatMemory, false)
+  assert.ok(!('chatMemory' in applied.memory!))
 })
 
 test('tools e aprovações: nomes, rótulos, itens com padrão "Sempre permitir" e "Perguntar"', () => {
@@ -309,16 +396,19 @@ test('tools e aprovações: nomes, rótulos, itens com padrão "Sempre permitir"
     ['Buscar memória', 'Ler memória', 'Gravar memória', 'Reescrever memória', 'Apagar memória']
   )
   const wd = TOOL_DEFINITIONS.memory_write.function.description
-  for (const k of [
-    'profile',
-    'topics',
-    'areas',
-    'people',
-    'preferences',
-    'target "chat"',
-    'Discrepância'
-  ])
+  for (const k of ['profile', 'topics', 'areas', 'people', 'preferences', 'Discrepância'])
     assert.ok(wd.includes(k), k)
+  // sem memória "do chat": nada de target nem da regra global × chat
+  for (const t of ['memory_write', 'memory_rewrite'] as const) {
+    const f = TOOL_DEFINITIONS[t].function
+    assert.ok(!('target' in (f.parameters as any).properties), `${t} sem target`)
+    assert.doesNotMatch(f.description, /target|Global × chat|memória do chat/)
+  }
+  assert.doesNotMatch(TOOL_DEFINITIONS.memory_delete.function.description, /deste chat/)
+  for (const p of [DEFAULT_MEMORY_HELP_PROMPT, DEFAULT_MEMORY_EXTRACTION_PROMPT]) {
+    assert.doesNotMatch(p, /target|Global × chat/)
+    assert.match(p, /contradiz|Discrepâncias/)
+  }
   for (const item of ['memory_write', 'memory_rewrite', 'memory_delete'] as const) {
     assert.ok(APPROVAL_ITEMS.includes(item))
     assert.equal(TOOL_ITEM[item], item)
@@ -465,6 +555,30 @@ test('snapshot por sessão: congela no 1º request; renova em refresh/compactaç
     assert.equal(svc.preview(ro, session).snapshotAt, null)
     assert.match(svc.preview(ro, session).index!, /Projetos — leitura/)
     assert.deepEqual(svc.preview(ro, session).tools, ['memory_search', 'memory_read'])
+    // sem coleção de escrita em nenhuma categoria → request sem tools de escrita
+    const roReq = buildRequest(
+      { ...ro, config: { ...ro.config, toolsInPrompt: false } },
+      session,
+      [],
+      provider,
+      env
+    ).body as any
+    assert.deepEqual(
+      roReq.tools.map((t: any) => t.function.name).filter((n: string) => n.startsWith('memory_')),
+      ['memory_search', 'memory_read']
+    )
+    // chatMemory legado sem coleção ativa → nada de memória na request
+    const legacyChat = {
+      ...chat,
+      config: {
+        ...chat.config,
+        toolsInPrompt: false,
+        memory: { ...memory, collections: [], chatMemory: true }
+      }
+    }
+    const legacy = buildRequest(legacyChat, session, [], provider, env).body as any
+    assert.ok(!textOf(legacy.messages[0].content).includes('<memory>'))
+    assert.ok(!legacy.tools.some((t: any) => t.function.name.startsWith('memory_')))
 
     // desligada → nada de memória na request
     const offChat = {
@@ -547,7 +661,7 @@ test('mensagens só de exibição (erro, extração) ficam fora da API, do conte
 
 // ---------------- tools ----------------
 
-test('tools: write (criar/atualizar/candidatas/force_new/target chat/sem destino), rewrite, delete, read, search', () => {
+test('tools: write (criar/atualizar/candidatas/force_new/sem coleção de escrita), rewrite, delete, read, search', () => {
   const conn = openDb('tools.db')
   const svc = new MemoryService(conn)
   const s = svc.store
@@ -562,8 +676,7 @@ test('tools: write (criar/atualizar/candidatas/force_new/target chat/sem destino
   })
   const memory = mem({
     collections: [fam.id, mine.id, prof.id],
-    writeTo: { people: mine.id },
-    chatMemory: true
+    writeTo: { people: mine.id }
   })
   const { chat } = insertChat(conn, memory)
   const ctx = (): any => ({
@@ -620,19 +733,23 @@ test('tools: write (criar/atualizar/candidatas/force_new/target chat/sem destino
   r = run('memory_write', { id: ana.id, ops: [{ op: 'add', fact: 'x' }] })
   assert.equal(r.status, 'error')
   assert.match(r.content, /só de leitura.*memory_rewrite/)
-  // categoria sem coleção de escrita: erro claro (sugere chat)
-  r = run('memory_write', { category: 'profile', title: 'Eu' })
-  assert.match(r.content, /não há coleção de escrita para Perfil.*target "chat"/)
-  // target chat → "Este chat" criada sob demanda
-  r = run('memory_write', {
-    category: 'profile',
-    title: 'Eu',
-    target: 'chat',
-    ops: [{ op: 'add', fact: 'Dev' }]
-  })
-  assert.equal(r.status, 'ok', r.content)
-  const chatCol = s.chatCollection(chat.id, 'profile', false)!
-  assert.equal(s.getMemory(r.changes[0].memoryId)!.collectionId, chatCol.id)
+  // categoria sem coleção de escrita: erro claro, nada criado (target legado é ignorado)
+  const before = s.listMemories({}).length
+  r = run('memory_write', { category: 'profile', title: 'Eu', ops: [{ op: 'add', fact: 'Dev' }] })
+  assert.equal(r.status, 'error')
+  assert.match(r.content, /^Erro: Sem coleção de escrita para Perfil \(profile\) neste chat/)
+  r = run('memory_write', { category: 'profile', title: 'Eu', target: 'chat' })
+  assert.match(r.content, /Sem coleção de escrita para Perfil/)
+  assert.equal(s.listMemories({}).length, before)
+  assert.deepEqual(
+    s.listCollections().map((c) => c.id),
+    [prof.id, fam.id, mine.id],
+    'nenhuma coleção criada'
+  )
+  // rewrite de memória numa categoria sem escrita → mesmo erro
+  const me = s.createMemory({ collectionId: prof.id, title: 'Perfil base' })
+  r = run('memory_rewrite', { id: me.id, summary: 'x' })
+  assert.match(r.content, /^Erro: Sem coleção de escrita para Perfil/)
   // categoria desligada / inválida
   const onlyPeople = {
     ...chat,
@@ -640,7 +757,7 @@ test('tools: write (criar/atualizar/candidatas/force_new/target chat/sem destino
   }
   r = runMemoryTool(
     'memory_write',
-    { category: 'profile', title: 'Y', target: 'chat' },
+    { category: 'profile', title: 'Y' },
     { store: s, am: svc.active(onlyPeople, { depth: 0 }), by: { updatedBy: 'model' } }
   )
   assert.match(r.content, /desligada/)

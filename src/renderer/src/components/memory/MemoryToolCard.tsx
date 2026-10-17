@@ -75,7 +75,7 @@ export function MemoryChangeChips({
       {changes.map((c, i) => {
         const Icon = OP_ICON[c.op]
         const col = cols.find((x) => x.id === c.collectionId)
-        const where = col ? (col.scope === 'chat' ? 'Este chat' : col.name) : null
+        const where = col?.name ?? null
         const body = (
           <>
             <Icon className="size-3 shrink-0" />
@@ -147,7 +147,7 @@ function MemoryLinks({
             {m && (
               <span className="shrink-0 text-[10.5px] text-faint">
                 {MEMORY_CATEGORY_LABELS[m.category]}
-                {col ? ` · ${col.scope === 'chat' ? 'Este chat' : col.name}` : ''}
+                {col ? ` · ${col.name}` : ''}
               </span>
             )}
           </button>

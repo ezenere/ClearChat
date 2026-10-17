@@ -1,14 +1,13 @@
 // Configurações → Memórias (global): por categoria, as coleções (criar, renomear, descrição, ícone,
 // apagar) → memórias da coleção (lista com busca) → detalhe editável (título, resumo, tópicos,
-// "Sempre carregar", mover, origem, substitui/substituída). Memórias de chats ficam à parte,
-// agrupadas por chat. Chats e personas só selecionam/ativam (aba Memória).
+// "Sempre carregar", mover, origem, substitui/substituída). Chats e personas só selecionam/ativam
+// (aba Memória).
 import {
   ArrowDown,
   ArrowLeft,
   ArrowUp,
   ArrowUpRight,
   ChevronRight,
-  MessageSquare,
   Pencil,
   Pin,
   Plus,
@@ -30,7 +29,6 @@ import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import {
   canAddFact,
-  chatMemoryGroups,
   cleanField,
   counter,
   matchesMemory,
@@ -235,11 +233,9 @@ function Home({
   nav: Nav
   onChanged: () => void
 }): React.JSX.Element {
-  const chats = useStore((s) => s.chats)
   const [query, setQuery] = useState('')
   const [creating, setCreating] = useState<MemoryCategory | null>(null)
   const [editing, setEditing] = useState<string | null>(null)
-  const groups = chatMemoryGroups(cols, chats)
   const results = query.trim() ? all.filter((m) => matchesMemory(m, query)) : null
 
   return (
@@ -321,27 +317,6 @@ function Home({
               </section>
             )
           })}
-
-          <section data-testid="memory-chat-groups">
-            <div className="mb-1.5 flex items-center gap-2 border-b border-border/50 pb-1.5">
-              <MessageSquare className="size-3.5 text-muted" strokeWidth={1.75} />
-              <span className="text-[13px] font-medium text-fg/90">Memórias de chats</span>
-              <span className="truncate text-[11px] text-subtle">
-                “Este chat” — só valem no chat dono (apagar o chat apaga)
-              </span>
-            </div>
-            {groups.length === 0 ? (
-              <p className="px-1 py-1.5 text-[11.5px] text-faint">
-                Nenhuma ainda. Ligue “Memória do chat” na aba Memória de um chat.
-              </p>
-            ) : (
-              <div className="space-y-1">
-                {groups.map((g) => (
-                  <ChatGroupRow key={g.chatId} group={g} onOpen={nav.collection} />
-                ))}
-              </div>
-            )}
-          </section>
         </>
       )}
     </div>
@@ -481,7 +456,7 @@ function CollectionForm({
           onClick={() => setIconsOpen((o) => !o)}
           className="rounded-lg transition-opacity hover:opacity-80"
         >
-          <CollectionIcon collection={{ icon, category, scope: 'shared' }} size="md" />
+          <CollectionIcon collection={{ icon, category }} size="md" />
         </button>
         <input
           autoFocus
@@ -533,51 +508,6 @@ function CollectionForm({
   )
 }
 
-function ChatGroupRow({
-  group,
-  onOpen
-}: {
-  group: ReturnType<typeof chatMemoryGroups>[number]
-  onOpen: (collectionId: string) => void
-}): React.JSX.Element {
-  const openChat = useStore((s) => s.openChat)
-  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
-  return (
-    <div
-      data-testid={`memory-chat-group-${group.chatId}`}
-      className="rounded-lg border border-border bg-bg/30 px-2.5 py-2"
-    >
-      <div className="flex items-center gap-2">
-        <MessageSquare className="size-3.5 shrink-0 text-subtle" />
-        <span className="min-w-0 flex-1 truncate text-[12.5px] text-fg/90">{group.title}</span>
-        <button
-          type="button"
-          onClick={() => {
-            setSettingsOpen(false)
-            void openChat(group.chatId)
-          }}
-          className="inline-flex shrink-0 items-center gap-1 text-[11px] text-subtle hover:text-fg"
-        >
-          Abrir chat <ArrowUpRight className="size-3" />
-        </button>
-      </div>
-      <div className="mt-1.5 flex flex-wrap gap-1">
-        {group.collections.map((c) => (
-          <button
-            key={c.id}
-            type="button"
-            onClick={() => onOpen(c.id)}
-            className="inline-flex items-center gap-1 rounded-md border border-border bg-elevated px-1.5 py-0.5 text-[11px] text-muted hover:border-border-strong hover:text-fg"
-          >
-            {MEMORY_CATEGORY_LABELS[c.category]}
-            <span className="text-faint tabular-nums">{c.count ?? 0}</span>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
 // ---------------- coleção: lista de memórias ----------------
 
 function CollectionView({
@@ -592,7 +522,6 @@ function CollectionView({
   onChanged: () => void
 }): React.JSX.Element {
   const cols = useStore((s) => s.memoryCollections)
-  const chats = useStore((s) => s.chats)
   const run = useStore((s) => s.run)
   const [query, setQuery] = useState('')
   const [editing, setEditing] = useState(false)
@@ -603,7 +532,6 @@ function CollectionView({
     () => all.filter((m) => m.collectionId === c.id).sort((a, b) => b.updatedAt - a.updatedAt),
     [all, c.id]
   )
-  const chat = c.scope === 'chat' ? chats.find((x) => x.id === c.chatId) : undefined
 
   // Busca: o FTS do main (memory.list com query); cai no filtro local se falhar.
   useEffect(() => {
@@ -639,29 +567,24 @@ function CollectionView({
         <div className="flex items-start gap-3" onMouseLeave={() => setConfirm(false)}>
           <CollectionIcon collection={c} size="md" className="size-10 [&_svg]:size-5" />
           <div className="min-w-0 flex-1">
-            <h3 className="truncate text-[15px] font-semibold tracking-tight">
-              {c.scope === 'chat' ? `Este chat · ${chat?.title || 'chat apagado'}` : c.name}
-            </h3>
+            <h3 className="truncate text-[15px] font-semibold tracking-tight">{c.name}</h3>
             <p className="text-[11.5px] text-subtle">
               {MEMORY_CATEGORY_LABELS[c.category]} · {own.length}{' '}
               {own.length === 1 ? 'memória' : 'memórias'}
-              {c.scope === 'chat' && ' · memória do chat'}
             </p>
             {c.description && (
               <p className="mt-1 text-[12.5px] leading-snug text-muted">{c.description}</p>
             )}
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {c.scope === 'shared' && (
-              <Button
-                size="sm"
-                variant="ghost"
-                icon={<Pencil className="size-3.5" />}
-                onClick={() => setEditing(true)}
-              >
-                Editar
-              </Button>
-            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<Pencil className="size-3.5" />}
+              onClick={() => setEditing(true)}
+            >
+              Editar
+            </Button>
             {confirm ? (
               <Button
                 size="sm"
@@ -778,8 +701,7 @@ function MemoryRows({
               </span>
               {col && (
                 <span className="mt-0.5 block truncate text-[10.5px] text-faint">
-                  {MEMORY_CATEGORY_LABELS[col.category]} ·{' '}
-                  {col.scope === 'chat' ? 'Este chat' : col.name}
+                  {MEMORY_CATEGORY_LABELS[col.category]} · {col.name}
                 </span>
               )}
             </span>
@@ -1049,7 +971,7 @@ function MemoryDetail({
   const targets = moveTargets(m, cols)
   const colLabel = (id: string): string => {
     const c = cols.find((x) => x.id === id)
-    return c ? (c.scope === 'chat' ? 'Este chat' : c.name) : 'coleção apagada'
+    return c ? c.name : 'coleção apagada'
   }
 
   const save = async (patch: MemoryPatch, label = 'Erro ao salvar a memória'): Promise<boolean> => {
@@ -1067,7 +989,7 @@ function MemoryDetail({
   return (
     <div data-testid="memory-detail" className="animate-fade-in">
       <BackLink onClick={() => (col ? nav.collection(col.id) : nav.home())}>
-        {col ? (col.scope === 'chat' ? 'Este chat' : col.name) : 'Memórias'}
+        {col ? col.name : 'Memórias'}
       </BackLink>
 
       <div className="flex items-start gap-2" onMouseLeave={() => setConfirm(false)}>
@@ -1317,7 +1239,7 @@ function MemoryDetail({
             }
             options={[...(col ? [col] : []), ...targets].map((c) => ({
               value: c.id,
-              label: c.scope === 'chat' ? 'Este chat' : c.name,
+              label: c.name,
               description: c.id === m.collectionId ? 'atual' : undefined
             }))}
           />

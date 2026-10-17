@@ -6,7 +6,6 @@ import assert from 'node:assert/strict'
 import {
   activeInCategory,
   canAddFact,
-  chatMemoryGroups,
   cleanField,
   collectionBadge,
   counter,
@@ -55,8 +54,6 @@ const col = (
   name,
   description: '',
   icon: null,
-  scope: 'shared',
-  chatId: null,
   createdAt: 0,
   updatedAt: 0,
   ...extra
@@ -67,10 +64,7 @@ const cols: MemoryCollection[] = [
   col('a-pad', 'areas', 'Padrão', { count: 2 }),
   col('a-app', 'areas', 'ClearChat'),
   col('p-pad', 'profile', 'Padrão'),
-  col('t-pad', 'topics', 'Padrão'),
-  col('chat-a', 'areas', 'Este chat', { scope: 'chat', chatId: 'c1', count: 2 }),
-  col('chat-p', 'people', 'Este chat', { scope: 'chat', chatId: 'c1', count: 1 }),
-  col('chat-x', 'areas', 'Este chat', { scope: 'chat', chatId: 'c2', count: 4 })
+  col('t-pad', 'topics', 'Padrão')
 ]
 
 const cfg = (p: Partial<MemoryConfig> = {}): MemoryConfig => ({
@@ -88,7 +82,7 @@ test('memoryConfigOf: ausente/parcial → padrões completos', () => {
   assert.deepEqual(m.extraction, { auto: false, prompt: null, providerId: null, model: null })
 })
 
-test('sharedCollections: só compartilhadas da categoria, "Padrão" primeiro', () => {
+test('sharedCollections: coleções da categoria, "Padrão" primeiro', () => {
   assert.deepEqual(
     sharedCollections(cols, 'areas').map((c) => c.id),
     ['a-pad', 'a-app', 'a-tcc']
@@ -101,21 +95,21 @@ test('sharedCollections: só compartilhadas da categoria, "Padrão" primeiro', (
   )
 })
 
-test('regra de envio: desligada, sem coleção, categoria desligada, memória do chat', () => {
-  assert.equal(
-    memoryWillSend(cfg({ enabled: false, collections: ['a-tcc'] }), cols, { chat: true }),
-    false
-  )
-  assert.equal(memoryWillSend(cfg(), cols, { chat: true }), false)
-  assert.equal(memoryWillSend(cfg({ collections: ['a-tcc'] }), cols, { chat: true }), true)
+test('regra de envio: desligada, sem coleção, categoria desligada, chatMemory legado', () => {
+  assert.equal(memoryWillSend(cfg({ enabled: false, collections: ['a-tcc'] }), cols), false)
+  assert.equal(memoryWillSend(cfg(), cols), false)
+  assert.equal(memoryWillSend(cfg({ collections: ['a-tcc'] }), cols), true)
   // categoria desligada ignora a coleção (sem perder a seleção)
   const off = cfg({ collections: ['a-tcc'], categories: ['profile'] })
-  assert.equal(memoryWillSend(off, cols, { chat: true }), false)
+  assert.equal(memoryWillSend(off, cols), false)
   // coleção apagada não conta
-  assert.equal(memoryWillSend(cfg({ collections: ['sumiu'] }), cols, { chat: true }), false)
-  // memória do chat basta no chat, mas não na persona
-  assert.equal(memoryWillSend(cfg({ chatMemory: true }), cols, { chat: true }), true)
-  assert.equal(memoryWillSend(cfg({ chatMemory: true }), cols, { chat: false }), false)
+  assert.equal(memoryWillSend(cfg({ collections: ['sumiu'] }), cols), false)
+  // sem a lista de coleções: conta os ids
+  assert.equal(memoryWillSend(cfg({ collections: ['x'] }), null), true)
+  // chatMemory de configs antigas é descartado e não ativa nada
+  const legacy = memoryConfigOf({ memory: { enabled: true, chatMemory: true } as never })
+  assert.ok(!('chatMemory' in legacy))
+  assert.equal(memoryWillSend(legacy, cols), false)
 })
 
 test('toggleCollection: desligar a coleção de escrita limpa a escrita; ligar liga a categoria', () => {
@@ -136,12 +130,11 @@ test('toggleCategory mantém a ordem da taxonomia', () => {
   assert.deepEqual(toggleCategory(m, 'people', false).categories, [])
 })
 
-test('coleção de escrita: só uma das ativas, da mesma categoria, compartilhada', () => {
+test('coleção de escrita: só uma das ativas, da mesma categoria', () => {
   const m = cfg({ collections: ['a-tcc', 'p-pad'] })
   assert.equal(writeTargetError(m, cols, 'areas', null), null)
   assert.match(writeTargetError(m, cols, 'areas', 'a-app') ?? '', /Ative a coleção/)
   assert.match(writeTargetError(m, cols, 'areas', 'p-pad') ?? '', /outra categoria/)
-  assert.match(writeTargetError(m, cols, 'areas', 'chat-a') ?? '', /memória do chat/)
   assert.match(writeTargetError(m, cols, 'areas', 'sumiu') ?? '', /não existe/)
   const ok = setWriteTarget(m, cols, 'areas', 'a-tcc')
   assert.equal(ok.error, null)
@@ -158,25 +151,21 @@ test('coleção de escrita: só uma das ativas, da mesma categoria, compartilhad
 
 test('herança da persona: selos, diferença e restaurar', () => {
   const persona = cfg({ collections: ['a-pad', 't-pad'], writeTo: { areas: 'a-pad' } })
-  const chat = cfg({
-    collections: ['a-pad', 'a-tcc'],
-    writeTo: { areas: 'a-tcc' },
-    chatMemory: true
-  })
+  const chat = cfg({ collections: ['a-pad', 'a-tcc'], writeTo: { areas: 'a-tcc' } })
   assert.equal(collectionBadge('a-pad', chat, persona), 'persona')
   assert.equal(collectionBadge('t-pad', chat, persona), 'persona-off')
   assert.equal(collectionBadge('a-tcc', chat, persona), 'added')
   assert.equal(collectionBadge('a-app', chat, persona), null)
   assert.equal(collectionBadge('a-pad', chat, null), null)
   assert.equal(differsFromPersona(chat, persona), true)
-  const restored = restoreFromPersona(chat, persona)
+  const restored = restoreFromPersona(persona)
   assert.equal(differsFromPersona(restored, persona), false)
-  // a memória do chat é do chat: restaurar não mexe
-  assert.equal(restored.chatMemory, true)
-  // ordem das coleções e memória do chat não contam como diferença
+  assert.deepEqual(restored, persona)
+  assert.notEqual(restored.collections, persona.collections, 'cópia')
+  // ordem das coleções não conta como diferença
   assert.equal(
     differsFromPersona(
-      cfg({ collections: ['t-pad', 'a-pad'], writeTo: { areas: 'a-pad' }, chatMemory: true }),
+      cfg({ collections: ['t-pad', 'a-pad'], writeTo: { areas: 'a-pad' } }),
       persona
     ),
     false
@@ -227,32 +216,14 @@ test('links [[slug]]', () => {
   assert.equal(plainMemoryText('[[sumiu]]'), 'sumiu')
 })
 
-test('memórias de chat agrupadas por chat (mais recente primeiro)', () => {
-  const g = chatMemoryGroups(cols, [
-    { id: 'c1', title: 'TCC', updatedAt: 10 },
-    { id: 'c2', title: '', updatedAt: 20 }
-  ])
-  assert.deepEqual(
-    g.map((x) => [x.chatId, x.title, x.count]),
-    [
-      ['c2', 'Chat sem título', 4],
-      ['c1', 'TCC', 3]
-    ]
-  )
-  assert.deepEqual(
-    g[1].collections.map((c) => c.category),
-    ['areas', 'people']
-  )
-})
-
-test('mover: só coleções compartilhadas da mesma categoria', () => {
+test('mover: só coleções da mesma categoria', () => {
   assert.deepEqual(
     moveTargets({ collectionId: 'a-tcc', category: 'areas' }, cols).map((c) => c.id),
     ['a-pad', 'a-app']
   )
   assert.deepEqual(
-    moveTargets({ collectionId: 'chat-a', category: 'areas' }, cols).map((c) => c.id),
-    ['a-pad', 'a-app', 'a-tcc']
+    moveTargets({ collectionId: 'p-pad', category: 'profile' }, cols).map((c) => c.id),
+    []
   )
 })
 
@@ -275,7 +246,6 @@ test('tools: resumo de uma linha e ids citados', () => {
   assert.equal(
     memoryToolSummary('memory_write', {
       category: 'people',
-      target: 'chat',
       title: 'Ana',
       ops: [
         { op: 'add', fact: 'x' },
@@ -283,7 +253,7 @@ test('tools: resumo de uma linha e ids citados', () => {
         { op: 'remove', fact: '#1' }
       ]
     }),
-    'Pessoas · este chat · Ana · +2 −1'
+    'Pessoas · Ana · +2 −1'
   )
   assert.equal(memoryToolSummary('memory_write', { category: 'areas' }), 'Áreas · nova')
   assert.equal(

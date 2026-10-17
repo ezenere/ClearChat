@@ -1,6 +1,7 @@
-// Memória modular: cada coleção pertence a UMA categoria da taxonomia fixa (ex.: "Padrão" em cada
-// categoria, "Projeto TCC" em Áreas). Chats/personas ativam coleções (várias por categoria para
-// leitura) e escolhem no máximo UMA coleção de escrita por categoria via `ChatConfig.memory`.
+// Memória modular: cada coleção (criada pelo usuário, global) pertence a UMA categoria da taxonomia
+// fixa (ex.: "Padrão" em cada categoria, "Projeto TCC" em Áreas). Chats/personas ativam coleções
+// (várias por categoria para leitura) e escolhem no máximo UMA coleção de escrita por categoria via
+// `ChatConfig.memory`. Não há memória "do chat": o contexto do chat já é a memória dele.
 // Ver SPEC.md → "Memória".
 
 export const MEMORY_CATEGORIES = ['profile', 'topics', 'areas', 'people', 'preferences'] as const
@@ -23,8 +24,6 @@ export const MEMORY_CATEGORY_HINTS: Record<MemoryCategory, string> = {
   preferences: 'como o usuário quer que o chat se comporte'
 }
 
-export type MemoryCollectionScope = 'shared' | 'chat'
-
 export interface MemoryCollection {
   id: string
   name: string
@@ -32,9 +31,6 @@ export interface MemoryCollection {
   icon: string | null
   /** Categoria da coleção (fixa; todas as memórias dela têm esta categoria). */
   category: MemoryCategory
-  scope: MemoryCollectionScope
-  /** Só em scope 'chat': o chat dono (apagar o chat apaga a coleção). */
-  chatId: string | null
   createdAt: number
   updatedAt: number
   /** Quantidade de memórias (preenchido em list). */
@@ -81,8 +77,6 @@ export type MemoryPatch = Partial<Omit<MemoryInput, 'collectionId'>> & { collect
 
 export interface MemoryListQuery {
   collectionId?: string
-  /** Coleção de memória do chat (scope 'chat'). */
-  chatId?: string
   category?: MemoryCategory
   query?: string
 }
@@ -94,13 +88,11 @@ export interface MemoryConfig {
   collections: string[]
   /**
    * Coleção de escrita por categoria (uma das ativas daquela categoria). Ausente/null = o modelo não
-   * grava naquela categoria (só na memória do chat, se ligada). Também é o destino de memory_rewrite.
+   * grava naquela categoria. Também é o destino de memory_rewrite.
    */
   writeTo: Partial<Record<MemoryCategory, string | null>>
   /** Categorias ligadas (padrão: todas). Desligar uma categoria ignora suas coleções sem perder a seleção. */
   categories: MemoryCategory[]
-  /** Memória própria do chat: uma coleção scope 'chat' por categoria, criada sob demanda (só no chat; personas ignoram). */
-  chatMemory: boolean
   /** Texto de auxílio anexado ao system prompt. text null = padrão. */
   helpPrompt: { enabled: boolean; text: string | null }
   /** Extração automática após a compactação + botão "Extrair memórias agora". prompt/model null = padrão/modelo do chat. */
@@ -120,7 +112,6 @@ export function defaultMemoryConfig(): MemoryConfig {
     collections: [],
     writeTo: {},
     categories: [...MEMORY_CATEGORIES],
-    chatMemory: false,
     helpPrompt: { enabled: false, text: null },
     extraction: { auto: false, prompt: null, providerId: null, model: null },
     subagents: false
@@ -158,7 +149,7 @@ const strOrNull = (v: unknown): string | null => (typeof v === 'string' && v.tri
 /**
  * Config completa a partir de qualquer valor salvo (ausente/parcial/inválido → padrões). Listas sem
  * duplicatas; `writeTo` só com categorias válidas (o valor é conferido contra as coleções ativas
- * na resolução — ver main/memory/config.ts).
+ * na resolução — ver main/memory/config.ts). Campos legados (ex.: `chatMemory`) são descartados.
  */
 export function normalizeMemoryConfig(v: unknown): MemoryConfig {
   const d = defaultMemoryConfig()
@@ -181,7 +172,6 @@ export function normalizeMemoryConfig(v: unknown): MemoryConfig {
     collections,
     writeTo,
     categories,
-    chatMemory: src.chatMemory === true,
     helpPrompt: { enabled: hp.enabled === true, text: strOrNull(hp.text) },
     extraction: {
       auto: ex.auto === true,

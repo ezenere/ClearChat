@@ -36,8 +36,8 @@ export interface MemoryMockDeps {
     createdAt?: number
   ) => StoredMessage
   delay: <T>(v: T, ms?: number) => Promise<T>
-  /** Cenário "memory": coleções/memórias de chat do chat c5. */
-  withChatData: boolean
+  /** Cenário "memory": memórias gravadas no chat c5 e snapshot do índice da s5. */
+  withScenario: boolean
 }
 
 let seq = 0
@@ -61,9 +61,7 @@ export const MOCK_COLS = {
   clearchat: 'col-clearchat',
   people: 'col-people',
   family: 'col-family',
-  prefs: 'col-prefs',
-  chatAreas: 'col-chat-c5-areas',
-  chatPeople: 'col-chat-c5-people'
+  prefs: 'col-prefs'
 } as const
 
 /** Config de memória da persona "Assistente pessoal" do cenário. */
@@ -88,14 +86,13 @@ export function mockPersonaMemory(): MemoryConfig {
   }
 }
 
-/** Config do chat c5: herda da persona, + Projeto TCC (escrita em Áreas), − Tópicos, memória do chat. */
+/** Config do chat c5: herda da persona, + Projeto TCC (escrita em Áreas), − Tópicos, extração automática. */
 export function mockChatMemory(): MemoryConfig {
   const p = mockPersonaMemory()
   return {
     ...p,
     collections: [...p.collections.filter((c) => c !== MOCK_COLS.topics), MOCK_COLS.tcc],
     writeTo: { ...p.writeTo, areas: MOCK_COLS.tcc },
-    chatMemory: true,
     extraction: { auto: true, prompt: null, providerId: null, model: null }
   }
 }
@@ -107,16 +104,13 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
     category: MemoryCategory,
     name: string,
     description: string,
-    icon: string | null = null,
-    chatId: string | null = null
+    icon: string | null = null
   ): MemoryCollection => ({
     id,
     category,
     name,
     description,
     icon,
-    scope: chatId ? 'chat' : 'shared',
-    chatId,
     createdAt: now - 30 * D,
     updatedAt: now - 2 * D
   })
@@ -142,11 +136,6 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
     col(MOCK_COLS.family, 'people', 'Família', 'Família e bichos', '🏡'),
     col(MOCK_COLS.prefs, 'preferences', 'Padrão', 'Como eu gosto das respostas')
   ]
-  if (deps.withChatData)
-    collections.push(
-      col(MOCK_COLS.chatAreas, 'areas', 'Este chat', '', null, 'c5'),
-      col(MOCK_COLS.chatPeople, 'people', 'Este chat', '', null, 'c5')
-    )
 
   const mem = (
     id: string,
@@ -303,11 +292,11 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       { pinned: true, updatedAt: now - 10 * D }
     )
   ]
-  if (deps.withChatData)
+  if (deps.withScenario)
     memories.push(
       mem(
         'm-cap3',
-        MOCK_COLS.chatAreas,
+        MOCK_COLS.tcc,
         'Capítulo 3 em revisão',
         'Seções 3.2 e 3.4 precisam de figuras novas',
         ['Figura do merge de RGA está desatualizada', 'Faltam benchmarks com 10k operações'],
@@ -315,7 +304,7 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       ),
       mem(
         'm-helena',
-        MOCK_COLS.chatPeople,
+        MOCK_COLS.people,
         'Banca: Profa. Helena',
         'Convidada para a banca do TCC',
         ['Especialista em sistemas distribuídos'],
@@ -324,7 +313,7 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
     )
 
   const snapshots = new Map<string, number>()
-  if (deps.withChatData) snapshots.set('s5', now - 40 * 60_000)
+  if (deps.withScenario) snapshots.set('s5', now - 40 * 60_000)
 
   const changed = (collectionId: string | null, memoryId: string | null): void =>
     emit({ type: 'memory-changed', collectionId, memoryId })
@@ -349,20 +338,14 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
     const s = deps.sessions.find((x) => x.id === sessionId)
     return s ? deps.chats.find((c) => c.id === s.chatId) : undefined
   }
-  const activeCols = (cfg: MemoryConfig, chatId: string): MemoryCollection[] =>
-    collections.filter(
-      (c) =>
-        (c.scope === 'shared' &&
-          cfg.collections.includes(c.id) &&
-          cfg.categories.includes(c.category)) ||
-        (c.scope === 'chat' && cfg.chatMemory && c.chatId === chatId)
-    )
+  const activeCols = (cfg: MemoryConfig): MemoryCollection[] =>
+    collections.filter((c) => cfg.collections.includes(c.id) && cfg.categories.includes(c.category))
 
   const render = (sessionId: string): MemoryPreview => {
     const chat = chatOf(sessionId)
     const cfg = memoryConfigOf(chat?.config)
-    const cols = chat ? activeCols(cfg, chat.id) : []
-    const active = !!chat && cfg.enabled && (cols.length > 0 || cfg.chatMemory)
+    const cols = chat ? activeCols(cfg) : []
+    const active = !!chat && cfg.enabled && cols.length > 0
     if (!active) return { active: false, index: null, help: null, tools: [], snapshotAt: null }
     const superseded = new Set(
       memories
@@ -378,10 +361,9 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       if (!inCat.length) continue
       lines.push('', `## ${MEMORY_CATEGORY_LABELS[cat]}`)
       for (const c of inCat) {
-        const write = c.scope === 'chat' || cfg.writeTo[cat] === c.id
-        const name = c.scope === 'chat' ? 'Este chat (memória do chat)' : c.name
+        const write = cfg.writeTo[cat] === c.id
         lines.push(
-          `### ${name} [${write ? 'escrita' : 'leitura'}]${c.description ? ` — ${c.description}` : ''}`
+          `### ${c.name} [${write ? 'escrita' : 'leitura'}]${c.description ? ` — ${c.description}` : ''}`
         )
         const list = memories.filter((m) => m.collectionId === c.id && !superseded.has(m.id))
         if (!list.length) lines.push('(vazia)')
@@ -392,7 +374,9 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       }
     }
     lines.push('</memory>')
-    const writes = MEMORY_CATEGORIES.some((c) => cfg.writeTo[c]) || cfg.chatMemory
+    const writes = MEMORY_CATEGORIES.some(
+      (c) => cfg.writeTo[c] && cols.some((x) => x.id === cfg.writeTo[c])
+    )
     return {
       active: true,
       index: lines.join('\n'),
@@ -414,8 +398,6 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
         name: input.name.trim(),
         description: input.description ?? '',
         icon: input.icon ?? null,
-        scope: 'shared',
-        chatId: null,
         createdAt: Date.now(),
         updatedAt: Date.now()
       }
@@ -452,11 +434,6 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       const out = memories
         .filter((m) => !query?.collectionId || m.collectionId === query.collectionId)
         .filter((m) => !query?.category || m.category === query.category)
-        .filter(
-          (m) =>
-            !query?.chatId ||
-            collections.some((c) => c.id === m.collectionId && c.chatId === query.chatId)
-        )
         .filter((m) => {
           if (!terms.length) return true
           const hay = [m.title, m.summary, ...m.facts]
@@ -529,11 +506,9 @@ export function createMemoryMock(deps: MemoryMockDeps): ClearApi['memory'] {
       await delay(undefined, 1400)
       if (!chat || !p.active) throw new Error('A memória não está ativa neste chat.')
       const cfg = memoryConfigOf(chat.config)
-      const target =
-        (cfg.writeTo.areas && collections.find((c) => c.id === cfg.writeTo.areas)) ||
-        collections.find(
-          (c) => c.scope === 'chat' && c.chatId === chat.id && c.category === 'areas'
-        )
+      const target = cfg.writeTo.areas
+        ? collections.find((c) => c.id === cfg.writeTo.areas)
+        : undefined
       const changes: MemoryExtractionResult['changes'] = []
       if (target) {
         const m: Memory = {

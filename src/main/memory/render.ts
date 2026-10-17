@@ -34,7 +34,7 @@ export function indexGroups(store: MemoryStore, am: ActiveMemory): IndexGroup[] 
   const groups: IndexGroup[] = []
   for (const cat of am.categories) {
     const cols = am.byCategory[cat] ?? []
-    if (!cols.length && !am.chatMemory && !am.writeTo[cat]) continue
+    if (!cols.length) continue
     groups.push({
       category: cat,
       collections: cols.map((c) => ({
@@ -54,8 +54,6 @@ export interface RenderOptions {
   maxChars?: number
   /** 'pinned' (padrão: tópicos só das fixadas) | 'all' (extração: todos os tópicos). */
   facts?: 'pinned' | 'all'
-  /** Memória do chat ligada (menciona target "chat" quando ainda não há coleção do chat). */
-  chatMemory?: boolean
   /** Cabeçalho (padrão: o do system prompt). */
   header?: string
 }
@@ -105,20 +103,11 @@ function renderWith(
       '',
       `## ${MEMORY_CATEGORY_LABELS[g.category]} (${g.category}: ${MEMORY_CATEGORY_HINTS[g.category]})`
     )
-    if (!g.collections.length) {
-      out.push(
-        opts.chatMemory
-          ? '(nenhuma memória ainda — grave com memory_write target "chat")'
-          : '(nenhuma memória ainda)'
-      )
-      continue
-    }
     for (const c of g.collections) {
       const col = c.collection
       const kind = c.writable ? 'escrita' : 'leitura'
-      const scope = col.scope === 'chat' ? ' · memória deste chat (target "chat")' : ''
-      out.push(`### ${col.name} — ${kind}${scope}`)
-      if (col.description && col.scope !== 'chat') out.push(col.description)
+      out.push(`### ${col.name} — ${kind}`)
+      if (col.description) out.push(col.description)
       const shown = c.memories.filter((m) => keep.has(m.id))
       for (const m of shown) out.push(entry(m))
       const hidden = c.memories.length - shown.length
