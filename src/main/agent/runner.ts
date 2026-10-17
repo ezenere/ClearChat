@@ -52,6 +52,7 @@ import {
   contextUsage,
   hasCompactableHistory,
   isContextLengthError,
+  isDisplayOnly,
   resolveContextWindow
 } from '@shared/context'
 import { emit } from '../events'
@@ -128,6 +129,8 @@ import {
 } from '@shared/askUser'
 import { cancelQuestion, getQuestion, listQuestions, requestQuestion } from './questions'
 import { resolveAskUserQuestions } from '../askUserImages'
+import { MEMORY_TOOL_NAMES } from '@shared/tools'
+import { afterCompaction, ensureSnapshot, runMemoryToolFor } from '../memory'
 
 export const CANCELLED_TEXT = '[Interrompido pelo usuário antes de concluir]'
 export const DENIED_TEXT = 'O usuário negou a execução desta ferramenta.'
@@ -191,6 +194,8 @@ interface ToolOutcome {
   approval?: ApprovalRecord
   /** ask_user: perguntas mostradas + respostas (card do questionário). */
   askUser?: AskUserRecord
+  /** memory_write/rewrite/delete: o que mudou (card da tool). */
+  memoryChanges?: MessageMeta['memoryChanges']
   durationMs: number
 }
 
@@ -324,6 +329,8 @@ export function repairTail(
   let idx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i].message
+    // card da extração de memórias pode entrar no meio de um turno (só exibição): ignora
+    if (msgs[i].meta.kind === 'memory-extraction') continue
     if (m.role === 'assistant') {
       idx = i
       break
@@ -592,6 +599,8 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
       emit({ type: 'message-added', message: r.message })
       chatsRepo.touch(session.chatId)
     } else append(session.id, { role: 'user', content: m.text }, meta)
+    // memória: o índice congelado é renovado no próximo request; extração automática (se ligada)
+    void afterCompaction(session.id)
     return { kind: 'ok' }
   } finally {
     emit({ type: 'compaction', sessionId: session.id, state: null })
@@ -766,6 +775,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!session.model) return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
 
   const history = messagesRepo.list(session.id)
+  // memória: o índice vai congelado por sessão (snapshot no 1º request; ver memory/service.ts)
+  if (session.depth === 0) ensureSnapshot(chat, session)
   let req: BuiltRequest
   try {
     req = buildRequest(chat, session, history, provider)
@@ -873,6 +884,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       if (r.smartOverride) tmeta.smartOverride = true
       if (r.approval) tmeta.approval = r.approval
       if (r.askUser) tmeta.askUser = r.askUser
+      if (r.memoryChanges?.length) tmeta.memoryChanges = r.memoryChanges
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
         tmeta.kind = 'tool-cancelled'
@@ -1148,6 +1160,14 @@ async function executeTool(
     if (name === 'message_subagent')
       return done(await runMessageSubagent(session, chat, args, signal))
     if (name === 'ask_user') return done(await runAskUser(session, chat, toolCallId, args, signal))
+    if (MEMORY_TOOL_NAMES.includes(name)) {
+      const r = runMemoryToolFor(chat, session, name, args)
+      return done({
+        content: r.content,
+        status: r.status,
+        ...(r.changes?.length ? { memoryChanges: r.changes } : {})
+      })
+    }
     const root = chat.config.cwd
     const provider = name === 'list_models' ? providerFor(chat, session) : null
     const sessionProvider = name === 'read_file' ? providerFor(chat, session) : null
@@ -1507,7 +1527,7 @@ function lastAssistantText(sessionId: string): string {
   const msgs = messagesRepo.list(sessionId)
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
-    if (m.message.role === 'assistant' && m.meta.kind !== 'error') return m.message.content ?? ''
+    if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) return m.message.content ?? ''
   }
   return ''
 }

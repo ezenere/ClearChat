@@ -709,7 +709,8 @@ async function main(): Promise<void> {
       await badge.click()
       const pop = page.getByTestId('auto-approve-popover')
       await pop.waitFor()
-      assert((await pop.getByTestId('auto-approve-item').count()) === 8, '8 itens')
+      // 8 itens + 3 de memória (Gravar, Reescrever e Apagar memória)
+      assert((await pop.getByTestId('auto-approve-item').count()) === 11, '11 itens')
       await pop.getByText('fake/judge-1'.split('/').pop()!).waitFor()
       assert((await pop.getByRole('switch').count()) === 0, 'sem liga/desliga no popover')
       await sleep(400) // animação de entrada

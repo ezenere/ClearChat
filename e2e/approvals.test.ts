@@ -436,7 +436,10 @@ test('modos: padrão global, override do chat, normalização', () => {
     writeFile: 'always',
     editFile: 'always',
     sendToChat: 'always',
-    delegate: 'always'
+    delegate: 'always',
+    memory_write: 'always',
+    memory_rewrite: 'always',
+    memory_delete: 'always'
   })
   assert.deepEqual(normalizeApprovalModes({ commands: 'always', pages: 'x' }), {
     ...DEFAULT_APPROVAL_MODES,

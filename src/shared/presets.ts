@@ -3,6 +3,7 @@
 import type { ChatConfig, ChatParams, Preset } from './types'
 import { migrateConfigTools } from './toolRename'
 import { migrateLegacyApprovals, normalizeChatModes } from './approvalPolicy'
+import { normalizeMemoryConfig, type MemoryConfig } from './memory'
 
 export type PresetConfig = Partial<ChatConfig>
 
@@ -16,7 +17,8 @@ export const PRESETS_SEEDED_SETTING = 'presetsSeeded'
 
 /**
  * Campos de ChatConfig que uma persona guarda. Ficam de fora: `cwd` (opcional — "incluir
- * diretório raiz") e `presetId` (informativo, do chat).
+ * diretório raiz") e `presetId` (informativo, do chat). `memory`: a persona não tem memória do chat
+ * (`chatMemory` é sempre false nela e aplicar a persona mantém o do chat — ver applyPreset).
  */
 export const PRESET_FIELDS = [
   'providerId',
@@ -76,7 +78,9 @@ export function sanitizePresetConfig(cfg: unknown): PresetConfig {
         ? cleanParams(src[k] as ChatParams)
         : k === 'approvalModes'
           ? normalizeChatModes(src[k])
-          : clone(src[k])
+          : k === 'memory'
+            ? { ...normalizeMemoryConfig(src[k]), chatMemory: false }
+            : clone(src[k])
   }
   if (out.approvalModes && !Object.keys(out.approvalModes as object).length)
     delete out.approvalModes
@@ -106,11 +110,15 @@ export function snapshotPreset(
  */
 export function applyPreset(base: ChatConfig, preset: PresetConfig | null | undefined): ChatConfig {
   const p = sanitizePresetConfig(preset ?? {})
-  return {
+  const out: ChatConfig = {
     ...clone(base),
     ...p,
     params: { ...cleanParams(base.params), ...(p.params ?? {}) }
   }
+  // memória do chat é do chat: a persona nunca a liga nem desliga
+  if (p.memory)
+    out.memory = { ...p.memory, chatMemory: base.memory?.chatMemory === true } as MemoryConfig
+  return out
 }
 
 /** Mescla um patch (com semântica de chat: params nulos = remover) num rascunho de persona. */

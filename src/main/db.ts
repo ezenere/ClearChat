@@ -6,6 +6,7 @@ import { migrateToolShellRename } from './migrateTools'
 import { migrateApprovalModes, migrateSmartApproveItems } from './migrateApprovals'
 import { SCHEMA } from './dbSchema'
 import { ensureSearchIndex } from './searchIndex'
+import { ensureMemorySchema } from './memory/schema'
 
 let db: Database.Database | null = null
 
@@ -67,6 +68,12 @@ function migrate(conn: Database.Database): void {
       console.log(`[clearchat] migração do Smart-Approve: ${r.chats} chats, ${r.presets} personas`)
   } catch (e) {
     console.error('[clearchat] migração do Smart-Approve', e)
+  }
+  // memória modular: coleções, memórias, FTS e sessions.memory_json (idempotente)
+  try {
+    ensureMemorySchema(conn)
+  } catch (e) {
+    console.error('[clearchat] schema da memória', e)
   }
   // índice FTS5 das mensagens (read_history em outros chats) — cria/popula uma vez; depois o repo mantém
   try {

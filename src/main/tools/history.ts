@@ -4,6 +4,7 @@
 // "all"): HistoryStore (consultas + índice FTS5, ver searchIndex.ts) — e2e/historySearch.test.ts.
 import { contentText, messageAttachments, toolContentText } from '@shared/attachments'
 import { LIMITS } from '@shared/limits'
+import { isDisplayOnly } from '@shared/context'
 import type { ApiMessage, StoredMessage } from '@shared/types'
 import {
   fail,
@@ -48,7 +49,7 @@ const clampInt = (v: number | undefined, def: number, max: number): number =>
 
 /** Mensagens consultáveis: tudo menos erros só de exibição, em ordem de seq. */
 export function historyMessages(history: StoredMessage[]): StoredMessage[] {
-  return history.filter((m) => m.meta?.kind !== 'error').sort((a, b) => a.seq - b.seq)
+  return history.filter((m) => !isDisplayOnly(m.meta)).sort((a, b) => a.seq - b.seq)
 }
 
 function toolNameMap(msgs: StoredMessage[]): Map<string, string> {

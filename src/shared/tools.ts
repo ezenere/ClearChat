@@ -1,7 +1,7 @@
 // Definições das tools no formato OpenAI (`tools: [{ type: 'function', function }]`).
 // Compartilhadas: o main as envia na request; o renderer as mostra no (i) de cada tool.
 import type { ToolName } from './types'
-import { LIMITS } from './limits'
+import { LIMITS, MEMORY_LIMITS as ML } from './limits'
 import { ASK_USER_LIMITS as AL } from './askUser'
 import { shellDescriptionPrefix, toolShellInfo, type ShellInfoLite } from './shellInfo'
 
@@ -66,6 +66,21 @@ export const TOOL_NAMES: ToolName[] = [
   'ask_user'
 ]
 
+/**
+ * Tools da memória modular (SPEC → Memória). NÃO entram em TOOL_NAMES/enabledTools: a
+ * disponibilidade vem de ChatConfig.memory (ligada + algo ativo; escrita só com destino de escrita;
+ * subagentes só search/read com `memory.subagents`). Vão no fim da lista de tools, nesta ordem.
+ */
+export const MEMORY_TOOL_NAMES: ToolName[] = [
+  'memory_search',
+  'memory_read',
+  'memory_write',
+  'memory_rewrite',
+  'memory_delete'
+]
+/** Tools de memória que gravam (passam pelo gate de aprovação; nunca para subagentes). */
+export const MEMORY_WRITE_TOOLS: ToolName[] = ['memory_write', 'memory_rewrite', 'memory_delete']
+
 /** Rótulos curtos (pt-BR) para a UI. */
 export const TOOL_LABELS: Record<ToolName, string> = {
   list_dir: 'Listar pasta',
@@ -91,7 +106,12 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   wait_subagents: 'Aguardar subagentes',
   cancel_subagent: 'Cancelar subagente',
   message_subagent: 'Mensagem ao subagente',
-  ask_user: 'Perguntar ao usuário'
+  ask_user: 'Perguntar ao usuário',
+  memory_search: 'Buscar memória',
+  memory_read: 'Ler memória',
+  memory_write: 'Gravar memória',
+  memory_rewrite: 'Reescrever memória',
+  memory_delete: 'Apagar memória'
 }
 
 const def = (
@@ -110,6 +130,111 @@ const def = (
 
 const L = LIMITS
 const n = (v: number): string => v.toLocaleString('pt-BR')
+
+const MEMORY_CATEGORY_ENUM = ['profile', 'topics', 'areas', 'people', 'preferences']
+
+/** Taxonomia fixa (descrição de memory_write). */
+const MEMORY_TAXONOMY =
+  'Categorias: profile = quem é o usuário (identidade, profissão, formação, onde vive); topics = hábitos e interesses recorrentes; areas = frentes ativas (projetos, tarefas em andamento, metas); people = pessoas (e animais) da vida do usuário — uma memória por pessoa; preferences = como o usuário quer que o chat se comporte (tom, formato, idioma, o que evitar).'
+
+const MEMORY_OPS_PROP: JsonSchemaProp = {
+  type: 'array',
+  description:
+    'Alterações nos tópicos (fatos curtos), aplicadas em ordem: add (novo tópico em `fact`), remove (`fact` = texto do tópico ou "#n"), replace (`fact` = tópico atual ou "#n", `with` = texto novo).',
+  items: {
+    type: 'object',
+    properties: {
+      op: { type: 'string', enum: ['add', 'remove', 'replace'] },
+      fact: {
+        type: 'string',
+        description: 'Tópico (add) ou o tópico atual / "#n" (remove, replace).'
+      },
+      with: { type: 'string', description: 'replace: texto novo do tópico.' }
+    },
+    required: ['op', 'fact'],
+    additionalProperties: false
+  }
+}
+
+const MEMORY_TARGET_PROP: JsonSchemaProp = {
+  type: 'string',
+  enum: ['shared', 'chat'],
+  description:
+    'shared (padrão) = coleção de escrita da categoria (vale para outros chats); chat = memória só deste chat.'
+}
+
+export const MEMORY_TOOL_DEFINITIONS = {
+  memory_search: def(
+    'memory_search',
+    `Busca nas memórias ativas deste chat (título, resumo e tópicos; sem acento/caixa). Retorna id, categoria, coleção (escrita/leitura), título, resumo e trecho. Use quando o índice não bastar para responder sobre o usuário, pessoas ou projetos, e antes de criar uma memória. Padrão ${ML.searchDefaultResults} resultados (máx. ${ML.searchMaxResults}).`,
+    {
+      query: { type: 'string', description: 'Palavras a buscar.' },
+      category: {
+        type: 'string',
+        enum: MEMORY_CATEGORY_ENUM,
+        description: 'Só esta categoria.'
+      },
+      collection: { type: 'string', description: 'Só esta coleção (id ou nome).' },
+      limit: { type: 'number', description: `Máximo de resultados (máx. ${ML.searchMaxResults}).` }
+    },
+    ['query']
+  ),
+  memory_read: def(
+    'memory_read',
+    `Lê memórias completas (título, resumo, todos os tópicos, coleção, última atualização) pelos ids do índice/busca (ou slugs de [[slug]]). Até ${ML.readMaxIds} por chamada; só memórias de coleções ativas.`,
+    {
+      ids: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Ids (ou slugs) das memórias.'
+      }
+    },
+    ['ids']
+  ),
+  memory_write: def(
+    'memory_write',
+    `Grava um fato durável sobre o usuário. ${MEMORY_TAXONOMY} Sem id → cria na coleção de escrita da categoria; se já existir memória parecida, nada é criado e as candidatas voltam: repita com o id (ou force_new se for outro assunto). Com id → atualiza (só memórias graváveis; memória de coleção só de leitura → memory_rewrite). Global × chat: o que serve fora desta conversa → target "shared" (padrão); o que só importa para a tarefa deste chat → target "chat". Discrepância: se o usuário disser algo que contradiz uma memória, corrija-a (replace/remove) em vez de criar outra. Tópicos curtos e factuais (≤ ${ML.factChars} caracteres, ≤ ${ML.maxFacts} por memória); título ≤ ${ML.titleChars}; resumo ≤ ${ML.summaryChars} (uma frase). Cite outra memória com [[slug]].`,
+    {
+      category: {
+        type: 'string',
+        enum: MEMORY_CATEGORY_ENUM,
+        description: 'Categoria (obrigatória ao criar; ao atualizar vem da memória).'
+      },
+      target: MEMORY_TARGET_PROP,
+      id: { type: 'string', description: 'Memória a atualizar (omita para criar).' },
+      title: { type: 'string', description: 'Título curto (assunto da memória).' },
+      summary: { type: 'string', description: 'Resumo de uma frase (aparece no índice).' },
+      ops: MEMORY_OPS_PROP,
+      force_new: {
+        type: 'boolean',
+        description: 'Criar mesmo havendo candidatas parecidas (só se forem outro assunto).'
+      }
+    }
+  ),
+  memory_rewrite: def(
+    'memory_rewrite',
+    'Corrige uma memória de coleção SÓ DE LEITURA: cria uma versão atualizada na coleção de escrita da categoria (ou na memória do chat, target "chat") que a substitui neste chat; a original fica intacta na coleção dela. Em memória gravável equivale a memory_write com id. Passe facts (lista completa nova) ou ops (alterações sobre os tópicos atuais).',
+    {
+      id: { type: 'string', description: 'Memória a reescrever.' },
+      target: MEMORY_TARGET_PROP,
+      title: { type: 'string', description: 'Novo título (padrão: o atual).' },
+      summary: { type: 'string', description: 'Novo resumo (padrão: o atual).' },
+      facts: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Lista completa nova de tópicos (substitui os atuais).'
+      },
+      ops: MEMORY_OPS_PROP
+    },
+    ['id']
+  ),
+  memory_delete: def(
+    'memory_delete',
+    'Apaga uma memória gravável (da coleção de escrita da categoria ou da memória deste chat) que ficou errada ou obsoleta. Para corrigir parte dela, prefira memory_write com ops.',
+    { id: { type: 'string', description: 'Memória a apagar.' } },
+    ['id']
+  )
+} satisfies Partial<Record<ToolName, ToolDefinition>>
 
 export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   list_dir: def(
@@ -506,7 +631,8 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
       }
     },
     ['questions']
-  )
+  ),
+  ...MEMORY_TOOL_DEFINITIONS
 }
 
 /** Definição da tool `shell` com o shell detectado na descrição (null = genérica). */

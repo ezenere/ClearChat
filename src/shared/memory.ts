@@ -149,3 +149,46 @@ export interface MemoryExtractionResult {
   }[]
   error?: string
 }
+
+export const isMemoryCategory = (v: unknown): v is MemoryCategory =>
+  typeof v === 'string' && (MEMORY_CATEGORIES as readonly string[]).includes(v)
+
+const strOrNull = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null)
+
+/**
+ * Config completa a partir de qualquer valor salvo (ausente/parcial/inválido → padrões). Listas sem
+ * duplicatas; `writeTo` só com categorias válidas (o valor é conferido contra as coleções ativas
+ * na resolução — ver main/memory/config.ts).
+ */
+export function normalizeMemoryConfig(v: unknown): MemoryConfig {
+  const d = defaultMemoryConfig()
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return d
+  const src = v as Record<string, unknown>
+  const collections = Array.isArray(src.collections)
+    ? [...new Set(src.collections.filter((x): x is string => typeof x === 'string' && !!x))]
+    : d.collections
+  const writeTo: MemoryConfig['writeTo'] = {}
+  if (src.writeTo && typeof src.writeTo === 'object')
+    for (const [k, val] of Object.entries(src.writeTo as Record<string, unknown>))
+      if (isMemoryCategory(k)) writeTo[k] = typeof val === 'string' && val ? val : null
+  const categories = Array.isArray(src.categories)
+    ? MEMORY_CATEGORIES.filter((c) => (src.categories as unknown[]).includes(c))
+    : d.categories
+  const hp = (src.helpPrompt ?? {}) as Record<string, unknown>
+  const ex = (src.extraction ?? {}) as Record<string, unknown>
+  return {
+    enabled: src.enabled === true,
+    collections,
+    writeTo,
+    categories,
+    chatMemory: src.chatMemory === true,
+    helpPrompt: { enabled: hp.enabled === true, text: strOrNull(hp.text) },
+    extraction: {
+      auto: ex.auto === true,
+      prompt: strOrNull(ex.prompt),
+      providerId: strOrNull(ex.providerId),
+      model: strOrNull(ex.model)
+    },
+    subagents: src.subagents === true
+  }
+}
