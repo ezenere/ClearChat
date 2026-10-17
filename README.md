@@ -315,6 +315,12 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-e2e npm run test:e2e:memory
 # Configurações → Memórias, aba Memória, persona, cards; screenshots 1280x820 e 900x600 em $CLEARCHAT_E2E_DIR/shots)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-ui-e2e npm run test:e2e:memory-ui
 
+# E2E do layout do chat contra o mock (composer flutuante sobre a lista: cada estado da pilha de baixo —
+# multi-linha, anexos, fila, aprovações, questionário, falha de conexão, rodando, subsessão, banner de contexto —
+# visível/clicável, padding do fim = altura da pilha, "ir para o fim"; tabelas markdown sem palavras partidas;
+# screenshots 1280x820 / 900x600 em $CLEARCHAT_E2E_DIR/shots)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-overlay-e2e npm run test:e2e:overlay
+
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui
 # para depois de um passo (os passos são dependentes):

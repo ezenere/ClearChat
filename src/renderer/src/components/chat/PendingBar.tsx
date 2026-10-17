@@ -56,7 +56,7 @@ export function PendingBar({
 
   if (!queue.length && !failures.length) return null
   return (
-    <div className="mb-2 space-y-1.5">
+    <div className="mb-2 space-y-1.5" data-stack-extra>
       {failures.slice(0, 3).map((f) => (
         <FailureNotice key={f.sessionId} failure={f} onDismiss={() => dismiss(f.sessionId)} />
       ))}

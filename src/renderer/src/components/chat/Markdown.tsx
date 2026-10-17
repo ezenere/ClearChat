@@ -10,6 +10,7 @@ import remarkMath from 'remark-math'
 import { normalizeFences } from '../../lib/fences'
 import { cn } from '../../lib/format'
 import { normalizeMath } from '../../lib/math'
+import { tableMinWidthEm, type HastLike } from '../../lib/tableWidth'
 
 function textOf(node: ReactNode): string {
   if (node == null || typeof node === 'boolean') return ''
@@ -69,6 +70,14 @@ function CodeBlock({ children }: { children?: ReactNode }): React.JSX.Element {
 
 const components: Components = {
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+  // tabela larga rola na horizontal dentro do próprio container (as colunas não são espremidas)
+  table: ({ children, node }) => (
+    <div className="md-table">
+      <table style={node ? { minWidth: `${tableMinWidthEm(node as HastLike)}em` } : undefined}>
+        {children}
+      </table>
+    </div>
+  ),
   a: ({ href, children }) => (
     <a href={href} target="_blank" rel="noreferrer">
       {children}

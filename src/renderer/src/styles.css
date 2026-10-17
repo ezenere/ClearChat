@@ -269,19 +269,32 @@
   border-radius: 5px;
   color: #e9d5ff;
 }
+.md .md-table {
+  margin: 0.9em 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+/* Colunas pelo conteúdo (table-layout auto): nenhuma fica mais estreita que a maior palavra dela —
+   o `overflow-wrap: anywhere` do .md reduziria o min-content da célula a um caractere ("Tra/jetó/ria").
+   Passou da largura → o .md-table rola na horizontal. */
 .md table {
   border-collapse: collapse;
-  margin: 0.9em 0;
   font-size: 13px;
-  display: block;
-  overflow-x: auto;
-  max-width: 100%;
+  table-layout: auto;
 }
 .md th,
 .md td {
   border: 1px solid var(--color-border);
   padding: 0.4em 0.75em;
   text-align: left;
+  word-break: normal;
+  overflow-wrap: break-word;
+  hyphens: manual;
+}
+/* URLs e código longos dentro da célula ainda podem quebrar (só eles) */
+.md td :is(a, code),
+.md th :is(a, code) {
+  overflow-wrap: anywhere;
 }
 .md th {
   background: var(--color-surface);
@@ -301,7 +314,7 @@
 }
 
 /* Cursor de streaming */
-.stream-caret > :last-child:not(ul, ol, pre, table, blockquote)::after,
+.stream-caret > :last-child:not(ul, ol, pre, table, blockquote, .md-table)::after,
 .stream-caret > :is(ul, ol):last-child > li:last-child::after,
 .stream-caret > blockquote:last-child > :last-child::after,
 .stream-caret:empty::after {
@@ -314,4 +327,25 @@
   border-radius: 2px;
   background: var(--color-accent-strong);
   animation: pulse-soft 1s ease-in-out infinite;
+}
+
+/* Composer flutuante (ChatView → ChatStage): degradê atrás da pilha de baixo, do transparente (40px
+   acima dela) ao fundo — o conteúdo da lista aparece ao lado do composer e some sob a parte de baixo
+   dele. Com fila / pendências / banner de contexto acima do campo, o fundo fica sólido a partir do
+   topo da pilha (o texto deles não se mistura com as mensagens). */
+.composer-fade {
+  background: linear-gradient(
+    to bottom,
+    transparent 0,
+    color-mix(in srgb, var(--color-bg) 72%, transparent) 45%,
+    var(--color-bg) calc(100% - 44px)
+  );
+}
+[data-composer-stack]:has([data-stack-extra]) .composer-fade {
+  background: linear-gradient(
+    to bottom,
+    transparent 0,
+    color-mix(in srgb, var(--color-bg) 78%, transparent) 24px,
+    var(--color-bg) 40px
+  );
 }

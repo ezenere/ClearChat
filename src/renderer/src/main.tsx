@@ -11,6 +11,9 @@ async function start(): Promise<void> {
   if (import.meta.env.VITE_CLEAR_MOCK === '1') {
     const { createMockApi } = await import('./dev/mockApi')
     installApi(createMockApi(new URLSearchParams(location.search).get('scenario') ?? 'chat'))
+    // estado do app acessível aos E2E contra o mock (só neste build)
+    const { useStore } = await import('./store')
+    ;(window as unknown as { __clearStore?: typeof useStore }).__clearStore = useStore
   }
   createRoot(document.getElementById('root')!).render(
     <StrictMode>

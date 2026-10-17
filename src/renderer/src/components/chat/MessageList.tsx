@@ -1212,8 +1212,8 @@ export function MessageList({
     const ro = new ResizeObserver(() => {
       if (pinned.current) el.scrollTop = el.scrollHeight
     })
-    ro.observe(content)
-    // o scroller encolhe quando algo aparece acima do composer (fila de aprovações, avisos)
+    // border-box: o padding do fim acompanha o composer flutuante (cresce com fila, anexos, texto)
+    ro.observe(content, { box: 'border-box' })
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
@@ -1380,8 +1380,18 @@ export function MessageList({
 
   return (
     <div className="relative min-h-0 flex-1">
-      <div ref={scroller} onScroll={onScroll} className="absolute inset-0 overflow-y-auto">
-        <div ref={inner} className="mx-auto w-full max-w-[780px] px-8 pt-6 pb-10">
+      <div
+        ref={scroller}
+        onScroll={onScroll}
+        data-chat-scroller
+        data-testid="chat-scroller"
+        className="absolute inset-0 scroll-pt-6 scroll-pb-[calc(var(--chat-bottom-inset,0px)+16px)] overflow-y-auto [scrollbar-gutter:stable]"
+      >
+        {/* o fim fica acima do composer flutuante (--chat-bottom-inset = altura da pilha de baixo) */}
+        <div
+          ref={inner}
+          className="mx-auto w-full max-w-[1920px] px-8 pt-6 pb-[calc(var(--chat-bottom-inset,140px)+24px)]"
+        >
           {loaded && messages.length === 0 && !draft && !busy && empty}
           {oldMsgs.length > 0 && showOld && (
             <div
@@ -1457,8 +1467,9 @@ export function MessageList({
             const el = scroller.current
             if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
           }}
-          className="absolute bottom-3 left-1/2 flex size-8 -translate-x-1/2 animate-pop-in items-center justify-center rounded-full border border-border-strong bg-elevated text-muted shadow-popover hover:text-fg"
+          className="absolute bottom-[calc(var(--chat-bottom-inset,0px)+10px)] left-1/2 z-30 flex size-8 -translate-x-1/2 animate-pop-in items-center justify-center rounded-full border border-border-strong bg-elevated text-muted shadow-popover hover:text-fg"
           aria-label="Ir para o fim"
+          data-testid="scroll-to-bottom"
         >
           <ArrowDown className="size-4" />
         </button>

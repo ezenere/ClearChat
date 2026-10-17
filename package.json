@@ -28,6 +28,7 @@
     "test:e2e:retry": "electron-vite build && node e2e/network-retry.spec.ts",
     "test:e2e:queue": "electron-vite build && node e2e/approval-queue.spec.ts",
     "test:e2e:memory-ui": "node e2e/memory-ui.spec.ts",
+    "test:e2e:overlay": "node e2e/chat-overlay.spec.ts",
     "icons": "scripts/icons/render.sh",
     "dist": "npm run typecheck && electron-vite build && electron-builder --linux",
     "dist:appimage": "npm run typecheck && electron-vite build && electron-builder --linux AppImage",

@@ -55,6 +55,8 @@ export function createMockApi(scenario: string): ClearApi {
     }
   ]
   const emit = (e: AgentEvent): void => listeners.forEach((l) => l(e))
+  // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
+  ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
 
   const providers: Provider[] =
     scenario === 'onboarding'
@@ -1166,6 +1168,20 @@ export function createMockApi(scenario: string): ClearApi {
     },
     agent: {
       send: async (sid, text, atts) => {
+        // agente ocupado → fila (chips acima do composer), como no backend
+        const ss = sessions.find((x) => x.id === sid)
+        if (ss && ['running', 'waiting', 'awaiting_approval'].includes(ss.status)) {
+          const item: QueuedMessage = {
+            id: id('q'),
+            sessionId: sid,
+            text,
+            ...(atts?.length ? { attachments: atts } : {}),
+            createdAt: Date.now()
+          }
+          queues[sid] = [...(queues[sid] ?? []), item]
+          emit({ type: 'queue-updated', sessionId: sid, queue: queues[sid] })
+          return { queued: true }
+        }
         const m = msg(sid, {
           role: 'user',
           content: atts?.length

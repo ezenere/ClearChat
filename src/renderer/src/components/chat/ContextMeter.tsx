@@ -147,6 +147,7 @@ export function CompactBanner({
   return (
     <div
       data-testid="compact-banner"
+      data-stack-extra
       className="mb-2 flex animate-slide-up items-center gap-2.5 rounded-xl border border-warning/25 bg-warning/[0.06] py-1.5 pr-1.5 pl-3 text-[12.5px]"
     >
       <Gauge className="size-3.5 shrink-0 text-warning" />

@@ -12,7 +12,7 @@ import {
   Sparkles,
   Square
 } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import type { ApprovalItem, ApprovalMode, Chat, ChatConfig, Session } from '@shared/types'
 import { CONFIRM_TOOLS } from '@shared/types'
@@ -30,6 +30,7 @@ import { providerKind } from '@shared/providerKinds'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
 import { isBusy, useStore } from '../../store'
 import { api } from '../../lib/api'
+import { anchorTracker } from '../../lib/useAnchor'
 import { TaskInfo } from '../apiDocs'
 import { TopBar } from '../TopBar'
 import { IconButton } from '../ui/controls'
@@ -391,7 +392,7 @@ function SubBanner({ chat, session }: { chat: Chat; session: Session }): React.J
   const parentLabel = parent ? (parent.depth === 0 ? 'principal' : sessionLabel(parent)) : 'pai'
   return (
     <div className="shrink-0 border-b border-border/70 bg-accent-soft/40 px-8">
-      <div className="mx-auto flex h-10 max-w-[780px] items-center gap-2 text-[12.5px]">
+      <div className="mx-auto flex h-10 max-w-[1920px] items-center gap-2 text-[12.5px]">
         <Bot className="size-3.5 shrink-0 text-accent-strong" />
         <span data-testid="sub-banner" className="min-w-0 truncate text-muted">
           Conversando com o subagente{' '}
@@ -509,13 +510,72 @@ export function ChatView({
         </div>
       )}
       {isSub && <SubBanner chat={chat} session={session} />}
+      <ChatStage chat={chat} session={session} />
+    </div>
+  )
+}
+
+/**
+ * Lista de mensagens + composer flutuando por cima dela (estilo Claude desktop): o scroller ocupa
+ * a área toda e a pilha de baixo (fila, pendências, composer) fica absoluta no rodapé, sobre um
+ * degradê transparente → fundo. A altura da pilha vira `--chat-bottom-inset` (padding do fim da
+ * lista e posição do "ir para o fim") e a margem do observador de âncoras (card coberto pelo
+ * composer não conta como visível). Sem re-render: só variável CSS.
+ */
+function ChatStage({ chat, session }: { chat: Chat; session: Session }): React.JSX.Element {
+  const isSub = session.depth > 0
+  const area = useRef<HTMLDivElement>(null)
+  const stack = useRef<HTMLDivElement>(null)
+  useLayoutEffect(() => {
+    const root = area.current
+    const el = stack.current
+    if (!root || !el) return
+    let last = -1
+    let lastBar = -1
+    const measure = (): void => {
+      const h = Math.round(el.getBoundingClientRect().height)
+      if (h !== last) {
+        last = h
+        root.style.setProperty('--chat-bottom-inset', `${h}px`)
+        anchorTracker.setBottomInset(h)
+      }
+      // a pilha não cobre a barra de rolagem (o degradê passaria por cima dela)
+      const sc = root.querySelector<HTMLElement>('[data-chat-scroller]')
+      const bar = sc ? sc.offsetWidth - sc.clientWidth : 0
+      if (bar !== lastBar) {
+        lastBar = bar
+        root.style.setProperty('--chat-scrollbar', `${bar}px`)
+      }
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    const sc = root.querySelector<HTMLElement>('[data-chat-scroller]')
+    if (sc) ro.observe(sc)
+    return () => ro.disconnect()
+  }, [])
+  return (
+    <div ref={area} data-testid="chat-stage" className="relative flex min-h-0 flex-1 flex-col">
       <MessageList
         chatId={chat.id}
         session={session}
         readOnly={isSub}
         empty={!isSub && <EmptyChat chat={chat} />}
       />
-      <Composer session={session} autoFocus />
+      <div
+        ref={stack}
+        data-testid="composer-stack"
+        data-composer-stack
+        className="pointer-events-none absolute bottom-0 left-0 z-20 right-[var(--chat-scrollbar,0px)]"
+      >
+        {/* degradê (styles.css → .composer-fade): o conteúdo aparece por trás e some sob o composer */}
+        <div
+          aria-hidden
+          data-testid="composer-fade"
+          className="composer-fade absolute inset-x-0 -top-10 bottom-0"
+        />
+        <Composer session={session} autoFocus />
+      </div>
     </div>
   )
 }

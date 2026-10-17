@@ -232,3 +232,33 @@ test('math: streaming — \\[ aberto no fim vira $$ só durante o streaming', ()
   // $$ aberto fica como está (o remark-math trata como bloco aberto até o fim).
   assert.equal(normalizeMath('$$\nx = ', true), '$$\nx = ')
 })
+
+test('tabelas: largura mínima pelas colunas (prosa até 14em, curtas 4em)', async () => {
+  const { columnLengths, tableMinWidthEm } = await import('../src/renderer/src/lib/tableWidth.ts')
+  const t = (s: string): { type: string; value: string } => ({ type: 'text', value: s })
+  const cell = (tag: string, s: string): object => ({
+    type: 'element',
+    tagName: tag,
+    children: [t(s)]
+  })
+  const row = (tag: string, ...c: string[]): object => ({
+    type: 'element',
+    tagName: 'tr',
+    children: c.map((x) => cell(tag, x))
+  })
+  const table = {
+    type: 'element',
+    tagName: 'table',
+    children: [
+      { type: 'element', tagName: 'thead', children: [row('th', '', 'Candidato A')] },
+      {
+        type: 'element',
+        tagName: 'tbody',
+        children: [row('td', 'Trajetória', 'x'.repeat(120)), row('td', 'Ficha criminal', 'curto')]
+      }
+    ]
+  }
+  assert.deepEqual(columnLengths(table as never), [14, 120])
+  // 7em + 1,5 (padding) + 14em + 1,5
+  assert.equal(tableMinWidthEm(table as never), 24)
+})

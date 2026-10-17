@@ -76,8 +76,20 @@ export class AnchorTracker {
     this.onChange = onChange
   }
 
+  private root: Element | null = null
+  /** Altura coberta no fim do scroller (composer flutuante): card sob ele não conta como visível. */
+  private bottomInset = 0
+
+  setBottomInset(px: number): void {
+    const v = Math.max(0, Math.round(px))
+    if (v === this.bottomInset) return
+    this.bottomInset = v
+    if (this.root) this.attach(this.root)
+  }
+
   attach(root: Element): void {
     this.detach()
+    this.root = root
     this.io = new IntersectionObserver(
       (entries) => {
         const patch: Record<string, boolean> = {}
@@ -88,7 +100,7 @@ export class AnchorTracker {
         if (Object.keys(patch).length) this.onChange(patch)
       },
       // precisa de uma faixa mínima do card na tela (não só 1px na borda)
-      { root, rootMargin: '-24px 0px -24px 0px', threshold: 0 }
+      { root, rootMargin: `-24px 0px -${24 + this.bottomInset}px 0px`, threshold: 0 }
     )
     for (const el of this.els.keys()) this.io.observe(el)
   }
@@ -96,6 +108,7 @@ export class AnchorTracker {
   detach(): void {
     this.io?.disconnect()
     this.io = null
+    this.root = null
   }
 
   add(el: Element, id: string): void {
