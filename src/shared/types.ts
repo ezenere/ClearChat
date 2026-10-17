@@ -1,3 +1,4 @@
+import type { MemoryConfig } from './memory'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
 export interface Provider {
@@ -194,6 +195,8 @@ export interface ChatConfig {
   appSignature: string
   /** Usada quando appSignature === 'custom'. */
   appSignatureCustom?: { referer: string; title: string }
+  /** Memória modular (SPEC → Memória). Ausente = desligada. */
+  memory?: MemoryConfig
   /**
    * Smart-Approve: o modelo "juiz" que decide as chamadas dos itens em modo `smart` (aprovar /
    * rejeitar / perguntar ao usuário). Ausente/sem modelo = esses itens perguntam. Ver smartApprove.ts.
@@ -672,3 +675,5 @@ export type AgentEvent =
   | { type: 'processes-updated'; chatId: string; processes: ProcessInfo[] }
   /** Modos globais / listas de aprovação mudaram (Configurações → Aprovações ou "+ lista" no card). */
   | { type: 'approval-settings-updated'; settings: ApprovalSettings }
+  /** Coleção/memória criada, alterada ou apagada (UI, tools do modelo ou extração). */
+  | { type: 'memory-changed'; collectionId: string | null; memoryId: string | null }

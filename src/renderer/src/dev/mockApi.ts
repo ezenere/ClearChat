@@ -784,6 +784,21 @@ export function createMockApi(scenario: string): ClearApi {
   }
 
   return {
+    // Memória: stub mínimo (o agente da UI implementa o mock completo).
+    memory: {
+      listCollections: () => delay([]),
+      createCollection: () => Promise.reject(new Error('mock: memória não implementada')),
+      updateCollection: () => Promise.reject(new Error('mock: memória não implementada')),
+      deleteCollection: () => delay(undefined),
+      list: () => delay([]),
+      create: () => Promise.reject(new Error('mock: memória não implementada')),
+      update: () => Promise.reject(new Error('mock: memória não implementada')),
+      delete: () => delay(undefined),
+      preview: () => delay({ active: false, index: null, help: null, tools: [], snapshotAt: null }),
+      refreshSnapshot: () =>
+        delay({ active: false, index: null, help: null, tools: [], snapshotAt: null }),
+      extractNow: () => Promise.reject(new Error('mock: memória não implementada'))
+    },
     providers: {
       list: () => delay(providers),
       create: async (p) => {

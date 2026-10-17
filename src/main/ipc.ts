@@ -31,6 +31,7 @@ import {
 import { invalidateModels, listModels, testProvider } from './providers'
 import * as fsapi from './fsapi'
 import * as runner from './agent/runner'
+import * as memory from './memory'
 import { answerQuestion } from './agent/questions'
 import { bwrapAvailable } from './tools/bash'
 import { listProcesses, processLogLines, stopChatProcesses, stopProcess } from './tools/processes'
@@ -44,6 +45,13 @@ import { saveAttachment } from './attachments'
 import { getApprovalSettings, updateApprovalSettings } from './approvalSettings'
 import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import type { ApprovalSettings } from '@shared/types'
+import type {
+  MemoryCollectionInput,
+  MemoryCollectionPatch,
+  MemoryInput,
+  MemoryListQuery,
+  MemoryPatch
+} from '@shared/memory'
 
 type Handler = (...args: never[]) => unknown
 
@@ -220,7 +228,20 @@ export function registerIpc(): void {
     [IPC.presets.create]: (input: PresetInput) => presetsRepo.create(input),
     [IPC.presets.update]: (id: string, patch: PresetPatch) => presetsRepo.update(id, patch ?? {}),
     [IPC.presets.delete]: (id: string) => presetsRepo.delete(id),
-    [IPC.presets.duplicate]: (id: string) => presetsRepo.duplicate(id)
+    [IPC.presets.duplicate]: (id: string) => presetsRepo.duplicate(id),
+    // ---- memória (SPEC → Memória) ----
+    [IPC.memory.listCollections]: () => memory.listCollections(),
+    [IPC.memory.createCollection]: (input: MemoryCollectionInput) => memory.createCollection(input),
+    [IPC.memory.updateCollection]: (id: string, patch: MemoryCollectionPatch) =>
+      memory.updateCollection(id, patch ?? {}),
+    [IPC.memory.deleteCollection]: (id: string) => memory.deleteCollection(id),
+    [IPC.memory.list]: (query?: MemoryListQuery) => memory.listMemories(query),
+    [IPC.memory.create]: (input: MemoryInput) => memory.createMemory(input),
+    [IPC.memory.update]: (id: string, patch: MemoryPatch) => memory.updateMemory(id, patch ?? {}),
+    [IPC.memory.delete]: (id: string) => memory.deleteMemory(id),
+    [IPC.memory.preview]: (sessionId: string) => memory.previewMemory(sessionId),
+    [IPC.memory.refreshSnapshot]: (sessionId: string) => memory.refreshSnapshot(sessionId),
+    [IPC.memory.extractNow]: (sessionId: string) => memory.extractNow(sessionId)
   }
 
   const missing = ALL_CHANNELS.filter((c) => !handlers[c])

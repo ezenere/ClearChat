@@ -58,6 +58,19 @@ const api: ClearApi = {
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
   },
+  memory: {
+    listCollections: () => invoke(IPC.memory.listCollections),
+    createCollection: (input) => invoke(IPC.memory.createCollection, input),
+    updateCollection: (id, patch) => invoke(IPC.memory.updateCollection, id, patch),
+    deleteCollection: (id) => invoke(IPC.memory.deleteCollection, id),
+    list: (query) => invoke(IPC.memory.list, query),
+    create: (input) => invoke(IPC.memory.create, input),
+    update: (id, patch) => invoke(IPC.memory.update, id, patch),
+    delete: (id) => invoke(IPC.memory.delete, id),
+    preview: (sessionId) => invoke(IPC.memory.preview, sessionId),
+    refreshSnapshot: (sessionId) => invoke(IPC.memory.refreshSnapshot, sessionId),
+    extractNow: (sessionId) => invoke(IPC.memory.extractNow, sessionId)
+  },
   presets: {
     list: () => invoke(IPC.presets.list),
     create: (input) => invoke(IPC.presets.create, input),

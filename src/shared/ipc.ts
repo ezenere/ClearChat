@@ -1,6 +1,17 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
 // Ver SPEC.md → "API do preload". Todo método (exceto onEvent) é ipcRenderer.invoke → ipcMain.handle.
 import type {
+  Memory,
+  MemoryCollection,
+  MemoryCollectionInput,
+  MemoryCollectionPatch,
+  MemoryExtractionResult,
+  MemoryInput,
+  MemoryListQuery,
+  MemoryPatch,
+  MemoryPreview
+} from './memory'
+import type {
   AgentEvent,
   ApiMessage,
   ApprovalRequest,
@@ -82,6 +93,19 @@ export const IPC = {
     update: 'presets:update',
     delete: 'presets:delete',
     duplicate: 'presets:duplicate'
+  },
+  memory: {
+    listCollections: 'memory:listCollections',
+    createCollection: 'memory:createCollection',
+    updateCollection: 'memory:updateCollection',
+    deleteCollection: 'memory:deleteCollection',
+    list: 'memory:list',
+    create: 'memory:create',
+    update: 'memory:update',
+    delete: 'memory:delete',
+    preview: 'memory:preview',
+    refreshSnapshot: 'memory:refreshSnapshot',
+    extractNow: 'memory:extractNow'
   },
   attachments: {
     pick: 'attachments:pick',
@@ -310,6 +334,24 @@ export interface ClearApi {
     delete(id: string): Promise<void>
     /** Cópia com nome "X (cópia)". */
     duplicate(id: string): Promise<Preset>
+  }
+  /** Memória modular (SPEC → Memória). CRUD global; seleção fica em ChatConfig.memory. */
+  memory: {
+    /** Inclui coleções de chat (scope 'chat'). */
+    listCollections(): Promise<MemoryCollection[]>
+    createCollection(input: MemoryCollectionInput): Promise<MemoryCollection>
+    updateCollection(id: string, patch: MemoryCollectionPatch): Promise<MemoryCollection>
+    deleteCollection(id: string): Promise<void>
+    list(query?: MemoryListQuery): Promise<Memory[]>
+    create(input: MemoryInput): Promise<Memory>
+    update(id: string, patch: MemoryPatch): Promise<Memory>
+    delete(id: string): Promise<void>
+    /** O que vai para a API na próxima request da sessão (índice/help/tools). */
+    preview(sessionId: string): Promise<MemoryPreview>
+    /** Renova o snapshot do índice da sessão ("Atualizar memória"). */
+    refreshSnapshot(sessionId: string): Promise<MemoryPreview>
+    /** Roda a extração de memórias agora (só sessão principal). */
+    extractNow(sessionId: string): Promise<MemoryExtractionResult>
   }
   /** Anexos: salvos no store content-addressed (userData/attachments) antes do envio. */
   attachments: {
