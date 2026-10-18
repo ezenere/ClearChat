@@ -1,0 +1,53 @@
+{
+  "requestId": "b5947044c4b78efa9552a7c89b306d95",
+  "resolvedSearchType": "neural",
+  "searchType": "auto",
+  "results": [
+    {
+      "id": "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html",
+      "title": "TypeScript: Documentation - TypeScript 4.9",
+      "url": "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html",
+      "publishedDate": "2022-11-15T00:00:00.000Z",
+      "author": null,
+      "highlights": [
+        "The new satisfies operator lets us validate that the type of an expression matches some type, without changing the resulting type of that expression.",
+        "We could try to catch that bleu typo by using a type annotation on palette, but we'd lose the information about each property."
+      ],
+      "highlightScores": [0.62, 0.41],
+      "favicon": "https://www.typescriptlang.org/favicon-32x32.png"
+    },
+    {
+      "id": "https://stackoverflow.com/questions/78636946/typescript-satisfies-operator",
+      "title": "When should I use the satisfies operator in TypeScript?",
+      "url": "https://stackoverflow.com/questions/78636946/typescript-satisfies-operator",
+      "publishedDate": "2024-06-18T09:12:44.000Z",
+      "author": "dev_user",
+      "highlights": [
+        "satisfies checks that a value conforms to a type while keeping the most specific inferred type &amp; literal types."
+      ],
+      "highlightScores": [0.55]
+    },
+    {
+      "id": "https://2ality.com/2025/02/satisfies-operator.html",
+      "title": "",
+      "url": "https://2ality.com/2025/02/satisfies-operator.html",
+      "publishedDate": null,
+      "author": "Axel Rauschmayer",
+      "highlights": [],
+      "summary": "An explainer of the satisfies operator with examples."
+    },
+    {
+      "id": "dup",
+      "title": "Duplicate of the first",
+      "url": "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html",
+      "highlights": ["dup"]
+    },
+    { "id": "bad", "title": "No URL", "url": "ftp://example.com/x", "highlights": ["x"] }
+  ],
+  "costDollars": {
+    "total": 0.006,
+    "search": { "neural": 0.005 },
+    "contents": { "highlights": 0.001 }
+  },
+  "searchTime": 412.6
+}

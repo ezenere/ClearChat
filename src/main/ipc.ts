@@ -45,6 +45,18 @@ import { saveAttachment } from './attachments'
 import { getApprovalSettings, updateApprovalSettings } from './approvalSettings'
 import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import type { ApprovalSettings } from '@shared/types'
+import {
+  PROTECTED_SETTINGS,
+  type EngineConfig,
+  type SearchEngineId
+} from '@shared/webSearchSettings'
+import {
+  getWebSearchSettings,
+  revealWebSearchKey,
+  setWebSearchKey,
+  updateWebSearchEngines
+} from './webSearchConfig'
+import { testWebSearchEngine } from './tools/web'
 import type {
   MemoryCollectionInput,
   MemoryCollectionPatch,
@@ -86,8 +98,15 @@ export function registerIpc(): void {
     [IPC.providers.test]: (p: ProviderTestInput) => testProvider(p),
 
     // ---- settings ----
-    [IPC.settings.get]: (key: string) => settingsRepo.get(key),
-    [IPC.settings.set]: (key: string, value: unknown) => settingsRepo.set(key, value),
+    // (as chaves de API dos buscadores não passam por aqui: só pelo domínio webSearch, mascaradas)
+    [IPC.settings.get]: (key: string) => {
+      if (PROTECTED_SETTINGS.includes(key)) throw new Error('Setting protegido.')
+      return settingsRepo.get(key)
+    },
+    [IPC.settings.set]: (key: string, value: unknown) => {
+      if (PROTECTED_SETTINGS.includes(key)) throw new Error('Setting protegido.')
+      return settingsRepo.set(key, value)
+    },
 
     // ---- chats ----
     [IPC.chats.list]: () => chatsRepo.list(),
@@ -151,6 +170,14 @@ export function registerIpc(): void {
     [IPC.approvals.getSettings]: () => getApprovalSettings(),
     [IPC.approvals.updateSettings]: (patch: Partial<ApprovalSettings>) =>
       updateApprovalSettings(patch ?? {}),
+
+    // ---- buscadores do web_search ----
+    [IPC.webSearch.getSettings]: () => getWebSearchSettings(),
+    [IPC.webSearch.updateEngines]: (engines: EngineConfig[]) => updateWebSearchEngines(engines),
+    [IPC.webSearch.setKey]: (engine: SearchEngineId, key: string | null) =>
+      setWebSearchKey(engine, key),
+    [IPC.webSearch.revealKey]: (engine: SearchEngineId) => revealWebSearchKey(engine),
+    [IPC.webSearch.test]: (engine: SearchEngineId) => testWebSearchEngine(engine),
 
     // ---- fs ----
     [IPC.fs.listDir]: (path: string) => fsapi.listDir(path),

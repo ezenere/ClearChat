@@ -113,11 +113,11 @@ test('fallback: DDG com resultados → não chama o Brave', async () => {
   assert.equal(r.status, 'ok')
   assert.match(
     r.content,
-    /^Resultados para "x" \(via DuckDuckGo\):\n\n1\. DDG título\n {3}https:\/\/ddg\.example\/\n {3}trecho ddg/
+    /^Resultados de DuckDuckGo para "x":\n\n1\. DDG título\n {3}https:\/\/ddg\.example\/\n {3}trecho ddg/
   )
 })
 
-test('fallback: DDG captcha (POST e GET) → Brave, com "via Brave Search; DuckDuckGo bloqueou"', async () => {
+test('fallback: DDG captcha (POST e GET) → Brave (site), com "após falha em DuckDuckGo"', async () => {
   const b = mock(
     () => DDG_CAPTCHA,
     () => ({ html: BRAVE, status: 200 })
@@ -128,7 +128,7 @@ test('fallback: DDG captcha (POST e GET) → Brave, com "via Brave Search; DuckD
   const lines = r.content.split('\n')
   assert.equal(
     lines[0],
-    'Resultados para "typescript satisfies operator" (via Brave Search; DuckDuckGo bloqueou):'
+    'Resultados de Brave Search (site) para "typescript satisfies operator" (após falha em DuckDuckGo: verificação anti-robô (captcha)):'
   )
   assert.equal(lines[2], '1. TypeScript: Documentation - TypeScript 4.9')
   assert.equal((r.content.match(/^\d+\. /gm) ?? []).length, 8) // LIMITS.webMaxResults
@@ -142,7 +142,10 @@ test('fallback: erro HTTP/rede no DDG → Brave; GET recupera sem Brave', async 
   )
   const r = await runWebSearch('q', b, sig())
   assert.deepEqual(b.calls, ['ddg:POST', 'ddg:GET', 'brave'])
-  assert.match(r.content, /^Resultados para "q" \(via Brave Search; DuckDuckGo falhou: HTTP 503\):/)
+  assert.match(
+    r.content,
+    /^Resultados de Brave Search \(site\) para "q" \(após falha em DuckDuckGo: HTTP 503\):/
+  )
 
   const b2 = mock(
     (m) => (m === 'POST' ? DDG_CAPTCHA : DDG_OK),
@@ -150,7 +153,7 @@ test('fallback: erro HTTP/rede no DDG → Brave; GET recupera sem Brave', async 
   )
   const r2 = await runWebSearch('q', b2, sig())
   assert.deepEqual(b2.calls, ['ddg:POST', 'ddg:GET'])
-  assert.match(r2.content, /\(via DuckDuckGo\)/)
+  assert.match(r2.content, /^Resultados de DuckDuckGo para/)
 })
 
 test('fallback: "sem resultados" legítimo do DDG não chama o Brave; página estranha chama', async () => {
@@ -161,7 +164,7 @@ test('fallback: "sem resultados" legítimo do DDG não chama o Brave; página es
   const r = await runWebSearch('zzz', b, sig())
   assert.deepEqual(b.calls, ['ddg:POST'])
   assert.equal(r.status, 'ok')
-  assert.equal(r.content, 'Nenhum resultado para "zzz" (DuckDuckGo).')
+  assert.equal(r.content, 'Nenhum resultado de DuckDuckGo para "zzz".')
 
   const b2 = mock(
     () => '<html><body>layout novo</body></html>',
@@ -169,7 +172,7 @@ test('fallback: "sem resultados" legítimo do DDG não chama o Brave; página es
   )
   const r2 = await runWebSearch('zzz', b2, sig())
   assert.deepEqual(b2.calls, ['ddg:POST', 'ddg:GET', 'brave'])
-  assert.match(r2.content, /via Brave Search; DuckDuckGo não retornou resultados/)
+  assert.match(r2.content, /após falha em DuckDuckGo: nenhum resultado \(possível bloqueio\)/)
 })
 
 test('fallback: os dois bloqueados → erro legível citando os dois', async () => {
@@ -179,9 +182,9 @@ test('fallback: os dois bloqueados → erro legível citando os dois', async () 
   )
   const r = await runWebSearch('q', b, sig())
   assert.equal(r.status, 'error')
-  assert.match(r.content, /bloqueada pelos dois buscadores/)
+  assert.match(r.content, /bloqueada pelos 2 buscadores habilitados/)
   assert.match(r.content, /DuckDuckGo: verificação anti-robô/)
-  assert.match(r.content, /Brave Search: verificação anti-robô.*HTTP 429/)
+  assert.match(r.content, /Brave Search \(site\): verificação anti-robô.*HTTP 429/)
 
   const b2 = mock(
     () => new Error('fetch failed'),
@@ -189,7 +192,7 @@ test('fallback: os dois bloqueados → erro legível citando os dois', async () 
   )
   const r2 = await runWebSearch('q', b2, sig())
   assert.equal(r2.status, 'error')
-  assert.match(r2.content, /DuckDuckGo: fetch failed; Brave Search: falha ao carregar/)
+  assert.match(r2.content, /DuckDuckGo: fetch failed; Brave Search \(site\): falha ao carregar/)
 })
 
 test('fallback: abort durante o DDG propaga AbortError (sem chamar o Brave)', async () => {
@@ -345,7 +348,10 @@ test('intervalo: DDG bloqueado → Brave na hora (sem esperar); próxima volta a
     }
   }
   const r1 = await runGatedWebSearch('q', b, sig(), gate)
-  assert.match(r1.content.split('\n')[0], /via Brave Search; DuckDuckGo bloqueou\):$/)
+  assert.match(
+    r1.content.split('\n')[0],
+    /após falha em DuckDuckGo: verificação anti-robô \(captcha\)\):$/
+  )
   ddgBlocked = false
   const waits: number[] = []
   const p = runGatedWebSearch('q', b, sig(), gate, (ms) => waits.push(ms))
@@ -355,7 +361,7 @@ test('intervalo: DDG bloqueado → Brave na hora (sem esperar); próxima volta a
   assert.deepEqual(waits, [5000])
   assert.equal(
     r2.content.split('\n')[0],
-    'Resultados para "q" (via DuckDuckGo): [aguardou 5,0 s pelo intervalo entre pesquisas]'
+    'Resultados de DuckDuckGo para "q": [aguardou 5,0 s pelo intervalo entre pesquisas]'
   )
 })
 

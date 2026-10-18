@@ -101,6 +101,13 @@ const api: ClearApi = {
     getSettings: () => invoke(IPC.approvals.getSettings),
     updateSettings: (patch) => invoke(IPC.approvals.updateSettings, patch)
   },
+  webSearch: {
+    getSettings: () => invoke(IPC.webSearch.getSettings),
+    updateEngines: (engines) => invoke(IPC.webSearch.updateEngines, engines),
+    setKey: (engine, key) => invoke(IPC.webSearch.setKey, engine, key),
+    revealKey: (engine) => invoke(IPC.webSearch.revealKey, engine),
+    test: (engine) => invoke(IPC.webSearch.test, engine)
+  },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)
     ipcRenderer.on(EVENT_CHANNEL, listener)

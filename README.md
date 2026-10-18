@@ -17,7 +17,7 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
   os níveis de `reasoning_effort` vêm do `/models` do provedor (OpenRouter `supported_efforts`, Anthropic
   `capabilities.effort`), com tabela conferida só onde a API não informa.
 - **Agente com ferramentas**: arquivos, shell do usuário (zsh/bash com o seu ambiente), processos em segundo
-  plano (emuladores, dev servers, logs com busca), pesquisa na web (DuckDuckGo → Brave), navegador oculto,
+  plano (emuladores, dev servers, logs com busca), pesquisa na web (DuckDuckGo, Brave, Exa, Tavily — ordem e fallback configuráveis), navegador oculto,
   leitura de imagens e PDFs, busca em outros chats.
 - **Subagentes**: em paralelo, com modelo próprio, em segundo plano — acordam o agente ao terminar.
   Mensagens entre chats.
@@ -156,6 +156,13 @@ npm run install:local -- --uninstall
   saída, `browse_url` pagina com `offset`, `list_dir`/`web_search`/`search_files`/`list_models` têm teto; o teto
   geral por resultado é configurável no chat ("Saída máx. por ferramenta"). `search_files` e
   `find_files` usam ripgrep quando disponível.
+- **Pesquisa na web** (Configurações → **Pesquisa na web**): DuckDuckGo e Brave (site) sem chave;
+  **Brave Search API**, **Exa** e **Tavily** com chave de API (fica só no banco local; a tela mostra a
+  máscara `tvly-…abcd`, com "mostrar" a pedido). A ordem é a prioridade (arrastar ou ↑/↓): cada pesquisa
+  usa **um buscador só** — o primeiro habilitado — e passa para o próximo se ele falhar (chave inválida,
+  cota/limite, captcha, rede, resposta vazia); a 1ª linha do resultado diz quem respondeu e quem falhou.
+  Buscador com API só pode ser ligado com chave. Botão **Testar** por buscador, (i) com a request exata
+  (sem a chave) e intervalo mínimo global entre pesquisas (uma pesquisa = uma vez, fallbacks na hora).
 - **`list_models`** ("Listar modelos"): o modelo lista os modelos de todos os provedores
   configurados (`/models`, com cache; seções `[Provedor]`, o da sessão primeiro; um provedor fora do ar
   aparece como erro na seção dele; `provider` filtra um só) filtrando por `query`, `tools_only`,
@@ -299,6 +306,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # memória (e2e/memory.test.ts: repositório/limites/FTS, config e personas, índice e snapshot,
                     # tools, extração com modelo falso, runner com provedor falso), UI da memória (e2e/memoryUi.test.ts:
                     # herança da persona, coleção de escrita, regra de envio, limites, [[slug]], resumos),
+                    # pesquisa na web (e2e/webSearch.test.ts + e2e/searchEngines.test.ts: DuckDuckGo/Brave (site),
+                    # parse de Exa/Tavily/Brave API com fixtures, ordem + fallback, intervalo, migração, máscara),
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
 # E2E do backend (Playwright `_electron`, chama window.api pelo renderer; faz chamadas reais e baratas ao OpenRouter)
@@ -325,6 +334,10 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-ui-e2e npm run test:e2e:memory-ui
 # visível/clicável, padding do fim = altura da pilha, "ir para o fim"; tabelas markdown sem palavras partidas;
 # screenshots 1280x820 / 900x600 em $CLEARCHAT_E2E_DIR/shots)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-overlay-e2e npm run test:e2e:overlay
+
+# E2E da pesquisa na web (UI real, 100% local: provedor e servidor de busca falsos via CLEARCHAT_SEARCH_BASE_*,
+# userData isolado, sem chaves reais; Configurações → Pesquisa na web + pesquisa pelo runner com fallback)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-websearch-e2e npm run test:e2e:websearch
 
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui

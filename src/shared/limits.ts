@@ -31,6 +31,8 @@ export const LIMITS = {
 
   /** web_search: máximo de resultados e de caracteres por trecho. */
   webMaxResults: 8,
+  /** web_search: teto da opção "resultados" dos buscadores com API. */
+  webMaxResultsCap: 10,
   webSnippetChars: 300,
 
   /** browse_url: caracteres de texto por página (paginação via offset). */

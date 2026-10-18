@@ -1,8 +1,22 @@
-// Orquestração do web_search (pura, sem Electron): DuckDuckGo HTML → fallback Brave Search.
+// Orquestração do web_search (pura, sem Electron): UM buscador por pesquisa — o primeiro habilitado
+// na ordem configurada; se ele FALHAR (sem chave, chave inválida, cota/limite, captcha/bloqueio,
+// rede, resposta vazia/inválida) tenta o próximo. Nunca mistura resultados de buscadores.
 // Os "fetchers" são injetados (web.ts liga os reais; os testes passam mocks).
 import { LIMITS } from '@shared/limits'
+import {
+  buildEngineRequest,
+  DEFAULT_ENGINES,
+  ENGINE_DEFAULT_BASE,
+  ENGINE_META,
+  isApiEngine,
+  type ApiEngineId,
+  type EngineHttpRequest,
+  type EngineOptions,
+  type SearchEngineId
+} from '@shared/webSearchSettings'
 import { parseDdgHtml, type SearchResult } from './ddg'
 import { isBraveBlocked, parseBraveHtml } from './brave'
+import { API_PARSERS, classifyHttp, type EngineFailure } from './searchApis'
 import { abortError, fail, ok, type ToolResult } from './util'
 
 export interface SearchPage {
@@ -11,12 +25,34 @@ export interface SearchPage {
   status?: number
 }
 
+export interface HttpResponse {
+  status: number
+  text: string
+}
+
 export interface SearchBackends {
   /** HTML de https://html.duckduckgo.com/html/ (lança em erro HTTP/rede). */
   ddg: (query: string, method: 'POST' | 'GET', signal: AbortSignal) => Promise<string>
   /** HTML (renderizado) de https://search.brave.com/search?q=… */
   brave: (query: string, signal: AbortSignal) => Promise<SearchPage>
+  /** HTTP das APIs (Exa, Tavily, Brave Search API). Lança só em erro de rede/timeout. */
+  http?: (req: EngineHttpRequest, signal: AbortSignal) => Promise<HttpResponse>
+  /** Base de cada API (padrão: ENGINE_DEFAULT_BASE; testes/E2E trocam). */
+  bases?: Partial<Record<ApiEngineId, string>>
 }
+
+/** Um buscador da pesquisa (habilitado, na ordem), com a chave quando exige. */
+export interface PlanEntry {
+  id: SearchEngineId
+  options?: EngineOptions
+  key?: string
+}
+
+/** Plano padrão (sem config): DuckDuckGo → Brave (site). */
+export const DEFAULT_PLAN: PlanEntry[] = DEFAULT_ENGINES.filter((e) => e.enabled).map((e) => ({
+  id: e.id,
+  options: e.options
+}))
 
 export type DdgOutcome =
   | { kind: 'results'; results: SearchResult[] }
@@ -24,6 +60,12 @@ export type DdgOutcome =
   | { kind: 'blocked' } // captcha / anomaly
   | { kind: 'error'; message: string } // HTTP / rede
   | { kind: 'suspect' } // 0 resultados sem a marca de "sem resultados" (layout mudou / bloqueio)
+
+/** Resultado de UM buscador: resultados, "sem resultados" legítimo (não faz fallback) ou falha. */
+export type EngineOutcome =
+  | { kind: 'results'; results: SearchResult[]; answer?: string }
+  | { kind: 'empty' }
+  | ({ kind: 'fail' } & EngineFailure)
 
 export function isDdgBlocked(html: string): boolean {
   return /anomaly-modal|anomaly\.js|bots use DuckDuckGo|captcha/i.test(html)
@@ -55,62 +97,172 @@ export async function searchDdg(
   return { kind: 'error', message: lastErr || 'falha desconhecida' }
 }
 
-function ddgReason(o: DdgOutcome): string {
-  if (o.kind === 'blocked') return 'DuckDuckGo bloqueou'
-  if (o.kind === 'error') return `DuckDuckGo falhou: ${o.message}`
-  return 'DuckDuckGo não retornou resultados'
+async function runDdg(
+  query: string,
+  b: SearchBackends,
+  signal: AbortSignal
+): Promise<EngineOutcome> {
+  const o = await searchDdg(query, b.ddg, signal)
+  if (o.kind === 'results' || o.kind === 'empty') return o
+  if (o.kind === 'blocked')
+    return { kind: 'fail', category: 'blocked', message: 'verificação anti-robô (captcha)' }
+  if (o.kind === 'suspect')
+    return { kind: 'fail', category: 'empty', message: 'nenhum resultado (possível bloqueio)' }
+  return {
+    kind: 'fail',
+    category: /^HTTP \d/.test(o.message) ? 'http' : 'network',
+    message: o.message
+  }
 }
 
-function ddgDetail(o: DdgOutcome): string {
-  if (o.kind === 'blocked') return 'DuckDuckGo: verificação anti-robô (captcha)'
-  if (o.kind === 'error') return `DuckDuckGo: ${o.message}`
-  return 'DuckDuckGo: nenhum resultado (possível bloqueio)'
+async function runBraveSite(
+  query: string,
+  b: SearchBackends,
+  signal: AbortSignal
+): Promise<EngineOutcome> {
+  try {
+    const page = await b.brave(query, signal)
+    const results = parseBraveHtml(page.html)
+    if (results.length) return { kind: 'results', results }
+    if (isBraveBlocked(page.html, page.status))
+      return {
+        kind: 'fail',
+        category: 'blocked',
+        message: `verificação anti-robô / limite de requisições${page.status ? ` (HTTP ${page.status})` : ''}`
+      }
+    if (page.status && page.status >= 400)
+      return { kind: 'fail', category: 'http', message: `HTTP ${page.status}` }
+    return { kind: 'empty' }
+  } catch (e) {
+    if (signal.aborted || (e as Error).name === 'AbortError') throw abortError()
+    return { kind: 'fail', category: 'network', message: (e as Error).message }
+  }
 }
 
-export function formatResults(query: string, via: string, results: SearchResult[]): string {
-  const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n).trimEnd()}…` : s)
+async function runApi(
+  id: ApiEngineId,
+  entry: PlanEntry,
+  query: string,
+  b: SearchBackends,
+  signal: AbortSignal
+): Promise<EngineOutcome> {
+  if (!entry.key) return { kind: 'fail', category: 'no-key', message: 'sem chave de API' }
+  if (!b.http) return { kind: 'fail', category: 'network', message: 'HTTP indisponível' }
+  const req = buildEngineRequest(
+    id,
+    query,
+    entry.key,
+    entry.options ?? {},
+    b.bases?.[id] || ENGINE_DEFAULT_BASE[id]
+  )
+  let res: HttpResponse
+  try {
+    res = await b.http(req, signal)
+  } catch (e) {
+    if (signal.aborted || (e as Error).name === 'AbortError') throw abortError()
+    const m = (e as Error).message
+    return { kind: 'fail', category: 'network', message: `erro de rede: ${m}` }
+  }
+  if (res.status < 200 || res.status >= 300)
+    return { kind: 'fail', ...classifyHttp(res.status, res.text) }
+  let json: unknown
+  try {
+    json = res.text.trim() ? JSON.parse(res.text) : null
+  } catch {
+    json = undefined
+  }
+  const parsed = json == null ? null : API_PARSERS[id](json)
+  if (!parsed)
+    return { kind: 'fail', category: 'empty', message: 'resposta vazia ou em formato inesperado' }
+  if (!parsed.results.length)
+    return parsed.answer ? { kind: 'results', ...parsed } : { kind: 'empty' }
+  return { kind: 'results', ...parsed }
+}
+
+/** Roda UM buscador (sem fallback). Abort propaga como AbortError. */
+export function runEngine(
+  entry: PlanEntry,
+  query: string,
+  backends: SearchBackends,
+  signal: AbortSignal
+): Promise<EngineOutcome> {
+  if (entry.id === 'ddg') return runDdg(query, backends, signal)
+  if (entry.id === 'brave-site') return runBraveSite(query, backends, signal)
+  if (isApiEngine(entry.id)) return runApi(entry.id, entry, query, backends, signal)
+  return Promise.resolve({ kind: 'fail', category: 'http', message: 'buscador desconhecido' })
+}
+
+const clip = (s: string, n: number): string => (s.length > n ? `${s.slice(0, n).trimEnd()}…` : s)
+
+export function formatResults(
+  header: string,
+  results: SearchResult[],
+  opts: { max?: number; answer?: string } = {}
+): string {
   const out = results
-    .slice(0, LIMITS.webMaxResults)
-    .map(
-      (r, i) =>
-        `${i + 1}. ${clip(r.title, 200)}\n   ${r.url}${r.snippet ? `\n   ${clip(r.snippet, LIMITS.webSnippetChars)}` : ''}`
-    )
+    .slice(0, Math.min(opts.max ?? LIMITS.webMaxResults, LIMITS.webMaxResultsCap))
+    .map((r, i) => {
+      const snip = r.snippet ? clip(r.snippet, LIMITS.webSnippetChars) : ''
+      const line = r.date ? (snip ? `${r.date} — ${snip}` : r.date) : snip
+      return `${i + 1}. ${clip(r.title, 200)}\n   ${r.url}${line ? `\n   ${line}` : ''}`
+    })
     .join('\n\n')
-  return `Resultados para "${query}" (${via}):\n\n${out}`
+  const answer = opts.answer ? `Resposta resumida: ${clip(opts.answer, 600)}\n\n` : ''
+  return `${header}:\n\n${answer}${out}`.trimEnd()
+}
+
+const label = (id: SearchEngineId): string => ENGINE_META[id].outputLabel
+
+/** " (após falha em DuckDuckGo: captcha; Exa: HTTP 429)" — vazio se ninguém falhou antes. */
+function failNote(failures: { id: SearchEngineId; f: EngineFailure }[]): string {
+  if (!failures.length) return ''
+  return ` (após falha em ${failures.map((x) => `${label(x.id)}: ${x.f.message}`).join('; ')})`
 }
 
 /**
- * DuckDuckGo (POST, depois GET). Se bloquear, falhar (HTTP/rede) ou vier vazio sem a página de
- * "sem resultados" → Brave Search. "Sem resultados" legítimo do DDG não dispara o fallback.
- * Retorna o texto completo (o chamador aplica o teto de saída).
+ * Pesquisa com fallback: tenta os buscadores do `plan` em ordem e devolve o PRIMEIRO que responder
+ * (resultados ou "sem resultados" legítimo). A 1ª linha diz quem respondeu e quem falhou antes.
+ * Todos falhando → erro legível citando cada um. Retorna o texto completo (o chamador aplica o teto).
  */
 export async function runWebSearch(
   query: string,
   backends: SearchBackends,
-  signal: AbortSignal
+  signal: AbortSignal,
+  plan: PlanEntry[] = DEFAULT_PLAN
 ): Promise<ToolResult> {
-  const ddg = await searchDdg(query, backends.ddg, signal)
-  if (ddg.kind === 'results') return ok(formatResults(query, 'via DuckDuckGo', ddg.results))
-  if (ddg.kind === 'empty') return ok(`Nenhum resultado para "${query}" (DuckDuckGo).`)
-  if (signal.aborted) throw abortError()
-
-  let braveErr: string
-  try {
-    const page = await backends.brave(query, signal)
-    const results = parseBraveHtml(page.html)
-    if (results.length)
-      return ok(formatResults(query, `via Brave Search; ${ddgReason(ddg)}`, results))
-    if (isBraveBlocked(page.html, page.status))
-      braveErr = `Brave Search: verificação anti-robô / limite de requisições${page.status ? ` (HTTP ${page.status})` : ''}`
-    else if (page.status && page.status >= 400) braveErr = `Brave Search: HTTP ${page.status}`
-    else return ok(`Nenhum resultado para "${query}" (via Brave Search; ${ddgReason(ddg)}).`)
-  } catch (e) {
-    if (signal.aborted || (e as Error).name === 'AbortError') throw abortError()
-    braveErr = `Brave Search: ${(e as Error).message}`
+  if (!plan.length)
+    return fail(
+      'Erro: nenhum buscador habilitado. Habilite ao menos um em Configurações → Pesquisa na web.'
+    )
+  const failures: { id: SearchEngineId; f: EngineFailure }[] = []
+  for (const entry of plan) {
+    if (signal.aborted) throw abortError()
+    const o = await runEngine(entry, query, backends, signal)
+    if (o.kind === 'results') {
+      const header = `Resultados de ${label(entry.id)} para "${query}"${failNote(failures)}`
+      return ok(
+        formatResults(header, o.results, {
+          max: entry.options?.maxResults,
+          answer: o.answer
+        })
+      )
+    }
+    if (o.kind === 'empty')
+      return ok(`Nenhum resultado de ${label(entry.id)} para "${query}"${failNote(failures)}.`)
+    failures.push({ id: entry.id, f: { category: o.category, message: o.message } })
   }
-  const both = ddg.kind === 'blocked' && braveErr.includes('anti-robô')
+  const detail = failures.map((x) => `${label(x.id)}: ${x.f.message}`).join('; ')
+  const allBlocked = failures.every((x) => x.f.category === 'blocked')
+  const what =
+    failures.length === 1
+      ? allBlocked
+        ? 'a busca foi bloqueada'
+        : 'a pesquisa falhou'
+      : allBlocked
+        ? `a busca foi bloqueada pelos ${failures.length} buscadores habilitados`
+        : `a pesquisa falhou nos ${failures.length} buscadores habilitados`
   return fail(
-    `Erro: ${both ? 'a busca foi bloqueada pelos dois buscadores' : 'a pesquisa falhou nos dois buscadores'} — ${ddgDetail(ddg)}; ${braveErr}. Tente novamente mais tarde ou use browse_url.`
+    `Erro: ${what} — ${detail}. Tente novamente mais tarde, ajuste os buscadores em Configurações → Pesquisa na web ou use browse_url.`
   )
 }
 
@@ -220,17 +372,18 @@ export function withWaitNote(text: string, waitedMs: number): string {
 }
 
 /**
- * web_search com o intervalo global: espera a vez no `gate` (só a pesquisa ao DuckDuckGo entra na
- * fila; o fallback Brave da MESMA chamada roda na hora — outro buscador) e anota a espera.
+ * web_search com o intervalo global: UMA pesquisa = UMA vez no `gate`, qualquer que seja o número
+ * de buscadores tentados — os fallbacks da MESMA chamada rodam na hora, sem esperar outro intervalo.
  */
 export async function runGatedWebSearch(
   query: string,
   backends: SearchBackends,
   signal: AbortSignal,
   gate: SearchGate,
-  onWait?: (remainingMs: number) => void
+  onWait?: (remainingMs: number) => void,
+  plan: PlanEntry[] = DEFAULT_PLAN
 ): Promise<ToolResult> {
   const waited = await gate.acquire(signal, onWait)
-  const r = await runWebSearch(query, backends, signal)
+  const r = await runWebSearch(query, backends, signal, plan)
   return { ...r, content: withWaitNote(r.content, waited) }
 }

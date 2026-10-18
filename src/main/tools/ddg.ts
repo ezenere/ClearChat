@@ -52,6 +52,8 @@ export interface SearchResult {
   title: string
   url: string
   snippet: string
+  /** Data de publicação curta (AAAA-MM-DD ou "2 days ago"), quando o buscador informa. */
+  date?: string
 }
 
 export function parseDdgHtml(html: string): SearchResult[] {

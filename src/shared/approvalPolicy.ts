@@ -134,7 +134,7 @@ export function modeHint(item: ApprovalItem, mode: ApprovalMode): string {
 /**
  * Padrão global: Comandos/Processos/Páginas/Busca em `lists` (com listas vazias = pergunta sempre —
  * o comportamento das versões anteriores; o usuário vai liberando com "+ whitelist"). Busca web
- * também pergunta: a consulta sai para um serviço externo (DuckDuckGo) e pode vazar contexto.
+ * também pergunta: a consulta sai para um serviço externo (DuckDuckGo, Brave, Exa, Tavily…) e pode vazar contexto.
  * Arquivos, chats e subagentes: `always` (rodavam sem perguntar antes de virarem itens).
  * Memória (gravar/reescrever/apagar): `always` — a terceira opção é "Perguntar".
  */

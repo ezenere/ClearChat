@@ -4,6 +4,7 @@ import Database from 'better-sqlite3'
 import { DB_FILENAME } from './migrate'
 import { migrateToolShellRename } from './migrateTools'
 import { migrateApprovalModes, migrateSmartApproveItems } from './migrateApprovals'
+import { migrateWebSearchEngines } from './migrateWebSearch'
 import { SCHEMA } from './dbSchema'
 import { ensureSearchIndex } from './searchIndex'
 import { ensureMemorySchema } from './memory/schema'
@@ -68,6 +69,12 @@ function migrate(conn: Database.Database): void {
       console.log(`[clearchat] migração do Smart-Approve: ${r.chats} chats, ${r.presets} personas`)
   } catch (e) {
     console.error('[clearchat] migração do Smart-Approve', e)
+  }
+  // web_search: lista ordenada de buscadores (DuckDuckGo → Brave (site); APIs desligadas) — idempotente
+  try {
+    if (migrateWebSearchEngines(conn).changed) console.log('[clearchat] buscadores do web_search')
+  } catch (e) {
+    console.error('[clearchat] migração dos buscadores', e)
   }
   // memória modular: coleções, memórias, FTS e sessions.memory_json (idempotente)
   try {

@@ -1,0 +1,103 @@
+{
+  "query": {
+    "original": "typescript satisfies operator",
+    "show_strict_warning": false,
+    "is_navigational": false,
+    "is_news_breaking": false,
+    "spellcheck_off": true,
+    "country": "us",
+    "bad_results": false,
+    "should_fallback": false,
+    "postal_code": "",
+    "city": "",
+    "header_country": "",
+    "more_results_available": true,
+    "state": ""
+  },
+  "mixed": {
+    "type": "mixed",
+    "main": [
+      { "type": "web", "index": 0, "all": false },
+      { "type": "web", "index": 1, "all": false },
+      { "type": "videos", "all": true }
+    ],
+    "top": [],
+    "side": []
+  },
+  "type": "search",
+  "videos": {
+    "type": "videos",
+    "results": [
+      {
+        "type": "video_result",
+        "url": "https://www.youtube.com/watch?v=abc",
+        "title": "satisfies in 100 seconds",
+        "description": "video"
+      }
+    ],
+    "mutated_by_goggles": false
+  },
+  "web": {
+    "type": "search",
+    "results": [
+      {
+        "title": "TypeScript: Documentation - TypeScript 4.9",
+        "url": "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "The new <strong>satisfies</strong> <strong>operator</strong> lets us validate that the type of an expression matches some type, without changing the resulting type of that expression.",
+        "page_age": "2022-11-15T00:00:00",
+        "profile": {
+          "name": "Typescriptlang",
+          "url": "https://www.typescriptlang.org/",
+          "long_name": "typescriptlang.org",
+          "img": "https://imgs.search.brave.com/x"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "typescriptlang.org",
+          "hostname": "www.typescriptlang.org",
+          "favicon": "https://imgs.search.brave.com/y",
+          "path": "› docs  › handbook  › release-notes  › typescript-4-9.html"
+        },
+        "age": "November 15, 2022",
+        "extra_snippets": [
+          "We could try to catch that bleu typo by using a type annotation on palette, but we&#x27;d lose the information about each property.",
+          "satisfies can also be used to catch lots of possible errors."
+        ]
+      },
+      {
+        "title": "Clarifying the `satisfies` Operator | Total TypeScript",
+        "url": "https://www.totaltypescript.com/clarifying-the-satisfies-operator",
+        "is_source_local": false,
+        "is_source_both": false,
+        "description": "The <strong>satisfies</strong> <strong>operator</strong> is a way to tell TypeScript that a value conforms to a type &amp; keep the inferred type.",
+        "profile": {
+          "name": "Total TypeScript",
+          "url": "https://www.totaltypescript.com/",
+          "long_name": "totaltypescript.com",
+          "img": "https://imgs.search.brave.com/z"
+        },
+        "language": "en",
+        "family_friendly": true,
+        "type": "search_result",
+        "subtype": "generic",
+        "is_live": false,
+        "meta_url": {
+          "scheme": "https",
+          "netloc": "totaltypescript.com",
+          "hostname": "www.totaltypescript.com",
+          "favicon": "https://imgs.search.brave.com/w",
+          "path": "› clarifying-the-satisfies-operator"
+        },
+        "age": "2 days ago"
+      }
+    ],
+    "family_friendly": true
+  }
+}

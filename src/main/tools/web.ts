@@ -1,16 +1,29 @@
-// web_search (DuckDuckGo HTML → fallback Brave Search; lógica pura em webSearch.ts) e
-// browse_url (BrowserWindow oculta).
+// web_search (buscadores em ordem de prioridade com fallback — DuckDuckGo, Brave (site), Brave
+// Search API, Exa, Tavily; lógica pura em webSearch.ts) e browse_url (BrowserWindow oculta).
 import { BrowserWindow, session as electronSession } from 'electron'
 import { isBraveBlocked } from './brave'
 import {
   fmtSecs,
   normalizeSearchInterval,
+  runEngine,
   runGatedWebSearch,
   SEARCH_INTERVAL_SETTING,
   SearchGate,
+  type HttpResponse,
+  type SearchBackends,
   type SearchPage
 } from './webSearch'
 import { settingsRepo } from '../repo'
+import { getEngineEntry, getSearchPlan } from '../webSearchConfig'
+import type { WebSearchTestResult } from '@shared/ipc'
+import {
+  API_ENGINE_IDS,
+  ENGINE_DEFAULT_BASE,
+  engineBaseEnv,
+  type ApiEngineId,
+  type EngineHttpRequest,
+  type SearchEngineId
+} from '@shared/webSearchSettings'
 import { LIMITS } from '@shared/limits'
 import {
   abortError,
@@ -32,7 +45,7 @@ async function ddgFetch(
   method: 'POST' | 'GET',
   signal: AbortSignal
 ): Promise<string> {
-  const base = 'https://html.duckduckgo.com/html/'
+  const base = baseOf('ddg')
   const timeout = AbortSignal.timeout(20_000)
   const sig = AbortSignal.any([signal, timeout])
   const res =
@@ -57,6 +70,38 @@ async function ddgFetch(
   return text
 }
 
+/** Base de um buscador: env CLEARCHAT_SEARCH_BASE_<ID> (testes/proxy) ou a oficial. */
+function baseOf(id: SearchEngineId): string {
+  return process.env[engineBaseEnv(id)]?.trim() || ENGINE_DEFAULT_BASE[id]
+}
+
+const API_TIMEOUT = 20_000
+
+/** HTTP das APIs de busca (fetch do Node: descompacta gzip sozinho). Lança só em rede/timeout. */
+async function apiFetch(req: EngineHttpRequest, signal: AbortSignal): Promise<HttpResponse> {
+  const timeout = AbortSignal.timeout(API_TIMEOUT)
+  try {
+    const res = await fetch(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
+      signal: AbortSignal.any([signal, timeout])
+    })
+    return { status: res.status, text: await res.text() }
+  } catch (e) {
+    if (signal.aborted) throw abortError()
+    if (timeout.aborted) throw new Error(`timeout de ${API_TIMEOUT / 1000} s`, { cause: e })
+    const cause = (e as { cause?: { code?: string; message?: string } }).cause
+    throw new Error(cause?.code || cause?.message || (e as Error).message, { cause: e })
+  }
+}
+
+function backends(): SearchBackends {
+  const bases: Partial<Record<ApiEngineId, string>> = {}
+  for (const id of API_ENGINE_IDS) bases[id] = baseOf(id)
+  return { ddg: ddgFetch, brave: braveFetch, http: apiFetch, bases }
+}
+
 /** Intervalo mínimo GLOBAL entre pesquisas (todos os chats/sessões/subagentes do processo). */
 const searchGate = new SearchGate({
   intervalMs: () => normalizeSearchInterval(settingsRepo.get(SEARCH_INTERVAL_SETTING)) * 1000
@@ -70,16 +115,63 @@ export async function webSearch(
   let waited = false
   const r = await runGatedWebSearch(
     query,
-    { ddg: ddgFetch, brave: braveFetch },
+    backends(),
     ctx.signal,
     searchGate,
     (ms) => {
       waited = true
       ctx.onOutput?.(`Aguardando intervalo entre pesquisas… (${fmtSecs(ms)} s)`)
-    }
+    },
+    getSearchPlan()
   )
   if (waited) ctx.onOutput?.('Pesquisando…')
   return r.status === 'error' ? r : ok(truncate(r.content, maxOutputOf(ctx)))
+}
+
+// "Testar" (Configurações → Pesquisa na web): UMA pesquisa pequena no buscador, fora do intervalo
+// global (não consome nem espera a vez das pesquisas do agente), com freio leve: um teste por vez
+// por buscador e no máximo um a cada TEST_COOLDOWN_MS.
+const TEST_QUERY = 'ClearChat open source'
+const TEST_COOLDOWN_MS = 3000
+const lastTest = new Map<SearchEngineId, number>()
+const testing = new Set<SearchEngineId>()
+
+export async function testWebSearchEngine(id: SearchEngineId): Promise<WebSearchTestResult> {
+  const entry = getEngineEntry(id)
+  if (testing.has(id))
+    return { ok: false, throttled: true, message: 'Já há um teste em andamento.' }
+  const since = Date.now() - (lastTest.get(id) ?? -Infinity)
+  if (since < TEST_COOLDOWN_MS)
+    return {
+      ok: false,
+      throttled: true,
+      message: `Aguarde ${fmtSecs(TEST_COOLDOWN_MS - since)} s para testar de novo.`
+    }
+  testing.add(id)
+  lastTest.set(id, Date.now())
+  const t0 = Date.now()
+  try {
+    const opts = entry.options?.maxResults ? { ...entry.options, maxResults: 3 } : entry.options
+    const o = await runEngine(
+      { ...entry, options: opts },
+      TEST_QUERY,
+      backends(),
+      AbortSignal.timeout(30_000)
+    )
+    const ms = Date.now() - t0
+    if (o.kind === 'fail') return { ok: false, message: o.message, ms }
+    const count = o.kind === 'results' ? o.results.length : 0
+    return {
+      ok: true,
+      count,
+      ms,
+      message: `${count} resultado${count === 1 ? '' : 's'} em ${fmtSecs(ms)} s`
+    }
+  } catch (e) {
+    return { ok: false, message: (e as Error).message }
+  } finally {
+    testing.delete(id)
+  }
 }
 
 /**
@@ -88,7 +180,7 @@ export async function webSearch(
  * renderizado — o parse é puro (brave.ts).
  */
 export async function braveFetch(query: string, signal: AbortSignal): Promise<SearchPage> {
-  const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`
+  const url = `${baseOf('brave-site')}?q=${encodeURIComponent(query)}`
   const win = new BrowserWindow({
     show: false,
     width: 1280,

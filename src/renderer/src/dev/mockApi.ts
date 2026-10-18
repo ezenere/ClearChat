@@ -2,7 +2,13 @@
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
-import type { ClearApi } from '@shared/ipc'
+import type { ClearApi, WebSearchSettingsState } from '@shared/ipc'
+import {
+  isApiEngine,
+  maskKey,
+  normalizeEngines,
+  type SearchEngineId
+} from '@shared/webSearchSettings'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
 import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
 import {
@@ -1438,6 +1444,41 @@ export function createMockApi(scenario: string): ClearApi {
         return delay(approvalSettings)
       }
     },
+    webSearch: (() => {
+      // chaves só no "main" do mock; a UI recebe a máscara
+      const keys: Partial<Record<SearchEngineId, string>> = {}
+      let engines = normalizeEngines(null)
+      const state = (): WebSearchSettingsState => ({
+        engines: normalizeEngines(engines, (id) => !!keys[id]).map((e) => ({
+          ...e,
+          hasKey: !!keys[e.id],
+          keyMask: maskKey(keys[e.id])
+        }))
+      })
+      return {
+        getSettings: () => delay(state()),
+        updateEngines: async (list) => {
+          const off = list.find((e) => e.enabled && isApiEngine(e.id) && !keys[e.id])
+          if (off) throw new Error(`Informe a chave de API para habilitar o ${off.id}.`)
+          engines = normalizeEngines(list, (id) => !!keys[id])
+          return delay(state())
+        },
+        setKey: async (id, key) => {
+          if (key?.trim()) keys[id] = key.trim()
+          else delete keys[id]
+          engines = normalizeEngines(engines, (x) => !!keys[x])
+          return delay(state())
+        },
+        revealKey: (id) => delay(keys[id] ?? null),
+        test: (id) =>
+          delay(
+            isApiEngine(id) && !keys[id]
+              ? { ok: false, message: 'sem chave de API' }
+              : { ok: true, count: 3, ms: 840, message: '3 resultados em 0,8 s' },
+            700
+          )
+      }
+    })(),
     onEvent: (cb) => {
       listeners.add(cb)
       if (scenario.startsWith('subagents')) {

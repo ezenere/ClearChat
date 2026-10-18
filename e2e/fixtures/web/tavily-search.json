@@ -1,0 +1,32 @@
+{
+  "query": "typescript satisfies operator",
+  "follow_up_questions": null,
+  "answer": "The satisfies operator, added in TypeScript 4.9, validates that an expression matches a type without widening the inferred type.",
+  "images": [],
+  "results": [
+    {
+      "url": "https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-9.html",
+      "title": "TypeScript: Documentation - TypeScript 4.9",
+      "content": "TypeScript 4.9 introduces the new <b>satisfies</b> operator, which lets us validate that the type of an expression matches some type, without changing the resulting type of that expression.",
+      "score": 0.9132,
+      "raw_content": null,
+      "published_date": "Tue, 15 Nov 2022 17:00:00 GMT"
+    },
+    {
+      "url": "https://www.totaltypescript.com/clarifying-the-satisfies-operator",
+      "title": "Clarifying the `satisfies` Operator | Total TypeScript",
+      "content": "The satisfies operator is a way to tell TypeScript that a value conforms to a type, while still letting TypeScript infer the most specific type.",
+      "score": 0.8744,
+      "raw_content": null
+    },
+    {
+      "url": "https://dev.to/example/satisfies-vs-as",
+      "title": "satisfies vs as in TypeScript",
+      "content": "Unlike a type assertion with as, satisfies never silences an error.",
+      "score": 0.61,
+      "raw_content": null
+    }
+  ],
+  "response_time": 1.67,
+  "request_id": "123e4567-e89b-12d3-a456-426614174111"
+}

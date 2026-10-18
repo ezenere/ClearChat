@@ -390,7 +390,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   web_search: def(
     'web_search',
-    `Pesquisa na web (DuckDuckGo, com fallback automático para o Brave Search se o DuckDuckGo bloquear ou falhar) e retorna até ${L.webMaxResults} resultados com título, URL e trecho; a 1ª linha diz qual buscador respondeu. Há um intervalo mínimo global entre pesquisas (configurável; padrão 5 s): se preciso, a chamada espera a vez e a 1ª linha informa quanto aguardou.`,
+    `Pesquisa na web com UM buscador por vez — o primeiro habilitado na ordem configurada pelo usuário (DuckDuckGo, Brave, Exa, Tavily…); se ele falhar (chave, cota, bloqueio, rede), tenta o próximo automaticamente — e retorna até ${L.webMaxResults} resultados com título, URL e trecho; a 1ª linha diz qual buscador respondeu (e quais falharam antes). Há um intervalo mínimo global entre pesquisas (configurável; padrão 5 s): se preciso, a chamada espera a vez e a 1ª linha informa quanto aguardou.`,
     { query: { type: 'string', description: 'Termos de busca.' } },
     ['query']
   ),

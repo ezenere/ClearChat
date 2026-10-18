@@ -1,5 +1,6 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
 // Ver SPEC.md → "API do preload". Todo método (exceto onEvent) é ipcRenderer.invoke → ipcMain.handle.
+import type { EngineConfig } from './webSearchSettings'
 import type {
   Memory,
   MemoryCollection,
@@ -129,6 +130,13 @@ export const IPC = {
   approvals: {
     getSettings: 'approvals:getSettings',
     updateSettings: 'approvals:updateSettings'
+  },
+  webSearch: {
+    getSettings: 'webSearch:getSettings',
+    updateEngines: 'webSearch:updateEngines',
+    setKey: 'webSearch:setKey',
+    revealKey: 'webSearch:revealKey',
+    test: 'webSearch:test'
   }
 } as const
 
@@ -228,6 +236,26 @@ export interface AppCapabilities {
 export interface ProcessLogsResult {
   info: ProcessInfo
   lines: { n: number; text: string }[]
+}
+
+/** Buscador do web_search como a UI o vê: a chave só como máscara ("tvly-…abcd"). */
+export interface WebSearchEngineState extends EngineConfig {
+  hasKey: boolean
+  keyMask: string | null
+}
+export interface WebSearchSettingsState {
+  /** Ordem = prioridade. */
+  engines: WebSearchEngineState[]
+}
+/** "Testar" de um buscador: uma pesquisa pequena (fora do intervalo global). */
+export interface WebSearchTestResult {
+  ok: boolean
+  /** "3 resultados em 1,2 s" / motivo da falha. */
+  message: string
+  count?: number
+  ms?: number
+  /** Recusado pelo freio do botão (teste em andamento / muito seguido) — sem ir à rede. */
+  throttled?: boolean
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -390,6 +418,22 @@ export interface ClearApi {
     updateSettings(
       patch: Partial<import('./types').ApprovalSettings>
     ): Promise<import('./types').ApprovalSettings>
+  }
+  /** Buscadores do web_search (Configurações → Pesquisa na web). */
+  webSearch: {
+    getSettings(): Promise<WebSearchSettingsState>
+    /** Substitui a lista (ordem/ligado/opções). Ligar buscador com API sem chave → erro legível. */
+    updateEngines(
+      engines: import('./webSearchSettings').EngineConfig[]
+    ): Promise<WebSearchSettingsState>
+    /** Salva a chave (null/vazio remove e desliga o buscador). */
+    setKey(
+      engine: import('./webSearchSettings').SearchEngineId,
+      key: string | null
+    ): Promise<WebSearchSettingsState>
+    /** Chave em claro, a pedido (botão mostrar). */
+    revealKey(engine: import('./webSearchSettings').SearchEngineId): Promise<string | null>
+    test(engine: import('./webSearchSettings').SearchEngineId): Promise<WebSearchTestResult>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void
