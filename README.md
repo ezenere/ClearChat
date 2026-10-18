@@ -27,6 +27,9 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
   parser conservador ("na dúvida, pergunta").
 - **Transparência total**: "Ver request" mostra o body exato enviado; cada mensagem e tool tem um (i) com o
   conteúdo real; custo, tokens e cache por resposta.
+- **Memória modular**: coleções por categoria (Perfil, Tópicos, Áreas, Pessoas, Preferências), ativadas por
+  chat ou persona, com escolha de onde o agente grava; índice congelado por sessão (não quebra o cache),
+  tools `memory_*` e extração automática após compactar. Tudo editável em Configurações → Memórias.
 - **Anexos**: imagens, PDF, áudio e arquivos de texto, conforme o que o modelo aceita.
 - **Memória modular**: coleções por categoria (perfil, tópicos, áreas, pessoas, preferências) que cada chat
   ou persona ativa; o modelo consulta e grava com ferramentas próprias, e uma extração pode rodar após a
@@ -38,6 +41,8 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
 | **Fila de aprovações** — vários subagentes pedindo ao mesmo tempo: "1 de 3", um de cada vez; falhas em vermelho. | **Questionário (`ask_user`)** — o agente pergunta com opções, ícones, imagens e ajuda; sempre há "Outro". |
 | ![Configurações de aprovações com whitelist, blacklist e teste de comando](docs/screenshots/configuracoes-aprovacoes.png) | ![Card de falha de conexão com Tentar de novo e Cancelar](docs/screenshots/falha-conexao.png) |
 | **Whitelist/Blacklist** globais com "Testar comando": veja o veredito de cada sub-comando. | **Falha de conexão** — caiu a rede? Você decide: tentar de novo ou cancelar. |
+
+![Memória: tools de busca e gravação no chat e painel de coleções por categoria](docs/screenshots/memoria.png)
 
 ![Markdown com LaTeX, blocos de código aninhados e streaming](docs/screenshots/markdown.png)
 
