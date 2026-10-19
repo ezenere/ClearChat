@@ -18,7 +18,16 @@ import {
   type ProviderTestInput,
   type SmartApproveTestInput
 } from '@shared/ipc'
-import type { ApiMessage, AttachmentInfo, Chat } from '@shared/types'
+import type { ApiMessage, AttachmentInfo, Chat, QuestionAnswer } from '@shared/types'
+import {
+  chatOfMessage,
+  chatOfSession,
+  gateById,
+  gateChat,
+  gatedSend,
+  syncEngine,
+  syncHandlers
+} from './sync'
 import { emit } from './events'
 import {
   chatsRepo,
@@ -78,6 +87,13 @@ function validateMessage(m: unknown): ApiMessage {
   return msg
 }
 
+/** Processos rodam no host: no controle remoto a lista é só leitura (§11). */
+function remoteProcessGuard(chatId: string): void {
+  const e = syncEngine()
+  if (e?.active && e.host.mode(chatId) === 'remote')
+    throw new Error(`Os processos rodam no host (${e.host.hostName(chatId)}) — gerencie-os por lá.`)
+}
+
 export function registerIpc(): void {
   presetsRepo.seed()
   const handlers: Record<string, Handler> = {
@@ -121,6 +137,8 @@ export function registerIpc(): void {
     },
     [IPC.chats.update]: (id: string, patch: ChatUpdateInput): Chat => {
       const { chat, modelChanged } = chatsRepo.update(id, patch ?? {})
+      // raiz escolhida neste dispositivo (chat vindo de outro): não pergunta mais ao virar host
+      if (patch?.config?.cwd) syncEngine()?.setChatRow(id, { cwd_confirmed: 1 })
       if (modelChanged && chat.mainSessionId) {
         const s = sessionsRepo.setModel(chat.mainSessionId, chat.config.model)
         if (s) emit({ type: 'session-updated', session: s })
@@ -129,6 +147,11 @@ export function registerIpc(): void {
       return chat
     },
     [IPC.chats.delete]: async (id: string) => {
+      const e = syncEngine()
+      if (e?.active && e.host.mode(id) === 'remote' && e.chatInfo(id).running)
+        throw new Error(
+          `O chat está rodando em ${e.host.hostName(id)} — pare o turno antes de apagá-lo.`
+        )
       await runner.stopChat(id)
       await stopChatProcesses(id)
       chatsRepo.delete(id)
@@ -140,11 +163,27 @@ export function registerIpc(): void {
 
     // ---- messages ----
     [IPC.messages.update]: (id: string, message: ApiMessage) => {
-      const m = messagesRepo.update(id, validateMessage(message))
-      emit({ type: 'message-updated', message: m })
-      return m
+      const msg = validateMessage(message)
+      const local = (): ReturnType<typeof messagesRepo.update> => {
+        const m = messagesRepo.update(id, msg)
+        emit({ type: 'message-updated', message: m })
+        return m
+      }
+      return gateChat(chatOfMessage(id), 'message.edit', { messageId: id, message: msg }, local, {
+        purpose: 'edit',
+        remote: () => ({ ...messagesRepo.get(id)!, message: msg })
+      })
     },
-    [IPC.messages.delete]: (id: string) => runner.deleteMessage(id),
+    [IPC.messages.delete]: (id: string) =>
+      gateChat(
+        chatOfMessage(id),
+        'message.delete',
+        { messageId: id },
+        () => runner.deleteMessage(id),
+        {
+          purpose: 'edit'
+        }
+      ),
 
     // ---- agent ----
     [IPC.agent.send]: (
@@ -152,27 +191,66 @@ export function registerIpc(): void {
       text: string,
       attachments?: AttachmentInfo[],
       skills?: string[]
-    ) =>
-      skills?.length
-        ? runner.sendWithSkills(sessionId, text, attachments, skills)
-        : runner.send(sessionId, text, attachments),
-    [IPC.agent.forceSend]: (queuedId: string) => runner.forceSend(queuedId),
-    [IPC.agent.removeQueued]: (queuedId: string) => runner.removeQueued(queuedId),
-    [IPC.agent.getQueue]: (sessionId: string) => runner.getQueue(sessionId),
-    [IPC.agent.stop]: (sessionId: string) => runner.stop(sessionId),
-    [IPC.agent.regenerate]: (sessionId: string) => runner.regenerate(sessionId),
+    ) => gatedSend(sessionId, text, attachments, skills),
+    [IPC.agent.forceSend]: (queuedId: string) =>
+      gateById(
+        (e) => e.host.findQueued(queuedId)?.chatId ?? null,
+        'queue.force',
+        { queuedId },
+        () => runner.forceSend(queuedId)
+      ),
+    [IPC.agent.removeQueued]: (queuedId: string) =>
+      gateById(
+        (e) => e.host.findQueued(queuedId)?.chatId ?? null,
+        'queue.remove',
+        { queuedId },
+        () => runner.removeQueued(queuedId)
+      ),
+    [IPC.agent.getQueue]: (sessionId: string) =>
+      syncEngine()?.host.mirrorQueue(sessionId) ?? runner.getQueue(sessionId),
+    [IPC.agent.stop]: (sessionId: string) =>
+      gateChat(chatOfSession(sessionId), 'stop', { sessionId }, () => runner.stop(sessionId), {
+        content: false
+      }),
+    [IPC.agent.regenerate]: (sessionId: string) =>
+      gateChat(chatOfSession(sessionId), 'regenerate', { sessionId }, () =>
+        runner.regenerate(sessionId)
+      ),
     [IPC.agent.approve]: (
       requestId: string,
       decision: ApprovalDecision,
       items?: ApprovalItemDecision[]
-    ) => runner.approve(requestId, decision, items),
-    [IPC.agent.pendingApprovals]: () => runner.pendingApprovals(),
+    ) =>
+      gateById(
+        (e) => e.host.findApproval(requestId),
+        'approval',
+        { requestId, decision, ...(items?.length ? { items } : {}) },
+        () => runner.approve(requestId, decision, items)
+      ),
+    [IPC.agent.pendingApprovals]: () => [
+      ...runner.pendingApprovals(),
+      ...(syncEngine()?.host.mirrorApprovals() ?? [])
+    ],
     [IPC.agent.previewRequest]: (sessionId: string) => runner.previewRequest(sessionId),
-    [IPC.agent.runningSessions]: () => runner.runningSessions(),
+    [IPC.agent.runningSessions]: () => [
+      ...new Set([...runner.runningSessions(), ...(syncEngine()?.host.mirrorRunning() ?? [])])
+    ],
     [IPC.agent.compact]: (sessionId: string, opts?: CompactOptions) =>
-      runner.compact(sessionId, opts ?? {}),
-    [IPC.agent.stopSubagents]: (chatId: string) => runner.stopSubagents(chatId),
-    [IPC.agent.smartOverride]: (messageId: string) => runner.smartOverride(messageId),
+      gateChat(
+        chatOfSession(sessionId),
+        'compact',
+        { sessionId, ...(opts ? { opts } : {}) },
+        () => runner.compact(sessionId, opts ?? {}),
+        { remote: (r) => ({ scheduled: !!r.queued }) }
+      ),
+    [IPC.agent.stopSubagents]: (chatId: string) =>
+      gateChat(chatId, 'stop_subagents', {}, () => runner.stopSubagents(chatId), {
+        content: false
+      }),
+    [IPC.agent.smartOverride]: (messageId: string) =>
+      gateChat(chatOfMessage(messageId), 'smart_override', { messageId }, () =>
+        runner.smartOverride(messageId)
+      ),
     [IPC.agent.smartApproveTest]: (input: SmartApproveTestInput) => runner.smartApproveTest(input),
 
     // ---- aprovações (modos globais + listas) ----
@@ -273,22 +351,56 @@ export function registerIpc(): void {
     }),
 
     // ---- questionários (ask_user) ----
-    [IPC.questions.answer]: (id: string, answers: unknown) => answerQuestion(id, answers),
-    [IPC.questions.cancel]: (id: string) => runner.cancelQuestionRequest(id),
-    [IPC.questions.pending]: () => runner.pendingQuestions(),
+    [IPC.questions.answer]: (id: string, answers: unknown) =>
+      gateById(
+        (e) => e.host.findQuestion(id),
+        'question',
+        { requestId: id, answers: answers as QuestionAnswer[] },
+        () => answerQuestion(id, answers)
+      ),
+    [IPC.questions.cancel]: (id: string) =>
+      gateById(
+        (e) => e.host.findQuestion(id),
+        'question',
+        { requestId: id, cancel: true },
+        () => runner.cancelQuestionRequest(id)
+      ),
+    [IPC.questions.pending]: () => [
+      ...runner.pendingQuestions(),
+      ...(syncEngine()?.host.mirrorQuestions() ?? [])
+    ],
 
     // ---- falha de conexão com o provedor (Tentar de novo / Cancelar) ----
-    [IPC.retries.retry]: (id: string) => runner.retryRequest(id),
-    [IPC.retries.cancel]: (id: string) => runner.cancelRetryRequest(id),
-    [IPC.retries.pending]: () => runner.pendingRetries(),
+    [IPC.retries.retry]: (id: string) =>
+      gateById(
+        (e) => e.host.findRetry(id),
+        'retry',
+        { requestId: id, action: 'retry' },
+        () => runner.retryRequest(id)
+      ),
+    [IPC.retries.cancel]: (id: string) =>
+      gateById(
+        (e) => e.host.findRetry(id),
+        'retry',
+        { requestId: id, action: 'cancel' },
+        () => runner.cancelRetryRequest(id)
+      ),
+    [IPC.retries.pending]: () => [
+      ...runner.pendingRetries(),
+      ...(syncEngine()?.host.mirrorRetries() ?? [])
+    ],
 
     // ---- processos em segundo plano (process_start) ----
-    [IPC.processes.list]: (chatId: string) => listProcesses(chatId),
+    [IPC.processes.list]: (chatId: string) =>
+      syncEngine()?.host.mirrorProcesses(chatId) ?? listProcesses(chatId),
     [IPC.processes.stop]: async (chatId: string, id: string) => {
+      remoteProcessGuard(chatId)
       await stopProcess(chatId, id, 'SIGTERM')
     },
-    [IPC.processes.logs]: (chatId: string, id: string, tail?: number) =>
-      processLogLines(chatId, id, tail),
+    [IPC.processes.logs]: (chatId: string, id: string, tail?: number) => {
+      remoteProcessGuard(chatId)
+      return processLogLines(chatId, id, tail)
+    },
 
     // ---- presets (personas) ----
     [IPC.presets.list]: () => presetsRepo.list(),
@@ -308,7 +420,24 @@ export function registerIpc(): void {
     [IPC.memory.delete]: (id: string) => memory.deleteMemory(id),
     [IPC.memory.preview]: (sessionId: string) => memory.previewMemory(sessionId),
     [IPC.memory.refreshSnapshot]: (sessionId: string) => memory.refreshSnapshot(sessionId),
-    [IPC.memory.extractNow]: (sessionId: string) => memory.extractNow(sessionId)
+    [IPC.memory.extractNow]: (sessionId: string) =>
+      gateChat(
+        chatOfSession(sessionId),
+        'memory.extract',
+        { sessionId },
+        () => memory.extractNow(sessionId),
+        {
+          remote: () => ({
+            created: 0,
+            updated: 0,
+            deleted: 0,
+            changes: [],
+            error: 'A extração roda no host; o resultado aparece no chat quando terminar.'
+          })
+        }
+      ),
+    // ---- sync ----
+    ...syncHandlers()
   }
 
   const missing = ALL_CHANNELS.filter((c) => !handlers[c])

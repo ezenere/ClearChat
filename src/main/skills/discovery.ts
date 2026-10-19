@@ -214,6 +214,8 @@ async function scanLocation(
 
 export interface DiscoverInput {
   settings: SkillsSettings
+  /** Locais do app (skills baixadas pelo sync), depois dos locais do usuário. */
+  appLocations?: { id: string; path: string; label: string }[]
   /** Diretório raiz do chat (skills de projeto, se `settings.projectSkills`). */
   cwd?: string | null
   counts?: boolean
@@ -246,6 +248,10 @@ export async function discoverSkills(input: DiscoverInput): Promise<SkillsDiscov
     enabled: l.enabled,
     kind: 'global'
   }))
+  for (const a of input.appLocations ?? []) {
+    if (locs.some((l) => expandHome(l.path, home) === expandHome(a.path, home))) continue
+    locs.push({ id: a.id, path: a.path, label: a.label, enabled: true, kind: 'global' })
+  }
   if (input.settings.projectSkills && input.cwd) {
     const p = projectLocation(input.cwd)
     const resolvedP = expandHome(p.path, home)

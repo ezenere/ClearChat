@@ -718,3 +718,13 @@ export type AgentEvent =
   | { type: 'memory-changed'; collectionId: string | null; memoryId: string | null }
   /** Locais de skills mudaram ou "Reescanear" (Configurações → Skills): listas recarregam. */
   | { type: 'skills-changed' }
+  /** Chat apagado fora da UI (sync: apagado em outro dispositivo / divergência descartada). */
+  | { type: 'chat-deleted'; chatId: string }
+  /** Sync: estado da conta/conexão mudou. */
+  | { type: 'sync-status'; status: import('./sync').SyncStatus }
+  /** Sync: host/divergência de um chat mudou. */
+  | { type: 'sync-chat-state'; info: import('./sync').ChatHostInfo }
+  /** Sync: tabelas locais mudaram por mudanças remotas (o renderer recarrega esses domínios). */
+  | { type: 'sync-data-changed'; scopes: import('./sync').SyncScope[] }
+  /** Sync: aviso para o usuário (toast; `chatId` = aviso também no chat). */
+  | { type: 'sync-notice'; kind: 'info' | 'error' | 'success'; text: string; chatId?: string }

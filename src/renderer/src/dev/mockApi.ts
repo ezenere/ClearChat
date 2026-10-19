@@ -10,6 +10,7 @@ import {
   type SkillsSettings
 } from '@shared/skills'
 import type { ClearApi, WebSearchSettingsState } from '@shared/ipc'
+import { OFFICIAL_SYNC_URL, type SyncStatus } from '@shared/sync'
 import {
   isApiEngine,
   maskKey,
@@ -1084,7 +1085,62 @@ export function createMockApi(scenario: string): ClearApi {
     )
   }
 
+  const syncStatus = (): SyncStatus => ({
+    phase: 'signed-out',
+    server: { kind: 'official', url: OFFICIAL_SYNC_URL, name: null, envOverride: false },
+    account: null,
+    device: null,
+    connection: 'disabled',
+    lastSyncAt: null,
+    pending: 0,
+    error: null,
+    quota: null,
+    remember: true,
+    merge: null,
+    prompts: [],
+    protocolError: null
+  })
+  const noSync = (): Promise<never> =>
+    Promise.reject(new Error('Sync indisponível no modo de demonstração.'))
+
   return {
+    sync: {
+      status: () => delay(syncStatus()),
+      probeServer: noSync,
+      setServer: noSync,
+      requestCode: noSync,
+      verifyCode: noSync,
+      refreshKeys: noSync,
+      unlock: noSync,
+      unlockWithRecovery: noSync,
+      resolveMerge: noSync,
+      lock: () => delay(syncStatus()),
+      logout: () => delay(syncStatus()),
+      changePassword: noSync,
+      newRecoveryKey: noSync,
+      devices: () => delay([]),
+      renameDevice: noSync,
+      revokeDevice: noSync,
+      syncNow: noSync,
+      openSignup: () => delay(undefined),
+      openSetup: () => delay(undefined),
+      chatStates: () => delay([]),
+      takeover: noSync,
+      cancelHandover: noSync,
+      setPinned: noSync,
+      confirmCwd: noSync,
+      divergence: noSync,
+      resolveDivergence: noSync,
+      setActiveChat: () => delay(undefined),
+      answerPrompt: noSync,
+      cloudSkills: () => delay([]),
+      trackedSkills: () => delay([]),
+      setSkillSync: noSync,
+      downloadSkills: noSync,
+      removeCloudSkill: noSync,
+      stopTrackingSkill: noSync,
+      hostSkills: () => delay(null)
+    },
     memory: createMemoryMock({
       emit,
       chats,

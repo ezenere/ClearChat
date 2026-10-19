@@ -5,6 +5,7 @@ import icon from '../../resources/icon.png?asset'
 import { closeDb, getDb, getDbPath } from './db'
 import { registerIpc } from './ipc'
 import { registerEventWindow } from './events'
+import { initSync, shutdownSync, syncEngine } from './sync'
 import { initRunner, shutdownRunner } from './agent/runner'
 import { emit } from './events'
 import { initShell } from './tools/shellEnv'
@@ -117,14 +118,22 @@ app.whenReady().then(() => {
   } catch (e) {
     console.error('[clearchat] gc de anexos', e)
   }
-  protocol.handle(ATTACHMENT_SCHEME, (req) => {
+  protocol.handle(ATTACHMENT_SCHEME, async (req) => {
     const file = parseAttachmentUrl(req.url.replace(/\/+$/, ''))
     if (!file) return new Response('bad request', { status: 400 })
-    try {
-      return new Response(new Uint8Array(readAttachment(file)), {
+    const serve = (): Response =>
+      new Response(new Uint8Array(readAttachment(file)), {
         headers: { 'content-type': mimeForFile(file), 'cache-control': 'max-age=31536000' }
       })
+    try {
+      return serve()
     } catch {
+      // ausente localmente: baixa do sync (anexo enviado por outro dispositivo)
+      try {
+        if (await syncEngine()?.ensureAttachment(file)) return serve()
+      } catch {
+        /* */
+      }
       return new Response('not found', { status: 404 })
     }
   })
@@ -144,6 +153,7 @@ app.whenReady().then(() => {
   initRunner()
   registerIpc()
   createWindow()
+  void initSync().catch((e) => console.error('[clearchat] sync', e))
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -155,6 +165,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  shutdownSync()
   shutdownRunner()
   killAllProcesses()
 })

@@ -1,6 +1,16 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
 // Ver SPEC.md → "API do preload". Todo método (exceto onEvent) é ipcRenderer.invoke → ipcMain.handle.
 import type { EngineConfig } from './webSearchSettings'
+import type {
+  ChatHostInfo,
+  CloudSkill,
+  DivergenceDetails,
+  SyncDevice,
+  SyncServerInfo,
+  SyncServerKind,
+  SyncStatus,
+  TakeoverOptions
+} from './sync'
 import type { SkillsDiscoverOptions, SkillsDiscovery, SkillsSettings } from './skills'
 import type {
   Memory,
@@ -139,6 +149,43 @@ export const IPC = {
     read: 'skills:read',
     pickFolder: 'skills:pickFolder',
     openFolder: 'skills:openFolder'
+  },
+  sync: {
+    status: 'sync:status',
+    probeServer: 'sync:probeServer',
+    setServer: 'sync:setServer',
+    requestCode: 'sync:requestCode',
+    verifyCode: 'sync:verifyCode',
+    refreshKeys: 'sync:refreshKeys',
+    unlock: 'sync:unlock',
+    unlockWithRecovery: 'sync:unlockWithRecovery',
+    resolveMerge: 'sync:resolveMerge',
+    lock: 'sync:lock',
+    logout: 'sync:logout',
+    changePassword: 'sync:changePassword',
+    newRecoveryKey: 'sync:newRecoveryKey',
+    devices: 'sync:devices',
+    renameDevice: 'sync:renameDevice',
+    revokeDevice: 'sync:revokeDevice',
+    syncNow: 'sync:syncNow',
+    openSignup: 'sync:openSignup',
+    openSetup: 'sync:openSetup',
+    chatStates: 'sync:chatStates',
+    takeover: 'sync:takeover',
+    cancelHandover: 'sync:cancelHandover',
+    setPinned: 'sync:setPinned',
+    confirmCwd: 'sync:confirmCwd',
+    divergence: 'sync:divergence',
+    resolveDivergence: 'sync:resolveDivergence',
+    setActiveChat: 'sync:setActiveChat',
+    answerPrompt: 'sync:answerPrompt',
+    cloudSkills: 'sync:cloudSkills',
+    trackedSkills: 'sync:trackedSkills',
+    setSkillSync: 'sync:setSkillSync',
+    downloadSkills: 'sync:downloadSkills',
+    removeCloudSkill: 'sync:removeCloudSkill',
+    stopTrackingSkill: 'sync:stopTrackingSkill',
+    hostSkills: 'sync:hostSkills'
   },
   webSearch: {
     getSettings: 'webSearch:getSettings',
@@ -459,6 +506,60 @@ export interface ClearApi {
     /** Chave em claro, a pedido (botão mostrar). */
     revealKey(engine: import('./webSearchSettings').SearchEngineId): Promise<string | null>
     test(engine: import('./webSearchSettings').SearchEngineId): Promise<WebSearchTestResult>
+  }
+  /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
+  sync: {
+    status(): Promise<SyncStatus>
+    /** Valida um servidor (GET <base>/api/info). Sem url = o servidor atual. */
+    probeServer(url?: string): Promise<SyncServerInfo>
+    /** Só deslogado. kind 'official' = clear.ezenere.com; 'self' = url. */
+    setServer(kind: SyncServerKind, url?: string): Promise<SyncStatus>
+    /** Envia o código por e-mail (captcha numa janela, se a instância exigir). */
+    requestCode(email: string): Promise<void>
+    verifyCode(email: string, code: string): Promise<SyncStatus>
+    /** Conta sem chaves: "Já defini a senha". */
+    refreshKeys(): Promise<SyncStatus>
+    unlock(password: string, remember: boolean): Promise<SyncStatus>
+    unlockWithRecovery(
+      recoveryKey: string,
+      newPassword: string,
+      remember: boolean
+    ): Promise<SyncStatus>
+    resolveMerge(priority: 'online' | 'local'): Promise<SyncStatus>
+    /** Esquece a DEK neste computador (continua logado). */
+    lock(): Promise<SyncStatus>
+    logout(): Promise<SyncStatus>
+    changePassword(newPassword: string): Promise<void>
+    newRecoveryKey(): Promise<{ recoveryKey: string }>
+    devices(): Promise<SyncDevice[]>
+    renameDevice(id: string, name: string): Promise<void>
+    revokeDevice(id: string): Promise<void>
+    syncNow(): Promise<SyncStatus>
+    openSignup(): Promise<void>
+    openSetup(): Promise<void>
+    chatStates(): Promise<ChatHostInfo[]>
+    /** "Executar neste dispositivo" (troca de host). */
+    takeover(chatId: string, opts: TakeoverOptions): Promise<ChatHostInfo>
+    cancelHandover(chatId: string): Promise<void>
+    setPinned(chatId: string, pinned: boolean): Promise<void>
+    /** Raiz local escolhida ao virar host de um chat vindo de outro dispositivo. */
+    confirmCwd(chatId: string, cwd: string): Promise<void>
+    divergence(chatId: string): Promise<DivergenceDetails>
+    /** Mantém uma versão; a outra é APAGADA (depois do aviso na UI). */
+    resolveDivergence(chatId: string, keep: 'online' | 'local'): Promise<void>
+    /** Chat aberto na tela (stream ao vivo do host). */
+    setActiveChat(chatId: string | null): Promise<void>
+    /** "Chat apagado em outro dispositivo": manter como novo / descartar. */
+    answerPrompt(chatId: string, keep: boolean): Promise<SyncStatus>
+    cloudSkills(): Promise<CloudSkill[]>
+    /** Skills locais com "Sincronizar" ligado (nomes). */
+    trackedSkills(): Promise<string[]>
+    setSkillSync(name: string, on: boolean): Promise<void>
+    downloadSkills(names?: string[]): Promise<number>
+    removeCloudSkill(name: string): Promise<void>
+    stopTrackingSkill(name: string): Promise<void>
+    /** Skills do host (controle remoto): null = este dispositivo executa o chat. */
+    hostSkills(chatId: string): Promise<{ name: string; description: string }[] | null>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

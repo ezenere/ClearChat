@@ -1,6 +1,6 @@
 // Skills — API do main (IPC, runner): settings globais (setting `skillsSettings`), descoberta e
 // skills ativas por chat, invocação manual e pastas do sandbox. Ver SPEC.md → "Skills".
-import { promises as fs } from 'fs'
+import { existsSync, promises as fs } from 'fs'
 import {
   normalizeSkillsConfig,
   normalizeSkillsSettings,
@@ -31,9 +31,19 @@ export function updateSkillsSettings(patch: Partial<SkillsSettings>): SkillsSett
   return next
 }
 
+/** Pasta das skills baixadas pelo sync (`<userData>/synced-skills`) — local do app. */
+let syncedSkillsDir: string | null = null
+export function setSyncedSkillsDir(dir: string | null): void {
+  syncedSkillsDir = dir
+}
+
 export function discover(opts: SkillsDiscoverOptions = {}): Promise<SkillsDiscovery> {
   return discoverSkills({
     settings: getSkillsSettings(),
+    appLocations:
+      syncedSkillsDir && existsSync(syncedSkillsDir)
+        ? [{ id: 'synced', path: syncedSkillsDir, label: 'sincronizadas (nuvem)' }]
+        : [],
     cwd: opts.cwd ?? null,
     counts: !!opts.counts,
     rescan: !!opts.rescan
