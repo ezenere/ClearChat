@@ -3,7 +3,7 @@
 // sem key): builda o renderer com VITE_CLEAR_MOCK=1 numa pasta de rascunho (não mexe em out/), abre
 // `index.html?scenario=branches` numa janela Electron mínima e percorre o chat "Cache das respostas
 // da API" (resposta do 1º turno regenerada: 2 versões; pergunta do 2º editada: 3 versões, a 2ª ativa):
-//   ‹ i/n › visível com o i/n certo (balão do usuário e rodapé do assistente), trocar muda o caminho
+//   ‹ i/n › (só no hover, como os outros ícones) com o i/n certo (balão do usuário e rodapé do assistente), trocar muda o caminho
 //   mostrado (botões e ←/→ com o grupo em foco) e mantém o ‹ › no mesmo lugar da tela; "Regenerar
 //   resposta" em todos os turnos; editar → "Enviar" (desabilitado sem mudança) cria uma nova versão;
 //   regenerar um turno anterior cria uma versão da resposta; tudo desabilitado com o agente rodando
@@ -130,14 +130,17 @@ app.on('window-all-closed', () => app.quit())
     await scroller().getByText('E como invalidar quando a chave muda?').waitFor()
     assert.equal(await scroller().getByText('Mostra um exemplo em Go.').count(), 0)
     assert.equal(await scroller().getByText('TTL curto').count(), 0)
-    // sempre visível (não só no hover)
-    await page.mouse.move(2, 2)
-    assert.equal(
-      await switchers()
+    // como os outros ícones do rodapé: some sem o mouse, aparece no hover da mensagem
+    const opacity = (): Promise<string> =>
+      switchers()
         .first()
-        .evaluate((e) => getComputedStyle(e).opacity),
-      '1'
-    )
+        .evaluate((e) => getComputedStyle(e).opacity)
+    await page.mouse.move(2, 2)
+    await page.waitForTimeout(400) // transição
+    assert.equal(await opacity(), '0')
+    await msgBlock('stale-while-revalidate').hover()
+    await page.waitForTimeout(400)
+    assert.equal(await opacity(), '1')
     await shot('01-branched-chat')
   })
 

@@ -1069,8 +1069,8 @@ interface Ctx {
   regenTargets: Set<string>
   /** Erro persistido que fecha o caminho ("Tentar de novo"), ou null. */
   trailingErrorId: string | null
-  /** ‹ i/n › da mensagem (null = só uma versão). */
-  switcher: (m: StoredMessage) => ReactNode
+  /** ‹ i/n › da mensagem (null = só uma versão). `reveal`: só aparece no hover, como os outros ícones do rodapé. */
+  switcher: (m: StoredMessage, reveal?: boolean) => ReactNode
   /** Avisos do editor de nova versão (fronteira de compactação, subagentes que serão parados…). */
   editHints: (m: StoredMessage) => ReactNode[]
 }
@@ -1360,7 +1360,7 @@ export function MessageList({
         return 'Disponível quando os subagentes desta versão terminarem'
       return null
     }
-    const switcher = (m: StoredMessage): ReactNode => {
+    const switcher = (m: StoredMessage, reveal = true): ReactNode => {
       const info = siblings.get(m.id)
       if (!info) return null
       return (
@@ -1370,6 +1370,11 @@ export function MessageList({
           onSelect={onSelectBranch}
           disabledReason={switchBlocked(m)}
           local={localSwitch}
+          className={
+            reveal
+              ? 'opacity-0 transition-opacity group-hover/msg:opacity-100 focus-within:opacity-100'
+              : undefined
+          }
         />
       )
     }
@@ -1621,8 +1626,9 @@ export function MessageList({
   const renderItem = (m: StoredMessage, old: boolean): ReactNode => {
     const el = renderMessage(m, old)
     if (!el) return null
-    // outras mensagens com versões (erro, sintética…): ‹ i/n › numa linha pequena acima
-    const row = siblings.has(m.id) && !nativeSwitcher(m) ? ctx.switcher(m) : null
+    // outras mensagens com versões (erro, sintética…): ‹ i/n › numa linha pequena acima (fora do
+    // grupo de hover da mensagem: fica sempre visível)
+    const row = siblings.has(m.id) && !nativeSwitcher(m) ? ctx.switcher(m, false) : null
     return (
       <Fragment key={m.id}>
         {starts.has(m.id) && <DaySeparator ts={m.createdAt} now={now} />}
