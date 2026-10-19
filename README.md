@@ -10,6 +10,14 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
 
 ![Chat com agente: tool de shell aguardando aprovação comando a comando](docs/screenshots/chat.png)
 
+> ⚠️ **AVISO — PROTOCOLO DE SYNC COMPARTILHADO COM O SERVIDOR**
+>
+> Estes dois projetos (**ClearChat** app ↔ **ClearChatWebsite** servidor/site) compartilham o protocolo
+> de sync em [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md) (e os vetores em `docs/test-vectors/`).
+> **Qualquer mudança** no protocolo, na criptografia, nos esquemas dos registros, nos endpoints ou nas
+> mensagens de WebSocket precisa ser feita **nos DOIS repositórios** — mantenha os documentos idênticos,
+> regenere os vetores e suba a versão do protocolo. Mudar um lado só **quebra o sync**.
+
 ## Destaques
 
 - **Qualquer provedor**: OpenAI-compatible genérico, OpenRouter e Anthropic nativa (PDF como documento,
