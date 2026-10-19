@@ -3,10 +3,23 @@ import { randomUUID } from 'crypto'
 import { homedir } from 'os'
 import { getDb } from './db'
 import { indexMessage } from './searchIndex'
+import { ROOT_PARENT } from './migrateBranches'
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
 import { providerKind } from '@shared/providerKinds'
 import { migrateConfigTools } from '@shared/toolRename'
+import {
+  activeLeaf,
+  activePath,
+  buildTree,
+  pruneSel,
+  selEquals,
+  selKey,
+  selectionToReach,
+  toBranchSel,
+  type BranchSel,
+  type TreeMessage
+} from '@shared/branches'
 import {
   APPROVAL_MODES_SETTING,
   migrateApprovalConfig,
@@ -182,6 +195,7 @@ interface SessionRow {
   task: string | null
   status: string
   created_at: number
+  branch_sel_json?: string | null
 }
 
 const toSession = (r: SessionRow): Session => ({
@@ -195,8 +209,22 @@ const toSession = (r: SessionRow): Session => ({
   title: r.title,
   task: r.task,
   status: r.status as SessionStatus,
-  createdAt: r.created_at
+  createdAt: r.created_at,
+  branchSel: toBranchSel(parse<unknown>(r.branch_sel_json, {}))
 })
+
+/** Seleção do ramo ativo da sessão ({} se não existe). */
+function readSel(sessionId: string): BranchSel {
+  const r = getDb().prepare('SELECT branch_sel_json FROM sessions WHERE id = ?').get(sessionId) as
+    { branch_sel_json: string | null } | undefined
+  return toBranchSel(parse<unknown>(r?.branch_sel_json, {}))
+}
+
+function writeSel(sessionId: string, sel: BranchSel): void {
+  getDb()
+    .prepare('UPDATE sessions SET branch_sel_json = ? WHERE id = ?')
+    .run(JSON.stringify(sel), sessionId)
+}
 
 export const sessionsRepo = {
   list(chatId: string): Session[] {
@@ -214,13 +242,14 @@ export const sessionsRepo = {
     const sess: Session = {
       ...s,
       providerId: s.providerId ?? null,
+      branchSel: s.branchSel ?? {},
       id: randomUUID(),
       createdAt: Date.now()
     }
     getDb()
       .prepare(
-        `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task, status, created_at, branch_sel_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         sess.id,
@@ -233,7 +262,8 @@ export const sessionsRepo = {
         sess.title,
         sess.task,
         sess.status,
-        sess.createdAt
+        sess.createdAt,
+        JSON.stringify(sess.branchSel)
       )
     return sess
   },
@@ -243,6 +273,18 @@ export const sessionsRepo = {
   },
   delete(id: string): void {
     getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id)
+  },
+  /**
+   * Grava a seleção do ramo ativo (limpa: entradas inválidas/redundantes saem — o caminho é o
+   * mesmo). Só escreve se mudou (o trigger do sync marcaria a sessão). Retorna a sessão.
+   */
+  setBranchSel(id: string, sel: BranchSel): Session | null {
+    const db = getDb()
+    db.transaction(() => {
+      const next = pruneSel(buildTree(treeNodes(id)), sel)
+      if (!selEquals(readSel(id), next)) writeSel(id, next)
+    })()
+    return sessionsRepo.get(id)
   },
   setModel(id: string, model: string): Session | null {
     getDb().prepare('UPDATE sessions SET model = ? WHERE id = ?').run(model, id)
@@ -273,6 +315,9 @@ export const sessionsRepo = {
 }
 
 // ---------------- messages ----------------
+// Árvore de mensagens (ramos — ver src/shared/branches.ts): parent_id '' = raiz, NULL = legado
+// (→ anterior por seq), senão o id do pai. `path` = caminho ativo (o que o agente vê); `listAll` =
+// todas as versões (UI, sync, buscas por id).
 
 interface MessageRow {
   id: string
@@ -281,71 +326,202 @@ interface MessageRow {
   message_json: string
   meta_json: string
   created_at: number
+  parent_id?: string | null
 }
 
-const toMessage = (r: MessageRow): StoredMessage => ({
-  id: r.id,
-  sessionId: r.session_id,
-  seq: r.seq,
-  message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
-  meta: parse<MessageMeta>(r.meta_json, {}),
-  createdAt: r.created_at
-})
+/** Coluna → StoredMessage.parentId (undefined = legado, derivar). */
+const toParentId = (v: string | null | undefined): string | null | undefined =>
+  v == null ? undefined : v === ROOT_PARENT ? null : v
+
+/** StoredMessage.parentId → coluna. */
+const fromParentId = (p: string | null): string => p ?? ROOT_PARENT
+
+const toMessage = (r: MessageRow): StoredMessage => {
+  const m: StoredMessage = {
+    id: r.id,
+    sessionId: r.session_id,
+    seq: r.seq,
+    message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
+    meta: parse<MessageMeta>(r.meta_json, {}),
+    createdAt: r.created_at
+  }
+  const p = toParentId(r.parent_id)
+  if (p !== undefined) m.parentId = p
+  return m
+}
+
+/** Só a estrutura (id, seq, pai) das mensagens da sessão — para calcular a árvore. */
+function treeNodes(sessionId: string): TreeMessage[] {
+  const rows = getDb()
+    .prepare('SELECT id, seq, parent_id FROM messages WHERE session_id = ?')
+    .all(sessionId) as { id: string; seq: number; parent_id: string | null }[]
+  return rows.map((r) => {
+    const p = toParentId(r.parent_id)
+    return p === undefined ? { id: r.id, seq: r.seq } : { id: r.id, seq: r.seq, parentId: p }
+  })
+}
+
+function insertRow(msg: StoredMessage, parentId: string | null): void {
+  const db = getDb()
+  db.prepare(
+    'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run(
+    msg.id,
+    msg.sessionId,
+    msg.seq,
+    JSON.stringify(msg.message),
+    JSON.stringify(msg.meta),
+    msg.createdAt,
+    fromParentId(parentId)
+  )
+  indexMessage(db, msg.id, msg.message, msg.meta)
+}
+
+function nextSeq(sessionId: string): number {
+  const r = getDb()
+    .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ?')
+    .get(sessionId) as { m: number }
+  return r.m + 1
+}
+
+export interface MessageRemoval {
+  message: StoredMessage
+  /** Filhos que passaram a apontar para o pai da apagada (já com o parentId novo). */
+  reparented: StoredMessage[]
+  /** A seleção do ramo ativo da sessão mudou (emitir session-updated). */
+  selChanged: boolean
+}
 
 export const messagesRepo = {
-  list(sessionId: string): StoredMessage[] {
+  /** TODAS as mensagens da sessão (todos os ramos), por seq. UI, sync e buscas por id. */
+  listAll(sessionId: string): StoredMessage[] {
     const rows = getDb()
       .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY seq')
       .all(sessionId) as MessageRow[]
     return rows.map(toMessage)
+  },
+  /** Caminho ativo da sessão (raiz → folha, crescente em seq): o histórico que o agente vê. */
+  path(sessionId: string): StoredMessage[] {
+    return activePath(messagesRepo.listAll(sessionId), readSel(sessionId))
   },
   get(id: string): StoredMessage | null {
     const r = getDb().prepare('SELECT * FROM messages WHERE id = ?').get(id) as
       MessageRow | undefined
     return r ? toMessage(r) : null
   },
-  append(sessionId: string, message: ApiMessage, meta: MessageMeta = {}): StoredMessage {
+  /**
+   * Acrescenta no fim. Pai = `parentId` explícito (null = raiz) ou, por padrão, a folha do caminho
+   * ativo (calculada dentro da transação). Um `null` na seleção sob esse pai (ramo novo vazio do
+   * regenerate) é limpo — a mensagem passa a ser o caminho.
+   */
+  append(
+    sessionId: string,
+    message: ApiMessage,
+    meta: MessageMeta = {},
+    parentId?: string | null
+  ): StoredMessage {
     const db = getDb()
     const tx = db.transaction((): StoredMessage => {
-      const r = db
-        .prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages WHERE session_id = ?')
-        .get(sessionId) as { m: number }
+      const tree = buildTree(treeNodes(sessionId))
+      const sel = readSel(sessionId)
+      let parent: string | null
+      if (parentId === undefined) parent = activeLeaf(tree, sel)?.id ?? null
+      else {
+        if (parentId !== null && !tree.byId.has(parentId))
+          throw new Error(`Mensagem pai não encontrada na sessão: ${parentId}`)
+        parent = parentId
+      }
       const msg: StoredMessage = {
         id: randomUUID(),
         sessionId,
-        seq: r.m + 1,
+        seq: nextSeq(sessionId),
+        parentId: parent,
         message,
         meta,
         createdAt: Date.now()
       }
-      db.prepare(
-        'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        msg.id,
-        sessionId,
-        msg.seq,
-        JSON.stringify(message),
-        JSON.stringify(meta),
-        msg.createdAt
-      )
-      indexMessage(db, msg.id, message, meta)
+      insertRow(msg, parent)
+      const k = selKey(parent)
+      if (Object.prototype.hasOwnProperty.call(sel, k) && sel[k] === null) {
+        delete sel[k]
+        writeSel(sessionId, sel)
+      }
       return msg
     })
     return tx()
   },
   /**
+   * Novo ramo: insere `message` como filho de `parentId` (null = nova raiz) — irmã das versões
+   * que já existem ali — e seleciona o caminho até ela (o resto do caminho é ela mesma).
+   */
+  branch(
+    sessionId: string,
+    parentId: string | null,
+    message: ApiMessage,
+    meta: MessageMeta = {}
+  ): StoredMessage {
+    const db = getDb()
+    const tx = db.transaction((): StoredMessage => {
+      const nodes = treeNodes(sessionId)
+      if (parentId !== null && !nodes.some((n) => n.id === parentId))
+        throw new Error(`Mensagem pai não encontrada na sessão: ${parentId}`)
+      const msg: StoredMessage = {
+        id: randomUUID(),
+        sessionId,
+        seq: nextSeq(sessionId),
+        parentId,
+        message,
+        meta,
+        createdAt: Date.now()
+      }
+      insertRow(msg, parentId)
+      const tree = buildTree([...nodes, { id: msg.id, seq: msg.seq, parentId }])
+      const sel = readSel(sessionId)
+      const next = pruneSel(tree, selectionToReach(tree, sel, msg.id))
+      if (!selEquals(sel, next)) writeSel(sessionId, next)
+      return msg
+    })
+    return tx()
+  },
+  /** Nova versão de `messageId`: irmã dela (mesmo pai efetivo), já selecionada. Ver `branch`. */
+  addSibling(messageId: string, message: ApiMessage, meta: MessageMeta = {}): StoredMessage {
+    const cur = messagesRepo.get(messageId)
+    if (!cur) throw new Error(`Mensagem não encontrada: ${messageId}`)
+    const parent = buildTree(treeNodes(cur.sessionId)).parentOf.get(messageId) ?? null
+    return messagesRepo.branch(cur.sessionId, parent, message, meta)
+  },
+  /** Troca de versão: grava a seleção mínima para o caminho ativo passar por `messageId`. */
+  select(messageId: string): Session {
+    const cur = messagesRepo.get(messageId)
+    if (!cur) throw new Error(`Mensagem não encontrada: ${messageId}`)
+    const tree = buildTree(treeNodes(cur.sessionId))
+    const sel = readSel(cur.sessionId)
+    const next = pruneSel(tree, selectionToReach(tree, sel, messageId))
+    if (!selEquals(sel, next)) writeSel(cur.sessionId, next)
+    return sessionsRepo.get(cur.sessionId)!
+  },
+  /**
    * Insere uma mensagem na posição `seq`, deslocando (+1) as de seq ≥ `seq` da sessão. Só o número
    * de ordem muda — o conteúdo das mensagens deslocadas fica intacto. Usado pela compactação para
    * pôr a fronteira antes de mensagens do usuário ainda não respondidas.
+   * Árvore: a nova entra entre a mensagem que estava em `seq` (pending0) e o pai dela (a fronteira
+   * herda o pai; pending0 passa a ser filha da fronteira; uma seleção que apontava para pending0
+   * aponta para a fronteira). Sem mensagem em `seq` → filha da folha do caminho ativo.
    */
   insertAt(
     sessionId: string,
     seq: number,
     message: ApiMessage,
     meta: MessageMeta = {}
-  ): { message: StoredMessage; shifted: StoredMessage[] } {
+  ): { message: StoredMessage; shifted: StoredMessage[]; selChanged: boolean } {
     const db = getDb()
     const tx = db.transaction(() => {
+      const tree = buildTree(treeNodes(sessionId))
+      const sel = readSel(sessionId)
+      const pending0 = tree.ordered.find((n) => n.seq === seq) ?? null
+      const parent = pending0
+        ? (tree.parentOf.get(pending0.id) ?? null)
+        : (activeLeaf(tree, sel)?.id ?? null)
       // dois passos (negativo → positivo) para não violar o índice único (session_id, seq)
       db.prepare('UPDATE messages SET seq = -(seq + 1) WHERE session_id = ? AND seq >= ?').run(
         sessionId,
@@ -356,27 +532,28 @@ export const messagesRepo = {
         id: randomUUID(),
         sessionId,
         seq,
+        parentId: parent,
         message,
         meta,
         createdAt: Date.now()
       }
-      db.prepare(
-        'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(
-        msg.id,
-        sessionId,
-        msg.seq,
-        JSON.stringify(message),
-        JSON.stringify(meta),
-        msg.createdAt
-      )
-      indexMessage(db, msg.id, message, meta)
+      insertRow(msg, parent)
+      let selChanged = false
+      if (pending0) {
+        db.prepare('UPDATE messages SET parent_id = ? WHERE id = ?').run(msg.id, pending0.id)
+        const k = selKey(parent)
+        if (sel[k] === pending0.id) {
+          sel[k] = msg.id
+          writeSel(sessionId, sel)
+          selChanged = true
+        }
+      }
       const shifted = (
         db
           .prepare('SELECT * FROM messages WHERE session_id = ? AND seq > ? ORDER BY seq')
           .all(sessionId, seq) as MessageRow[]
       ).map(toMessage)
-      return { message: msg, shifted }
+      return { message: msg, shifted, selChanged }
     })
     return tx()
   },
@@ -395,11 +572,55 @@ export const messagesRepo = {
     })()
     return { ...cur, message, meta: nextMeta }
   },
+  /** Apaga uma mensagem (ver `remove`). */
   delete(id: string): StoredMessage | null {
+    return messagesRepo.remove(id)?.message ?? null
+  },
+  /**
+   * Apaga uma mensagem; os filhos dela passam para o pai dela (a conversa continua ligada) e a
+   * seleção é ajustada para o caminho ativo continuar o mesmo, sem a apagada (a escolha feita
+   * "dentro" dela sobe para o pai). Se a apagada era a folha, o caminho segue pelo pai.
+   */
+  remove(id: string): MessageRemoval | null {
     const cur = messagesRepo.get(id)
     if (!cur) return null
-    getDb().prepare('DELETE FROM messages WHERE id = ?').run(id)
-    return cur
+    const sid = cur.sessionId
+    const db = getDb()
+    return db.transaction((): MessageRemoval => {
+      const nodes = treeNodes(sid)
+      const tree = buildTree(nodes)
+      const sel = readSel(sid)
+      const oldLeaf = activeLeaf(tree, sel)
+      const parent = tree.parentOf.get(id) ?? null
+      const kids = new Set((tree.children.get(id) ?? []).map((k) => k.id))
+      const upd = db.prepare('UPDATE messages SET parent_id = ? WHERE id = ?')
+      for (const k of kids) upd.run(fromParentId(parent), k)
+      db.prepare('DELETE FROM messages WHERE id = ?').run(id)
+
+      const tree2 = buildTree(
+        nodes
+          .filter((n) => n.id !== id)
+          .map((n) => (kids.has(n.id) ? { ...n, parentId: parent } : n))
+      )
+      let next: BranchSel = { ...sel }
+      const pk = selKey(parent)
+      const has = Object.prototype.hasOwnProperty.call(next, id)
+      const inner = has ? next[id] : undefined
+      delete next[id]
+      if (next[pk] === id) {
+        if (inner === undefined) delete next[pk]
+        else next[pk] = inner
+      }
+      const target = oldLeaf && oldLeaf.id !== id ? oldLeaf.id : parent
+      if (target) next = selectionToReach(tree2, next, target)
+      next = pruneSel(tree2, next)
+      const selChanged = !selEquals(sel, next)
+      if (selChanged) writeSel(sid, next)
+      const reparented = [...kids]
+        .map((k) => messagesRepo.get(k))
+        .filter((m): m is StoredMessage => !!m)
+      return { message: cur, reparented, selChanged }
+    })()
   }
 }
 

@@ -1,5 +1,9 @@
 // Sem Electron: importado por db.ts e pelos testes (banco temporário).
 // Schema: ver SPEC.md → "Banco". JSON fica em colunas *_json; IDs = crypto.randomUUID(); timestamps = Date.now().
+// Árvore de mensagens (ramos): messages.parent_id ('' = raiz, NULL = legado → anterior por seq) e
+// sessions.branch_sel_json — em bancos antigos as colunas, o índice (session_id, parent_id) e o
+// preenchimento vêm de ensureMessageTree (migrateBranches.ts); o índice fica lá porque este SCHEMA
+// roda antes das migrações (num banco antigo a coluna ainda não existe).
 export const SCHEMA = `
 CREATE TABLE IF NOT EXISTS providers (
   id           TEXT PRIMARY KEY,
@@ -34,7 +38,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   title               TEXT NOT NULL DEFAULT '',
   task                TEXT,
   status              TEXT NOT NULL DEFAULT 'idle',
-  created_at          INTEGER NOT NULL
+  created_at          INTEGER NOT NULL,
+  branch_sel_json     TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_chat ON sessions(chat_id);
 
@@ -44,7 +49,8 @@ CREATE TABLE IF NOT EXISTS messages (
   seq          INTEGER NOT NULL,
   message_json TEXT NOT NULL,
   meta_json    TEXT NOT NULL DEFAULT '{}',
-  created_at   INTEGER NOT NULL
+  created_at   INTEGER NOT NULL,
+  parent_id    TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
 

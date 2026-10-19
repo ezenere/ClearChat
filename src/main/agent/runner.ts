@@ -312,9 +312,16 @@ export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<voi
 
 /** Apaga uma mensagem do histórico (IPC messages.delete) + subsessões que ela originou. */
 export async function deleteMessage(id: string): Promise<void> {
-  const m = messagesRepo.delete(id)
-  if (!m) return
+  const r = messagesRepo.remove(id)
+  if (!r) return
+  const m = r.message
   emit({ type: 'message-deleted', sessionId: m.sessionId, messageId: m.id })
+  // árvore: os filhos passaram para o pai da apagada (e a seleção pode ter mudado)
+  for (const x of r.reparented) emit({ type: 'message-updated', message: x })
+  if (r.selChanged) {
+    const s = sessionsRepo.get(m.sessionId)
+    if (s) emit({ type: 'session-updated', session: s })
+  }
   await deleteSubSessionsOf([m])
 }
 
@@ -326,7 +333,7 @@ export function repairTail(
   sessionId: string,
   reason: 'cancelled' | 'app-closed' = 'cancelled'
 ): void {
-  const msgs = messagesRepo.list(sessionId)
+  const msgs = messagesRepo.path(sessionId)
   let idx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i].message
@@ -376,7 +383,7 @@ function maybeSetTitle(session: Session, text: string): void {
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return
   if (chat.title && chat.title !== 'Novo chat') return
-  const hasUser = messagesRepo.list(session.id).some((m) => m.message.role === 'user')
+  const hasUser = messagesRepo.path(session.id).some((m) => m.message.role === 'user')
   if (hasUser) return
   const line = text.replace(/\s+/g, ' ').trim()
   if (!line) return
@@ -497,7 +504,7 @@ async function shouldAutoCompact(st: RunState): Promise<boolean> {
   const session = sessionsRepo.get(st.sessionId)
   const chat = session && chatsRepo.get(session.chatId)
   if (!session || !chat || !autoCompactAllowed(chat, session.depth)) return false
-  const history = messagesRepo.list(session.id)
+  const history = messagesRepo.path(session.id)
   if (!hasCompactableHistory(history)) return false
   const usage = contextUsage(history)
   if (!usage) return false
@@ -518,7 +525,7 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
   const provider = providerFor(chat, session)
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
   repairTail(session.id)
-  const history = messagesRepo.list(session.id)
+  const history = messagesRepo.path(session.id)
   if (!hasCompactableHistory(history)) return { kind: 'skipped' }
   const window = await contextWindowFor(chat, session)
   const prompt = chat.config.compactPrompt?.trim()
@@ -790,7 +797,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
   if (!session.model) return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
 
-  const history = messagesRepo.list(session.id)
+  const history = messagesRepo.path(session.id)
   // memória: o índice vai congelado por sessão (snapshot no 1º request; ver memory/service.ts)
   if (session.depth === 0) ensureSnapshot(chat, session)
   let req: BuiltRequest
@@ -814,7 +821,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     signal,
     attempt: async () => {
       if (!first) {
-        req = buildRequest(chat, session, messagesRepo.list(session.id), provider)
+        req = buildRequest(chat, session, messagesRepo.path(session.id), provider)
         acc = newAccumulator()
         t0 = Date.now()
       }
@@ -1109,7 +1116,7 @@ async function executeTool(
           cwd: chat.config.cwd,
           confine: chat.config.confineToRoot !== false,
           sandbox: !!chat.config.sandboxBash && bwrapAvailable(),
-          history: messagesRepo.list(session.id)
+          history: messagesRepo.path(session.id)
         },
         signal
       })
@@ -1222,7 +1229,7 @@ async function executeTool(
           : undefined,
       chats:
         name === 'get_chat_info' || name === 'list_chats' ? chatToolsCtx(chat, session) : undefined,
-      history: name === 'read_history' ? () => messagesRepo.list(session.id) : undefined,
+      history: name === 'read_history' ? () => messagesRepo.path(session.id) : undefined,
       historyStore: name === 'read_history' ? historyStore(getDb()) : undefined,
       // read_file: imagens/PDF só se o modelo da sessão os lê (mesma regra dos anexos)
       media: sessionProvider
@@ -1551,7 +1558,7 @@ function deliverToSession(
 }
 
 function lastAssistantText(sessionId: string): string {
-  const msgs = messagesRepo.list(sessionId)
+  const msgs = messagesRepo.path(sessionId)
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i]
     if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) return m.message.content ?? ''
@@ -1647,7 +1654,7 @@ async function runSendToChat(
   if (!targetSession) return fail(`Erro: o chat ${tname} não tem sessão principal.`, target.id)
 
   // Laço entre chats: o turno atual deste chat já veio de uma cadeia de mensagens entre chats?
-  const { hops, allowed } = nextInterChatHops(messagesRepo.list(chat.mainSessionId))
+  const { hops, allowed } = nextInterChatHops(messagesRepo.path(chat.mainSessionId))
   if (!allowed)
     return fail(
       `Erro: limite de ${LIMITS.interChatMaxHops} saltos entre chats atingido — este turno já faz parte de uma cadeia de ${hops - 1} mensagens entre chats. A mensagem NÃO foi enviada; responda normalmente em vez de reenviar.`,
@@ -1865,7 +1872,7 @@ export async function stopSubagents(chatId: string): Promise<void> {
 
 /** Última atividade de uma subsessão (texto curto para check_subagents). */
 function sessionTail(sessionId: string): string {
-  const msgs = messagesRepo.list(sessionId)
+  const msgs = messagesRepo.path(sessionId)
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i].message
     if (msgs[i].meta.kind === 'error') return `erro: ${msgs[i].meta.error ?? ''}`
@@ -1881,7 +1888,7 @@ function sessionTail(sessionId: string): string {
 
 function runCheckSubagents(session: Session, chat: Chat): Omit<ToolOutcome, 'durationMs'> {
   const kids = sessionsRepo.list(chat.id).filter((s) => s.parentSessionId === session.id)
-  const pm = messagesRepo.list(session.id)
+  const pm = messagesRepo.path(session.id)
   const rows: SubagentRow[] = kids.map((k) => {
     const rep = reports.latest(k.id)
     const toolMsg = pm.find((m) => m.message.role === 'tool' && m.meta.subSessionId === k.id)
@@ -1890,7 +1897,7 @@ function runCheckSubagents(session: Session, chat: Chat): Omit<ToolOutcome, 'dur
     const hasCallback = pm.some(
       (m) => m.meta.kind === 'subagent-callback' && m.meta.subSessionId === k.id
     )
-    const msgs = messagesRepo.list(k.id)
+    const msgs = messagesRepo.path(k.id)
     let result: SubagentRow['result']
     if (running) result = rep ? 'pending' : 'none'
     else if (rep) result = rep.claimed || rep.callbackSent ? 'delivered' : 'pending'
@@ -2118,7 +2125,7 @@ async function runMessageSubagent(
 
 /** Último diretório do shell salvo nesta sessão (restaura o `cd` do bash após reiniciar o app). */
 function lastShellCwd(sessionId: string): string | undefined {
-  const msgs = messagesRepo.list(sessionId)
+  const msgs = messagesRepo.path(sessionId)
   for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].meta.shellCwd) return msgs[i].meta.shellCwd
   return undefined
 }
@@ -2143,7 +2150,7 @@ export function compact(sessionId: string, opts: CompactOptions = {}): { schedul
     return { scheduled: true }
   }
   repairTail(sessionId)
-  if (!hasCompactableHistory(messagesRepo.list(sessionId)))
+  if (!hasCompactableHistory(messagesRepo.path(sessionId)))
     throw new Error('Nada para compactar ainda (nenhuma resposta desde a última compactação).')
   startLoop(session, undefined, { compact: req, compactOnly: true })
   return { scheduled: false }
@@ -2235,7 +2242,7 @@ export async function regenerate(sessionId: string): Promise<void> {
   if (session.depth !== 0) throw new Error('Subsessões são somente leitura.')
   if (runs.has(sessionId)) await stop(sessionId)
   if (runs.has(sessionId)) throw new Error('A sessão ainda está parando; tente novamente.')
-  const msgs = messagesRepo.list(sessionId)
+  const msgs = messagesRepo.path(sessionId)
   let idx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
     if (msgs[i].message.role === 'user' && !msgs[i].meta.synthetic) {
@@ -2296,7 +2303,7 @@ export function smartOverride(messageId: string): void {
   if (!session) throw new Error('Sessão não encontrada.')
   const toolCallId = msg.message.tool_call_id
   let call: ToolCall | undefined
-  for (const m of messagesRepo.list(session.id)) {
+  for (const m of messagesRepo.listAll(session.id)) {
     if (m.message.role === 'assistant')
       call = m.message.tool_calls?.find((t) => t.id === toolCallId) ?? call
     if (call) break
@@ -2380,7 +2387,7 @@ export function previewRequest(sessionId: string): RequestPreview {
   if (!chat) throw new Error('Chat não encontrado.')
   const provider = providerFor(chat, session)
   if (!provider) throw new Error('Nenhum provider configurado para este chat.')
-  const req = buildRequest(chat, session, messagesRepo.list(sessionId), provider)
+  const req = buildRequest(chat, session, messagesRepo.path(sessionId), provider)
   const masked = maskRequest(req, provider.apiKey)
   // anexos: o base64 aparece encurtado (a request real leva o arquivo inteiro)
   const { body, truncated } = truncateBodyForPreview(masked.body)
@@ -2443,7 +2450,7 @@ export function initRunner(): void {
     try {
       const s = sessionsRepo.get(id)
       if (!s || s.depth === 0 || !s.parentSessionId) continue
-      const pm = messagesRepo.list(s.parentSessionId)
+      const pm = messagesRepo.path(s.parentSessionId)
       if (!pm.some((m) => m.message.role === 'tool' && m.meta.subSessionId === id)) continue
       appendAppClosedCallback(s.parentSessionId, {
         title: s.title,

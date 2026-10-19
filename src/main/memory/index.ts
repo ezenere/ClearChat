@@ -149,7 +149,7 @@ async function extract(
     : sessionProviderId(chat.config, session)
   const provider = providerId ? providersRepo.get(providerId) : null
   const model = cfg.model ?? session.model ?? chat.config.model
-  const history: StoredMessage[] = messagesRepo.list(sessionId)
+  const history: StoredMessage[] = messagesRepo.path(sessionId)
   const out = await runExtraction({
     service: svc,
     chat,

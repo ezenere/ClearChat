@@ -21,18 +21,26 @@ Segurança Electron: `contextIsolation: true`, `nodeIntegration: false`, `sandbo
 
 ```sql
 providers(id TEXT PK, name TEXT, base_url TEXT, api_key TEXT, headers_json TEXT DEFAULT '{}', created_at INTEGER)
-settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS), skillsSettings (locais de skills — ver "Skills"), updateDismissedVersion (aviso de versão dispensado — ver "Atualizações")
+settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS), skillsSettings (locais de skills — ver "Skills"), updateDismissedVersion (aviso de versão dispensado — ver "Atualizações"), migration.messageTree (preenchimento único de messages.parent_id — ver "Árvore de mensagens")
 chats(id TEXT PK, title TEXT, config_json TEXT, main_session_id TEXT, created_at INTEGER, updated_at INTEGER)
 sessions(id TEXT PK, chat_id TEXT, parent_session_id TEXT NULL, parent_tool_call_id TEXT NULL, depth INTEGER,
          model TEXT, title TEXT, task TEXT NULL, status TEXT, created_at INTEGER,
-         provider_id TEXT NULL)                   -- provedor da subsessão (ALTER TABLE idempotente em db.ts); NULL na principal
-messages(id TEXT PK, session_id TEXT, seq INTEGER, message_json TEXT, meta_json TEXT, created_at INTEGER)
+         provider_id TEXT NULL,                   -- provedor da subsessão (ALTER TABLE idempotente em db.ts); NULL na principal
+         branch_sel_json TEXT DEFAULT '{}')       -- ramo ativo: { [parentId | "root"]: childId | null } (ver "Árvore de mensagens")
+messages(id TEXT PK, session_id TEXT, seq INTEGER, message_json TEXT, meta_json TEXT, created_at INTEGER,
+         parent_id TEXT NULL)                     -- mensagem anterior no mesmo ramo; '' = raiz; NULL = legado (→ anterior por seq). Índice (session_id, parent_id)
 presets(id TEXT PK, name TEXT, description TEXT, icon TEXT, config_json TEXT, created_at INTEGER, updated_at INTEGER)  -- personas (ver "Personas")
 message_search(docid INTEGER PK, message_id TEXT UNIQUE)   -- índice de busca (ver "Histórico → Índice FTS5")
 messages_fts USING fts5(body, tool, content='', contentless_delete=1, tokenize='unicode61 remove_diacritics 2')  -- rowid = docid
 memory_collections(…) / memories(…) / memories_fts(…)  -- memória modular (ver "Memória → Dados"); sessions.memory_json = snapshot do índice + última extração
 ```
 IDs: `crypto.randomUUID()` (exceto memórias: `m` + 7 caracteres base36 — ver "Memória"). Timestamps: `Date.now()`. Deletar chat apaga sessions/messages (cascade manual ou FK ON DELETE CASCADE).
+
+**Árvore de mensagens (ramos — `src/shared/branches.ts`, `src/main/migrateBranches.ts`, `messagesRepo`).** As mensagens de uma sessão formam uma árvore (editar uma mensagem do usuário cria uma irmã; regenerar, um novo filho do prompt — a versão antiga fica salva). Algoritmo normativo = `docs/SYNC_PROTOCOL.md` §4.3.8 (casos em `docs/test-vectors/branches.json`, testados em `e2e/branches.test.ts`):
+- **Pai efetivo** (`resolveParent`): `parentId` null → raiz; id de mensagem da mesma sessão com seq menor → ele; ausente/inválido (pai que não existe, de seq ≥, linha legada) → a anterior por seq (empate: maior id). Invariante `seq(pai) < seq(filho)`: `seq` segue ordem topológica e `#seq` estável (read_history, `summaryOf`); num caminho há lacunas.
+- **Caminho ativo** (`activePath`): da raiz, em cada nó `branchSel[chave]` se nomeia um filho existente, senão o filho mais novo (maior seq); `null` = o caminho termina ali (ramo vazio transitório do regenerate). Chat linear = `{}`. `siblings` → `{ index, count, prevId, nextId }`; `selectionToReach`/`pruneSel` mantêm a seleção mínima (escolher a versão mais nova apaga a chave). Turnos: `isPromptMessage` (user, não fronteira, não `synthetic` sem kind, não só-exibição), `turnAnchor`, `turnResponse`, `lastTurnAnchor`; `isBranchEditable` = mensagem digitada (sem kind/`queued`/`forced`, não sintética) na principal.
+- **Banco**: `parent_id` '' = raiz e NULL = legado (qualquer código/registro que grava sem a coluna — sync de cliente < 0.7, testes — cai no linear por seq, nunca vira raiz extra). `ensureMessageTree` (em `migrate()`): ALTERs idempotentes + índice; uma vez (`migration.messageTree`) preenche `parent_id` com a anterior por seq, numa transação com `sync_flags 'apply'` (os triggers do sync não marcam nada — as mensagens não são reenviadas; os outros leitores derivam a mesma mãe).
+- **Repo** (`messagesRepo`): `path(sid)` = caminho ativo (o que o agente vê: runner, tools, memória, read_history de outros chats via `historyStore.messages`); `listAll(sid)` = todas as versões (IPC `sessions.messages`, buscas por id como `smartOverride`). `append(sid, msg, meta, parentId?)` — pai padrão = folha do caminho ativo, calculada na transação; limpa um `null` sob esse pai. `branch(sid, parentId, …)` / `addSibling(id, …)` = nova versão já selecionada; `select(id)` = troca de versão. `insertAt` (compactação): a fronteira herda o pai da 1ª pendente e vira o pai dela (seleção que apontava para a pendente passa à fronteira). `remove`/`delete`: os filhos passam ao pai da apagada e a seleção é ajustada para o caminho continuar o mesmo. `sessionsRepo.setBranchSel` grava a seleção (limpa; só escreve se mudou — o trigger do sync marca a sessão).
 
 **Migração do nome antigo** (`src/main/migrate.ts`, `migrateLegacyData(userData)`): o app se chamava "CleartChat" (typo). No `ready`, antes de abrir o banco e só no userData padrão (não com `CLEARCHAT_USER_DATA`): se `<userData>/clearchat.db` não existe e `<irmão>/CleartChat/cleartchat.db` existe, copia com `VACUUM INTO` numa conexão somente leitura (cópia consistente, já com o WAL) para um temporário e renomeia; fallback: cópia crua de `.db` + `-wal`/`-shm` validada ao abrir. O diretório antigo fica intacto. Testado em `e2e/unit.test.ts`.
 
@@ -110,7 +118,8 @@ export type SessionStatus = 'idle' | 'running' | 'awaiting_approval' | 'done' | 
   | 'waiting'   // subagente que encerrou o turno com filhos em segundo plano pendentes (dorme até os callbacks)
   | 'awaiting_input'   // principal esperando a resposta de um questionário (ask_user) — conta como ocupada (isBusy)
 export interface Session { id: string; chatId: string; parentSessionId: string | null; parentToolCallId: string | null
-  depth: 0 | 1 | 2; model: string; providerId?: string | null; title: string; task: string | null; status: SessionStatus; createdAt: number }
+  depth: 0 | 1 | 2; model: string; providerId?: string | null; title: string; task: string | null; status: SessionStatus; createdAt: number
+  branchSel?: Record<string, string | null> }   // ramo ativo ({ [parentId | "root"]: childId | null }; {} = linear) — ver "Banco → Árvore de mensagens"
 
 // Formato OpenAI exato — é o que é persistido e reenviado byte-a-byte (essencial para token caching)
 export type ContentPart =               // todos aceitam cache_control?: { type: 'ephemeral' } e _attachment?: AttachmentMeta (privado, nunca enviado)
@@ -154,7 +163,8 @@ export interface MessageMeta {
   memoryExtraction?: MemoryExtractionResult & { model?; providerId?; usage?: Usage; request?: unknown; trigger: 'manual' | 'compaction' } // kind 'memory-extraction'
   memoryChanges?: MemoryExtractionResult['changes'] // mensagem tool de memory_write/rewrite/delete
 }
-export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number }
+export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number
+  parentId?: string | null }     // anterior no mesmo ramo; null = raiz; ausente = legado (→ anterior por seq)
 
 export interface QueuedMessage { id: string; sessionId: string; text: string; createdAt: number; attachments?: AttachmentInfo[]
   skillParts?: ContentPart[]     // skills da lâmpada, já lidas no envio (parts <skill> com _skill)
@@ -198,7 +208,7 @@ interface ClearApi {
   settings:  { get<T>(key): T | null; set(key, value: unknown): void }
   chats:     { list(): Chat[]; get(id): Chat | null; create(input: { title?: string; config?: Partial<ChatConfig> }): Chat
                update(id, patch: { title?: string; config?: Partial<ChatConfig> }): Chat; delete(id): void }
-  sessions:  { list(chatId): Session[]; messages(sessionId): StoredMessage[] }
+  sessions:  { list(chatId): Session[]; messages(sessionId): StoredMessage[] }   // messages = TODAS as versões (o renderer calcula o caminho ativo)
   messages:  { update(id, message: ApiMessage): StoredMessage; delete(id): void }   // edição livre do histórico
   agent: {
     send(sessionId, text, attachments?: AttachmentInfo[], skills?: string[]): { queued: boolean }   // skills = nomes da lâmpada: SKILL.md lido no envio (erro legível → nada enviado)   // principal OU subagente (conversa direta). idle → inicia turno; running/waiting → enfileira (com os anexos); subagente concluído → retoma (resultado volta ao pai como callback)

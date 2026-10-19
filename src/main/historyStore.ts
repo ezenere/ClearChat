@@ -2,6 +2,8 @@
 // conexão (sem Electron) — o runner passa historyStore(getDb()); os testes, um banco temporário.
 import type Database from 'better-sqlite3'
 import type { ApiMessage, MessageMeta, StoredMessage } from '@shared/types'
+import { activePath, toBranchSel } from '@shared/branches'
+import { ROOT_PARENT } from './migrateBranches'
 import {
   countByChat,
   isSearchIndexReady,
@@ -30,6 +32,7 @@ export interface HistoryStore {
   chats(): StoreChat[]
   chat(id: string): StoreChat | null
   sessions(chatId: string): StoreSession[]
+  /** Caminho ativo da sessão (o ramo selecionado — o que o agente daquele chat vê). */
   messages(sessionId: string): StoredMessage[]
   message(id: string): StoredMessage | null
   /** Nome da tool chamada por `toolCallId` (mensagem assistant anterior a `seq` na sessão). */
@@ -45,6 +48,7 @@ interface Row {
   message_json: string
   meta_json: string
   created_at: number
+  parent_id?: string | null
 }
 
 function parse<T>(s: string, fallback: T): T {
@@ -55,14 +59,19 @@ function parse<T>(s: string, fallback: T): T {
   }
 }
 
-const toMessage = (r: Row): StoredMessage => ({
-  id: r.id,
-  sessionId: r.session_id,
-  seq: r.seq,
-  message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
-  meta: parse<MessageMeta>(r.meta_json, {}),
-  createdAt: r.created_at
-})
+const toMessage = (r: Row): StoredMessage => {
+  const m: StoredMessage = {
+    id: r.id,
+    sessionId: r.session_id,
+    seq: r.seq,
+    message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
+    meta: parse<MessageMeta>(r.meta_json, {}),
+    createdAt: r.created_at
+  }
+  // parent_id: '' = raiz, NULL = legado (→ anterior por seq), senão o pai (ver migrateBranches.ts)
+  if (r.parent_id != null) m.parentId = r.parent_id === ROOT_PARENT ? null : r.parent_id
+  return m
+}
 
 const CHAT_COLS = 'id, title, main_session_id AS mainSessionId, updated_at AS updatedAt'
 
@@ -79,12 +88,16 @@ export function historyStore(conn: Database.Database): HistoryStore {
           'SELECT id, chat_id AS chatId, title, depth FROM sessions WHERE chat_id = ? ORDER BY created_at'
         )
         .all(chatId) as StoreSession[],
-    messages: (sessionId) =>
-      (
+    messages: (sessionId) => {
+      const all = (
         conn
           .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY seq')
           .all(sessionId) as Row[]
-      ).map(toMessage),
+      ).map(toMessage)
+      const s = conn.prepare('SELECT branch_sel_json FROM sessions WHERE id = ?').get(sessionId) as
+        { branch_sel_json?: string | null } | undefined
+      return activePath(all, toBranchSel(parse<unknown>(s?.branch_sel_json ?? '{}', {})))
+    },
     message: (id) => {
       const r = conn.prepare('SELECT * FROM messages WHERE id = ?').get(id) as Row | undefined
       return r ? toMessage(r) : null

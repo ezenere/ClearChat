@@ -161,7 +161,7 @@ export function registerIpc(): void {
 
     // ---- sessions ----
     [IPC.sessions.list]: (chatId: string) => sessionsRepo.list(chatId),
-    [IPC.sessions.messages]: (sessionId: string) => messagesRepo.list(sessionId),
+    [IPC.sessions.messages]: (sessionId: string) => messagesRepo.listAll(sessionId),
 
     // ---- messages ----
     [IPC.messages.update]: (id: string, message: ApiMessage) => {

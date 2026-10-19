@@ -333,6 +333,12 @@ export interface Session {
   task: string | null
   status: SessionStatus
   createdAt: number
+  /**
+   * Ramo ativo da árvore de mensagens: { [parentId | "root"]: childId | null }. Chave ausente ou
+   * filho inexistente → o filho mais novo; `null` → o caminho termina ali (transitório). Vazio =
+   * chat linear. Ver `src/shared/branches.ts`.
+   */
+  branchSel?: Record<string, string | null>
 }
 
 // Formato OpenAI exato — é o que é persistido e reenviado byte-a-byte (essencial para token caching)
@@ -498,6 +504,11 @@ export interface StoredMessage {
   id: string
   sessionId: string
   seq: number
+  /**
+   * Mensagem anterior no mesmo ramo (árvore de mensagens); `null` = raiz da sessão; ausente =
+   * linha/registro legado → a anterior por seq (`resolveParent` em `src/shared/branches.ts`).
+   */
+  parentId?: string | null
   message: ApiMessage
   meta: MessageMeta
   createdAt: number

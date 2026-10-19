@@ -262,7 +262,7 @@ async function newChat(enabledTools: string[] = []): Promise<{ chatId: string; s
 }
 
 const status = (sid: string): string => mods!.repo.sessionsRepo.get(sid)!.status
-const msgs = (sid: string): any[] => mods!.repo.messagesRepo.list(sid)
+const msgs = (sid: string): any[] => mods!.repo.messagesRepo.listAll(sid)
 
 test('rede cai no meio do stream → card; Tentar de novo → resposta completa, sem parcial', async () => {
   const { runner, events } = await load()

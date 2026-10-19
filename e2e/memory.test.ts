@@ -1209,7 +1209,7 @@ test('runner: índice na request, memory_write do agente persiste (aprovação "
   const saved = memory.listMemories({ query: 'palmeiras' })
   assert.equal(saved.length, 1)
   assert.equal(saved[0].collectionId, profileCol)
-  const tool = repo.messagesRepo.list(sid).find((m) => m.message.role === 'tool')!
+  const tool = repo.messagesRepo.listAll(sid).find((m) => m.message.role === 'tool')!
   assert.equal(tool.meta.toolStatus, 'ok')
   assert.equal(tool.meta.memoryChanges![0].op, 'create')
   assert.deepEqual(tool.meta.approval, { item: 'memory_write', mode: 'always' })
@@ -1269,7 +1269,7 @@ test('runner: "Extrair memórias agora" grava, persiste o card (fora da API) e m
   const r = await memory.extractNow(sid)
   assert.equal(r.error, undefined)
   assert.equal(r.created, 1)
-  const card = repo.messagesRepo.list(sid).find((m) => m.meta.kind === 'memory-extraction')!
+  const card = repo.messagesRepo.listAll(sid).find((m) => m.meta.kind === 'memory-extraction')!
   assert.ok(card.meta.synthetic)
   assert.equal(card.meta.memoryExtraction!.trigger, 'manual')
   assert.equal(card.meta.memoryExtraction!.model, EXTRACT)
@@ -1302,7 +1302,7 @@ test('runner: compactação renova o snapshot e dispara a extração automática
   assert.ok(snap1)
   runner.compact(sid)
   const card = await waitFor(
-    () => repo.messagesRepo.list(sid).find((m) => m.meta.kind === 'memory-extraction'),
+    () => repo.messagesRepo.listAll(sid).find((m) => m.meta.kind === 'memory-extraction'),
     10000,
     'card da extração automática'
   )

@@ -8,6 +8,7 @@ import { migrateWebSearchEngines } from './migrateWebSearch'
 import { SCHEMA } from './dbSchema'
 import { ensureSearchIndex } from './searchIndex'
 import { ensureMemorySchema } from './memory/schema'
+import { ensureMessageTree } from './migrateBranches'
 
 let db: Database.Database | null = null
 
@@ -81,6 +82,14 @@ function migrate(conn: Database.Database): void {
     ensureMemorySchema(conn)
   } catch (e) {
     console.error('[clearchat] schema da memória', e)
+  }
+  // árvore de mensagens (ramos): messages.parent_id + sessions.branch_sel_json; parent_id preenchido
+  // uma vez (anterior por seq), sem marcar nada como sujo no sync
+  try {
+    const r = ensureMessageTree(conn)
+    if (!r.skipped) console.log(`[clearchat] árvore de mensagens: ${r.filled} mensagens`)
+  } catch (e) {
+    console.error('[clearchat] árvore de mensagens', e)
   }
   // índice FTS5 das mensagens (read_history em outros chats) — cria/popula uma vez; depois o repo mantém
   try {
