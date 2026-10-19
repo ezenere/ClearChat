@@ -291,7 +291,10 @@ const COMMAND_KINDS = new Set([
   'message.edit',
   'message.delete',
   'compact',
-  'memory.extract'
+  'memory.extract',
+  'branch.edit',
+  'branch.regenerate',
+  'branch.select'
 ])
 const ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 const BLOB_RE = /^[0-9a-f]{64}$/

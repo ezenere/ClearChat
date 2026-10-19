@@ -405,6 +405,23 @@ test('troca de host, comandos remotos, queda e tolerância', async () => {
   await wa.req('remote.result', { chat_id: X, cmd_id: 'cmd-1', env: env() })
   const result = await wb.wait((f) => f.t === 'remote.result')
   assert.equal(result.cmd_id, 'cmd-1')
+  // versões de mensagens (protocolo 1.2.0): os kinds branch.* passam; kind desconhecido é recusado
+  for (const kind of ['branch.edit', 'branch.regenerate', 'branch.select']) {
+    const cmdId = `cmd-${kind}`
+    const r = await wb.req('remote.send', { chat_id: X, cmd_id: cmdId, kind, env: env() })
+    assert.equal(r.status, 'delivered', kind)
+    const c = await wa.wait((f) => f.t === 'remote.command' && f.cmd_id === cmdId)
+    assert.equal(c.kind, kind)
+    await wa.req('remote.result', { chat_id: X, cmd_id: cmdId, env: env() })
+    await wb.wait((f) => f.t === 'remote.result' && f.cmd_id === cmdId)
+  }
+  const unknown = await wb.req('remote.send', {
+    chat_id: X,
+    cmd_id: 'cmd-x',
+    kind: 'branch.delete',
+    env: env()
+  })
+  assert.equal(unknown.code, 'invalid_request')
   // troca next_turn: pendente até o release
   const tk = await wb.req('host.takeover', { chat_id: X, mode: 'next_turn', confirm_pinned: false })
   assert.equal(tk.status, 'pending')
