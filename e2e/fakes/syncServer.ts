@@ -153,7 +153,7 @@ interface Device {
   revoked: boolean
   inGrace: boolean
   graceTimer?: ReturnType<typeof setTimeout>
-  /** Já ficou offline (tolerância esgotada) desde a última conexão → `host_back` ao voltar. */
+  /** Já ficou offline (tolerância esgotada) desde a última conexão (volta → `host_back`, como da tolerância). */
   wentOffline: boolean
   /** Chats em que deixou de ser host enquanto desconectado → `host.revoked` após o welcome. */
   pendingRevoked: { chat_id: string; epoch: number; reason: string }[]
@@ -1607,7 +1607,8 @@ export async function startFakeSyncServer(opts: FakeSyncOptions = {}): Promise<F
     c.userId = u.id
     for (const id of Array.isArray(f.subscriptions) ? f.subscriptions : [])
       if (typeof id === 'string') c.subscriptions.add(id)
-    const wasOffline = dev.wentOffline
+    // backend real: `host_back` ao voltar da tolerância OU de offline (entrar na tolerância não tem evento)
+    const wasOffline = dev.wentOffline || dev.inGrace
     if (dev.graceTimer) clearTimeout(dev.graceTimer)
     dev.graceTimer = undefined
     dev.inGrace = false

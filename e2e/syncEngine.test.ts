@@ -64,7 +64,7 @@ interface Dev {
 
 function device(
   name: string,
-  opts: { runner?: RunnerAdapter; conn?: Database.Database } = {}
+  opts: { runner?: RunnerAdapter; conn?: Database.Database; server?: FakeSyncServer } = {}
 ): Dev {
   const conn = opts.conn ?? newDb()
   const listeners = new Set<(e: AgentEvent) => void>()
@@ -89,7 +89,7 @@ function device(
     deviceName: name,
     platform: 'linux',
     runner: opts.runner ?? null,
-    envUrl: srv.url,
+    envUrl: (opts.server ?? srv).url,
     timing: {
       pollMs: 40,
       pushDebounceMs: 20,
@@ -874,4 +874,56 @@ test('cursor expirado (410) → resync completo; keys.reset volta a "definir sen
     'sessão mantida (4403 logo depois do reset não desloga)'
   )
   assert.ok(A.conn.prepare("SELECT 1 FROM providers WHERE id = 'pa'").get(), 'dados locais ficam')
+})
+
+test('host_back: piscada na tolerância não avisa; queda (caiu) → volta avisa "voltou"', async () => {
+  const s2 = await startFakeSyncServer({ hostDropGraceMs: 1500 })
+  try {
+    const email = `blip-${Date.now()}@teste.dev`
+    await s2.createAccount({ email, password: PASSWORD })
+    const loginOn = async (d: Dev): Promise<void> => {
+      await d.eng.init()
+      await d.eng.requestCode(email)
+      await d.eng.verifyCode(email, s2.lastCode(email)!)
+      await d.eng.unlock(PASSWORD, true)
+    }
+    const A = device('PC', { server: s2 })
+    const { chatId, sessionId } = addChat(A.conn, 'Piscada')
+    addMessage(A.conn, sessionId, 'user', 'oi')
+    await loginOn(A)
+    await settled(A)
+    const B = device('Notebook', { server: s2 })
+    await loginOn(B)
+    await settled(B)
+    await waitFor(() => B.eng.host.mode(chatId) === 'remote', 'B controle remoto')
+    const notices = (): string[] =>
+      B.events.flatMap((e) => (e.type === 'sync-notice' ? [e.text] : []))
+    const backEvents = (): number => B.events.filter((e) => e.type === 'sync-chat-state').length
+    // piscada: cai e volta dentro da tolerância → host_back, sem "caiu" nem "voltou"
+    const n0 = backEvents()
+    s2.dropDevice(A.eng.deviceId)
+    await waitFor(
+      () =>
+        s2.chatState(s2.userIdOf(email)!, chatId).host.status === 'online' && backEvents() > n0 + 1,
+      'A voltou da tolerância'
+    )
+    await sleep(300)
+    const backs = (): number =>
+      s2.wsLog.filter(
+        (l) =>
+          l.dir === 'out' && l.deviceId === B.eng.deviceId && l.frame?.event?.kind === 'host_back'
+      ).length
+    assert.ok(backs() >= 1, 'o servidor emitiu host_back na volta da tolerância')
+    assert.ok(!notices().some((t) => /caiu|voltou/.test(t)), `sem aviso na piscada: ${notices()}`)
+    assert.equal(B.eng.host.mode(chatId), 'remote')
+    // queda: tolerância esgota → "caiu"; volta → "voltou"
+    s2.setRefuseConnections(A.eng.deviceId, true)
+    s2.dropDevice(A.eng.deviceId)
+    await waitFor(() => notices().some((t) => /caiu/.test(t)), 'aviso "caiu"')
+    s2.setRefuseConnections(A.eng.deviceId, false)
+    await waitFor(() => notices().some((t) => /voltou a ficar online/.test(t)), 'aviso "voltou"')
+    await waitFor(() => B.eng.host.mode(chatId) === 'remote', 'B volta a ser controle remoto')
+  } finally {
+    await s2.close()
+  }
 })

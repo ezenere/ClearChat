@@ -186,6 +186,8 @@ export class HostController {
   private counters = new Map<string, number>()
   private reqChat = new Map<string, string>()
   private sessionChat = new Map<string, string>()
+  /** Chats em que "o dispositivo remoto caiu" foi mostrado (para avisar a volta). */
+  private dropShown = new Set<string>()
   private active: string | null = null
   private connected = false
   private idleTimer: ReturnType<typeof setInterval> | null = null
@@ -412,16 +414,21 @@ export class HostController {
       )?.title || 'chat'
     switch (ev.kind) {
       case 'host_dropped':
-        if (s.host && s.host.device_id !== this.me)
+        if (s.host && s.host.device_id !== this.me) {
+          this.dropShown.add(id)
           this.engine.emit({
             type: 'sync-notice',
             kind: 'error',
             text: `O dispositivo remoto (${s.host.name}) caiu.`,
             chatId: id
           })
+        }
         break
-      case 'host_back':
-        if (s.host && s.host.device_id !== this.me)
+      case 'host_back': {
+        // `host_back` também vem depois de uma piscada na tolerância (sem "caiu" antes): só avisa a
+        // volta se a queda foi mostrada (ou o estado anterior já era offline)
+        const shown = this.dropShown.delete(id) || prev?.host?.status === 'offline'
+        if (shown && s.host && s.host.device_id !== this.me)
           this.engine.emit({
             type: 'sync-notice',
             kind: 'info',
@@ -429,7 +436,9 @@ export class HostController {
             chatId: id
           })
         break
+      }
       case 'host_changed':
+        this.dropShown.delete(id)
         if (s.host?.device_id === this.me && prev?.host?.device_id !== this.me)
           this.onBecameHost(id)
         else if (prev?.host?.device_id === this.me && s.host?.device_id !== this.me) {
