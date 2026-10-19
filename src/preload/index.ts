@@ -33,7 +33,8 @@ const api: ClearApi = {
     delete: (id) => invoke(IPC.messages.delete, id)
   },
   agent: {
-    send: (sessionId, text, attachments) => invoke(IPC.agent.send, sessionId, text, attachments),
+    send: (sessionId, text, attachments, skills) =>
+      invoke(IPC.agent.send, sessionId, text, attachments, skills),
     forceSend: (queuedId) => invoke(IPC.agent.forceSend, queuedId),
     removeQueued: (queuedId) => invoke(IPC.agent.removeQueued, queuedId),
     getQueue: (sessionId) => invoke(IPC.agent.getQueue, sessionId),
@@ -70,6 +71,14 @@ const api: ClearApi = {
     preview: (sessionId) => invoke(IPC.memory.preview, sessionId),
     refreshSnapshot: (sessionId) => invoke(IPC.memory.refreshSnapshot, sessionId),
     extractNow: (sessionId) => invoke(IPC.memory.extractNow, sessionId)
+  },
+  skills: {
+    getSettings: () => invoke(IPC.skills.getSettings),
+    updateSettings: (patch) => invoke(IPC.skills.updateSettings, patch),
+    discover: (opts) => invoke(IPC.skills.discover, opts),
+    read: (file) => invoke(IPC.skills.read, file),
+    pickFolder: () => invoke(IPC.skills.pickFolder),
+    openFolder: (path) => invoke(IPC.skills.openFolder, path)
   },
   presets: {
     list: () => invoke(IPC.presets.list),

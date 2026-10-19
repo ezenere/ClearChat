@@ -1,6 +1,6 @@
 // Fila de mensagens por sessão (memória). Emite `queue-updated` a cada mudança.
 import { randomUUID } from 'crypto'
-import type { AttachmentInfo, MessageMeta, QueuedMessage } from '@shared/types'
+import type { AttachmentInfo, ContentPart, MessageMeta, QueuedMessage } from '@shared/types'
 import { emit } from '../events'
 
 const queues = new Map<string, QueuedMessage[]>()
@@ -20,10 +20,12 @@ export function enqueue(
   sessionId: string,
   text: string,
   attachments?: AttachmentInfo[],
-  meta?: MessageMeta
+  meta?: MessageMeta,
+  skillParts?: ContentPart[]
 ): QueuedMessage {
   const item: QueuedMessage = { id: randomUUID(), sessionId, text, createdAt: Date.now() }
   if (attachments?.length) item.attachments = attachments
+  if (skillParts?.length) item.skillParts = skillParts
   if (meta) item.meta = meta // ex.: mensagem de outro chat (kind 'inter-chat')
   queues.set(sessionId, [...(queues.get(sessionId) ?? []), item])
   notify(sessionId)

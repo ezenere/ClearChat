@@ -9,13 +9,12 @@ import { listModelsTool } from './models'
 import { getChatInfoTool, listChatsTool } from './chats'
 import { readHistoryTool } from './history'
 import { browseUrl, webSearch } from './web'
+import { listSkillsTool, skillLoadTool, skillReadTool } from './skills'
 import {
-  abortError,
   fail,
   isInside,
-  maxOutputOf,
+  runToolImpl,
   ToolError,
-  truncateHeadTail,
   type ShellState,
   type ToolContext,
   type ToolResult
@@ -64,7 +63,10 @@ const IMPLS: Partial<Record<ToolName, Impl>> = {
   list_models: listModelsTool,
   get_chat_info: getChatInfoTool,
   list_chats: listChatsTool,
-  read_history: readHistoryTool
+  read_history: readHistoryTool,
+  list_skills: listSkillsTool,
+  skill_load: skillLoadTool,
+  skill_read: skillReadTool
 }
 
 /** Faz parse dos argumentos (string JSON da tool_call). */
@@ -97,21 +99,5 @@ export async function runLocalTool(
 ): Promise<ToolResult> {
   const impl = IMPLS[name]
   if (!impl) return fail(`Erro: ferramenta desconhecida: ${name}`)
-  try {
-    const r = await impl(args, ctx)
-    // rede de segurança: nenhuma tool devolve mais que o limite configurado
-    const max = maxOutputOf(ctx)
-    return r.content.length > max ? { ...r, content: truncateHeadTail(r.content, max, 0.5) } : r
-  } catch (e) {
-    if (ctx.signal.aborted || (e as Error).name === 'AbortError') throw abortError()
-    if (e instanceof ToolError)
-      return fail(e.message.startsWith('Erro') ? e.message : `Erro: ${e.message}`)
-    const err = e as NodeJS.ErrnoException
-    if (err.code === 'ENOENT') return fail(`Erro: caminho não encontrado: ${err.path ?? ''}`.trim())
-    if (err.code === 'EACCES' || err.code === 'EPERM')
-      return fail(`Erro: permissão negada: ${err.path ?? ''}`.trim())
-    if (err.code === 'EISDIR') return fail(`Erro: é um diretório: ${err.path ?? ''}`.trim())
-    if (err.code === 'ENOTDIR') return fail(`Erro: não é um diretório: ${err.path ?? ''}`.trim())
-    return fail(`Erro: ${err.message ?? String(e)}`)
-  }
+  return runToolImpl(impl, args, ctx)
 }

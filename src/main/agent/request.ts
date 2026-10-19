@@ -1,10 +1,11 @@
 // Construção da request (função pura). Usada pelo runner E pelo previewRequest.
 // Ver SPEC.md → "Construção da request" e "Token caching".
 import * as os from 'os'
-import { defaultToolsPrompt } from '@shared/defaults'
+import { DEFAULT_SKILLS_SUPPORT_PROMPT, defaultToolsPrompt } from '@shared/defaults'
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
-import { TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
+import { SKILL_TOOL_NAMES, TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
+import { normalizeSkillsConfig, skillsActiveFor } from '@shared/skills'
 import { activeHistory, isDisplayOnly } from '@shared/context'
 import { bwrapAvailable, shellLabel } from '../tools/bash'
 import { expandAttachments, hoistToolMedia } from '../attachments'
@@ -162,7 +163,27 @@ export function availableTools(
   )
   // memória: pela config de memória do chat (não por enabledTools), sempre no fim
   const memory = memoryToolsSource(chat, session).filter((n) => !base.includes(n))
-  return memory.length ? [...base, ...memory] : base
+  // skills: pela config de skills (ligadas; subagentes só com `subagents`) — depois da memória
+  const skills = skillsActive(chat, session) ? SKILL_TOOL_NAMES : []
+  return memory.length || skills.length ? [...base, ...memory, ...skills] : base
+}
+
+// ---------------- skills (SPEC → Skills) ----------------
+// Só a config decide (nunca as skills descobertas): definições e prompt estáveis na sessão.
+
+/** Skills vão para a API nesta sessão (ligadas no chat; subagente só com `skills.subagents`)? */
+export function skillsActive(chat: Pick<Chat, 'config'>, session: Pick<Session, 'depth'>): boolean {
+  return skillsActiveFor(normalizeSkillsConfig(chat.config.skills), session)
+}
+
+/** Prompt de apoio das skills anexado ao system prompt (null = não vai). */
+export function skillsSupportPrompt(
+  chat: Pick<Chat, 'config'>,
+  session: Pick<Session, 'depth'>
+): string | null {
+  const cfg = normalizeSkillsConfig(chat.config.skills)
+  if (!skillsActiveFor(cfg, session) || !cfg.supportPrompt.enabled) return null
+  return cfg.supportPrompt.text ?? DEFAULT_SKILLS_SUPPORT_PROMPT
 }
 
 // ---------------- memória (SPEC → Memória) ----------------
@@ -203,7 +224,8 @@ export function toolDefinitions(
 
 /**
  * Conteúdo do system prompt (string; vazio = não envia): system prompt → <environment> → memória
- * (índice + help, só na principal com memória ativa) → texto das tools (modo texto).
+ * (índice + help, só na principal com memória ativa) → prompt de apoio das skills (se ligado) →
+ * texto das tools (modo texto).
  */
 export function systemContent(
   chat: Chat,
@@ -223,6 +245,7 @@ export function systemContent(
     add(memory.index ?? '')
     add(memory.help ?? '')
   }
+  add(skillsSupportPrompt(chat, session) ?? '')
   if (cfg.toolsInPrompt) {
     const defs = toolDefinitions(availableTools(chat, session, history))
     add(cfg.toolsPromptText ?? defaultToolsPrompt(defs, cfg.nativeTools))

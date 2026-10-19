@@ -1,4 +1,5 @@
 import type { MemoryConfig, MemoryExtractionResult } from './memory'
+import type { SkillPartMeta, SkillsConfig } from './skills'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
 export interface Provider {
@@ -100,6 +101,10 @@ export type ToolName =
   | 'memory_write'
   | 'memory_rewrite'
   | 'memory_delete'
+  // skills (SPEC → Skills): disponibilidade pela config de skills, não por enabledTools
+  | 'list_skills'
+  | 'skill_load'
+  | 'skill_read'
 
 /**
  * Tools cujo padrão global é PERGUNTAR (modo `lists`; ver approvalPolicy.ts) — os itens Comandos,
@@ -207,6 +212,8 @@ export interface ChatConfig {
   appSignatureCustom?: { referer: string; title: string }
   /** Memória modular (SPEC → Memória). Ausente = desligada. */
   memory?: MemoryConfig
+  /** Skills (SPEC → Skills). Ausente = desligadas. */
+  skills?: SkillsConfig
   /**
    * Smart-Approve: o modelo "juiz" que decide as chamadas dos itens em modo `smart` (aprovar /
    * rejeitar / perguntar ao usuário). Ausente/sem modelo = esses itens perguntam. Ver smartApprove.ts.
@@ -351,7 +358,14 @@ export interface AttachmentMeta {
 }
 
 export type ContentPart =
-  | { type: 'text'; text: string; cache_control?: CacheControl; _attachment?: AttachmentMeta }
+  | {
+      type: 'text'
+      text: string
+      cache_control?: CacheControl
+      _attachment?: AttachmentMeta
+      /** Invocação manual de skill (bloco <skill>): privado, removido na request (ver SPEC → Skills). */
+      _skill?: SkillPartMeta
+    }
   | {
       type: 'image_url'
       image_url: { url: string; detail?: 'auto' | 'low' | 'high' }
@@ -496,6 +510,8 @@ export interface QueuedMessage {
   createdAt: number
   /** Anexos da mensagem enfileirada (já salvos no store). */
   attachments?: AttachmentInfo[]
+  /** Skills carregadas manualmente (parts `<skill>` já lidos no envio, com `_skill`). */
+  skillParts?: ContentPart[]
   /** Meta extra aplicada ao persistir (ex.: kind 'inter-chat' + origem). */
   meta?: MessageMeta
 }
@@ -700,3 +716,5 @@ export type AgentEvent =
   | { type: 'approval-settings-updated'; settings: ApprovalSettings }
   /** Coleção/memória criada, alterada ou apagada (UI, tools do modelo ou extração). */
   | { type: 'memory-changed'; collectionId: string | null; memoryId: string | null }
+  /** Locais de skills mudaram ou "Reescanear" (Configurações → Skills): listas recarregam. */
+  | { type: 'skills-changed' }

@@ -14,7 +14,7 @@ import { join } from 'path'
 import { StringDecoder } from 'string_decoder'
 import { LIMITS } from '@shared/limits'
 import type { ProcessInfo } from '@shared/types'
-import { bwrapAvailable, isDir, killGroup, real, shellArgv } from './bash'
+import { bwrapAvailable, isDir, killGroup, real, sandboxBinds, shellArgv } from './bash'
 import { shellLaunch } from './shellEnv'
 import {
   fail,
@@ -385,7 +385,14 @@ export async function processStart(
 
   // cd explícito (o bwrap faz --chdir para o raiz); mesma linha do comando
   const script = `cd -- "$CLEAR_START_DIR" || exit 1; ${command}`
-  const [cmd, argv] = shellArgv(launch.shell.path, launch.flag, script, sandbox, real(root))
+  const [cmd, argv] = shellArgv(
+    launch.shell.path,
+    launch.flag,
+    script,
+    sandbox,
+    real(root),
+    sandboxBinds(ctx.roBinds)
+  )
   let child: ChildProcess
   try {
     child = spawn(cmd, argv, {

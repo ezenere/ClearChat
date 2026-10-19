@@ -46,6 +46,7 @@ import { SmartApproveSection } from './SmartApproveSection'
 import { ChatApprovalSection } from '../approvals/ChatApprovalSection'
 import { memoryConfigOf, memoryWillSend } from '../../lib/memory'
 import { useMemoryCollections } from '../memory/hooks'
+import { SkillsSection, SubagentSkillsLine } from '../skills/SkillsSection'
 
 export interface CfgProps {
   cfg: ChatConfig
@@ -708,6 +709,7 @@ export function SubagentSection({
   return (
     <Section title="Subagentes" aside={<SystemPromptInfo subagent side="left" />}>
       <SubagentMemoryLine cfg={cfg} chatScope={chatScope} onOpenMemory={onOpenMemory} />
+      <SubagentSkillsLine cfg={cfg} chatScope={chatScope} />
       <AutoTextarea
         value={cfg.subagentSystemPrompt}
         aria-label="System prompt dos subagentes"
@@ -763,6 +765,7 @@ export function ToolsEditor({
   return (
     <>
       <ToolsListSection {...props} />
+      <SkillsSection {...props} chatScope={chatScope} />
       <ToolsPromptSection {...props} />
       <ChatApprovalSection {...props} />
       <SmartApproveSection {...props} />

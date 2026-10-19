@@ -78,6 +78,13 @@ export const MEMORY_TOOL_NAMES: ToolName[] = [
   'memory_rewrite',
   'memory_delete'
 ]
+/**
+ * Tools de skills (SPEC → Skills). NÃO entram em TOOL_NAMES/enabledTools: disponíveis quando
+ * `ChatConfig.skills.enabled` (subagentes: com `skills.subagents`). Só leitura (sem aprovação).
+ * Definições estáticas — a lista de skills NUNCA vai nelas (prefixo de cache estável).
+ */
+export const SKILL_TOOL_NAMES: ToolName[] = ['list_skills', 'skill_load', 'skill_read']
+
 /** Tools de memória que gravam (passam pelo gate de aprovação; nunca para subagentes). */
 export const MEMORY_WRITE_TOOLS: ToolName[] = ['memory_write', 'memory_rewrite', 'memory_delete']
 
@@ -111,7 +118,10 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   memory_read: 'Ler memória',
   memory_write: 'Gravar memória',
   memory_rewrite: 'Reescrever memória',
-  memory_delete: 'Apagar memória'
+  memory_delete: 'Apagar memória',
+  list_skills: 'Listar skills',
+  skill_load: 'Carregar skill',
+  skill_read: 'Ler arquivo da skill'
 }
 
 const def = (
@@ -224,6 +234,39 @@ export const MEMORY_TOOL_DEFINITIONS = {
     'Apaga uma memória gravável (da coleção de escrita da categoria) que ficou errada ou obsoleta. Para corrigir parte dela, prefira memory_write com ops.',
     { id: { type: 'string', description: 'Memória a apagar.' } },
     ['id']
+  )
+} satisfies Partial<Record<ToolName, ToolDefinition>>
+
+export const SKILL_TOOL_DEFINITIONS = {
+  list_skills: def(
+    'list_skills',
+    'Lista as skills disponíveis neste chat — pacotes de instruções especializadas (SKILL.md + arquivos de referência e scripts) instalados pelo usuário: nome, descrição (o que faz e quando usar) e local. Chame antes de tarefas especializadas para ver se alguma se aplica; depois carregue a escolhida com skill_load.',
+    {
+      query: {
+        type: 'string',
+        description: 'Opcional: filtra por termos no nome ou na descrição.'
+      }
+    }
+  ),
+  skill_load: def(
+    'skill_load',
+    'Carrega uma skill: devolve o SKILL.md completo (instruções a seguir à risca), a lista de arquivos da pasta da skill (caminhos relativos e tamanhos) e o caminho absoluto dessa pasta. Leia os arquivos citados com skill_read; rode os scripts da skill com a tool shell usando o caminho absoluto.',
+    { name: { type: 'string', description: 'Nome da skill (como em list_skills).' } },
+    ['name']
+  ),
+  skill_read: def(
+    'skill_read',
+    `Lê um arquivo de dentro da pasta de uma skill (referências, templates, scripts) — mesmo formato e limites de read_file: linhas numeradas "N\tconteúdo", no máximo ${n(L.readDefaultLines)} linhas sem offset/limit. Só alcança arquivos da própria skill.`,
+    {
+      name: { type: 'string', description: 'Nome da skill.' },
+      path: {
+        type: 'string',
+        description: 'Caminho do arquivo relativo à pasta da skill (ex.: "references/guia.md").'
+      },
+      offset: { type: 'number', description: 'Linha inicial (1 = primeira linha).' },
+      limit: { type: 'number', description: 'Número máximo de linhas a ler.' }
+    },
+    ['name', 'path']
   )
 } satisfies Partial<Record<ToolName, ToolDefinition>>
 
@@ -623,7 +666,8 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
     },
     ['questions']
   ),
-  ...MEMORY_TOOL_DEFINITIONS
+  ...MEMORY_TOOL_DEFINITIONS,
+  ...SKILL_TOOL_DEFINITIONS
 }
 
 /** Definição da tool `shell` com o shell detectado na descrição (null = genérica). */

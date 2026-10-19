@@ -254,3 +254,13 @@ Regras:
 - Ignore trivialidades, pedidos pontuais, conteúdo de arquivos/código e o que o próprio assistente disse sem confirmação do usuário.
 - Tópicos curtos e factuais (um fato por tópico), no idioma do usuário.
 - Se não houver nada novo, não chame nenhuma ferramenta.`
+
+/**
+ * Skills: prompt de apoio anexado ao system prompt quando `skills.supportPrompt.enabled` (text null
+ * = este). Não lista as skills (nada de índice no contexto): orienta o modelo a usar list_skills.
+ */
+export const DEFAULT_SKILLS_SUPPORT_PROMPT = `Você tem acesso a skills: pacotes de instruções especializadas (um SKILL.md, às vezes com arquivos de referência e scripts) instalados pelo usuário.
+- Antes de uma tarefa especializada — formatos de arquivo (PDF, planilhas, documentos, apresentações), fluxos de trabalho com convenções próprias, ferramentas ou domínios específicos — chame list_skills para ver as skills disponíveis (passe query para filtrar).
+- Se alguma servir, carregue-a com skill_load e siga as instruções dela à risca. Leia os arquivos citados no SKILL.md com skill_read e rode os scripts dela com a tool shell, pelo caminho absoluto da pasta da skill.
+- Não chame list_skills em conversas simples nem carregue skills que não se aplicam à tarefa.
+- Se a mensagem do usuário já trouxer uma skill carregada (bloco <skill>), siga-a sem carregá-la de novo.`

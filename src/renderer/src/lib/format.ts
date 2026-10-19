@@ -1,5 +1,5 @@
 import type { ApiMessage, ContentPart, ModelInfo, Session } from '@shared/types'
-import { contentText } from '@shared/attachments'
+import { contentText, isAppPart } from '@shared/attachments'
 
 export { clsx as cn } from 'clsx'
 
@@ -18,7 +18,7 @@ export function withText(message: ApiMessage, text: string): ApiMessage {
   if (message.role === 'assistant') return { ...message, content: text }
   if (typeof message.content === 'string') return { ...message, content: text }
   const parts = message.content
-  const attachments = parts.filter((p) => p._attachment)
+  const attachments = parts.filter(isAppPart) // anexos e skills carregadas ficam intactos
   if (!attachments.length) {
     if (parts.length === 0) return { ...message, content: text }
     const first = parts.find((p) => p.type === 'text') ?? { type: 'text' as const, text: '' }

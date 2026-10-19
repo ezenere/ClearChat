@@ -71,7 +71,8 @@ export interface SubFailure {
   dismissed: boolean
 }
 
-export type SettingsTab = 'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'web'
+export type SettingsTab =
+  'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'skills' | 'web'
 
 export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'files'
 
@@ -90,7 +91,9 @@ const SECTION_TAB: Record<string, PanelTab> = {
   'smart-approve': 'tools',
   aprovacoes: 'tools',
   memoria: 'memory',
-  'memoria-subagentes': 'memory'
+  'memoria-subagentes': 'memory',
+  skills: 'tools',
+  'skills-subagentes': 'tools'
 }
 
 function loadPanelTab(): PanelTab {
@@ -176,6 +179,12 @@ interface State {
   memoryTick: number
   /** Coleção/memória a abrir em Configurações → Memórias. */
   memoryFocus: MemoryFocus | null
+  /** Incrementado a cada `skills-changed` (listas de skills recarregam). */
+  skillsTick: number
+  /** Skill a destacar/abrir em Configurações → Skills (nome). */
+  skillsFocus: string | null
+  /** Skills escolhidas na lâmpada do composer, ainda não enviadas (por sessão; nomes). */
+  pendingSkills: Record<string, string[]>
 }
 
 interface Actions {
@@ -198,7 +207,16 @@ interface Actions {
   deleteChat(chatId: string): Promise<void>
   patchConfig(chatId: string, patch: Partial<ChatConfig>): void
   flushConfig(chatId: string): Promise<void>
-  send(sessionId: string, text: string, attachments?: AttachmentInfo[]): Promise<boolean>
+  send(
+    sessionId: string,
+    text: string,
+    attachments?: AttachmentInfo[],
+    skills?: string[]
+  ): Promise<boolean>
+  /** Chips "Carregar skill" do composer. */
+  setPendingSkills(sessionId: string, names: string[]): void
+  /** Abre Configurações → Skills (opcionalmente destacando uma skill). */
+  openSkills(name?: string | null): void
   /** Anexa arquivos (arrastar/colar) ao composer da sessão. */
   addFiles(sessionId: string, files: File[]): Promise<void>
   /** Seletor nativo de arquivos (main lê e salva). */
@@ -324,6 +342,9 @@ export const useStore = create<Store>()((set, get) => ({
   memoryCollections: [],
   memoryTick: 0,
   memoryFocus: null,
+  skillsTick: 0,
+  skillsFocus: null,
+  pendingSkills: {},
 
   async run(fn, label) {
     try {
@@ -565,18 +586,28 @@ export const useStore = create<Store>()((set, get) => ({
     if (chat) set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? withPending(chat) : c)) }))
   },
 
-  async send(sessionId, text, attachments) {
+  async send(sessionId, text, attachments, skills) {
     const session = get().sessions[sessionId]
     if (session) await get().flushConfig(session.chatId)
     set((s) => ({ errors: { ...s.errors, [sessionId]: undefined } }))
     const res = await get().run(
       () =>
-        attachments?.length
-          ? api.agent.send(sessionId, text, attachments)
-          : api.agent.send(sessionId, text),
+        skills?.length
+          ? api.agent.send(sessionId, text, attachments ?? [], skills)
+          : attachments?.length
+            ? api.agent.send(sessionId, text, attachments)
+            : api.agent.send(sessionId, text),
       'Falha ao enviar'
     )
     return res !== undefined
+  },
+
+  setPendingSkills(sessionId, names) {
+    set((s) => ({ pendingSkills: { ...s.pendingSkills, [sessionId]: names } }))
+  },
+
+  openSkills(name) {
+    set({ settingsOpen: true, settingsTab: 'skills', skillsFocus: name ?? null })
   },
 
   async addFiles(sessionId, files) {
@@ -1000,6 +1031,9 @@ function applyEvent(e: AgentEvent): void {
       set((s) => ({ memoryTick: s.memoryTick + 1 }))
       scheduleMemoryReload()
       break
+    case 'skills-changed':
+      set((s) => ({ skillsTick: s.skillsTick + 1 }))
+      break
   }
 }
 
@@ -1055,3 +1089,9 @@ export const selectProcesses =
   (chatId: string) =>
   (s: Store): ProcessInfo[] =>
     s.processes[chatId] ?? EMPTY_PROCESSES
+
+const EMPTY_SKILLS: string[] = []
+export const selectPendingSkills =
+  (sessionId: string) =>
+  (s: Store): string[] =>
+    s.pendingSkills[sessionId] ?? EMPTY_SKILLS

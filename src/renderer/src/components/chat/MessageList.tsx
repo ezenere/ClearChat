@@ -20,7 +20,7 @@ import {
 } from 'lucide-react'
 import { splitInterChatText } from '@shared/interChat'
 import { isContextLengthError, isDisplayOnly, latestBoundaryIndex } from '@shared/context'
-import { messageAttachments } from '@shared/attachments'
+import { messageAttachments, messageSkills } from '@shared/attachments'
 import {
   Fragment,
   memo,
@@ -442,7 +442,8 @@ function UserMessage({
   const run = useStore((s) => s.run)
   const [editing, setEditing] = useState(false)
   const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
-  const hasAttachments = messageAttachments(msg.message).length > 0
+  const hasAttachments =
+    messageAttachments(msg.message).length > 0 || messageSkills(msg.message).length > 0
   const kind = msg.meta.kind
   return (
     <div className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2">
@@ -860,7 +861,8 @@ function SubsessionUserMessage({
 }): React.JSX.Element {
   const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
   const body = from === 'parent' ? text.replace(/^\[Mensagem do agente pai\]\n/, '') : text
-  const hasAttachments = messageAttachments(msg.message).length > 0
+  const hasAttachments =
+    messageAttachments(msg.message).length > 0 || messageSkills(msg.message).length > 0
   return (
     <div
       data-testid={from === 'parent' ? 'parent-message' : 'user-in-sub'}

@@ -2,6 +2,13 @@
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
+import {
+  defaultSkillsSettings,
+  normalizeSkillsSettings,
+  type SkillInfo,
+  type SkillsDiscovery,
+  type SkillsSettings
+} from '@shared/skills'
 import type { ClearApi, WebSearchSettingsState } from '@shared/ipc'
 import {
   isApiEngine,
@@ -1444,6 +1451,64 @@ export function createMockApi(scenario: string): ClearApi {
         return delay(approvalSettings)
       }
     },
+    skills: (() => {
+      // skills fictícias (só para o modo mock da UI)
+      let settings: SkillsSettings = defaultSkillsSettings()
+      const mk = (
+        name: string,
+        description: string,
+        extra: Partial<SkillInfo> = {}
+      ): SkillInfo => ({
+        name,
+        description,
+        dir: `/home/voce/.claude/skills/${name}`,
+        file: `/home/voce/.claude/skills/${name}/SKILL.md`,
+        locationId: 'default',
+        locationLabel: '~/.claude/skills',
+        warnings: [],
+        files: 3,
+        ...extra
+      })
+      const list = [
+        mk(
+          'pdf',
+          'Extrai texto e tabelas de PDFs, preenche formulários e junta arquivos. Use com PDFs.'
+        ),
+        mk(
+          'frontend-design',
+          'Interfaces web caprichadas: layout, tipografia e cores consistentes.'
+        ),
+        mk('changelog', 'Gera o changelog a partir dos commits desde a última tag.')
+      ]
+      const disc = (): SkillsDiscovery => ({
+        locations: settings.locations.map((l) => ({
+          id: l.id,
+          path: l.path,
+          resolved: l.path.replace('~', '/home/voce'),
+          label: l.path,
+          enabled: l.enabled,
+          kind: 'global' as const,
+          exists: true,
+          skills: l.id === 'default' ? list : []
+        })),
+        skills: settings.locations.some((l) => l.id === 'default' && l.enabled) ? list : []
+      })
+      return {
+        getSettings: () => delay(settings),
+        updateSettings: async (patch) => {
+          settings = normalizeSkillsSettings({ ...settings, ...patch })
+          emit({ type: 'skills-changed' })
+          return delay(settings)
+        },
+        discover: () => delay(disc()),
+        read: (file) =>
+          delay(
+            `---\nname: ${file.split('/').slice(-2)[0]}\ndescription: (mock)\n---\n\n# Instruções\n`
+          ),
+        pickFolder: () => delay(null),
+        openFolder: () => delay(undefined)
+      }
+    })(),
     webSearch: (() => {
       // chaves só no "main" do mock; a UI recebe a máscara
       const keys: Partial<Record<SearchEngineId, string>> = {}

@@ -21,7 +21,7 @@ Segurança Electron: `contextIsolation: true`, `nodeIntegration: false`, `sandbo
 
 ```sql
 providers(id TEXT PK, name TEXT, base_url TEXT, api_key TEXT, headers_json TEXT DEFAULT '{}', created_at INTEGER)
-settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS)
+settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS), skillsSettings (locais de skills — ver "Skills")
 chats(id TEXT PK, title TEXT, config_json TEXT, main_session_id TEXT, created_at INTEGER, updated_at INTEGER)
 sessions(id TEXT PK, chat_id TEXT, parent_session_id TEXT NULL, parent_tool_call_id TEXT NULL, depth INTEGER,
          model TEXT, title TEXT, task TEXT NULL, status TEXT, created_at INTEGER,
@@ -58,6 +58,7 @@ export type ToolName = 'list_dir' | 'read_file' | 'search_files' | 'find_files' 
   | 'check_subagents' | 'wait_subagents' | 'cancel_subagent' | 'message_subagent'                  // só com delegate_task disponível
   | 'ask_user'                                                                                     // questionário — só na sessão principal
   | 'memory_search' | 'memory_read' | 'memory_write' | 'memory_rewrite' | 'memory_delete'           // memória (fora de enabledTools; ver "Memória")
+  | 'list_skills' | 'skill_load' | 'skill_read'                                                    // skills (fora de enabledTools; ver "Skills")
 export const CONFIRM_TOOLS: ToolName[] = ['shell', 'process_start', 'web_search', 'browse_url']   // itens cujo padrão global pergunta; process_stop NÃO (ver "Aprovações")
 export type ApprovalItem = 'commands' | 'processes' | 'pages' | 'search'      // shell · process_start · browse_url · web_search
   | 'writeFile' | 'editFile' | 'sendToChat' | 'delegate'                       // write_file · edit_file · send_to_chat · delegate_task (padrão always)
@@ -89,6 +90,8 @@ export interface ChatConfig {
   approvalModes?: Partial<Record<ApprovalItem, ApprovalMode>>  // ajuste por chat; ausente = padrão global (settings approvalModes)
   autoApprove?: ToolName[]      // LEGADO (≤ 0.3.0): só alias de leitura → approvalModes (migrateApprovalConfig)
   smartApprove?: SmartApproveConfig // juiz dos itens em modo smart (ver "Smart-Approve"); ausente/sem modelo = esses itens perguntam
+  memory?: MemoryConfig         // memória modular (ver "Memória")
+  skills?: SkillsConfig         // skills (ver "Skills"); ausente = desligadas
   presetId?: string             // persona de onde o chat veio — só informativo
 }
 export interface SmartApproveConfig { providerId: string | null; model: string | null   // par do juiz (qualquer provedor); sem liga/desliga
@@ -111,7 +114,7 @@ export interface Session { id: string; chatId: string; parentSessionId: string |
 
 // Formato OpenAI exato — é o que é persistido e reenviado byte-a-byte (essencial para token caching)
 export type ContentPart =               // todos aceitam cache_control?: { type: 'ephemeral' } e _attachment?: AttachmentMeta (privado, nunca enviado)
-  | { type: 'text'; text: string }
+  | { type: 'text'; text: string; _skill?: SkillPartMeta }               // _skill: skill carregada pela lâmpada (privado, nunca enviado — ver "Skills")
   | { type: 'image_url'; image_url: { url: string } }                     // persistido: url = clearchat-attachment://<sha256>.<ext>
   | { type: 'file'; file: { filename: string; file_data: string } }      // PDF (idem)
   | { type: 'input_audio'; input_audio: { data: string; format: string } } // wav/mp3 (idem)
@@ -154,6 +157,7 @@ export interface MessageMeta {
 export interface StoredMessage { id: string; sessionId: string; seq: number; message: ApiMessage; meta: MessageMeta; createdAt: number }
 
 export interface QueuedMessage { id: string; sessionId: string; text: string; createdAt: number; attachments?: AttachmentInfo[]
+  skillParts?: ContentPart[]     // skills da lâmpada, já lidas no envio (parts <skill> com _skill)
   meta?: MessageMeta }           // meta extra aplicada ao persistir (inter-chat, callback de subagente, mensagem do pai)
 export interface ApprovalRequest { id: string; chatId: string; sessionId: string; toolCallId: string; toolName: ToolName; args: unknown; createdAt: number
   smartApprove?: SmartApproveRecord    // o juiz pediu a decisão (ou falhou) — o card mostra o motivo
@@ -181,6 +185,7 @@ export type AgentEvent =
   | { type: 'error'; sessionId: string; error: string }
   | { type: 'processes-updated'; chatId: string; processes: ProcessInfo[] }   // processos em segundo plano do chat (ver "Processos em segundo plano")
   | { type: 'approval-settings-updated'; settings: ApprovalSettings }        // modos globais / listas mudaram
+  | { type: 'skills-changed' }                                               // locais de skills mudaram / Reescanear
 ```
 
 ## API do preload (`window.api`) — todos retornam Promise (ipcRenderer.invoke), exceto `onEvent`
@@ -195,7 +200,7 @@ interface ClearApi {
   sessions:  { list(chatId): Session[]; messages(sessionId): StoredMessage[] }
   messages:  { update(id, message: ApiMessage): StoredMessage; delete(id): void }   // edição livre do histórico
   agent: {
-    send(sessionId, text, attachments?: AttachmentInfo[]): { queued: boolean }   // principal OU subagente (conversa direta). idle → inicia turno; running/waiting → enfileira (com os anexos); subagente concluído → retoma (resultado volta ao pai como callback)
+    send(sessionId, text, attachments?: AttachmentInfo[], skills?: string[]): { queued: boolean }   // skills = nomes da lâmpada: SKILL.md lido no envio (erro legível → nada enviado)   // principal OU subagente (conversa direta). idle → inicia turno; running/waiting → enfileira (com os anexos); subagente concluído → retoma (resultado volta ao pai como callback)
     forceSend(queuedId): void                   // ⚡: aborta o que está rodando e injeta a mensagem já
     removeQueued(queuedId): void
     getQueue(sessionId): QueuedMessage[]
@@ -222,6 +227,8 @@ interface ClearApi {
              delete(id): void; duplicate(id): Preset }   // PresetInput = { name; description?; icon?; config: Partial<ChatConfig> }
   attachments: { pick(): { items: AttachmentInfo[]; errors: string[] }        // diálogo nativo (multi); o main lê e salva no store
                  add(input: { name; mime?; data: Uint8Array }): AttachmentInfo } // arrastar/colar: bytes do renderer → store (erro legível se grande/não suportado)
+  skills: { getSettings(): SkillsSettings; updateSettings(patch): SkillsSettings; discover(opts?: { cwd?; counts?; rescan? }): SkillsDiscovery
+            read(file /* só SKILL.md */): string; pickFolder(): string | null; openFolder(path): void }   // ver "Skills"
   approvals: { getSettings(): ApprovalSettings; updateSettings(patch: Partial<ApprovalSettings>): ApprovalSettings }  // modos globais + listas (substitui inteiros; entrada inválida → erro)
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
@@ -242,6 +249,8 @@ body = {
 }
 system content = (session.depth===0 ? systemPrompt : subagentSystemPrompt)
                + (envInPrompt ? "\n\n<environment>\nroot: …\nos: …\nshell: zsh 5.9\n<regras do workspace>\n</environment>" : "")   // SEM data/hora nem dir. atual do shell → estável p/ cache
+               + (memória ativa e principal ? "\n\n" + índice + "\n\n" + help : "")          // ver "Memória"
+               + (skills ativas e supportPrompt.enabled ? "\n\n" + (supportPrompt.text ?? DEFAULT_SKILLS_SUPPORT_PROMPT) : "")   // ver "Skills"
                + (toolsInPrompt ? "\n\n" + (toolsPromptText ?? defaultToolsPrompt(tools, nativeTools)) : "")
 ```
 Se o system content ficar vazio, não envia mensagem system.
@@ -264,7 +273,7 @@ Por chat, o usuário escolhe quais headers de atribuição (`HTTP-Referer` / `X-
 ### Personas (presets de chat) — `src/shared/presets.ts`
 
 Registro de configurações de chat reutilizáveis (tabela `presets`, `presetsRepo` em `repo.ts`, canais `presets:*`).
-- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `approvalModes` (o override por chat; as listas são globais e nunca entram), `smartApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash`, `smartApprove` — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
+- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `approvalModes` (o override por chat; as listas são globais e nunca entram), `smartApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash`, `smartApprove`, `memory`, `skills` (os dois gravados normalizados) — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
 - **Campos ausentes seguem os padrões** de "Novos chats" (modelo/system prompt/pasta padrão + `DEFAULT_CHAT_CONFIG`): `applyPreset(base, config)` = base ← persona (params mesclados). `providerId` + `model` são **um par** (`resolvePresetModel` em `src/shared/models.ts`): persona sem modelo → o par padrão (o `providerId` sozinho é ignorado); com modelo e sem `providerId` (antigas) → o modelo no provedor padrão; provedor apagado → o par padrão + aviso no Novo chat e no editor ("O provedor … não existe mais"). Sem `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
 - `snapshotPreset(chatConfig, { includeCwd })` = persona a partir de um chat (snapshot completo dos campos acima). `patchPresetConfig` mescla edições num rascunho (params nulos removem).
 - **Primeira execução** (`presetsRepo.seed()`, chamado em `registerIpc`): cria "Padrão" com config **vazia** (= segue "Novos chats", então mudar o modelo/system prompt padrão continua valendo) e a define em `defaultPresetId`; a flag `presetsSeeded` impede recriá-la depois de apagada. Sem nenhuma persona o app funciona igual (só os padrões).
@@ -524,12 +533,12 @@ Estética: escura, elegante, minimalista (referência: Linear / Claude desktop /
 - **Contexto**: medidor compacto no rodapé do composer (e no banner de subsessão) — anel + "38k / 200k · 19%", cor muda em 70% / limite; tooltip com entrada/resposta/cache/janela; janela desconhecida → "N tokens · definir janela"; clique → seção Contexto da Config. Banner acima do composer no limite com "Compactar conversa" (dispensável). Mensagens antes da fronteira ficam visíveis porém esmaecidas, com divisor "Conversa compactada · N mensagens resumidas · não são mais enviadas à API" (Ocultar/Mostrar); a fronteira é um card "Resumo da conversa" (markdown recolhível, (i) "Enviado como mensagem role:user no início do histórico", N mensagens, tokens antes → depois, custo). Compactação em andamento: card com o resumo ao vivo. Erro de contexto excedido → botão "Compactar e tentar de novo".
 - **Composer**: textarea auto-grow, Enter envia / Shift+Enter quebra linha, botão Parar quando rodando. Mensagens **enfileiradas** aparecem acima do composer como chips com botão ⚡ (forçar) no canto e X (remover).
 - **Painel direito** (colapsável), abas:
-  Cabeçalho: abas **Modelo · Chat · Tools · Arquivos** (ícone + rótulo; `role="tab"`), botão **"Ver request"** ({ }, de qualquer aba → modal com o JSON exato da próxima request, `previewRequest`) e fechar. A última aba fica em `localStorage` (`clearchat.panelTab`, com try/catch). Em subsessão, as abas de config mostram a nota "Configuração do chat (compartilhada) · esta subsessão usa o modelo X e o system prompt de subagentes". Tudo editável a qualquer momento; salva automaticamente. Os editores (`panel/editors.tsx`) recebem `{cfg, patch}` e são os mesmos no editor de personas.
+  Cabeçalho: abas **Modelo · Chat · Tools · Memória · Arquivos** (a seção Skills fica na aba Tools) (ícone + rótulo; `role="tab"`), botão **"Ver request"** ({ }, de qualquer aba → modal com o JSON exato da próxima request, `previewRequest`) e fechar. A última aba fica em `localStorage` (`clearchat.panelTab`, com try/catch). Em subsessão, as abas de config mostram a nota "Configuração do chat (compartilhada) · esta subsessão usa o modelo X e o system prompt de subagentes". Tudo editável a qualquer momento; salva automaticamente. Os editores (`panel/editors.tsx`) recebem `{cfg, patch}` e são os mesmos no editor de personas.
   - **Modelo**: o seletor único de modelo (par provedor + modelo; (i) explica que o id vai como `model` para o endpoint daquele provedor) (+ contexto/preço/tools), system prompt (i), parâmetros (cada um com toggle "enviar" — só os ativados vão; (i)), reasoning_effort, **Request**: "Token caching (cache_control)" (i; depende do modelo/provedor) e body extra JSON (i).
   - **Chat**: título, persona de origem + **"Salvar como persona"** (snapshot da config do chat; opção de incluir a raiz ou atualizar a persona de origem), **Diretório raiz** (caminho, "Alterar…", "Confinar ferramentas à raiz" (i), "Bash em sandbox" (i) — só se bwrap existir —, "Bloco de ambiente" no system prompt (i, mostra o texto)), **Assinatura do app** (i), **Contexto** (uso/janela, "Definir janela manualmente", "Sugerir compactação em N%", "Compactar automaticamente", prompt de compactação editável com reset e (i), "Compactar agora"; o medidor do composer abre esta aba).
   - **Tools**: tools habilitadas (cada uma com (i) mostrando a definição JSON enviada), "Enviar tools nativas (campo tools)" (i), "Texto das tools no system prompt" (i) + textarea editável com reset, **Aprovações** (modo por item com "Padrão (X)"; ver "Aprovações"), **Smart-Approve** (ver acima; (i) com a request exata do juiz), system prompt de subagentes (i), **Limites** ("Saída máx. por ferramenta" (i)).
   - **Arquivos**: navegador da raiz — com `confineToRoot` o breadcrumb começa na raiz e nunca sobe acima dela; recarregar (e recarrega sozinho a cada resultado de tool do chat); "Usar como raiz", "Escolher pasta…", "Nova pasta…" (cria na pasta atual e entra nela); clicar arquivo → preview (somente leitura).
-- **Configurações** (modal), abas: **Provedores** (CRUD: nome, base URL, API key mascarada, headers extras JSON, testar — nenhum é "padrão"); **Personas** (lista com ícone, nome, "<Provedor> · <modelo>" e descrição/resumo; Editar — nome/ícone/descrição + sub-abas Modelo · Chat · Tools com os mesmos editores do painel, incluindo "Definir diretório raiz"; na aba Modelo, nota "Definido nesta persona" / "Segue o modelo padrão" + "Usar o padrão" (remove o par da persona); Duplicar; estrela = definir como padrão; Apagar com confirmação; "Nova persona"); **Novos chats** (persona padrão, **Modelo padrão** — um seletor só que grava `defaultProviderId` + `defaultModel` juntos; provedor apagado → "Não definido" —, system prompt e pasta padrão — usados nos campos que a persona não define); **Aprovações** (modos globais + listas; ver "Aprovações").
+- **Configurações** (modal), abas: **Provedores** (CRUD: nome, base URL, API key mascarada, headers extras JSON, testar — nenhum é "padrão"); **Personas** (lista com ícone, nome, "<Provedor> · <modelo>" e descrição/resumo; Editar — nome/ícone/descrição + sub-abas Modelo · Chat · Tools com os mesmos editores do painel, incluindo "Definir diretório raiz"; na aba Modelo, nota "Definido nesta persona" / "Segue o modelo padrão" + "Usar o padrão" (remove o par da persona); Duplicar; estrela = definir como padrão; Apagar com confirmação; "Nova persona"); **Novos chats** (persona padrão, **Modelo padrão** — um seletor só que grava `defaultProviderId` + `defaultModel` juntos; provedor apagado → "Não definido" —, system prompt e pasta padrão — usados nos campos que a persona não define); **Aprovações** (modos globais + listas; ver "Aprovações"); **Memórias** (ver "Memória"); **Skills** (locais; ver "Skills"); **Pesquisa na web**.
 - Componente `<ApiInfo>`: ícone (i) com tooltip (Radix Tooltip ou próprio) — usar em TODO lugar que vira parte do prompt/request.
 
 ## Notas do scaffold (fase 1)
@@ -695,3 +704,56 @@ interface MemoryConfig {
 - **Painel do chat** (aba Chat ou aba própria "Memória"): toggle geral; por categoria (com toggle da categoria) as coleções daquela categoria (selos *da persona* / *adicionada*), ligar/desligar cada uma, escolher a coleção de escrita da categoria (ou nenhuma); help prompt (toggle + texto + restaurar); extração (auto, modelo, prompt, "Extrair memórias agora"); "Atualizar memória" (renova o snapshot); toggle "Memória nos subagentes"; (i) com o índice exato.
 - **Editor de personas**: a mesma seção, sem "Extrair agora"/"Atualizar memória".
 - **Seção de subagentes** (aba Tools): indicação se a memória está liberada para subagentes (e se está ligada no chat).
+
+## Skills (contrato — `src/shared/skills.ts`, `src/main/skills/`, `src/main/tools/skills.ts`, request, runner, UI)
+
+Skills no formato **Agent Skills** da Anthropic / Claude Code (conferido em agentskills.io/specification e code.claude.com/docs/en/skills, 2026-10): uma skill é uma **pasta** com `SKILL.md` — frontmatter YAML entre linhas `---` + corpo markdown — e arquivos extras opcionais (`scripts/`, `references/`, `assets/`…). **Não há índice de skills no contexto**: com as skills ligadas vão um prompt de apoio (opcional) e três tools; o modelo descobre as skills com `list_skills`. Nenhuma criação/edição de skill pelo modelo.
+
+### Formato e parse (`src/main/skills/parse.ts`, puro)
+- `parseSkillMd(texto, nomeDaPasta)` → `{ meta, body, content, warnings, error? }`. Texto normalizado (BOM fora, CRLF/CR → LF) — `content` é o que vai ao modelo. YAML: o subconjunto usado nas skills (`parseYaml`): `chave: valor` simples / entre aspas (`"…"` com escapes, `'…'` com `''`) / multilinha dobrado, blocos `|` e `>`, listas (`- x` e `[a, b]`), um nível de mapa (`metadata:`), comentários `#`. Erro de YAML → skill inválida com a linha.
+- **Inválida** (aparece nas Configurações com o erro; nunca é oferecida): sem frontmatter (1ª linha ≠ `---`), frontmatter não fechado, YAML ruim, `name` não textual, **sem `description`** (vazia conta) ou `SKILL.md` > 1 MB.
+- **Avisos** (continua válida): sem `name` → usa o nome da pasta (como o Claude Code); `name` ≠ pasta; nome fora do padrão da spec (`a-z0-9` e hífens, sem hífen no início/fim nem duplo, ≤ 64); `description` > 1024; `compatibility` > 500.
+- Campos conhecidos: `name`, `description`, `license`, `compatibility`, `allowed-tools` (texto ou lista → texto separado por espaço; **só informativo** — não altera aprovações), `metadata` (mapa). Os demais vão para `meta.other` (texto) — mostrados na UI e ignorados.
+
+### Locais e descoberta (`src/main/skills/discovery.ts`, fs puro; settings em `src/main/skills/index.ts`)
+- Setting global `skillsSettings` = `SkillsSettings { locations: { id, path, enabled }[]; projectSkills: boolean }` (`normalizeSkillsSettings`: ids únicos, caminhos não vazios e sem repetição; o id `project` é reservado). Padrão: `[{ id: 'default', path: '~/.claude/skills', enabled: true }]` (listada mesmo sem a pasta existir — "pasta não existe") + `projectSkills: true`. `~` é guardado e expandido ao escanear (`expandHome`).
+- Cada local é uma pasta cujas **subpastas com `SKILL.md`** são skills (links de pasta seguidos; ocultas ignoradas; ≤ 500 por local) — ou a própria pasta, se tiver um `SKILL.md`. Skills de projeto: `<cwd do chat>/.claude/skills` (`projectLocation`), por último, só se `projectSkills` (e não duplicam um local já listado).
+- **Precedência**: a ordem dos locais; nomes repetidos → vence a primeira ocorrência; as outras ganham `shadowedBy` (rótulo do local vencedor). `discoverSkills` escaneia todos os locais (inclusive desabilitados, para a UI) e devolve `SkillsDiscovery { locations: SkillLocationScan[]; skills }` — `skills` = efetivas (válidas, de locais habilitados, sem as sobrescritas). `counts` conta os arquivos (Configurações).
+- **Cache**: parse por (mtime, tamanho) do `SKILL.md`; "Reescanear" (`discover({ rescan: true })`) limpa o cache e emite `skills-changed`. A listagem de pastas é refeita a cada descoberta (barata).
+- `listSkillFiles(dir)`: recursivo, `SKILL.md` primeiro, pula `.git`/`node_modules`/`__pycache__`/`.venv` e pastas ocultas, não segue links de pasta; ≤ 500 arquivos, profundidade ≤ 6.
+
+### Config (em `ChatConfig.skills?`, persona via `PRESET_FIELDS`; chat herda da persona como a memória)
+```ts
+interface SkillsConfig {
+  enabled: boolean                                   // desligado → NADA de skills vai para a API (sem prompt, sem tools, sem lâmpada)
+  disabled: string[]                                 // skills desligadas aqui (por nome); padrão = todas as efetivas
+  supportPrompt: { enabled: boolean; text: string | null }   // padrão ligado; null = DEFAULT_SKILLS_SUPPORT_PROMPT (defaults.ts)
+  subagents: boolean                                 // subagentes recebem as mesmas tools + prompt de apoio (padrão false)
+}
+```
+- `normalizeSkillsConfig` (ausente = `defaultSkillsConfig()` = desligada). Skills ativas de um chat = `activeFromDiscovery(discover({ cwd }), cfg)` = efetivas − `disabled` (`activeSkillsFor`). Sessão: `skillsActiveFor(cfg, session)` = `enabled && (depth === 0 || subagents)`; subagentes usam o mesmo conjunto ativo do chat.
+
+### Envio à API (controle total: tudo com (i))
+- **Só a config decide** (`skillsActive` / `skillsSupportPrompt` em `request.ts`) — nunca as skills descobertas: definições e prompt **estáveis na sessão** (prefixo de cache), mesmo que skills apareçam/sumam.
+- System prompt (`systemContent`): … → memória → **prompt de apoio** (`\n\n` + texto) → texto das tools.
+- Tools: `SKILL_TOOL_NAMES = ['list_skills', 'skill_load', 'skill_read']` (fora de `TOOL_NAMES`/`enabledTools`, `SKILL_TOOL_DEFINITIONS` em `tools.ts`), acrescentadas por `availableTools` **depois** das de memória. A lista de skills nunca vai nas definições. Modo texto: entram no texto das tools como as demais.
+- Só leitura → não são itens de aprovação (rodam direto; nem Smart-Approve). Scripts rodam pela tool `shell`/`process_start` com as aprovações normais. Sandbox (bwrap): as pastas das skills ativas da sessão (realpath, só as que existem e não estão dentro da raiz) entram como `--ro-bind` depois do `/tmp` privado e antes da raiz (`shellArgv(…, roBinds)` / `sandboxBinds`; o `/` já é somente leitura, mas skills sob `/tmp` ficariam escondidas).
+
+### Tools (`src/main/tools/skills.ts`; registradas em `runLocalTool`; `ToolContext.skills` = skills ativas da sessão, resolvidas pelo runner; erros → `Erro: …`)
+- `list_skills { query? }` → `[N skills disponíveis neste chat]` (ou `[K de N skills para "q"]`) + `- nome — descrição (local)` (descrição numa linha) + "Carregue a que se aplica com skill_load…". `query`: todos os termos no nome/descrição, sem acento/caixa. Corta no teto `maxToolOutputChars` com `[… mais N skills — refine com query]`. Nenhuma → orienta Configurações → Skills.
+- `skill_load { name }` (nome exato; senão sem caixa; senão o nome da pasta) → `<skill name="…" path="<pasta absoluta>">\n<SKILL.md>\n</skill>` + `Pasta da skill: …` + `Arquivos (N):` (`caminho (tamanho)`, ≤ 1/3 do teto) + dica de `skill_read` e de rodar scripts com `shell` pelo caminho absoluto. SKILL.md maior que o que cabe → cortado em linha com `[… SKILL.md cortado: … leia o resto com skill_read {"name", "path": "SKILL.md", "offset": N}]`. Não encontrada → erro com os nomes disponíveis.
+- `skill_read { name, path, offset?, limit? }` → `path` relativo à pasta da skill (absoluto aceito se dentro dela); **confinado por realpath** (`..`, absoluto de fora e links que escapam → `Erro: acesso negado — "…" fica fora da pasta da skill "x" (…)`), **independente de `confineToRoot`**. Leitura = `readFile` do `read_file` (mesmo formato, janelas e limites; imagem/PDF se o modelo ler) com a pasta da skill como base.
+
+### Invocação manual (lâmpada do composer)
+- Só com `skills.enabled` no chat. A lâmpada abre um picker com busca (↑/↓, Enter, Esc) entre as skills **ativas**; escolher adiciona um chip "Carregar skill X" (vários; removíveis; `store.pendingSkills[sessionId]`). Desligar as skills esconde os chips (nada é enviado).
+- `agent.send(sessionId, text, attachments, skills)` → `runner.sendWithSkills`: lê cada `SKILL.md` **no envio** (`resolveManualSkills`: skills desligadas / inexistente ou desligada / falha de leitura → **erro legível e nada é enviado**; o composer devolve texto, anexos e chips) e monta `manualSkillPart` = `{ type: 'text', text: '<skill name="…" path="<pasta>">\n<SKILL.md normalizado>\n</skill>', _skill: { name, path, truncated? } }` (≤ 200.000 caracteres; acima, cortado com nota). Conteúdo da mensagem: `[...anexos, ...skills, { type:'text', text }]` (texto vazio permitido com skill). Fila e ⚡: os parts já lidos viajam em `QueuedMessage.skillParts`.
+- Request: `expandAttachments` remove `_skill` (e `_attachment`) **na cópia** — o texto enviado é idêntico ao persistido; cache_control no último text part como sempre. `contentText` ignora parts de skill (título, copiar, editar — `withText` preserva o part); `messageSkills(msg)`. Compactação encurtada (`trimmed`/`tail`) troca por `[skill carregada: nome]`.
+- UI: card "Skill carregada: X" acima do balão (SKILL.md · N caracteres, "Ver conteúdo enviado", link para Configurações → Skills, (i) com o texto exato); a fila mostra 💡 com os nomes.
+
+### UI
+- **Configurações → Skills**: lista numerada de locais (ordem = precedência; ↑/↓; switch; "Abrir pasta" (`shell.openPath`); remover; selo "padrão"; "pasta não existe"); "Adicionar pasta…" (diálogo nativo), "Restaurar a pasta padrão", "Reescanear"; por local, as skills (nome, nº de arquivos, avisos, "sobrescrita por …", "inválida" + erro); clicar abre o `SKILL.md` em modo leitura com os campos do frontmatter. Toggle "Incluir .claude/skills do diretório raiz do chat" (+ as skills de projeto do chat aberto). (i) dos locais.
+- **Aba Tools** do painel e do editor de personas → seção **Skills**: toggle, "N/M skills ativas" + link "Locais", checklist (switch por skill, local, avisos, link para o preview), prompt de apoio (toggle + texto editável + restaurar, (i) com o texto), "Skills nos subagentes" ((i)); (i) geral com as definições exatas das 3 tools ou "nada de skills vai para a API". Seção Subagentes: linha "Skills para subagentes: ligadas/desligadas" (+ aviso se as skills estão desligadas).
+- **Cards** (`components/skills/SkillToolCard.tsx`): `list_skills` (contagem + chips dos nomes → abrem a skill nas Configurações), `skill_load` (SKILL.md carregado · N arquivos · pasta), `skill_read` (caminho · linhas); resultado completo no expandido com o (i) `role: tool`.
+
+### Testes
+`e2e/skills.test.ts` (em `npm run test:unit`, só pastas temporárias com home injetada): parse (válido, sem frontmatter, não fechado, YAML ruim, sem name/description, campos extras, CRLF/BOM, blocos), descoberta (precedência, sobrescrita, inválidas, projeto, local desligado, local que é a própria skill, link de pasta, cache por mtime), settings/config/herança, ativas (subconjunto), `list_skills`/`skill_load`/`skill_read` (saídas, limites, corte, confinação com `..`/absoluto/symlink), sandbox (`--ro-bind`), request (desligadas → nada; prompt + tools; subagentes; modo texto), invocação manual (part exato, `_skill` removido em openai/anthropic, edição, compactação, corte, erros). `e2e/skills.spec.ts` (`npm run test:e2e:skills`): app real com provedor falso, userData isolado e **HOME temporária** (o `~/.claude/skills` padrão resolve dentro dela) — Configurações → Skills, list_skills → skill_load → skill_read pelo agente, desligadas → nada, seção da aba Tools, lâmpada → picker → chip → part `<skill>` + card, fila, erro legível, subagentes com/sem, editor de personas; screenshots.

@@ -30,6 +30,9 @@ macOS (Apple Silicon e Intel) e Linux (AppImage, .deb, .pacman, .tar.gz).
 - **Memória modular**: coleções por categoria (Perfil, Tópicos, Áreas, Pessoas, Preferências), ativadas por
   chat ou persona, com escolha de onde o agente grava; índice congelado por sessão (não quebra o cache),
   tools `memory_*` e extração automática após compactar. Tudo editável em Configurações → Memórias.
+- **Skills** (formato Agent Skills / Claude Code — pasta com `SKILL.md`): locais configuráveis (padrão
+  `~/.claude/skills`, mais `.claude/skills` do projeto), sem índice no contexto — o modelo descobre com
+  `list_skills` e carrega com `skill_load` / `skill_read`; ou você carrega uma pela lâmpada do composer.
 - **Anexos**: imagens, PDF, áudio e arquivos de texto, conforme o que o modelo aceita.
 - **Memória modular**: coleções por categoria (perfil, tópicos, áreas, pessoas, preferências) que cada chat
   ou persona ativa; o modelo consulta e grava com ferramentas próprias, e uma extração pode rodar após a
@@ -133,7 +136,7 @@ npm run install:local -- --uninstall
   define a padrão. Campos que a persona não define seguem "Novos chats"; a "Padrão" (criada na 1ª
   execução, apagável) não define nenhum. Provedor + modelo da persona andam juntos: sem modelo → o
   par padrão; provedor apagado → o par padrão, com aviso.
-- **Painel direito**: abas Modelo · Chat · Tools · Memória · Arquivos; "Ver request" ({ }) no cabeçalho.
+- **Painel direito**: abas Modelo · Chat · Tools (com a seção Skills) · Memória · Arquivos; "Ver request" ({ }) no cabeçalho.
 
 ## Workspace, contexto e limites
 
@@ -261,6 +264,32 @@ npm run install:local -- --uninstall
   extração ("Extrair memórias agora" só no chat), "Atualizar memória" e subagentes — com (i) do índice exato (`memory.preview`) ou "Nada de memória vai para a API".
   Cards das tools com chips das mudanças (abrem a memória nas Configurações) e card da extração.
 
+## Skills
+
+- **Formato** (Agent Skills da Anthropic / Claude Code): uma pasta por skill com `SKILL.md` — frontmatter
+  YAML com `name` e `description` (opcionais `license`, `compatibility`, `allowed-tools`, `metadata`;
+  campos desconhecidos são mostrados e ignorados) e as instruções em markdown — mais arquivos extras
+  opcionais (referências, scripts). Sem `description` (ou sem frontmatter) a skill é inválida e aparece com
+  o erro; sem `name`, vale o nome da pasta.
+- **Locais** (Configurações → **Skills**, globais): lista ordenada de pastas (padrão `~/.claude/skills`),
+  cada uma com liga/desliga, ↑/↓, "Abrir pasta", remover, "Adicionar pasta…" e "Reescanear"; com nomes
+  repetidos vence o primeiro local ("sobrescrita por …"). "Incluir .claude/skills do diretório raiz do chat"
+  acrescenta as skills de projeto (por último). Cada skill mostra descrição, nº de arquivos, avisos e o
+  `SKILL.md` em modo leitura.
+- **Por chat/persona** (`ChatConfig.skills`, herdado da persona; aba **Tools** → seção Skills): liga/desliga,
+  checklist para desligar skills específicas, prompt de apoio (editável, com restaurar) e "Skills nos
+  subagentes". Desligadas: **nada** de skills vai para a API.
+- **O que vai para a API**: nenhuma lista de skills. Só o prompt de apoio (anexado ao system prompt — diz que
+  há skills e para chamar `list_skills` antes de tarefas especializadas) e três tools de definição fixa
+  (prefixo de cache estável): `list_skills {query?}` (nome, descrição, local), `skill_load {name}` (o
+  `SKILL.md` inteiro, a lista de arquivos e a pasta absoluta) e `skill_read {name, path}` (lê um arquivo da
+  skill, confinado à pasta dela — mesmo com o chat confinado à raiz). Scripts rodam pela tool `shell` (com
+  as aprovações de sempre); no sandbox (bwrap), as pastas das skills ativas entram somente leitura.
+- **Lâmpada no composer** (só com skills ligadas): busca entre as skills ativas → chip "Carregar skill X" (vários,
+  removíveis). No envio o `SKILL.md` é lido e vai junto com a mensagem como um part
+  `<skill name="…" path="…">…</skill>` (card "Skill carregada" com (i) do texto exato). Funciona com fila e
+  ⚡; se não der para ler, a mensagem não é enviada (erro legível).
+
 ## Anexos
 
 - 📎 no composer (diálogo nativo), arrastar arquivos para o chat ou colar imagens. Imagens
@@ -308,6 +337,8 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # herança da persona, coleção de escrita, regra de envio, limites, [[slug]], resumos),
                     # pesquisa na web (e2e/webSearch.test.ts + e2e/searchEngines.test.ts: DuckDuckGo/Brave (site),
                     # parse de Exa/Tavily/Brave API com fixtures, ordem + fallback, intervalo, migração, máscara),
+                    # skills (e2e/skills.test.ts: parse do SKILL.md, descoberta com precedência/conflitos/projeto,
+                    # confinação do skill_read, saídas e limites das tools, config/herança, request e invocação manual),
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
 # E2E do backend (Playwright `_electron`, chama window.api pelo renderer; faz chamadas reais e baratas ao OpenRouter)
@@ -334,6 +365,11 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-memory-ui-e2e npm run test:e2e:memory-ui
 # visível/clicável, padding do fim = altura da pilha, "ir para o fim"; tabelas markdown sem palavras partidas;
 # screenshots 1280x820 / 900x600 em $CLEARCHAT_E2E_DIR/shots)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-overlay-e2e npm run test:e2e:overlay
+
+# E2E das skills (app real, 100% local: provedor falso, userData isolado e HOME temporária — nunca lê o
+# ~/.claude/skills real; Configurações → Skills, tools no chat, lâmpada → chip → card, fila, subagentes;
+# screenshots em $CLEARCHAT_E2E_DIR/shots)
+CLEARCHAT_E2E_DIR=/tmp/clearchat-skills-e2e npm run test:e2e:skills
 
 # E2E da pesquisa na web (UI real, 100% local: provedor e servidor de busca falsos via CLEARCHAT_SEARCH_BASE_*,
 # userData isolado, sem chaves reais; Configurações → Pesquisa na web + pesquisa pelo runner com fallback)

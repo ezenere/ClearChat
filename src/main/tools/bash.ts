@@ -73,6 +73,11 @@ export const real = (p: string): string => {
   }
 }
 
+/** Pastas extras do sandbox: as que existem, pelo realpath (sem repetidas). */
+export function sandboxBinds(dirs: string[] | undefined): string[] {
+  return [...new Set((dirs ?? []).filter(isDir).map(real))]
+}
+
 /** Script executado: trap que reporta o pwd final no fd 3, cd para o diretório inicial, comando. */
 export function wrapCommand(command: string): string {
   // Prólogo na MESMA linha do comando: números de linha em mensagens de erro do bash batem.
@@ -89,8 +94,14 @@ export function shellArgv(
   flag: string,
   script: string,
   sandbox: boolean,
-  rootReal: string
+  rootReal: string,
+  roBinds: string[] = []
 ): [string, string[]] {
+  // pastas extras somente leitura (skills ativas): depois do /tmp privado (alcançáveis mesmo lá) e
+  // antes da raiz (uma pasta dentro da raiz continua gravável pela montagem da raiz)
+  const extra = roBinds
+    .filter((d) => d && !isInside(rootReal, d))
+    .flatMap((d) => ['--ro-bind', d, d])
   return sandbox
     ? [
         'bwrap',
@@ -104,6 +115,7 @@ export function shellArgv(
           '/proc',
           '--tmpfs',
           '/tmp',
+          ...extra,
           '--bind',
           rootReal,
           rootReal,
@@ -160,7 +172,14 @@ function runShell(
     const env = launch.env
     const script = wrapCommand(command)
     const rootReal = real(root)
-    const [cmd, argv] = shellArgv(launch.shell.path, launch.flag, script, sandbox, rootReal)
+    const [cmd, argv] = shellArgv(
+      launch.shell.path,
+      launch.flag,
+      script,
+      sandbox,
+      rootReal,
+      sandboxBinds(ctx.roBinds)
+    )
     const child = spawn(cmd, argv as string[], {
       cwd: start,
       env,

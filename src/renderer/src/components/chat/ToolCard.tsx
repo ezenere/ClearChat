@@ -62,10 +62,13 @@ import { isAnchorShown, shortFailure } from '../../lib/approvalAnchors'
 import { useAnchor } from '../../lib/useAnchor'
 import { isMemoryTool, memoryToolSummary } from '../../lib/memory'
 import { MEMORY_TOOL_ICONS, MemoryToolBody } from '../memory/MemoryToolCard'
+import { isSkillTool, skillToolSummary } from '../../lib/skills'
+import { SKILL_TOOL_ICONS, SkillToolBody } from '../skills/SkillToolCard'
 
 // Partial + string: tools novas (ex.: memória, do contrato do backend) caem no Wrench/no mapa delas.
 const ICONS: Partial<Record<ToolName, LucideIcon>> = {
   ...MEMORY_TOOL_ICONS,
+  ...SKILL_TOOL_ICONS,
   list_dir: FolderTree,
   read_file: FileText,
   search_files: FileSearch,
@@ -112,6 +115,7 @@ function parseArgs(raw: string): Record<string, unknown> | null {
 function summary(name: string, args: Record<string, unknown> | null): string {
   if (!args) return ''
   if (isMemoryTool(name)) return memoryToolSummary(name, args)
+  if (isSkillTool(name)) return skillToolSummary(name, args)
   const pick = (k: string): string => (typeof args[k] === 'string' ? (args[k] as string) : '')
   switch (name) {
     case 'shell':
@@ -643,6 +647,10 @@ export function ToolCard({
 
       {isMemoryTool(call.name) && !streaming && (
         <MemoryToolBody name={call.name} args={args} result={result} resultText={resultText} />
+      )}
+
+      {isSkillTool(call.name) && !streaming && (
+        <SkillToolBody name={call.name} args={args} result={result} resultText={resultText} />
       )}
 
       {name === 'process_start' && !streaming && (

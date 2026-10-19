@@ -79,6 +79,9 @@ function shrinkMessage(m: StoredMessage): StoredMessage {
 function shrinkPart(p: ContentPart): ContentPart {
   const a = p._attachment
   if (a && a.kind !== 'text') return { type: 'text', text: attachmentPlaceholder(a) }
+  // skill carregada manualmente: só o nome (o modelo pode recarregá-la com skill_load)
+  if (p.type === 'text' && p._skill)
+    return { type: 'text', text: `[skill carregada: ${p._skill.name}]` }
   if (p.type === 'text') return { type: 'text', text: shorten(p.text, a ? TOOL_MAX * 2 : MSG_MAX) }
   return p
 }

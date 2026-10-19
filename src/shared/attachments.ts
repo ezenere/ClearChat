@@ -2,6 +2,7 @@
 // Ver SPEC.md → "Anexos".
 import type { ApiMessage, AttachmentKind, AttachmentMeta, ContentPart, ModelInfo } from './types'
 import type { ProviderKind } from './providerKinds'
+import type { SkillPartMeta } from './skills'
 
 /** Esquema das referências persistidas e do protocolo que serve os arquivos ao renderer. */
 export const ATTACHMENT_SCHEME = 'clearchat-attachment'
@@ -193,12 +194,24 @@ export function messageAttachments(m: ApiMessage): AttachmentMeta[] {
   return m.content.map((p) => p._attachment).filter((a): a is AttachmentMeta => !!a)
 }
 
-/** Texto digitado da mensagem (ignora parts de anexo). */
+/** Part com skill carregada manualmente (bloco <skill>, `_skill`)? */
+export const isSkillPart = (p: ContentPart): boolean => p.type === 'text' && !!p._skill
+
+/** Part privado do app (anexo ou skill): não é texto digitado; a edição o preserva. */
+export const isAppPart = (p: ContentPart): boolean => !!p._attachment || isSkillPart(p)
+
+/** Skills carregadas manualmente numa mensagem (na ordem). */
+export function messageSkills(m: ApiMessage): SkillPartMeta[] {
+  if (m.role !== 'user' || typeof m.content === 'string' || !m.content) return []
+  return m.content.flatMap((p) => (p.type === 'text' && p._skill ? [p._skill] : []))
+}
+
+/** Texto digitado da mensagem (ignora parts de anexo e de skill). */
 export function contentText(content: string | ContentPart[] | null | undefined): string {
   if (content == null) return ''
   if (typeof content === 'string') return content
   return content
-    .filter((p) => !p._attachment && p.type === 'text')
+    .filter((p) => !isAppPart(p) && p.type === 'text')
     .map((p) => (p as { text: string }).text)
     .join('')
 }

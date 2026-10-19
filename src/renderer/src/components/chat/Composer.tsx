@@ -1,11 +1,17 @@
-import { ArrowUp, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
+import { ArrowUp, Lightbulb, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { modalityWarning } from '@shared/attachments'
 import type { QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { splitInterChatText } from '@shared/interChat'
-import { isBusy, selectPendingAttachments, selectQueue, useStore } from '../../store'
+import {
+  isBusy,
+  selectPendingAttachments,
+  selectPendingSkills,
+  selectQueue,
+  useStore
+} from '../../store'
 import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
 import { AutoTextarea } from '../ui/controls'
@@ -15,6 +21,8 @@ import { CompactBanner, ContextMeter } from './ContextMeter'
 import { QuestionForm } from './AskUser'
 import { RetryForm } from './RetryCard'
 import { PendingBar } from './PendingBar'
+import { SkillChip, SkillPickerButton } from '../skills/SkillPicker'
+import { skillsConfigOf } from '../../lib/skills'
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
 function pastedName(file: File, i: number): File {
@@ -54,6 +62,14 @@ function QueueChip({ item }: { item: QueuedMessage }): React.JSX.Element {
       <p className="line-clamp-2 text-[12.5px] leading-snug text-fg/85">
         {origin ? origin.text : item.text}
       </p>
+      {item.skillParts?.length ? (
+        <p className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-subtle">
+          <Lightbulb className="size-3 shrink-0" />
+          {item.skillParts
+            .flatMap((p) => (p.type === 'text' && p._skill ? [p._skill.name] : []))
+            .join(', ')}
+        </p>
+      ) : null}
       {item.attachments?.length ? (
         <p className="mt-0.5 flex items-center gap-1 truncate text-[11px] text-subtle">
           <Paperclip className="size-3 shrink-0" />
@@ -111,6 +127,11 @@ export function Composer({
   const pickFiles = useStore((s) => s.pickFiles)
   const removeAttachment = useStore((s) => s.removeAttachment)
   const clearAttachments = useStore((s) => s.clearAttachments)
+  const pendingSkillsRaw = useStore(selectPendingSkills(session.id))
+  const setPendingSkills = useStore((s) => s.setPendingSkills)
+  // skills desligadas no chat → os chips somem (e nada é enviado)
+  const skillsOn = !!chat && skillsConfigOf(chat.config).enabled
+  const pendingSkills = skillsOn ? pendingSkillsRaw : []
   const { supportOf, tooltip: attachTip } = useAttachmentSupport(session)
   /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
@@ -131,7 +152,7 @@ export function Composer({
   }, [ready, supportOf])
   const warnKey = warnings.join('|')
   const confirming = !!warnKey && confirmKey === warnKey
-  const canSend = !loading && (!!text.trim() || ready.length > 0)
+  const canSend = !loading && (!!text.trim() || ready.length > 0 || pendingSkills.length > 0)
 
   const submit = async (force = false): Promise<void> => {
     const t = text.trim()
@@ -141,12 +162,15 @@ export function Composer({
       return
     }
     const atts = ready.map((a) => a.info!)
+    const skills = [...pendingSkills]
     setText('')
     setConfirmKey(null)
     if (atts.length) clearAttachments(session.id)
-    const ok = await send(session.id, t, atts)
+    if (skills.length) setPendingSkills(session.id, [])
+    const ok = await send(session.id, t, atts, skills)
     if (!ok) {
       setText(t)
+      if (skills.length) setPendingSkills(session.id, skills)
       if (atts.length) {
         // devolve os anexos ao composer
         useStore.setState((s) => ({
@@ -196,8 +220,20 @@ export function Composer({
           >
             {question && <QuestionForm key={question.id} request={question} />}
             {!question && retry && <RetryForm key={retry.id} request={retry} />}
-            {!blocked && pending.length > 0 && (
+            {!blocked && (pending.length > 0 || pendingSkills.length > 0) && (
               <div className="flex flex-wrap gap-2 px-3 pt-3" onClick={(e) => e.stopPropagation()}>
+                {pendingSkills.map((n) => (
+                  <SkillChip
+                    key={`skill:${n}`}
+                    name={n}
+                    onRemove={() =>
+                      setPendingSkills(
+                        session.id,
+                        pendingSkills.filter((x) => x !== n)
+                      )
+                    }
+                  />
+                ))}
                 {pending.map((a) => (
                   <ComposerAttachmentChip
                     key={a.id}
@@ -283,6 +319,7 @@ export function Composer({
                   </button>
                 </Tip>
               )}
+              {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
               <span className="flex items-center gap-1.5 text-[11px] text-faint">
                 <ComposerInfo running={busy} />
                 {busy ? (

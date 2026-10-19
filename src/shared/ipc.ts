@@ -1,6 +1,7 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
 // Ver SPEC.md → "API do preload". Todo método (exceto onEvent) é ipcRenderer.invoke → ipcMain.handle.
 import type { EngineConfig } from './webSearchSettings'
+import type { SkillsDiscoverOptions, SkillsDiscovery, SkillsSettings } from './skills'
 import type {
   Memory,
   MemoryCollection,
@@ -130,6 +131,14 @@ export const IPC = {
   approvals: {
     getSettings: 'approvals:getSettings',
     updateSettings: 'approvals:updateSettings'
+  },
+  skills: {
+    getSettings: 'skills:getSettings',
+    updateSettings: 'skills:updateSettings',
+    discover: 'skills:discover',
+    read: 'skills:read',
+    pickFolder: 'skills:pickFolder',
+    openFolder: 'skills:openFolder'
   },
   webSearch: {
     getSettings: 'webSearch:getSettings',
@@ -305,7 +314,9 @@ export interface ClearApi {
     send(
       sessionId: string,
       text: string,
-      attachments?: AttachmentInfo[]
+      attachments?: AttachmentInfo[],
+      /** Skills escolhidas na lâmpada do composer: SKILL.md lido no envio (erro → nada enviado). */
+      skills?: string[]
     ): Promise<{ queued: boolean }>
     /** ⚡: aborta o que está rodando e injeta a mensagem já. */
     forceSend(queuedId: string): Promise<void>
@@ -418,6 +429,20 @@ export interface ClearApi {
     updateSettings(
       patch: Partial<import('./types').ApprovalSettings>
     ): Promise<import('./types').ApprovalSettings>
+  }
+  /** Skills (Configurações → Skills; seleção por chat em ChatConfig.skills). Ver SPEC → Skills. */
+  skills: {
+    getSettings(): Promise<SkillsSettings>
+    /** Substitui `locations` e/ou `projectSkills`. Emite `skills-changed`. */
+    updateSettings(patch: Partial<SkillsSettings>): Promise<SkillsSettings>
+    /** Escaneia os locais (+ projeto de `cwd`). `rescan` ignora o cache (e emite `skills-changed`). */
+    discover(opts?: SkillsDiscoverOptions): Promise<SkillsDiscovery>
+    /** Conteúdo de um SKILL.md (preview somente leitura). Só arquivos chamados SKILL.md. */
+    read(file: string): Promise<string>
+    /** Diálogo nativo para escolher uma pasta de skills. */
+    pickFolder(): Promise<string | null>
+    /** Abre a pasta no gerenciador de arquivos (`~` expandido). */
+    openFolder(path: string): Promise<void>
   }
   /** Buscadores do web_search (Configurações → Pesquisa na web). */
   webSearch: {

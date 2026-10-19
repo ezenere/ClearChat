@@ -309,10 +309,12 @@ export function validateAttachments(list: unknown): AttachmentInfo[] {
  */
 export function buildUserContent(
   text: string,
-  attachments: AttachmentInfo[]
+  attachments: AttachmentInfo[],
+  skillParts: ContentPart[] = []
 ): string | ContentPart[] {
-  if (!attachments.length) return text
-  const parts = attachments.map(attachmentPart)
+  if (!attachments.length && !skillParts.length) return text
+  // anexos → skills carregadas manualmente (blocos <skill>) → texto digitado (por último)
+  const parts = [...attachments.map(attachmentPart), ...skillParts]
   if (text.trim()) parts.push({ type: 'text', text })
   return parts
 }
@@ -321,11 +323,12 @@ export function buildUserContent(
 
 const toBase64 = (b: Buffer): string => b.toString('base64')
 
-/** Remove campos privados (prefixo `_`) de um part. */
+/** Remove campos privados (`_attachment`, `_skill`) de um part. */
 function stripPrivate(p: ContentPart): ContentPart {
-  if (!p._attachment) return p
-  const { _attachment: _a, ...rest } = p
+  if (!p._attachment && !(p.type === 'text' && p._skill)) return p
+  const { _attachment: _a, ...rest } = p as ContentPart & { _skill?: unknown }
   void _a
+  delete (rest as { _skill?: unknown })._skill
   return rest as ContentPart
 }
 
@@ -376,7 +379,8 @@ export function expandAttachments(
   return messages.map((m) => {
     // user/system (anexos) e tool (read_file de imagem/PDF)
     if (m.role === 'assistant' || typeof m.content === 'string' || !m.content) return m
-    if (!m.content.some((p) => p._attachment || hasRef(p))) return m
+    if (!m.content.some((p) => p._attachment || hasRef(p) || (p.type === 'text' && p._skill)))
+      return m
     return { ...m, content: m.content.map((p) => expandPart(p, read)) } as ApiMessage
   })
 }

@@ -1534,6 +1534,7 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
     sandboxBash: true,
     smartApprove: { providerId: 'p1', model: 'judge' },
     memory: { enabled: true, collections: ['c1'], chatMemory: true },
+    skills: { enabled: true, disabled: ['pdf'] },
     presetId: 'old'
   } as any
   const snap = snapshotPreset(cfg)

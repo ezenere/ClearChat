@@ -129,8 +129,9 @@ import {
 } from '@shared/askUser'
 import { cancelQuestion, getQuestion, listQuestions, requestQuestion } from './questions'
 import { resolveAskUserQuestions } from '../askUserImages'
-import { MEMORY_TOOL_NAMES } from '@shared/tools'
+import { MEMORY_TOOL_NAMES, SKILL_TOOL_NAMES } from '@shared/tools'
 import { afterCompaction, ensureSnapshot, runMemoryToolFor } from '../memory'
+import { manualSkillParts, sandboxSkillDirs, sessionSkills } from '../skills'
 
 export const CANCELLED_TEXT = '[Interrompido pelo usuário antes de concluir]'
 export const DENIED_TEXT = 'O usuário negou a execução desta ferramenta.'
@@ -388,12 +389,27 @@ function appendUser(
   session: Session,
   text: string,
   meta: MessageMeta = {},
-  attachments: AttachmentInfo[] = []
+  attachments: AttachmentInfo[] = [],
+  skillParts: ContentPart[] = []
 ): StoredMessage {
   // mensagem de outro chat: o título (se ainda não houver) vem do corpo, sem o cabeçalho
   const titleText = meta.kind === 'inter-chat' ? splitInterChatText(text).body : text
-  maybeSetTitle(session, titleText.trim() ? titleText : attachments.map((a) => a.name).join(', '))
-  return append(session.id, { role: 'user', content: buildUserContent(text, attachments) }, meta)
+  maybeSetTitle(
+    session,
+    titleText.trim()
+      ? titleText
+      : [
+          ...attachments.map((a) => a.name),
+          ...skillParts.flatMap((p) =>
+            p.type === 'text' && p._skill ? [`Skill ${p._skill.name}`] : []
+          )
+        ].join(', ')
+  )
+  return append(
+    session.id,
+    { role: 'user', content: buildUserContent(text, attachments, skillParts) },
+    meta
+  )
 }
 
 // ---------------- loop ----------------
@@ -617,7 +633,7 @@ function onAborted(st: RunState, partial: string): 'continue' | LoopOutcome {
     setStatus(st.sessionId, 'running')
     for (const f of st.forced.splice(0)) {
       const s = sessionsRepo.get(st.sessionId)
-      if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
+      if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments, f.skillParts)
     }
     return 'continue'
   }
@@ -670,14 +686,14 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
         }
         for (const f of st.forced.splice(0)) {
           const s = sessionsRepo.get(st.sessionId)
-          if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
+          if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments, f.skillParts)
         }
       }
     }
 
     for (const q of drainQueue(st.sessionId)) {
       const s = sessionsRepo.get(st.sessionId)
-      if (s) appendUser(s, q.text, { kind: 'queued', ...q.meta }, q.attachments)
+      if (s) appendUser(s, q.text, { kind: 'queued', ...q.meta }, q.attachments, q.skillParts)
     }
     const signal = st.controller.signal
     let res: StepResult
@@ -740,7 +756,7 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
     if (st.forced.length) {
       for (const f of st.forced.splice(0)) {
         const s = sessionsRepo.get(st.sessionId)
-        if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments)
+        if (s) appendUser(s, f.text, { kind: 'forced', ...f.meta }, f.attachments, f.skillParts)
       }
       continue
     }
@@ -1170,13 +1186,23 @@ async function executeTool(
     }
     const root = chat.config.cwd
     const provider = name === 'list_models' ? providerFor(chat, session) : null
-    const sessionProvider = name === 'read_file' ? providerFor(chat, session) : null
+    const sessionProvider =
+      name === 'read_file' || name === 'skill_read' ? providerFor(chat, session) : null
+    const sandbox = !!chat.config.sandboxBash
+    // skills: as ativas desta sessão (tools) e, no sandbox, as pastas delas montadas só leitura
+    const skills = SKILL_TOOL_NAMES.includes(name) ? await sessionSkills(chat, session) : undefined
+    const roBinds =
+      sandbox && (name === 'shell' || name === 'process_start')
+        ? await sandboxSkillDirs(chat, session)
+        : undefined
     const allProviders = name === 'list_models' ? modelSources(chat, session) : []
     const r = await runLocalTool(name, args, {
       cwd: root,
       confine: chat.config.confineToRoot !== false,
       maxOutput: clampToolOutput(chat.config.maxToolOutputChars),
-      sandbox: !!chat.config.sandboxBash,
+      sandbox,
+      ...(roBinds?.length ? { roBinds } : {}),
+      ...(skills ? { skills } : {}),
       shell:
         name === 'shell' || name === 'process_start'
           ? shellStateFor(session.id, root, () => lastShellCwd(session.id))
@@ -1507,16 +1533,17 @@ function deliverToSession(
   text: string,
   meta: MessageMeta,
   wake = true,
-  attachments: AttachmentInfo[] = []
+  attachments: AttachmentInfo[] = [],
+  skillParts: ContentPart[] = []
 ): { queuedId?: string; run?: RunState } {
   const cur = runs.get(session.id)
   if (cur) {
-    const q = enqueue(session.id, text, attachments, meta)
+    const q = enqueue(session.id, text, attachments, meta, skillParts)
     wakeSession(session.id)
     return { queuedId: q.id, run: cur }
   }
   repairTail(session.id)
-  appendUser(session, text, meta, attachments)
+  appendUser(session, text, meta, attachments, skillParts)
   if (!wake) return {}
   const run = startLoop(session)
   if (session.depth > 0 && session.parentSessionId) attachReport(run, session, true)
@@ -2129,14 +2156,36 @@ export function compact(sessionId: string, opts: CompactOptions = {}): { schedul
 export function send(
   sessionId: string,
   text: string,
-  attachmentsInput?: AttachmentInfo[]
+  attachmentsInput?: AttachmentInfo[],
+  skillParts: ContentPart[] = []
 ): { queued: boolean } {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
   const attachments = validateAttachments(attachmentsInput)
   text = typeof text === 'string' ? text : ''
-  if (!text.trim() && !attachments.length) throw new Error('Mensagem vazia.')
-  return { queued: !!deliverToSession(session, text, {}, true, attachments).queuedId }
+  if (!text.trim() && !attachments.length && !skillParts.length) throw new Error('Mensagem vazia.')
+  return {
+    queued: !!deliverToSession(session, text, {}, true, attachments, skillParts).queuedId
+  }
+}
+
+/**
+ * `send` com skills escolhidas no composer (lâmpada): os SKILL.md são lidos AGORA e viram parts
+ * `<skill>` da mensagem (também na fila / ⚡). Erro legível → nada é enviado.
+ */
+export async function sendWithSkills(
+  sessionId: string,
+  text: string,
+  attachmentsInput?: AttachmentInfo[],
+  skillNames?: unknown
+): Promise<{ queued: boolean }> {
+  const session = sessionsRepo.get(sessionId)
+  if (!session) throw new Error('Sessão não encontrada.')
+  const chat = chatsRepo.get(session.chatId)
+  if (!chat) throw new Error('Chat não encontrado.')
+  validateAttachments(attachmentsInput) // falha antes de ler as skills
+  const parts = await manualSkillParts(chat, skillNames)
+  return send(sessionId, text, attachmentsInput, parts)
 }
 
 export function forceSend(queuedId: string): void {
@@ -2155,7 +2204,7 @@ export function forceSend(queuedId: string): void {
     requeueFront(item.sessionId, [item])
     return
   }
-  deliverToSession(session, item.text, item.meta ?? {}, true, item.attachments)
+  deliverToSession(session, item.text, item.meta ?? {}, true, item.attachments, item.skillParts)
 }
 
 export function removeQueued(queuedId: string): void {

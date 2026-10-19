@@ -1,6 +1,6 @@
 // Registro dos handlers IPC (ipcMain.handle) — um para cada canal em `IPC` (src/shared/ipc.ts).
 // Handlers recebem os argumentos posicionais na mesma ordem da API do preload.
-import { BrowserWindow, dialog, ipcMain } from 'electron'
+import { BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import {
   ALL_CHANNELS,
   IPC,
@@ -57,6 +57,8 @@ import {
   updateWebSearchEngines
 } from './webSearchConfig'
 import { testWebSearchEngine } from './tools/web'
+import * as skills from './skills'
+import type { SkillsDiscoverOptions, SkillsSettings } from '@shared/skills'
 import type {
   MemoryCollectionInput,
   MemoryCollectionPatch,
@@ -145,8 +147,15 @@ export function registerIpc(): void {
     [IPC.messages.delete]: (id: string) => runner.deleteMessage(id),
 
     // ---- agent ----
-    [IPC.agent.send]: (sessionId: string, text: string, attachments?: AttachmentInfo[]) =>
-      runner.send(sessionId, text, attachments),
+    [IPC.agent.send]: (
+      sessionId: string,
+      text: string,
+      attachments?: AttachmentInfo[],
+      skills?: string[]
+    ) =>
+      skills?.length
+        ? runner.sendWithSkills(sessionId, text, attachments, skills)
+        : runner.send(sessionId, text, attachments),
     [IPC.agent.forceSend]: (queuedId: string) => runner.forceSend(queuedId),
     [IPC.agent.removeQueued]: (queuedId: string) => runner.removeQueued(queuedId),
     [IPC.agent.getQueue]: (sessionId: string) => runner.getQueue(sessionId),
@@ -178,6 +187,37 @@ export function registerIpc(): void {
       setWebSearchKey(engine, key),
     [IPC.webSearch.revealKey]: (engine: SearchEngineId) => revealWebSearchKey(engine),
     [IPC.webSearch.test]: (engine: SearchEngineId) => testWebSearchEngine(engine),
+
+    // ---- skills (SPEC → Skills) ----
+    [IPC.skills.getSettings]: () => skills.getSkillsSettings(),
+    [IPC.skills.updateSettings]: (patch: Partial<SkillsSettings>) => {
+      const next = skills.updateSkillsSettings(patch ?? {})
+      emit({ type: 'skills-changed' })
+      return next
+    },
+    [IPC.skills.discover]: async (opts?: SkillsDiscoverOptions) => {
+      const r = await skills.discover(opts ?? {})
+      if (opts?.rescan) emit({ type: 'skills-changed' })
+      return r
+    },
+    [IPC.skills.read]: async (file: string) => {
+      if (typeof file !== 'string' || basename(file) !== 'SKILL.md')
+        throw new Error('Só arquivos SKILL.md.')
+      return readFileAsync(file, 'utf8')
+    },
+    [IPC.skills.pickFolder]: async () => {
+      const win = BrowserWindow.getFocusedWindow()
+      const opts: Electron.OpenDialogOptions = {
+        title: 'Escolher pasta de skills',
+        properties: ['openDirectory', 'createDirectory', 'showHiddenFiles']
+      }
+      const r = win ? await dialog.showOpenDialog(win, opts) : await dialog.showOpenDialog(opts)
+      return r.canceled || !r.filePaths[0] ? null : r.filePaths[0]
+    },
+    [IPC.skills.openFolder]: async (path: string) => {
+      const err = await shell.openPath(skills.resolveLocationPath(String(path ?? '')))
+      if (err) throw new Error(err)
+    },
 
     // ---- fs ----
     [IPC.fs.listDir]: (path: string) => fsapi.listDir(path),

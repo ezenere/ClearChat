@@ -1,5 +1,14 @@
 // Anexos na UI: chips do composer, miniaturas/chips nas mensagens do usuário e lightbox.
-import { AudioLines, ChevronDown, FileText, FileType2, TriangleAlert, X } from 'lucide-react'
+import {
+  ArrowUpRight,
+  AudioLines,
+  ChevronDown,
+  FileText,
+  FileType2,
+  Lightbulb,
+  TriangleAlert,
+  X
+} from 'lucide-react'
 import { useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -12,7 +21,9 @@ import {
 import type { AttachmentKind, AttachmentMeta, ContentPart } from '@shared/types'
 import { cn } from '../../lib/format'
 import type { PendingAttachment } from '../../store'
-import { AttachmentApiInfo } from '../apiDocs'
+import { AttachmentApiInfo, SkillPartInfo } from '../apiDocs'
+import { skillBlockBody, type SkillPartMeta } from '@shared/skills'
+import { useStore } from '../../store'
 import { Spinner } from '../ui/controls'
 import { useEscapeLayer } from '../ui/escape'
 import { Tip } from '../ui/Tooltip'
@@ -230,13 +241,15 @@ function FileChip({ meta, text }: { meta: AttachmentMeta; text?: string }): Reac
   )
 }
 
-/** Anexos de uma mensagem do usuário (acima do balão). */
+/** Anexos (e skills carregadas) de uma mensagem do usuário (acima do balão). */
 export function MessageAttachments({ parts }: { parts: ContentPart[] }): React.JSX.Element | null {
-  const items = parts.filter((p) => p._attachment)
+  const items = parts.filter((p) => p._attachment || (p.type === 'text' && p._skill))
   if (!items.length) return null
   return (
     <div className="flex max-w-[85%] flex-wrap justify-end gap-2" data-message-attachments>
       {items.map((p, i) => {
+        if (p.type === 'text' && p._skill)
+          return <SkillPartCard key={i} meta={p._skill} text={p.text} />
         const meta = p._attachment!
         if (meta.kind === 'image') return <ImageThumb key={i} meta={meta} />
         return <FileChip key={i} meta={meta} text={p.type === 'text' ? p.text : undefined} />
@@ -256,6 +269,67 @@ export function ToolResultMedia({ parts }: { parts: ContentPart[] }): React.JSX.
         if (meta.kind === 'image') return <ImageThumb key={i} meta={meta} />
         return <FileChip key={i} meta={meta} />
       })}
+    </div>
+  )
+}
+
+/** Card "Skill carregada: X" (invocação manual pela lâmpada) — (i) com o texto exato enviado. */
+export function SkillPartCard({
+  meta,
+  text
+}: {
+  meta: SkillPartMeta
+  text: string
+}): React.JSX.Element {
+  const [open, setOpen] = useState(false)
+  const openSkills = useStore((s) => s.openSkills)
+  const body = skillBlockBody(text)
+  return (
+    <div
+      data-testid="skill-part"
+      data-skill={meta.name}
+      className={cn('min-w-0', open && 'w-full')}
+    >
+      <div className="flex h-11 max-w-[320px] items-center gap-2.5 rounded-xl border border-accent/25 bg-accent-soft/30 py-1.5 pr-2 pl-1.5">
+        <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-accent/15 text-accent-strong">
+          <Lightbulb className="size-4" strokeWidth={1.75} />
+        </span>
+        <div className="min-w-0 flex-1 leading-tight">
+          <div className="truncate text-[12.5px] text-fg/90">
+            Skill carregada: <span className="font-mono">{meta.name}</span>
+          </div>
+          <div className="truncate text-[11px] text-subtle" title={meta.path}>
+            SKILL.md · {body.length.toLocaleString('pt-BR')} caracteres
+            {meta.truncated ? ' · cortado' : ''}
+          </div>
+        </div>
+        <SkillPartInfo meta={meta} text={text} side="left" />
+        <Tip label="Ver em Configurações → Skills">
+          <button
+            type="button"
+            onClick={() => openSkills(meta.name)}
+            aria-label="Ver em Configurações → Skills"
+            className="rounded-md p-1 text-subtle hover:bg-hover hover:text-fg"
+          >
+            <ArrowUpRight className="size-3.5" />
+          </button>
+        </Tip>
+        <Tip label={open ? 'Recolher' : 'Ver conteúdo enviado'}>
+          <button
+            type="button"
+            onClick={() => setOpen(!open)}
+            aria-label={open ? 'Recolher' : 'Ver conteúdo enviado'}
+            className="rounded-md p-1 text-subtle hover:bg-hover hover:text-fg"
+          >
+            <ChevronDown className={cn('size-3.5 transition-transform', open && 'rotate-180')} />
+          </button>
+        </Tip>
+      </div>
+      {open && (
+        <pre className="mt-1.5 max-h-72 animate-fade-in overflow-auto rounded-xl border border-border bg-bg/70 p-3 text-left font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap text-fg/85">
+          {body}
+        </pre>
+      )}
     </div>
   )
 }

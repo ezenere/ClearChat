@@ -10,6 +10,8 @@ import { ATTACHMENT_LIMITS } from '@shared/limits'
 import type { EffortSpec } from '@shared/modelParams'
 import type { MemoryPreview } from '@shared/memory'
 import { extractionOf, type MemoryExtractionMeta } from '../lib/memory'
+import { SKILL_LIMITS, skillBlockBody, type SkillPartMeta } from '@shared/skills'
+import { SKILL_TOOL_NAMES } from '@shared/tools'
 import { ApiInfo, C } from './ui/Tooltip'
 
 type Side = 'top' | 'right' | 'bottom' | 'left'
@@ -38,7 +40,8 @@ export function SystemPromptInfo({
       <p>
         Ordem do conteúdo: este texto → <C>\n\n</C> + bloco <C>{'<environment>'}</C> (se ativo) →{' '}
         <C>\n\n</C> + índice e instruções da memória (se ativa; só na principal) → <C>\n\n</C> +
-        texto das tools (se ativo). Com token caching, o conteúdo vai como{' '}
+        prompt de apoio das skills (se ligado) → <C>\n\n</C> + texto das tools (se ativo). Com token
+        caching, o conteúdo vai como{' '}
         <C>{'[{ type: "text", text, cache_control: { type: "ephemeral" } }]'}</C>. Se tudo ficar
         vazio, nenhuma mensagem system é enviada.
       </p>
@@ -934,6 +937,152 @@ export function ExtractionMessageInfo({
       {extraction.request == null && (
         <p className="text-subtle">O body da request não foi registrado nesta extração.</p>
       )}
+    </ApiInfo>
+  )
+}
+
+// ---------------- Skills (SPEC → Skills) ----------------
+
+/** (i) geral das skills do chat/persona: o que vai (prompt de apoio + 3 tools) ou nada. */
+export function SkillsSendInfo({
+  enabled,
+  support,
+  nativeTools
+}: {
+  enabled: boolean
+  /** Texto exato do prompt de apoio que vai (null = não vai). */
+  support: string | null
+  nativeTools: boolean
+}): React.JSX.Element {
+  return (
+    <ApiInfo
+      title="Skills na request"
+      side="left"
+      code={
+        enabled
+          ? JSON.stringify(
+              SKILL_TOOL_NAMES.map((n) => currentToolDefinition(n)),
+              null,
+              2
+            )
+          : undefined
+      }
+      codeLabel="Definições exatas (itens do array tools):"
+    >
+      {enabled ? (
+        <>
+          <p>
+            Ligadas:{' '}
+            {support ? (
+              <>
+                o prompt de apoio é anexado ao conteúdo da mensagem <C>{'role: "system"'}</C>{' '}
+                (precedido de <C>\n\n</C>, depois da memória) e{' '}
+              </>
+            ) : (
+              <>sem prompt de apoio; </>
+            )}
+            as tools <C>list_skills</C>, <C>skill_load</C> e <C>skill_read</C> vão{' '}
+            {nativeTools ? (
+              <>
+                no campo <C>tools</C>
+              </>
+            ) : (
+              <>no texto das tools (tools nativas desligadas)</>
+            )}
+            .
+          </p>
+          <p>
+            <strong className="text-fg">Nenhuma lista de skills vai no contexto</strong>: as
+            definições são fixas (prefixo de cache estável) e o modelo descobre as skills chamando{' '}
+            <C>list_skills</C>. O conteúdo de uma skill só entra quando ele chama <C>skill_load</C>/
+            <C>skill_read</C> (resultados <C>role: tool</C>) ou quando você a carrega pela lâmpada
+            do composer.
+          </p>
+        </>
+      ) : (
+        <p>
+          Desligadas: <strong className="text-fg">nada</strong> de skills vai para a API — sem
+          prompt de apoio, sem tools e sem a lâmpada no composer.
+        </p>
+      )}
+    </ApiInfo>
+  )
+}
+
+export function SkillsSupportInfo({ text }: { text: string }): React.JSX.Element {
+  return (
+    <ApiInfo title="Prompt de apoio das skills" code={text} codeLabel="Texto anexado:" side="left">
+      <p>
+        Ligado: anexado ao conteúdo da mensagem <C>{'role: "system"'}</C>, depois do bloco da
+        memória (se houver), precedido de <C>\n\n</C>. Nos subagentes, só com &quot;Skills nos
+        subagentes&quot; ligado. Não cita nenhuma skill — orienta o modelo a usar <C>list_skills</C>{' '}
+        antes de tarefas especializadas.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function SkillsSubagentsInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Skills nos subagentes" side="left">
+      <p>
+        Ligado (e com as skills ligadas no chat): as requests dos subagentes recebem as mesmas tools
+        (<C>list_skills</C>, <C>skill_load</C>, <C>skill_read</C>) e o mesmo prompt de apoio,
+        limitados às skills ativas deste chat. Desligado: nada de skills nos subagentes.
+      </p>
+    </ApiInfo>
+  )
+}
+
+export function SkillsLocationsInfo(): React.JSX.Element {
+  return (
+    <ApiInfo title="Locais de skills" side="left">
+      <p>
+        Cada local é uma pasta cujas subpastas com <C>SKILL.md</C> são skills (formato Agent Skills
+        / Claude Code: frontmatter YAML com <C>name</C> e <C>description</C>, depois as instruções
+        em markdown; arquivos extras opcionais). A ordem é a precedência: com nomes repetidos vence
+        o primeiro local; as skills de projeto (<C>{'<raiz do chat>/.claude/skills'}</C>) vêm por
+        último.
+      </p>
+      <p>
+        Nada daqui vai para a API sozinho: só quando um chat liga as skills (aba Tools) — e mesmo
+        assim só as tools e o prompt de apoio; o modelo lista as skills com <C>list_skills</C>.
+      </p>
+    </ApiInfo>
+  )
+}
+
+/** (i) do card "Skill carregada" (invocação manual): o texto exato enviado. */
+export function SkillPartInfo({
+  meta,
+  text,
+  side = 'left'
+}: {
+  meta: SkillPartMeta
+  text: string
+  side?: Side
+}): React.JSX.Element {
+  return (
+    <ApiInfo
+      title={`Skill ${meta.name}`}
+      side={side}
+      code={text}
+      codeLabel="Part enviado no content da mensagem role: user (texto exato):"
+    >
+      <p>
+        Carregada por você na lâmpada do composer: o SKILL.md foi lido no envio e vai como um part{' '}
+        <C>text</C> (<C>{'<skill name="…" path="…">…</skill>'}</C>,{' '}
+        {skillBlockBody(text).length.toLocaleString('pt-BR')} caracteres) antes do texto digitado,
+        em toda request enquanto estiver no histórico — conta tokens e é cacheável. O campo privado{' '}
+        <C>_skill</C> fica só no banco (removido na request).
+        {meta.truncated && (
+          <>
+            {' '}
+            <strong className="text-warning">Cortado</strong> no limite de{' '}
+            {SKILL_LIMITS.manualMaxChars.toLocaleString('pt-BR')} caracteres.
+          </>
+        )}
+      </p>
     </ApiInfo>
   )
 }

@@ -20,6 +20,7 @@ import { ModelInfoLine } from './panel/editors'
 import { ApprovalsSettings } from './approvals/ApprovalsSettings'
 import { WebSearchSettings } from './web/WebSearchSettings'
 import { MemorySettings } from './memory/MemorySettings'
+import { SkillsSettings } from './skills/SkillsSettings'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -312,7 +313,9 @@ export function SettingsModal(): React.JSX.Element {
         setEditingPreset(null)
       }}
       title="Configurações"
-      width={(tab === 'presets' && editingPreset) || tab === 'memory' ? 720 : 640}
+      width={
+        (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 640
+      }
     >
       <div className="mb-5 flex gap-1 border-b border-border">
         {(
@@ -322,6 +325,7 @@ export function SettingsModal(): React.JSX.Element {
             ['defaults', 'Novos chats'],
             ['approvals', 'Aprovações'],
             ['memory', 'Memórias'],
+            ['skills', 'Skills'],
             ['web', 'Pesquisa na web']
           ] as const
         ).map(([id, label]) => (
@@ -378,6 +382,8 @@ export function SettingsModal(): React.JSX.Element {
         <ApprovalsSettings />
       ) : tab === 'memory' ? (
         <MemorySettings />
+      ) : tab === 'skills' ? (
+        <SkillsSettings />
       ) : tab === 'web' ? (
         <WebSearchSettings />
       ) : (

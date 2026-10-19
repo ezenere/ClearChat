@@ -5,6 +5,7 @@ import { LIMITS } from '@shared/limits'
 import type { ContentPart, ModelInfo, StoredMessage } from '@shared/types'
 import type { MediaContext } from './media'
 import type { HistoryStore } from '../historyStore'
+import type { SkillInfo } from '@shared/skills'
 
 export const MAX_OUTPUT: number = LIMITS.maxToolOutputChars
 
@@ -28,6 +29,13 @@ export interface ToolContext {
   shell?: ShellState
   /** shell / process_start: roda via bubblewrap (raiz gravável, resto somente leitura). */
   sandbox?: boolean
+  /**
+   * shell / process_start no sandbox: pastas montadas somente leitura (as das skills ativas — os
+   * scripts delas precisam ser alcançáveis mesmo sob o /tmp privado).
+   */
+  roBinds?: string[]
+  /** list_skills / skill_load / skill_read: skills ATIVAS do chat (o runner resolve). */
+  skills?: SkillInfo[]
   /** Chat / sessão chamadores (process_*: registro de processos por chat). */
   chatId?: string
   sessionId?: string
@@ -301,4 +309,32 @@ export function abortError(): Error {
   const e = new Error('Aborted')
   e.name = 'AbortError'
   return e
+}
+
+/**
+ * Executa a implementação de uma tool local: erros viram resultado de texto (status 'error'), abort
+ * é relançado (AbortError) e a saída passa pelo teto `maxToolOutputChars` (rede de segurança).
+ */
+export async function runToolImpl(
+  impl: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>,
+  args: Record<string, unknown>,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  try {
+    const r = await impl(args, ctx)
+    // rede de segurança: nenhuma tool devolve mais que o limite configurado
+    const max = maxOutputOf(ctx)
+    return r.content.length > max ? { ...r, content: truncateHeadTail(r.content, max, 0.5) } : r
+  } catch (e) {
+    if (ctx.signal.aborted || (e as Error).name === 'AbortError') throw abortError()
+    if (e instanceof ToolError)
+      return fail(e.message.startsWith('Erro') ? e.message : `Erro: ${e.message}`)
+    const err = e as NodeJS.ErrnoException
+    if (err.code === 'ENOENT') return fail(`Erro: caminho não encontrado: ${err.path ?? ''}`.trim())
+    if (err.code === 'EACCES' || err.code === 'EPERM')
+      return fail(`Erro: permissão negada: ${err.path ?? ''}`.trim())
+    if (err.code === 'EISDIR') return fail(`Erro: é um diretório: ${err.path ?? ''}`.trim())
+    if (err.code === 'ENOTDIR') return fail(`Erro: não é um diretório: ${err.path ?? ''}`.trim())
+    return fail(`Erro: ${err.message ?? String(e)}`)
+  }
 }
