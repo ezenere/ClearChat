@@ -13,7 +13,8 @@ import {
 } from '../src/main/agent/llm.ts'
 import { parseTextToolCalls } from '../src/main/agent/textTools.ts'
 import { DEFAULT_CHAT_CONFIG } from '../src/shared/defaults.ts'
-import type { Chat, Provider, StoredMessage, ApiMessage } from '../src/shared/types.ts'
+import type { Chat, Provider, Session, StoredMessage, ApiMessage } from '../src/shared/types.ts'
+import { trackFailure } from '../src/renderer/src/lib/subFailures.ts'
 
 const env = { os: 'Linux 6.0 (x64)', shell: 'bash' }
 const orProvider: Provider = {
@@ -2048,5 +2049,45 @@ test('subagentes: posse (descendentes), resolução de id e subárvore', () => {
   assert.match(
     list,
     /x2 · "Resumo" · m · concluído · bloqueante · duração 1min 5s · resultado devolvido no delegate_task · último: "pronto"/
+  )
+})
+
+test('trackFailure: só a transição para error vira falha; error na primeira aparição (sync) não', () => {
+  const sub = (status: Session['status'], over: Partial<Session> = {}): Session => ({
+    id: 'sub1',
+    chatId: 'c1',
+    parentSessionId: 's1',
+    parentToolCallId: 'tc1',
+    depth: 1,
+    model: 'm',
+    providerId: null,
+    title: 'Pesquisa',
+    task: 'pesquisar',
+    status,
+    createdAt: 0,
+    ...over
+  })
+  const closed = { kind: 'new' } as const
+  // primeira aparição já em error (download do sync / chat não aberto) → nada
+  assert.deepEqual(trackFailure({}, undefined, sub('error'), closed), {})
+  // running → error com o chat fechado → falha não vista
+  const f = trackFailure({}, sub('running'), sub('error'), closed, 'boom')
+  assert.equal(f.sub1?.seen, false)
+  assert.equal(f.sub1?.dismissed, false)
+  assert.equal(f.sub1?.error, 'boom')
+  // vendo a própria subsessão → já vista e dispensada
+  const viewing = trackFailure({}, sub('interrupted'), sub('error'), {
+    kind: 'chat',
+    chatId: 'c1',
+    sessionId: 'sub1'
+  })
+  assert.deepEqual([viewing.sub1?.seen, viewing.sub1?.dismissed], [true, true])
+  // mesmo status → mesma referência; voltou a rodar → some
+  assert.equal(trackFailure(f, sub('error'), sub('error'), closed), f)
+  assert.deepEqual(trackFailure(f, sub('error'), sub('running'), closed), {})
+  // sessão principal nunca vira falha de subagente
+  assert.deepEqual(
+    trackFailure({}, sub('running', { depth: 0 }), sub('error', { depth: 0 }), closed),
+    {}
   )
 })

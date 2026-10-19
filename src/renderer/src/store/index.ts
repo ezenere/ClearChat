@@ -26,6 +26,7 @@ import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { contentText, formatSize } from '@shared/attachments'
 import { setToolShellInfo } from '@shared/shellInfo'
 import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
+import { trackFailure, type SubFailure } from '../lib/subFailures'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -57,20 +58,7 @@ export interface Toast {
   text: string
 }
 
-/**
- * Subagente que terminou em erro (status `error`), detectado pela transição em `session-updated`.
- * Só em memória (não sobrevive a reiniciar o app). `seen`: o chat foi aberto depois da falha (o
- * vermelho da sidebar some); `dismissed`: o aviso acima do composer foi dispensado / visto.
- */
-export interface SubFailure {
-  chatId: string
-  sessionId: string
-  title: string
-  error?: string
-  at: number
-  seen: boolean
-  dismissed: boolean
-}
+export type { SubFailure }
 
 export type SettingsTab =
   'account' | 'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'skills' | 'web'
@@ -967,33 +955,6 @@ function markFailures(
   return next ?? list
 }
 
-/** Subsessão entrou em `error` → registra a falha; voltou a rodar/concluiu → some. */
-function trackFailure(s: Store, session: Session): Record<string, SubFailure> {
-  const cur = s.subFailures[session.id]
-  if (session.depth === 0) return s.subFailures
-  if (session.status === 'error') {
-    if (cur) return s.subFailures
-    const open = s.view.kind === 'chat' && s.view.chatId === session.chatId
-    const viewing = open && s.view.kind === 'chat' && s.view.sessionId === session.id
-    return {
-      ...s.subFailures,
-      [session.id]: {
-        chatId: session.chatId,
-        sessionId: session.id,
-        title: session.title || session.task?.slice(0, 40) || 'Subagente',
-        error: s.errors[session.id],
-        at: Date.now(),
-        seen: open,
-        dismissed: viewing
-      }
-    }
-  }
-  if (!cur) return s.subFailures
-  const next = { ...s.subFailures }
-  delete next[session.id]
-  return next
-}
-
 function applyEvent(e: AgentEvent): void {
   const set = useStore.setState
   switch (e.type) {
@@ -1001,8 +962,13 @@ function applyEvent(e: AgentEvent): void {
     case 'session-updated':
       set((s) => {
         const prev = s.sessions[e.session.id]
-        const subFailures =
-          prev?.status === e.session.status ? s.subFailures : trackFailure(s, e.session)
+        const subFailures = trackFailure(
+          s.subFailures,
+          prev,
+          e.session,
+          s.view,
+          s.errors[e.session.id]
+        )
         return { sessions: { ...s.sessions, [e.session.id]: e.session }, subFailures }
       })
       break

@@ -16,7 +16,8 @@ import { ensureSyncSchema } from '../src/main/sync/schema'
 import { applyRemote, buildLocal, merge3, sameJson } from '../src/main/sync/records'
 import { SyncEngine } from '../src/main/sync/engine'
 import type { RunnerAdapter } from '../src/main/sync/host'
-import type { AgentEvent } from '../src/shared/types'
+import type { AgentEvent, Session } from '../src/shared/types'
+import { trackFailure, type SubFailure } from '../src/renderer/src/lib/subFailures'
 import { startFakeSyncServer, type FakeSyncServer } from './fakes/syncServer.ts'
 
 let srv: FakeSyncServer
@@ -481,6 +482,59 @@ test('upload inicial (online vazio) e download no segundo dispositivo (local vaz
   addMessage(B.conn, sessionId, 'user', 'do notebook')
   await synced(B, A)
   await waitFor(() => texts(A.conn, sessionId).includes('do notebook'), 'A recebe a mensagem de B')
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('PC novo: subagente que falhou há tempo não vira falha pendente; falha ao vivo de outro aparelho sim', async () => {
+  const email = await newAccount()
+  const A = device('PC')
+  const { chatId, sessionId } = addChat(A.conn, 'Com subagente que falhou')
+  const subId = randomUUID()
+  A.conn
+    .prepare(
+      `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, title, task, status, created_at)
+       VALUES (?, ?, ?, 'tc1', 1, 'fake/m', 'Pesquisa', 'pesquisar', 'error', 2)`
+    )
+    .run(subId, chatId, sessionId)
+  await login(A, email)
+  await settled(A)
+
+  // renderer do PC novo: aplica os session-created/updated como o store (applyEvent)
+  const B = device('PC novo')
+  const ui = { sessions: {} as Record<string, Session>, failures: {} as Record<string, SubFailure> }
+  let replayed = 0
+  const replay = (): void => {
+    for (; replayed < B.events.length; replayed++) {
+      const e = B.events[replayed]
+      if (e.type !== 'session-created' && e.type !== 'session-updated') continue
+      const prev = ui.sessions[e.session.id]
+      ui.failures = trackFailure(ui.failures, prev, e.session, { kind: 'new' })
+      ui.sessions[e.session.id] = e.session
+    }
+  }
+  await login(B, email)
+  await settled(B)
+  replay()
+  assert.equal(
+    (B.conn.prepare('SELECT status FROM sessions WHERE id = ?').get(subId) as any).status,
+    'error',
+    'o status gravado vem como está (o card do delegate mostra a falha)'
+  )
+  assert.ok(ui.sessions[subId], 'o download emitiu session-updated da subsessão')
+  assert.deepEqual(ui.failures, {}, 'falha antiga não deixa o chat vermelho nem o aviso')
+
+  // ao vivo: A volta a rodar o subagente e ele falha de novo → B vê a transição
+  A.conn.prepare("UPDATE sessions SET status = 'running' WHERE id = ?").run(subId)
+  await synced(A, B)
+  await waitFor(
+    () => (replay(), ui.sessions[subId]?.status !== 'error'),
+    'B vê o subagente rodando'
+  )
+  A.conn.prepare("UPDATE sessions SET status = 'error' WHERE id = ?").run(subId)
+  await synced(A, B)
+  await waitFor(() => (replay(), ui.failures[subId]), 'B registra a falha nova')
+  assert.equal(ui.failures[subId].seen, false, 'chat fechado → vermelho na sidebar')
   A.eng.destroy()
   B.eng.destroy()
 })
