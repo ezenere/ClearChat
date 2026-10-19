@@ -1180,21 +1180,38 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * Busca o payload dos registros `omitted` (§7.2) em `records/fetch`. A rota também tem o orçamento
+   * de ~8 MiB por página: o que passar dele volta `omitted` de novo — repete só com esses até não
+   * sobrar nenhum (o servidor sempre devolve o primeiro pedido com payload). Rodada sem nenhum payload
+   * novo: para (defesa contra laço); o que sobrar segue `omitted` e a aplicação fica adiada.
+   */
   private async fillOmitted(changes: Change[]): Promise<void> {
-    const need = changes.filter((c) => c.omitted && !c.deleted)
-    for (let i = 0; i < need.length; i += 500) {
-      const part = need.slice(i, i + 500)
-      const r = await this.http.post<{ records: Change[] }>('/api/v1/records/fetch', {
-        items: part.map((c) => ({ type: c.type, id: c.id }))
-      })
-      const map = new Map((r.records ?? []).map((x) => [key(x.type, x.id), x]))
-      for (const c of part) {
-        const full = map.get(key(c.type, c.id))
-        if (full && full.rev === c.rev) {
-          c.env = full.env
-          delete c.omitted
+    let need = changes.filter((c) => c.omitted && !c.deleted)
+    while (need.length) {
+      const again: Change[] = []
+      let filled = 0
+      for (let i = 0; i < need.length; i += 500) {
+        const part = need.slice(i, i + 500)
+        const r = await this.http.post<{ records: Change[] }>('/api/v1/records/fetch', {
+          items: part.map((c) => ({ type: c.type, id: c.id }))
+        })
+        const map = new Map((r.records ?? []).map((x) => [key(x.type, x.id), x]))
+        for (const c of part) {
+          const full = map.get(key(c.type, c.id))
+          if (!full || full.rev !== c.rev) continue // sumiu ou mudou: a nova revisão vem no pull
+          if (full.env && !full.omitted) {
+            c.env = full.env
+            delete c.omitted
+            filled++
+          } else again.push(c)
         }
       }
+      if (!filled) {
+        if (again.length) this.log('records/fetch sem progresso; adiando', again.length)
+        return
+      }
+      need = again
     }
   }
 

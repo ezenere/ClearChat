@@ -347,6 +347,87 @@ test('mapeamento: ida e volta de cada entidade (campos locais preservados)', () 
   })
 })
 
+// records/fetch com orçamento de página (§7.2): o que passar do orçamento volta `omitted` de novo.
+function omittedChange(id: string, rev = 1): any {
+  return { seq: rev, type: 'memory', id, scope: null, rev, deleted: false, omitted: true }
+}
+const fakeEnv = (id: string): any => ({ v: 1, alg: 'x', n: id, ct: id })
+function stubFetch(d: Dev, rounds: ((items: { type: string; id: string }[]) => any[])[]): any[][] {
+  const calls: any[][] = []
+  ;(d.eng as any).http.post = async (path: string, body: any) => {
+    assert.equal(path, '/api/v1/records/fetch')
+    calls.push(body.items.map((x: any) => x.id))
+    const fn = rounds[calls.length - 1]
+    assert.ok(fn, `chamada inesperada a records/fetch (${calls.length})`)
+    return { records: fn(body.items) }
+  }
+  return calls
+}
+
+test('records/fetch: repete só os que voltaram omitted até não sobrar nenhum', async () => {
+  const d = device('omit-loop')
+  const changes = [
+    omittedChange('a'),
+    omittedChange('b'),
+    omittedChange('c', 2),
+    omittedChange('d')
+  ]
+  const calls = stubFetch(d, [
+    // 1ª: orçamento estoura depois de "a"; "d" mudou de revisão (não repete)
+    (items) =>
+      items.map((it) =>
+        it.id === 'a'
+          ? { ...omittedChange('a'), omitted: undefined, env: fakeEnv('a') }
+          : it.id === 'd'
+            ? { ...omittedChange('d', 5) }
+            : { ...omittedChange(it.id, it.id === 'c' ? 2 : 1) }
+      ),
+    // 2ª: o resto vem com payload
+    (items) =>
+      items.map((it) => ({
+        ...omittedChange(it.id, it.id === 'c' ? 2 : 1),
+        omitted: undefined,
+        env: fakeEnv(it.id)
+      }))
+  ])
+  await (d.eng as any).fillOmitted(changes)
+  assert.deepEqual(calls, [
+    ['a', 'b', 'c', 'd'],
+    ['b', 'c']
+  ])
+  for (const c of changes.slice(0, 3)) {
+    assert.equal(c.omitted, undefined, `${c.id} preenchido`)
+    assert.deepEqual(c.env, fakeEnv(c.id))
+  }
+  assert.equal(changes[3].omitted, true)
+  assert.equal(changes[3].env, undefined)
+})
+
+test('records/fetch: rodada sem payload novo para (sem laço) e mantém omitted', async () => {
+  const d = device('omit-guard')
+  const changes = [omittedChange('a'), omittedChange('b'), omittedChange('c')]
+  const calls = stubFetch(d, [
+    (items) =>
+      items.map((it) =>
+        it.id === 'a'
+          ? { ...omittedChange('a'), omitted: undefined, env: fakeEnv('a') }
+          : omittedChange(it.id)
+      ),
+    // servidor fora do contrato: nada de payload → desiste em vez de repetir para sempre
+    (items) => items.map((it) => omittedChange(it.id))
+  ])
+  await (d.eng as any).fillOmitted(changes)
+  assert.deepEqual(calls, [
+    ['a', 'b', 'c'],
+    ['b', 'c']
+  ])
+  assert.deepEqual(changes[0].env, fakeEnv('a'))
+  for (const c of changes.slice(1)) {
+    assert.equal(c.omitted, true)
+    assert.equal(c.env, undefined)
+  }
+})
+
 test('upload inicial (online vazio) e download no segundo dispositivo (local vazio)', async () => {
   const email = await newAccount()
   const A = device('PC')
