@@ -85,7 +85,7 @@ import {
   type SubagentRow
 } from './subagents'
 import { listModels } from '../providers'
-import { contentText } from '@shared/attachments'
+import { contentText, isAppPart } from '@shared/attachments'
 import { providerKind } from '@shared/providerKinds'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
 import { availableTools, buildRequest, maskRequest, setProviderNamesSource } from './request'
@@ -132,6 +132,18 @@ import { resolveAskUserQuestions } from '../askUserImages'
 import { MEMORY_TOOL_NAMES, SKILL_TOOL_NAMES } from '@shared/tools'
 import { afterCompaction, ensureSnapshot, runMemoryToolFor } from '../memory'
 import { manualSkillParts, sandboxSkillDirs, sessionSkills } from '../skills'
+import {
+  activePath,
+  buildTree,
+  isBranchEditable,
+  lastTurnAnchor,
+  pruneSel,
+  selectionToReach,
+  selEquals,
+  turnAnchor,
+  turnResponse,
+  type BranchSel
+} from '@shared/branches'
 
 export const CANCELLED_TEXT = '[Interrompido pelo usuário antes de concluir]'
 export const DENIED_TEXT = 'O usuário negou a execução desta ferramenta.'
@@ -226,13 +238,35 @@ function setStatus(sessionId: string, status: SessionStatus): void {
   if (s) emit({ type: 'session-updated', session: s })
 }
 
+const hasPendingBranch = (sel: BranchSel | undefined): boolean =>
+  !!sel && Object.values(sel).includes(null)
+
 function append(sessionId: string, message: ApiMessage, meta: MessageMeta = {}): StoredMessage {
   if (shuttingDown) throw new Error('Aplicativo encerrando.')
+  const before = sessionsRepo.get(sessionId)?.branchSel
   const m = messagesRepo.append(sessionId, message, meta)
   emit({ type: 'message-added', message: m })
   const s = sessionsRepo.get(sessionId)
-  if (s) chatsRepo.touch(s.chatId)
+  if (s) {
+    chatsRepo.touch(s.chatId)
+    // 1ª mensagem do ramo novo do regenerate: o `null` da seleção saiu (o caminho segue por ela)
+    if (hasPendingBranch(before) && !selEquals(before, s.branchSel))
+      emit({ type: 'session-updated', session: s })
+  }
   return m
+}
+
+/**
+ * Tira os `null` da seleção (ramo vazio do regenerate que terminou sem nenhuma mensagem — Parar
+ * logo no início, app fechado): o caminho volta à versão que já existia. Emite session-updated.
+ */
+function clearPendingBranch(sessionId: string): void {
+  const s = sessionsRepo.get(sessionId)
+  if (!s || !hasPendingBranch(s.branchSel)) return
+  const next: BranchSel = {}
+  for (const [k, v] of Object.entries(s.branchSel ?? {})) if (v !== null) next[k] = v
+  const u = sessionsRepo.setBranchSel(sessionId, next)
+  if (u) emit({ type: 'session-updated', session: u })
 }
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
@@ -267,23 +301,17 @@ function subtree(chatId: string, rootIds: string[]): Session[] {
   return out
 }
 
-/**
- * Apaga as subsessões criadas pelos delegate_task destas mensagens (tool com meta.subSessionId ou
- * assistant com o tool_call de origem) — evita subsessões órfãs após regenerate/apagar mensagem.
- * Aborta as que estiverem rodando e emite `session-deleted` para cada uma (descendentes primeiro).
- */
-export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<void> {
-  if (!removed.length) return
-  const parent = sessionsRepo.get(removed[0].sessionId)
-  if (!parent) return
+/** Subsessões (raízes) criadas pelos delegate_task destas mensagens da sessão `parent`. */
+function subSessionRoots(parent: Session, msgs: StoredMessage[]): string[] {
   const callIds = new Set<string>()
   const subIds = new Set<string>()
-  for (const m of removed) {
+  for (const m of msgs) {
     if (m.meta.subSessionId) subIds.add(m.meta.subSessionId)
     if (m.message.role === 'assistant')
       for (const tc of m.message.tool_calls ?? []) callIds.add(tc.id)
   }
-  const roots = sessionsRepo
+  if (!subIds.size && !callIds.size) return []
+  return sessionsRepo
     .list(parent.chatId)
     .filter(
       (s) =>
@@ -291,6 +319,18 @@ export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<voi
         (subIds.has(s.id) || (s.parentToolCallId != null && callIds.has(s.parentToolCallId)))
     )
     .map((s) => s.id)
+}
+
+/**
+ * Apaga as subsessões criadas pelos delegate_task destas mensagens (tool com meta.subSessionId ou
+ * assistant com o tool_call de origem) — evita subsessões órfãs ao apagar mensagem.
+ * Aborta as que estiverem rodando e emite `session-deleted` para cada uma (descendentes primeiro).
+ */
+export async function deleteSubSessionsOf(removed: StoredMessage[]): Promise<void> {
+  if (!removed.length) return
+  const parent = sessionsRepo.get(removed[0].sessionId)
+  if (!parent) return
+  const roots = subSessionRoots(parent, removed)
   if (!roots.length) return
   const doomed = subtree(parent.chatId, roots)
   reports.drop(doomed.map((s) => s.id)) // apagadas: nenhum callback delas
@@ -461,6 +501,7 @@ function finish(st: RunState, status: SessionStatus): void {
     st.compact = null
     emit({ type: 'compaction', sessionId: st.sessionId, state: null })
   }
+  if (!shuttingDown) clearPendingBranch(st.sessionId)
   setStatus(st.sessionId, status)
 }
 
@@ -620,6 +661,11 @@ async function runCompaction(st: RunState, signal: AbortSignal): Promise<Compact
       )
       for (const x of r.shifted) emit({ type: 'message-updated', message: x })
       emit({ type: 'message-added', message: r.message })
+      // ramo: a seleção que apontava para a 1ª pendente passou para a fronteira
+      if (r.selChanged) {
+        const s = sessionsRepo.get(session.id)
+        if (s) emit({ type: 'session-updated', session: s })
+      }
       chatsRepo.touch(session.chatId)
     } else append(session.id, { role: 'user', content: m.text }, meta)
     // memória: o índice congelado é renovado no próximo request; extração automática (se ligada)
@@ -2236,29 +2282,175 @@ export async function stop(sessionId: string): Promise<void> {
   await waitDone(st)
 }
 
-export async function regenerate(sessionId: string): Promise<void> {
+// ---------------- versões da conversa (ramos — src/shared/branches.ts) ----------------
+
+/** Status em que a sessão está ocupada (turno, aprovação, questionário, card de rede, dormindo). */
+const BUSY_STATUSES: readonly SessionStatus[] = [
+  'running',
+  'awaiting_approval',
+  'awaiting_input',
+  'awaiting_retry',
+  'waiting'
+]
+
+const isSessionBusy = (s: Session): boolean => runs.has(s.id) || BUSY_STATUSES.includes(s.status)
+
+/** O que está em `from` e sai do caminho ao passar para `to` (tudo depois do ponto de divergência). */
+const leftBehind = (from: StoredMessage[], to: StoredMessage[]): StoredMessage[] => {
+  const keep = new Set(to.map((m) => m.id))
+  return from.filter((m) => !keep.has(m.id))
+}
+
+/** Subsessões (com descendentes) nascidas destas mensagens que ainda estão rodando. */
+function liveSubSessionsOf(parent: Session, msgs: StoredMessage[]): Session[] {
+  const roots = subSessionRoots(parent, msgs)
+  return roots.length ? subtree(parent.chatId, roots).filter((s) => runs.has(s.id)) : []
+}
+
+/**
+ * Parte abandonada da conversa (nova versão por edição/regenerate): os subagentes nascidos nela
+ * que ainda rodam (segundo plano / retomados) são parados SEM callback — o resultado cairia na
+ * versão nova, que não os pediu; callbacks deles já na fila da principal saem também. As
+ * subsessões continuam salvas (a versão antiga segue consultável).
+ */
+async function stopAbandonedSubagents(parent: Session, abandoned: StoredMessage[]): Promise<void> {
+  const roots = subSessionRoots(parent, abandoned)
+  if (!roots.length) return
+  const ids = subtree(parent.chatId, roots).map((s) => s.id)
+  const set = new Set(ids)
+  reports.drop(ids)
+  for (const q of getQueue(parent.id))
+    if (q.meta?.kind === 'subagent-callback' && set.has(q.meta.subSessionId ?? '')) takeQueued(q.id)
+  const live = ids.map((id) => runs.get(id)).filter((x): x is RunState => !!x)
+  for (const st of live) {
+    st.stopRequested = true
+    if (st.forced.length) requeueFront(st.sessionId, st.forced.splice(0))
+    st.controller.abort()
+  }
+  await Promise.all(live.map((st) => waitDone(st, 5000)))
+}
+
+/** Para o turno em andamento (como o regenerate sempre fez) antes de criar uma versão. */
+async function stopForBranch(sessionId: string): Promise<void> {
+  if (runs.has(sessionId)) await stop(sessionId)
+  if (runs.has(sessionId)) throw new Error('A sessão ainda está parando; tente novamente.')
+}
+
+/**
+ * Troca o texto de uma mensagem do usuário mantendo os parts do app (anexos e skills carregadas,
+ * na mesma ordem); o texto vira um único text part no fim (= `withText` do renderer).
+ */
+function withUserText(content: ApiMessage['content'], text: string): string | ContentPart[] {
+  if (content == null || typeof content === 'string') return text
+  const keep = content.filter(isAppPart)
+  if (!keep.length) {
+    if (!content.length) return text
+    const first = content.find((p) => p.type === 'text') ?? { type: 'text' as const, text: '' }
+    return [{ ...first, text } as ContentPart]
+  }
+  return text.trim() ? [...keep, { type: 'text', text }] : keep
+}
+
+/**
+ * Editar uma mensagem digitada da sessão principal = NOVA VERSÃO: uma irmã com o mesmo pai (texto
+ * novo; anexos/skills da original), já selecionada, e o agente roda a partir dela. A versão
+ * antiga (e tudo depois dela) continua salva. Para o turno em andamento e os subagentes em
+ * segundo plano da parte abandonada (sem callback). Editar acima de uma fronteira de compactação
+ * volta às mensagens originais (o caminho novo não tem a fronteira; o limite de contexto segue as
+ * regras de sempre: compactação automática / "Compactar e tentar de novo").
+ */
+export async function editBranch(messageId: string, message: ApiMessage): Promise<void> {
+  const cur = messagesRepo.get(messageId)
+  if (!cur) throw new Error('Mensagem não encontrada.')
+  const session = sessionsRepo.get(cur.sessionId)
+  if (!session) throw new Error('Sessão não encontrada.')
+  if (!isBranchEditable(cur, session.depth))
+    throw new Error('Só mensagens digitadas na sessão principal viram uma nova versão.')
+  if (!message || typeof message !== 'object' || message.role !== 'user')
+    throw new Error('Mensagem inválida.')
+  const content = withUserText(cur.message.content, contentText(message.content))
+  if (!contentText(content).trim() && !(Array.isArray(content) && content.length))
+    throw new Error('Mensagem vazia.')
+  await stopForBranch(session.id)
+  if (shuttingDown) throw new Error('Aplicativo encerrando.')
+  // caminho novo = ancestrais da original + a versão nova; o resto do caminho atual sai
+  const now = sessionsRepo.get(session.id) ?? session
+  const tree = buildTree(messagesRepo.listAll(session.id))
+  const keep = new Set<string>()
+  for (let p = tree.parentOf.get(cur.id) ?? null; p; p = tree.parentOf.get(p) ?? null) keep.add(p)
+  const abandoned = activePath(tree, now.branchSel).filter((m) => !keep.has(m.id))
+  await stopAbandonedSubagents(session, abandoned)
+  if (runs.has(session.id)) throw new Error('A sessão voltou a rodar; tente novamente.')
+  const m = messagesRepo.addSibling(cur.id, { role: 'user', content })
+  emit({ type: 'message-added', message: m })
+  const s = sessionsRepo.get(session.id) ?? now
+  emit({ type: 'session-updated', session: s })
+  chatsRepo.touch(session.chatId)
+  startLoop(s)
+}
+
+/**
+ * Regenerar = NOVA VERSÃO da resposta do turno que contém `messageId` (padrão: o último turno do
+ * caminho ativo): `branchSel[prompt] = null` (o caminho termina no prompt; a resposta nova entra
+ * como outro filho dele — a 1ª mensagem limpa o null; terminar sem nenhuma limpa em `finish`). A
+ * request é a mesma do turno original (mesmos bytes → prefixo inteiro do cache). Resposta que é só
+ * erro (só exibição) no fim do caminho é SUBSTITUÍDA (apagada e refeita), sem criar versão.
+ */
+export async function regenerate(sessionId: string, messageId?: string): Promise<void> {
   const session = sessionsRepo.get(sessionId)
   if (!session) throw new Error('Sessão não encontrada.')
   if (session.depth !== 0) throw new Error('Subsessões são somente leitura.')
-  if (runs.has(sessionId)) await stop(sessionId)
-  if (runs.has(sessionId)) throw new Error('A sessão ainda está parando; tente novamente.')
-  const msgs = messagesRepo.path(sessionId)
-  let idx = -1
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].message.role === 'user' && !msgs[i].meta.synthetic) {
-      idx = i
-      break
-    }
+  await stopForBranch(sessionId)
+  const path = messagesRepo.path(sessionId)
+  if (messageId && !path.some((m) => m.id === messageId))
+    throw new Error('Esta mensagem não está na versão ativa da conversa.')
+  const prompt = messageId ? turnAnchor(path, messageId) : lastTurnAnchor(path)
+  if (!prompt) throw new Error('Não há mensagem do usuário para regenerar.')
+  const after = path.slice(path.findIndex((m) => m.id === prompt.id) + 1)
+  const response = turnResponse(path, prompt.id)
+  if (
+    after.length &&
+    after.length === response.length &&
+    response.every((m) => isDisplayOnly(m.meta))
+  ) {
+    for (const m of response) await deleteMessage(m.id)
+  } else if (after.length) {
+    await stopAbandonedSubagents(session, after)
+    if (runs.has(sessionId)) throw new Error('A sessão voltou a rodar; tente novamente.')
+    const cur = sessionsRepo.get(sessionId)
+    if (!cur) return
+    const s = sessionsRepo.setBranchSel(sessionId, { ...cur.branchSel, [prompt.id]: null })
+    if (s) emit({ type: 'session-updated', session: s })
   }
-  if (idx === -1) throw new Error('Não há mensagem do usuário para regenerar.')
-  const removed = msgs.slice(idx + 1)
-  for (const m of removed) {
-    messagesRepo.delete(m.id)
-    emit({ type: 'message-deleted', sessionId, messageId: m.id })
-  }
-  await deleteSubSessionsOf(removed)
-  if (runs.has(sessionId)) return
-  startLoop(session)
+  if (runs.has(sessionId) || shuttingDown) return
+  startLoop(sessionsRepo.get(sessionId) ?? session)
+}
+
+/**
+ * Troca de versão: o caminho ativo passa a ir por `messageId` (a seleção mínima é gravada na
+ * sessão). Recusada com a sessão ocupada (o histórico do agente mudaria no meio do turno) ou com
+ * subagente em segundo plano ainda rodando na parte que sai ou entra no caminho.
+ */
+export async function selectBranch(messageId: string): Promise<Session> {
+  const cur = messagesRepo.get(messageId)
+  if (!cur) throw new Error('Mensagem não encontrada.')
+  const session = sessionsRepo.get(cur.sessionId)
+  if (!session) throw new Error('Sessão não encontrada.')
+  if (isSessionBusy(session)) throw new Error('Aguarde o agente terminar para trocar de versão.')
+  const tree = buildTree(messagesRepo.listAll(session.id))
+  const before = activePath(tree, session.branchSel)
+  const next = activePath(tree, pruneSel(tree, selectionToReach(tree, session.branchSel, cur.id)))
+  const live = liveSubSessionsOf(session, [
+    ...leftBehind(before, next),
+    ...leftBehind(next, before)
+  ])
+  if (live.length)
+    throw new Error(
+      `${live.length === 1 ? 'Há um subagente' : `Há ${live.length} subagentes`} em segundo plano rodando nesta versão — aguarde terminar ou pare antes de trocar de versão.`
+    )
+  const s = messagesRepo.select(cur.id)
+  emit({ type: 'session-updated', session: s })
+  return s
 }
 
 /**
@@ -2440,6 +2632,9 @@ export function initRunner(): void {
   for (const id of stale) {
     try {
       repairTail(id, 'app-closed')
+      // regenerate interrompido antes da 1ª mensagem: volta à versão que já existia. Só nas
+      // sessões que rodavam AQUI (este dispositivo era o host) — nunca grava chat alheio.
+      clearPendingBranch(id)
     } catch (e) {
       console.error('[clearchat] repairTail', id, e)
     }
@@ -2503,6 +2698,7 @@ export function shutdownRunner(): void {
   for (const id of ids) {
     try {
       repairTail(id, 'app-closed')
+      clearPendingBranch(id)
       const s = sessionsRepo.setStatus(id, retrySessions.has(id) ? 'error' : 'interrupted')
       if (s) emit({ type: 'session-updated', session: s })
     } catch (e) {

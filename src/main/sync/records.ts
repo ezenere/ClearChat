@@ -6,7 +6,9 @@ import { homedir } from 'node:os'
 import { providerKind } from '@shared/providerKinds'
 import type { AgentEvent, ApiMessage, MessageMeta, Session, StoredMessage } from '@shared/types'
 import type { SyncScope } from '@shared/sync'
+import { toBranchSel, type BranchSel } from '@shared/branches'
 import { indexMessage } from '../searchIndex'
+import { ROOT_PARENT } from '../migrateBranches'
 
 export type RecordType =
   | 'provider'
@@ -103,6 +105,63 @@ function setSetting(conn: Database.Database, key: string, value: unknown): void 
         'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
       )
       .run(key, JSON.stringify(value))
+}
+
+// Árvore de mensagens (§4.3.7/§4.3.8): coluna parent_id '' = raiz ↔ plaintext `parentId: null`;
+// coluna NULL (legado: registro de cliente < 0.7 ou linha antiga) ↔ `parentId` AUSENTE — quem lê
+// deriva "a anterior por seq" (src/shared/branches.ts) e nada é regravado por causa disso.
+
+/** messages.parent_id → `parentId` do plaintext/StoredMessage (undefined = ausente/derivar). */
+export const parentIdFromColumn = (v: string | null | undefined): string | null | undefined =>
+  v == null ? undefined : v === ROOT_PARENT ? null : v
+
+/** `parentId` do plaintext → messages.parent_id (ausente/inválido → NULL = derivar). */
+export const parentIdToColumn = (v: unknown): string | null =>
+  v === null ? ROOT_PARENT : typeof v === 'string' && v ? v : null
+
+/** sessions.branch_sel_json → BranchSel normalizado ({} quando vazio/inválido). */
+export const branchSelFromColumn = (v: string | null | undefined): BranchSel =>
+  toBranchSel(parse<unknown>(v, {}))
+
+/** Mãe derivada (§4.3.8) da mensagem (sessionId, seq): a anterior por seq (empate: maior id), ou raiz. */
+function derivedParent(conn: Database.Database, sessionId: string, seq: number): string | null {
+  const r = conn
+    .prepare(
+      'SELECT id FROM messages WHERE session_id = ? AND seq < ? AND seq > 0 ORDER BY seq DESC, id DESC LIMIT 1'
+    )
+    .get(sessionId, seq) as { id: string } | undefined
+  return r?.id ?? null
+}
+
+/**
+ * Igualdade de plaintexts (local × servidor) que ignora o que o leitor DERIVA de um registro antigo
+ * (escritor < 1.2.0): `parentId` ausente no servidor vale a mãe derivada (a local preenchida pela
+ * migração não é mudança) e `branchSel` ausente vale `{}`. Sem isso o app reenviaria (ou veria como
+ * "história diferente") toda mensagem antiga só por causa do `parent_id` preenchido localmente.
+ */
+export function sameRecordPlain(
+  conn: Database.Database,
+  type: string,
+  local: Plain,
+  remote: Plain | null | undefined
+): boolean {
+  if (!remote) return false
+  let l = local
+  if (type === 'message' && !('parentId' in remote) && 'parentId' in l) {
+    const seq = Number(l.seq)
+    const sid = String(l.sessionId ?? '')
+    if (l.parentId === derivedParent(conn, sid, seq)) {
+      l = { ...l }
+      delete l.parentId
+    }
+  } else if (type === 'session' && !('branchSel' in remote) && 'branchSel' in l) {
+    const sel = l.branchSel
+    if (sel && typeof sel === 'object' && !Object.keys(sel).length) {
+      l = { ...l }
+      delete l.branchSel
+    }
+  }
+  return sameJson(l, remote)
 }
 
 const stripCwd = (cfg: Plain): Plain => {
@@ -292,6 +351,7 @@ export function buildLocal(
             status: string
             created_at: number
             memory_json?: string | null
+            branch_sel_json?: string | null
           }
         | undefined
       if (!r) return null
@@ -309,7 +369,10 @@ export function buildLocal(
           task: r.task ?? null,
           status: r.status,
           createdAt: r.created_at,
-          memory: r.memory_json ? parse<Plain | null>(r.memory_json, null) : null
+          memory: r.memory_json ? parse<Plain | null>(r.memory_json, null) : null,
+          // SEMPRE enviado ({} quando vazio): a regravação mescla com a base do servidor e omitir
+          // traria de volta uma seleção velha (§4.3.7)
+          branchSel: branchSelFromColumn(r.branch_sel_json)
         })
       }
     }
@@ -326,19 +389,24 @@ export function buildLocal(
             meta_json: string
             created_at: number
             chat_id: string
+            parent_id?: string | null
           }
         | undefined
       if (!r) return null
+      const plain: Plain = {
+        sv: 1,
+        sessionId: r.session_id,
+        seq: r.seq,
+        message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
+        meta: parse<MessageMeta>(r.meta_json, {}),
+        createdAt: r.created_at
+      }
+      // legado (NULL) fica sem parentId: os leitores derivam; null explícito na raiz (§4.3.8)
+      const parentId = parentIdFromColumn(r.parent_id)
+      if (parentId !== undefined) plain.parentId = parentId
       return {
         scope: r.chat_id,
-        plain: {
-          sv: 1,
-          sessionId: r.session_id,
-          seq: r.seq,
-          message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
-          meta: parse<MessageMeta>(r.meta_json, {}),
-          createdAt: r.created_at
-        },
+        plain,
         shas: attachmentShas(r.message_json + '\n' + (r.meta_json ?? ''))
       }
     }
@@ -457,6 +525,7 @@ function rowSession(conn: Database.Database, id: string): Session | null {
         task: string | null
         status: string
         created_at: number
+        branch_sel_json?: string | null
       }
     | undefined
   if (!r) return null
@@ -471,7 +540,8 @@ function rowSession(conn: Database.Database, id: string): Session | null {
     title: r.title,
     task: r.task,
     status: r.status as Session['status'],
-    createdAt: r.created_at
+    createdAt: r.created_at,
+    branchSel: branchSelFromColumn(r.branch_sel_json)
   }
 }
 
@@ -484,10 +554,11 @@ export function rowMessage(conn: Database.Database, id: string): StoredMessage |
         message_json: string
         meta_json: string
         created_at: number
+        parent_id?: string | null
       }
     | undefined
   if (!r) return null
-  return {
+  const m: StoredMessage = {
     id: r.id,
     sessionId: r.session_id,
     seq: r.seq,
@@ -495,6 +566,41 @@ export function rowMessage(conn: Database.Database, id: string): StoredMessage |
     meta: parse<MessageMeta>(r.meta_json, {}),
     createdAt: r.created_at
   }
+  const parentId = parentIdFromColumn(r.parent_id)
+  if (parentId !== undefined) m.parentId = parentId
+  return m
+}
+
+/** Session a partir do plaintext do registro `session` (visualização: status sempre o gravado). */
+export function sessionFromPlain(id: string, p: Plain, chatId = String(p.chatId ?? '')): Session {
+  return {
+    id,
+    chatId,
+    parentSessionId: (p.parentSessionId as string) ?? null,
+    parentToolCallId: (p.parentToolCallId as string) ?? null,
+    depth: Number(p.depth ?? 0) as 0 | 1 | 2,
+    model: String(p.model ?? ''),
+    providerId: (p.providerId as string) ?? null,
+    title: String(p.title ?? ''),
+    task: (p.task as string) ?? null,
+    status: String(p.status ?? 'idle') as Session['status'],
+    createdAt: Number(p.createdAt ?? 0),
+    branchSel: toBranchSel(p.branchSel)
+  }
+}
+
+/** StoredMessage a partir do plaintext do registro `message` (parentId ausente = legado). */
+export function messageFromPlain(id: string, p: Plain): StoredMessage {
+  const m: StoredMessage = {
+    id,
+    sessionId: String(p.sessionId ?? ''),
+    seq: Number(p.seq ?? 0),
+    message: (p.message ?? { role: 'user', content: '' }) as ApiMessage,
+    meta: (p.meta ?? {}) as MessageMeta,
+    createdAt: Number(p.createdAt ?? 0)
+  }
+  if (p.parentId === null || (typeof p.parentId === 'string' && p.parentId)) m.parentId = p.parentId
+  return m
 }
 
 const str = (v: unknown, d = ''): string => (typeof v === 'string' ? v : d)
@@ -678,12 +784,13 @@ export function applyRemote(
       conn
         .prepare(
           `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task,
-             status, created_at, memory_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             status, created_at, memory_json, branch_sel_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET chat_id = excluded.chat_id, parent_session_id = excluded.parent_session_id,
              parent_tool_call_id = excluded.parent_tool_call_id, depth = excluded.depth, model = excluded.model,
              provider_id = excluded.provider_id, title = excluded.title, task = excluded.task, status = excluded.status,
-             created_at = excluded.created_at, memory_json = excluded.memory_json`
+             created_at = excluded.created_at, memory_json = excluded.memory_json,
+             branch_sel_json = excluded.branch_sel_json`
         )
         .run(
           id,
@@ -697,7 +804,9 @@ export function applyRemote(
           strOrNull(p.task),
           stored,
           num(p.createdAt, Date.now()),
-          p.memory && typeof p.memory === 'object' ? JSON.stringify(p.memory) : null
+          p.memory && typeof p.memory === 'object' ? JSON.stringify(p.memory) : null,
+          // ausente (escritor < 1.2.0) = {} (§4.3.7)
+          JSON.stringify(toBranchSel(p.branchSel))
         )
       const s = rowSession(conn, id)
       if (s) {
@@ -722,11 +831,21 @@ export function applyRemote(
       const meta = (p.meta ?? {}) as MessageMeta
       conn
         .prepare(
-          `INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, seq = excluded.seq,
-           message_json = excluded.message_json, meta_json = excluded.meta_json, created_at = excluded.created_at`
+           message_json = excluded.message_json, meta_json = excluded.meta_json, created_at = excluded.created_at,
+           parent_id = excluded.parent_id`
         )
-        .run(id, sessionId, seq, JSON.stringify(message), JSON.stringify(meta), num(p.createdAt))
+        .run(
+          id,
+          sessionId,
+          seq,
+          JSON.stringify(message),
+          JSON.stringify(meta),
+          num(p.createdAt),
+          // parentId ausente (cliente < 0.7) → NULL: derivado na leitura, nunca regravado (§4.3.8)
+          parentIdToColumn(p.parentId)
+        )
       indexMessage(conn, id, message, meta)
       const m = rowMessage(conn, id)
       if (m) res.events.push({ type: existed ? 'message-updated' : 'message-added', message: m })

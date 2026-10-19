@@ -20,7 +20,7 @@ import * as memory from '../memory'
 import * as skills from '../skills'
 import { clearSkillsCache } from '../skills/discovery'
 import { SyncEngine, type SecretStore } from './engine'
-import { NoHostError, type RunnerAdapter } from './host'
+import { cmdPurpose, NoHostError, type RunnerAdapter } from './host'
 
 let engine: SyncEngine | null = null
 
@@ -181,7 +181,9 @@ function runnerAdapter(): RunnerAdapter {
     cancelQuestion: (id) => runner.cancelQuestionRequest(id),
     retry: (id) => runner.retryRequest(id),
     cancelRetry: (id) => runner.cancelRetryRequest(id),
-    regenerate: (sid) => runner.regenerate(sid),
+    regenerate: (sid, messageId) => runner.regenerate(sid, messageId),
+    editBranch: (id, message) => runner.editBranch(id, message),
+    selectBranch: (id) => runner.selectBranch(id),
     editMessage(id, message) {
       const m = messagesRepo.update(id, message)
       emit({ type: 'message-updated', message: m })
@@ -291,7 +293,7 @@ export async function gateChat<T>(
     throw new Error('Este chat está divergente: escolha qual versão manter antes de continuar.')
   }
   if (opts.content !== false && (mode === 'local' || mode === 'remote'))
-    await e.host.ensureWindow(chatId, opts.purpose ?? 'run')
+    await e.host.ensureWindow(chatId, opts.purpose ?? cmdPurpose(kind))
   return local()
 }
 

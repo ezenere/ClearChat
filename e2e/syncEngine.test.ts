@@ -13,9 +13,17 @@ import { SCHEMA } from '../src/main/dbSchema'
 import { ensureMemorySchema } from '../src/main/memory/schema'
 import { ensureSearchIndex } from '../src/main/searchIndex'
 import { ensureSyncSchema } from '../src/main/sync/schema'
-import { applyRemote, buildLocal, merge3, sameJson } from '../src/main/sync/records'
-import { SyncEngine } from '../src/main/sync/engine'
-import type { RunnerAdapter } from '../src/main/sync/host'
+import {
+  applyRemote,
+  buildLocal,
+  merge3,
+  rowMessage,
+  sameJson,
+  sameRecordPlain
+} from '../src/main/sync/records'
+import { outdatedHosts, SyncEngine } from '../src/main/sync/engine'
+import { EDIT_NEEDS_UPDATE, type RunnerAdapter } from '../src/main/sync/host'
+import { activePath, resolveParents } from '../src/shared/branches'
 import type { AgentEvent, Session } from '../src/shared/types'
 import { trackFailure, type SubFailure } from '../src/renderer/src/lib/subFailures'
 import { startFakeSyncServer, type FakeSyncServer } from './fakes/syncServer.ts'
@@ -65,7 +73,12 @@ interface Dev {
 
 function device(
   name: string,
-  opts: { runner?: RunnerAdapter; conn?: Database.Database; server?: FakeSyncServer } = {}
+  opts: {
+    runner?: RunnerAdapter
+    conn?: Database.Database
+    server?: FakeSyncServer
+    appVersion?: string
+  } = {}
 ): Dev {
   const conn = opts.conn ?? newDb()
   const listeners = new Set<(e: AgentEvent) => void>()
@@ -86,7 +99,7 @@ function device(
       set: (k, v) => (v == null ? secrets.delete(k) : secrets.set(k, v)),
       available: () => true
     },
-    appVersion: 'test',
+    appVersion: opts.appVersion ?? 'test',
     deviceName: name,
     platform: 'linux',
     runner: opts.runner ?? null,
@@ -983,6 +996,8 @@ function stubRunner(log: any[]): RunnerAdapter {
     retry: fail,
     cancelRetry: fail,
     regenerate: async () => {},
+    editBranch: async () => {},
+    selectBranch: fail,
     editMessage: fail,
     deleteMessage: async () => {},
     compact: () => ({ scheduled: false }),
@@ -1233,4 +1248,346 @@ test('host_back: piscada na tolerância não avisa; queda (caiu) → volta avisa
   } finally {
     await s2.close()
   }
+})
+
+// ---------------- versões de mensagens (ramos, protocolo 1.2.0 — §4.3.7/§4.3.8/§8.6) ----------------
+
+/** Mensagem com mãe explícita: null = raiz (''), undefined = legado (NULL, derivar). */
+function addTreeMessage(
+  conn: Database.Database,
+  sessionId: string,
+  role: string,
+  content: string,
+  parent: string | null | undefined,
+  meta: Record<string, unknown> = {}
+): string {
+  const id = randomUUID()
+  const seq = (
+    conn
+      .prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM messages WHERE session_id = ?')
+      .get(sessionId) as any
+  ).s
+  conn
+    .prepare(
+      'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    )
+    .run(
+      id,
+      sessionId,
+      seq,
+      JSON.stringify({ role, content }),
+      JSON.stringify(meta),
+      Date.now(),
+      parent === undefined ? null : parent === null ? '' : parent
+    )
+  return id
+}
+
+const parentCol = (conn: Database.Database, id: string): string | null =>
+  (conn.prepare('SELECT parent_id FROM messages WHERE id = ?').get(id) as any)?.parent_id
+
+const selCol = (conn: Database.Database, sid: string): any =>
+  JSON.parse(
+    (conn.prepare('SELECT branch_sel_json FROM sessions WHERE id = ?').get(sid) as any)
+      .branch_sel_json
+  )
+
+test('ramos: parentId/branchSel ida e volta; legado sem parentId continua derivável; reenvio 0.6.x preserva', () => {
+  const a = newDb()
+  const b = newDb()
+  const { chatId, sessionId } = addChat(a, 'Ramos')
+  const u1 = addTreeMessage(a, sessionId, 'user', 'oi', null)
+  const r1 = addTreeMessage(a, sessionId, 'assistant', 'resposta 1', u1)
+  const r2 = addTreeMessage(a, sessionId, 'assistant', 'resposta 2', u1) // irmã de r1 (regenerar)
+  const old = addTreeMessage(a, sessionId, 'user', 'de um 0.6', undefined) // legado (NULL)
+  a.prepare('UPDATE sessions SET branch_sel_json = ? WHERE id = ?').run(
+    JSON.stringify({ [u1]: r1 }),
+    sessionId
+  )
+
+  // local → plaintext
+  const pu1 = buildLocal(a, 'message', u1)!.plain
+  assert.equal(pu1.parentId, null, 'raiz = null explícito')
+  assert.ok('parentId' in pu1)
+  assert.equal(buildLocal(a, 'message', r2)!.plain.parentId, u1)
+  assert.ok(!('parentId' in buildLocal(a, 'message', old)!.plain), 'legado: parentId ausente')
+  assert.deepEqual(buildLocal(a, 'session', sessionId)!.plain.branchSel, { [u1]: r1 })
+
+  // plaintext → local (outro aparelho) e de volta
+  applyRemote(b, 'chat', chatId, buildLocal(a, 'chat', chatId)!.plain, { defaultCwd: () => '/x' })
+  for (const [type, id] of [
+    ['session', sessionId],
+    ['message', u1],
+    ['message', r1],
+    ['message', r2],
+    ['message', old]
+  ] as const) {
+    const l = buildLocal(a, type, id)!
+    const res = applyRemote(b, type, id, JSON.parse(JSON.stringify(l.plain)))
+    assert.ok(sameJson(buildLocal(b, type, id)!.plain, l.plain), `${type} ida e volta`)
+    if (type === 'session') {
+      const ev = res.events.find((e) => e.type === 'session-updated') as any
+      assert.deepEqual(ev.session.branchSel, { [u1]: r1 }, 'evento leva branchSel')
+    }
+  }
+  assert.equal(parentCol(b, u1), '', 'raiz gravada como ""')
+  assert.equal(parentCol(b, r2), u1)
+  assert.equal(parentCol(b, old), null, 'legado continua NULL (nada derivado gravado)')
+  assert.deepEqual(rowMessage(b, r2)!.parentId, u1)
+  assert.equal(rowMessage(b, old)!.parentId, undefined)
+  // derivado na leitura: o legado vira filho da anterior por seq (r2); a seleção aponta r1
+  const msgs = [u1, r1, r2, old].map((id) => rowMessage(b, id)!)
+  assert.equal(resolveParents(msgs).get(old), r2)
+  assert.deepEqual(
+    activePath(msgs, selCol(b, sessionId)).map((m) => m.id),
+    [u1, r1]
+  )
+  assert.deepEqual(
+    activePath(msgs, {}).map((m) => m.id),
+    [u1, r2, old]
+  )
+
+  // registro de escritor < 1.2.0 sem branchSel → {}
+  const plainSess = { ...buildLocal(a, 'session', sessionId)!.plain }
+  delete plainSess.branchSel
+  applyRemote(b, 'session', sessionId, plainSess)
+  assert.deepEqual(selCol(b, sessionId), {})
+
+  // 0.6.x regrava (edita r2 como host): o plaintext dele não tem parentId/branchSel, mas o merge
+  // com a base ({...base, ...local}, §4.3) os preserva
+  const base = buildLocal(a, 'message', r2)!.plain
+  const oldLocal: any = { ...base, message: { role: 'assistant', content: 'editada no 0.6' } }
+  delete oldLocal.parentId
+  applyRemote(b, 'message', r2, { ...base, ...oldLocal })
+  assert.equal(parentCol(b, r2), u1, 'parentId preservado pela base')
+  const sBase = buildLocal(a, 'session', sessionId)!.plain
+  const sOld: any = { ...sBase, title: 'renomeada no 0.6' }
+  delete sOld.branchSel
+  applyRemote(b, 'session', sessionId, { ...sBase, ...sOld })
+  assert.deepEqual(selCol(b, sessionId), { [u1]: r1 }, 'branchSel preservado pela base')
+
+  // 0.7 limpando a seleção: sempre manda branchSel ({}), então a base não ressuscita a velha
+  a.prepare("UPDATE sessions SET branch_sel_json = '{}' WHERE id = ?").run(sessionId)
+  const merged = { ...sBase, ...buildLocal(a, 'session', sessionId)!.plain }
+  assert.deepEqual(merged.branchSel, {})
+  applyRemote(b, 'session', sessionId, merged)
+  assert.deepEqual(selCol(b, sessionId), {})
+
+  // comparação local × servidor: a mãe preenchida pela migração (= a derivada) e {} não contam
+  // como mudança num registro antigo; uma mãe diferente da derivada conta
+  const legacyRemote: any = { ...buildLocal(a, 'message', old)!.plain }
+  a.prepare('UPDATE messages SET parent_id = ? WHERE id = ?').run(r2, old) // = derivada
+  assert.ok(sameRecordPlain(a, 'message', buildLocal(a, 'message', old)!.plain, legacyRemote))
+  a.prepare('UPDATE messages SET parent_id = ? WHERE id = ?').run(r1, old) // ≠ derivada
+  assert.ok(!sameRecordPlain(a, 'message', buildLocal(a, 'message', old)!.plain, legacyRemote))
+  const legacySess: any = { ...buildLocal(a, 'session', sessionId)!.plain }
+  delete legacySess.branchSel
+  assert.ok(sameRecordPlain(a, 'session', buildLocal(a, 'session', sessionId)!.plain, legacySess))
+})
+
+test('ramos: copyChatAsNew remapeia mães, branchSel e subSessionId (legado continua NULL)', () => {
+  const d = device('cópia')
+  const conn = d.conn
+  const { chatId, sessionId } = addChat(conn, 'Original')
+  const u1 = addTreeMessage(conn, sessionId, 'user', 'oi', null)
+  const r1 = addTreeMessage(conn, sessionId, 'assistant', 'r1', u1)
+  const r2 = addTreeMessage(conn, sessionId, 'assistant', 'r2', u1)
+  const legacy = addTreeMessage(conn, sessionId, 'user', 'legado', undefined)
+  const subId = randomUUID()
+  conn
+    .prepare(
+      `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, title, task, status, created_at)
+       VALUES (?, ?, ?, 'tc1', 1, 'fake/m', 'Sub', 't', 'idle', 2)`
+    )
+    .run(subId, chatId, sessionId)
+  const tool = addTreeMessage(conn, sessionId, 'tool', 'feito', legacy, { subSessionId: subId })
+  addTreeMessage(conn, subId, 'user', 'tarefa', null)
+  conn
+    .prepare('UPDATE sessions SET branch_sel_json = ? WHERE id = ?')
+    .run(JSON.stringify({ [u1]: r1, root: u1, [r2]: null, gone: r1 }), sessionId)
+
+  const newChat = (d.eng as any).copyChatAsNew(chatId) as string
+  const ns = (
+    conn.prepare('SELECT main_session_id AS m FROM chats WHERE id = ?').get(newChat) as any
+  ).m
+  assert.ok(ns && ns !== sessionId)
+  const rows = conn
+    .prepare(
+      'SELECT id, parent_id, message_json, meta_json FROM messages WHERE session_id = ? ORDER BY seq'
+    )
+    .all(ns) as any[]
+  const byText = new Map(rows.map((r) => [JSON.parse(r.message_json).content, r]))
+  const nu1 = byText.get('oi')
+  const nr1 = byText.get('r1')
+  const nr2 = byText.get('r2')
+  assert.equal(nu1.parent_id, '', 'raiz continua raiz')
+  assert.equal(nr1.parent_id, nu1.id)
+  assert.equal(nr2.parent_id, nu1.id)
+  assert.ok(![u1, r1, r2].includes(nu1.id))
+  assert.equal(byText.get('legado').parent_id, null, 'legado continua NULL')
+  assert.equal(byText.get('feito').parent_id, byText.get('legado').id)
+  assert.notEqual(byText.get('feito').id, tool)
+  const newSub = (
+    conn.prepare('SELECT id FROM sessions WHERE chat_id = ? AND depth = 1').get(newChat) as any
+  ).id
+  assert.equal(
+    JSON.parse(byText.get('feito').meta_json).subSessionId,
+    newSub,
+    'subSessionId remapeado'
+  )
+  assert.deepEqual(
+    selCol(conn, ns),
+    { [nu1.id]: nr1.id, root: nu1.id, [nr2.id]: null },
+    'branchSel remapeado (entrada de fora da cópia some)'
+  )
+  // o original ficou intacto
+  assert.equal(parentCol(conn, r1), u1)
+  d.eng.destroy()
+})
+
+test('ramos: outdatedHosts — desktops que hospedam com app < 0.7.0 (lista de aparelhos)', async () => {
+  const dev = (o: Partial<any>): any => ({
+    id: randomUUID(),
+    name: 'X',
+    platform: 'linux',
+    client: 'desktop',
+    appVersion: '0.6.1',
+    canHost: true,
+    createdAt: '',
+    lastSeenAt: null,
+    lastIp: null,
+    online: true,
+    current: false,
+    ...o
+  })
+  assert.deepEqual(
+    outdatedHosts([
+      dev({ name: 'PC velho', appVersion: '0.6.1' }),
+      dev({ name: 'PC novo', appVersion: '0.7.0' }),
+      dev({ name: 'PC mais novo', appVersion: 'v1.0.2' }),
+      dev({ name: 'Eu', appVersion: '0.5.0', current: true }),
+      dev({ name: 'Site', client: 'web', canHost: false, appVersion: '0.1.0' }),
+      dev({ name: 'Celular', client: 'mobile', appVersion: '0.1.0' }),
+      dev({ name: 'Sem host', canHost: false, appVersion: '0.6.0' }),
+      dev({ name: 'Dev', appVersion: 'test' })
+    ]),
+    [{ name: 'PC velho', appVersion: '0.6.1' }]
+  )
+
+  // pela conta: a lista do GET /devices alimenta o status
+  const email = await newAccount()
+  const A = device('PC 0.7', { appVersion: '0.7.0' })
+  await login(A, email)
+  await settled(A)
+  assert.deepEqual(A.eng.status().outdatedHosts, [])
+  const B = device('PC antigo', { appVersion: '0.6.1' })
+  await login(B, email)
+  await settled(B)
+  await A.eng.devices()
+  assert.deepEqual(A.eng.status().outdatedHosts, [{ name: 'PC antigo', appVersion: '0.6.1' }])
+  await B.eng.logout()
+  await A.eng.devices()
+  assert.deepEqual(A.eng.status().outdatedHosts, [])
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('ramos: host executa branch.edit / branch.regenerate / branch.select; recusa message.edit em mensagem do usuário', async () => {
+  const email = await newAccount()
+  const logA: any[] = []
+  const runnerA: RunnerAdapter = {
+    ...stubRunner(logA),
+    regenerate: async (sid, messageId) => {
+      logA.push({ regenerate: sid, messageId })
+    },
+    editBranch: async (id, message) => {
+      logA.push({ editBranch: id, message })
+    },
+    selectBranch: async (id) => {
+      logA.push({ select: id })
+      return {} as Session
+    },
+    editMessage: (id, message) => {
+      logA.push({ edit: id, message })
+      return {} as any
+    }
+  }
+  const A = device('Host ramos', { runner: runnerA })
+  const { chatId, sessionId } = addChat(A.conn, 'Ramos remoto')
+  const u1 = addTreeMessage(A.conn, sessionId, 'user', 'oi', null)
+  const a1 = addTreeMessage(A.conn, sessionId, 'assistant', 'olá', u1)
+  const other = addChat(A.conn, 'Outro')
+  const foreign = addTreeMessage(A.conn, other.sessionId, 'user', 'de outro chat', null)
+  await login(A, email)
+  await settled(A)
+  await waitFor(() => A.eng.chatInfo(chatId).host?.self, 'A virou host')
+  const purposes: string[] = []
+  const kinds: string[] = []
+  const host = A.eng.host as any
+  const ensure = host.ensureWindow.bind(host)
+  host.ensureWindow = (c: string, p: string) => {
+    purposes.push(p)
+    return ensure(c, p)
+  }
+  const exec = host.execute.bind(host)
+  host.execute = (c: string, k: string, p: any) => {
+    kinds.push(k)
+    return exec(c, k, p)
+  }
+  const B = device('Remoto ramos', { runner: stubRunner([]) })
+  await login(B, email)
+  await settled(B)
+  await waitFor(() => B.eng.host.mode(chatId) === 'remote', 'B é controle remoto')
+  const send = (kind: string, p: Record<string, unknown>): Promise<any> =>
+    B.eng.host.sendCommand(chatId, kind, p)
+  const waitIdle = (): Promise<unknown> =>
+    waitFor(() => !host.windows.has(chatId), 'janela fechada', 10_000)
+
+  const msg = { role: 'user', content: 'oi editado' }
+  assert.equal((await send('branch.edit', { messageId: u1, message: msg })).status, 'accepted')
+  assert.deepEqual(logA.at(-1), { editBranch: u1, message: msg })
+  assert.equal(purposes.at(-1), 'run')
+  await waitIdle()
+
+  await send('branch.regenerate', { sessionId, messageId: a1 })
+  assert.deepEqual(logA.at(-1), { regenerate: sessionId, messageId: a1 })
+  assert.equal(purposes.at(-1), 'run')
+  await waitIdle()
+
+  await send('branch.select', { messageId: a1 })
+  assert.deepEqual(logA.at(-1), { select: a1 })
+  assert.equal(purposes.at(-1), 'edit')
+  await waitIdle()
+
+  // `regenerate` (sem prefixo): o controle remoto ≥ 1.2.0 manda branch.regenerate; um antigo que
+  // mande `regenerate` também vira regenerar em ramo do último turno no host
+  await send('regenerate', { sessionId })
+  assert.equal(kinds.at(-1), 'branch.regenerate', 'remoto nunca manda o regenerate antigo')
+  assert.deepEqual(logA.at(-1), { regenerate: sessionId, messageId: undefined })
+  await waitIdle()
+  const n = logA.length
+  assert.deepEqual(await (A.eng.host as any).execute(chatId, 'regenerate', { sessionId }), {})
+  assert.deepEqual(logA.at(-1), { regenerate: sessionId, messageId: undefined })
+  assert.equal(logA.length, n + 1)
+  await waitIdle()
+
+  // message.edit numa mensagem digitada na sessão principal → recusado ("atualize o app"), sem janela
+  const before = purposes.length
+  await assert.rejects(send('message.edit', { messageId: u1, message: msg }), (e: Error) => {
+    assert.equal(e.message, EDIT_NEEDS_UPDATE)
+    assert.match(e.message, /atualize/)
+    return true
+  })
+  assert.equal(purposes.length, before, 'recusa não abre janela')
+  assert.ok(!logA.some((x) => x.edit === u1))
+  // mensagem do assistente continua com edição no lugar
+  await send('message.edit', { messageId: a1, message: { role: 'assistant', content: 'x' } })
+  assert.equal(logA.at(-1).edit, a1)
+  assert.equal(purposes.at(-1), 'edit')
+  await waitIdle()
+  // validações: mensagem de outro chat, branch.edit numa resposta
+  await assert.rejects(send('branch.select', { messageId: foreign }), /não pertence/)
+  await assert.rejects(send('branch.edit', { messageId: a1, message: msg }), /principal/)
+  A.eng.destroy()
+  B.eng.destroy()
 })

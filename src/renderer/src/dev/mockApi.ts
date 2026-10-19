@@ -19,6 +19,18 @@ import {
   type SearchEngineId
 } from '@shared/webSearchSettings'
 import { copyName, sanitizePresetConfig } from '@shared/presets'
+import {
+  activeLeaf,
+  activePath,
+  buildTree,
+  lastTurnAnchor,
+  selectionToReach,
+  selKey,
+  turnAnchor,
+  turnResponse
+} from '@shared/branches'
+import { isDisplayOnly } from '@shared/context'
+import { contentText } from '@shared/attachments'
 import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
 import {
   createMemoryMock,
@@ -433,6 +445,123 @@ export function createMockApi(scenario: string): ClearApi {
       { usage: { promptTokens: 1200, completionTokens: 80 }, model: 'anthropic/claude-haiku-4.5' }
     )
   ]
+
+  // Chat com VERSÕES (ramos): a resposta do 1º turno foi regenerada (2 versões, a mais nova ativa),
+  // a pergunta do 2º foi editada (3 versões, a 2ª selecionada em branchSel) e o 3º turno só existe
+  // na versão selecionada. ‹ i/n › e "Regenerar resposta" em todos os turnos.
+  if (scenario !== 'onboarding') {
+    chats.push({
+      id: 'cbr',
+      title: 'Cache das respostas da API',
+      config: cfg,
+      mainSessionId: 'sbr',
+      createdAt: daysAgo(4, 10, 0),
+      updatedAt: daysAgo(4, 10, 12)
+    })
+    const sbr: Session = {
+      id: 'sbr',
+      chatId: 'cbr',
+      parentSessionId: null,
+      parentToolCallId: null,
+      depth: 0,
+      model: cfg.model,
+      title: 'Principal',
+      task: null,
+      status: 'idle',
+      createdAt: daysAgo(4, 10, 0),
+      branchSel: {}
+    }
+    sessions.push(sbr)
+    const usage = (p: number): StoredMessage['meta'] => ({
+      usage: { promptTokens: p, completionTokens: 140, cachedTokens: p - 180, cost: 0.0016 },
+      model: cfg.model,
+      durationMs: 2400
+    })
+    const at = (
+      parent: StoredMessage | null,
+      message: StoredMessage['message'],
+      meta: StoredMessage['meta'],
+      minute: number
+    ): StoredMessage => ({
+      ...msg('sbr', message, meta, daysAgo(4, 10, minute)),
+      parentId: parent ? parent.id : null
+    })
+    const u1 = at(
+      null,
+      {
+        role: 'user',
+        content: 'Como cachear a lista de modelos da API sem mostrar dados velhos por muito tempo?'
+      },
+      {},
+      0
+    )
+    const a1 = at(
+      u1,
+      {
+        role: 'assistant',
+        content:
+          'Um cache em memória com **TTL curto** (5 minutos) resolve: depois disso a próxima chamada vai à rede de novo.'
+      },
+      usage(820),
+      1
+    )
+    const a1b = at(
+      u1,
+      {
+        role: 'assistant',
+        content:
+          'Use **stale-while-revalidate**: responda na hora com o que está em cache e, se tiver mais de 5 minutos, busque a versão nova em segundo plano. Assim a tela nunca espera a rede e o dado velho dura no máximo uma visita.'
+      },
+      usage(820),
+      2
+    )
+    const u2a = at(a1b, { role: 'user', content: 'Mostra um exemplo em TypeScript.' }, {}, 3)
+    const a2a = at(
+      u2a,
+      {
+        role: 'assistant',
+        content:
+          '```ts\nconst cache = new Map<string, { at: number; data: Model[] }>()\nexport async function models(key: string): Promise<Model[]> {\n  const hit = cache.get(key)\n  if (hit && Date.now() - hit.at < 300_000) return hit.data\n  const data = await fetchModels(key)\n  cache.set(key, { at: Date.now(), data })\n  return data\n}\n```'
+      },
+      usage(1010),
+      4
+    )
+    const u2b = at(a1b, { role: 'user', content: 'Mostra um exemplo em Python.' }, {}, 5)
+    const a2b = at(
+      u2b,
+      {
+        role: 'assistant',
+        content:
+          '```python\n_cache: dict[str, tuple[float, list]] = {}\n\ndef models(key: str) -> list:\n    hit = _cache.get(key)\n    if hit and time.time() - hit[0] < 300:\n        return hit[1]\n    data = fetch_models(key)\n    _cache[key] = (time.time(), data)\n    return data\n```'
+      },
+      usage(1010),
+      6
+    )
+    const u2c = at(a1b, { role: 'user', content: 'Mostra um exemplo em Go.' }, {}, 7)
+    const a2c = at(
+      u2c,
+      {
+        role: 'assistant',
+        content:
+          '```go\nfunc (c *Cache) Models(key string) []Model {\n\tif e, ok := c.m[key]; ok && time.Since(e.at) < 5*time.Minute {\n\t\treturn e.data\n\t}\n\t// …\n}\n```'
+      },
+      usage(1010),
+      8
+    )
+    const u3 = at(a2b, { role: 'user', content: 'E como invalidar quando a chave muda?' }, {}, 10)
+    const a3 = at(
+      u3,
+      {
+        role: 'assistant',
+        content:
+          'Use a chave (ou um hash dela) como parte da chave do cache: trocar a chave vira automaticamente um cache novo, e o antigo expira sozinho.'
+      },
+      usage(1240),
+      12
+    )
+    messages.push(u1, a1, a1b, u2a, a2a, u2b, a2b, u2c, a2c, u3, a3)
+    sbr.branchSel = { [a1b.id]: u2b.id }
+  }
 
   let approvalSettings: ApprovalSettings = normalizeApprovalSettings(
     { commands: 'lists', processes: 'lists', pages: 'lists', search: 'lists' },
@@ -1099,10 +1228,48 @@ export function createMockApi(scenario: string): ClearApi {
     remember: true,
     merge: null,
     prompts: [],
-    protocolError: null
+    protocolError: null,
+    // ?scenario=branches → aviso "Atualize <dispositivo> para usar versões de mensagens"
+    outdatedHosts: scenario === 'branches' ? [{ name: 'Notebook antigo', appVersion: '0.6.1' }] : []
   })
   const noSync = (): Promise<never> =>
     Promise.reject(new Error('Sync indisponível no modo de demonstração.'))
+
+  // ---- ramos (versões de mensagens) ----
+  const sessionMsgs = (sid: string): StoredMessage[] => messages.filter((m) => m.sessionId === sid)
+  const busyStatus = (st: Session['status']): boolean =>
+    ['running', 'waiting', 'awaiting_approval', 'awaiting_input', 'awaiting_retry'].includes(st)
+  /** Resposta simulada sob `parentId`: rodando → mensagem do assistente → ociosa. */
+  const mockReply = (sid: string, parentId: string, text: string): void => {
+    const s = sessions.find((x) => x.id === sid)
+    if (!s) return
+    s.status = 'running'
+    emit({ type: 'session-updated', session: { ...s } })
+    setTimeout(() => {
+      const m: StoredMessage = {
+        ...msg(
+          sid,
+          { role: 'assistant', content: text },
+          {
+            model: chats.find((c) => c.id === s.chatId)?.config.model,
+            usage: { promptTokens: 1300, completionTokens: 60 },
+            durationMs: 900
+          }
+        ),
+        parentId
+      }
+      messages.push(m)
+      // o primeiro filho sob um `null` (regenerar) desfaz a pausa do caminho
+      if (s.branchSel && s.branchSel[parentId] === null) {
+        const next = { ...s.branchSel }
+        delete next[parentId]
+        s.branchSel = next
+      }
+      s.status = 'idle'
+      emit({ type: 'message-added', message: m })
+      emit({ type: 'session-updated', session: { ...s } })
+    }, 900)
+  }
 
   return {
     sync: {
@@ -1252,6 +1419,7 @@ export function createMockApi(scenario: string): ClearApi {
           emit({ type: 'queue-updated', sessionId: sid, queue: queues[sid] })
           return { queued: true }
         }
+        const leaf = activeLeaf(sessionMsgs(sid), ss?.branchSel)
         const m = msg(sid, {
           role: 'user',
           content: atts?.length
@@ -1265,6 +1433,7 @@ export function createMockApi(scenario: string): ClearApi {
               ]
             : text
         })
+        m.parentId = leaf ? leaf.id : null
         messages.push(m)
         emit({ type: 'message-added', message: m })
         return { queued: false }
@@ -1281,7 +1450,48 @@ export function createMockApi(scenario: string): ClearApi {
         // Parar com o card de falha de conexão aberto = Cancelar
         for (const r of retries.filter((x) => x.sessionId === sid)) resolveRetryMock(r.id, false)
       },
-      regenerate: async () => {},
+      // regenerar = nova versão da resposta do turno (resposta só com erros → substitui)
+      regenerate: async (sid, messageId) => {
+        const s = sessions.find((x) => x.id === sid)
+        if (!s) throw new Error('Sessão não encontrada.')
+        const path = activePath(sessionMsgs(sid), s.branchSel)
+        const anchor = messageId ? turnAnchor(path, messageId) : lastTurnAnchor(path)
+        if (!anchor) throw new Error('Nada para regenerar.')
+        const resp = turnResponse(path, anchor.id)
+        if (resp.length && resp.every((m) => isDisplayOnly(m.meta))) {
+          for (const r of resp) {
+            messages.splice(messages.indexOf(r), 1)
+            emit({ type: 'message-deleted', sessionId: sid, messageId: r.id })
+          }
+        } else s.branchSel = { ...(s.branchSel ?? {}), [anchor.id]: null }
+        mockReply(sid, anchor.id, '(demonstração) Nova versão da resposta.')
+      },
+      editBranch: async (mid, message) => {
+        const orig = messages.find((x) => x.id === mid)
+        const s = orig && sessions.find((x) => x.id === orig.sessionId)
+        if (!orig || !s) throw new Error('Mensagem não encontrada.')
+        const parent = buildTree(sessionMsgs(s.id)).parentOf.get(mid) ?? null
+        const m: StoredMessage = { ...msg(s.id, message), parentId: parent }
+        messages.push(m)
+        const sel = { ...(s.branchSel ?? {}) }
+        delete sel[selKey(parent)]
+        s.branchSel = sel
+        emit({ type: 'message-added', message: m })
+        mockReply(
+          s.id,
+          m.id,
+          `(demonstração) Resposta à nova versão: “${contentText(message.content).slice(0, 80)}”`
+        )
+      },
+      selectBranch: async (mid) => {
+        const target = messages.find((x) => x.id === mid)
+        const s = target && sessions.find((x) => x.id === target.sessionId)
+        if (!target || !s) throw new Error('Mensagem não encontrada.')
+        if (busyStatus(s.status)) throw new Error('Disponível quando o agente terminar.')
+        s.branchSel = selectionToReach(sessionMsgs(s.id), s.branchSel, mid)
+        emit({ type: 'session-updated', session: { ...s } })
+        return delay({ ...s }, 30)
+      },
       approve: async (rid, _decision, items) => {
         const req = approvals.find((a) => a.id === rid)
         if (req?.check && isListItem(req.check.item) && items?.length) {
@@ -1334,7 +1544,9 @@ export function createMockApi(scenario: string): ClearApi {
                 role: 'system',
                 content: [{ type: 'text', text: sys, cache_control: { type: 'ephemeral' } }]
               },
-              ...messages.filter((m) => m.sessionId === sid).map((m) => m.message)
+              ...activePath(sessionMsgs(sid), s.branchSel)
+                .filter((m) => !isDisplayOnly(m.meta))
+                .map((m) => m.message)
             ],
             stream: true,
             stream_options: { include_usage: true },

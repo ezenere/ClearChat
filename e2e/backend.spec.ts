@@ -25,6 +25,7 @@ import {
 import { execSync } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { activePath } from '../src/shared/branches.ts'
 
 const KEY = process.env.OPENROUTER_API_KEY
 if (!KEY) {
@@ -162,7 +163,21 @@ function addCost(msgs: any[]): void {
   for (const m of msgs) if (m.meta?.usage?.cost) totalCost += m.meta.usage.cost
 }
 
+/** Caminho ativo da sessão (o que o agente vê); `sessions.messages` traz TODAS as versões. */
 async function messages(sessionId: string): Promise<any[]> {
+  const all = await allMessages(sessionId)
+  const sel = await page.evaluate(async (sid) => {
+    const w = (window as any).api
+    for (const c of await w.chats.list()) {
+      const s = (await w.sessions.list(c.id)).find((x: any) => x.id === sid)
+      if (s) return s.branchSel ?? {}
+    }
+    return {}
+  }, sessionId)
+  return activePath(all, sel)
+}
+
+async function allMessages(sessionId: string): Promise<any[]> {
   return api<any[]>('sessions.messages', sessionId)
 }
 
@@ -673,8 +688,9 @@ async function main(): Promise<void> {
     msgs = await messages(sid)
     assert(msgs.at(-1).meta.interrupted === true, 'parcial persistido após stop')
 
-    // regenerate
+    // regenerate = nova versão da resposta (a interrompida continua salva, como irmã)
     const lastUser = msgs.filter((m) => m.message.role === 'user').at(-1)
+    const oldPartial = msgs.at(-1)
     await api('agent.regenerate', sid)
     await waitIdle(chatId, sid)
     msgs = await messages(sid)
@@ -686,6 +702,11 @@ async function main(): Promise<void> {
         msgs.at(-1).message.role === 'assistant' &&
         !msgs.at(-1).meta.interrupted,
       'regenerado'
+    )
+    const kept = (await allMessages(sid)).find((m) => m.id === oldPartial.id)
+    assert(
+      kept && kept.parentId === lastUser.id && msgs.at(-1).parentId === lastUser.id,
+      'versão antiga mantida (irmã da nova)'
     )
     await api('chats.update', chatId, { config: { params: prevParams } })
   })
@@ -770,17 +791,26 @@ async function main(): Promise<void> {
         JSON.stringify(pr.body.messages[1].content).includes(child.task.slice(0, 40)),
       'task é a 1ª mensagem user da request do subagente'
     )
-    // regenerate apaga a subsessão órfã (evento session-deleted)
+    // regenerate = nova versão: a subsessão da versão antiga continua salva (não é apagada) e o
+    // delegate antigo sai do caminho ativo (mas não do banco)
     await clearEvents()
     await api('agent.regenerate', sid)
     await waitIdle(chatId, sid, 180_000)
     const after = await api<any[]>('sessions.list', chatId)
-    assert(!after.some((s) => s.id === child.id), 'subsessão órfã apagada no regenerate')
     assert(
-      (await events()).some((e) => e.type === 'session-deleted' && e.sessionId === child.id),
-      'evento session-deleted'
+      after.some((s) => s.id === child.id),
+      'subsessão da versão antiga mantida'
     )
-    assert((await messages(child.id)).length === 0, 'mensagens da subsessão apagadas')
+    assert(
+      !(await events()).some((e) => e.type === 'session-deleted' && e.sessionId === child.id),
+      'nada apagado'
+    )
+    assert((await messages(child.id)).length > 0, 'mensagens da subsessão mantidas')
+    assert(
+      !(await messages(sid)).some((m) => m.id === lastDelegate.id) &&
+        (await allMessages(sid)).some((m) => m.id === lastDelegate.id),
+      'delegate antigo fora do caminho ativo, mas salvo'
+    )
     // apagar a mensagem assistant com o tool_call do delegate também apaga a subsessão
     // (depois apaga a msg tool órfã, para manter o histórico pareado para os próximos testes)
     const m3 = await messages(sid)
@@ -1684,7 +1714,8 @@ async function main(): Promise<void> {
       ])
     )
     assert(/não encontrado no disco/.test(fake), `fake: ${fake}`)
-    // edição via messages.update mantém o part do anexo (provider inexistente: o modelo não roda)
+    // edição (nova versão via agent.editBranch) mantém o part do anexo (provider inexistente: o
+    // modelo não roda); messages.update recusa mensagem digitada da principal
     const img = await api('attachments.add', {
       name: 'unico.png',
       data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10, 9, 8, 7, 6, 5])
@@ -1698,10 +1729,15 @@ async function main(): Promise<void> {
       ...u.message,
       content: [u.message.content[0], { type: 'text', text: 'texto editado' }]
     }
-    const up = await api('messages.update', u.id, edited)
+    const refused = await err(() => api('messages.update', u.id, edited))
+    assert(/nova versão/.test(refused), `messages.update recusado: ${refused}`)
+    await api('agent.editBranch', u.id, { role: 'user', content: 'texto editado' })
+    await waitIdle(chat.id, se)
+    const up = (await messages(se)).find((m) => m.message.role === 'user')
     assert(
-      up.message.content[0]._attachment?.name === 'unico.png' &&
-        up.message.content[1].text === 'texto editado',
+      up.id !== u.id &&
+        up.message.content[0]._attachment?.name === 'unico.png' &&
+        up.message.content.at(-1).text === 'texto editado',
       'edição preserva anexo'
     )
     await api('chats.update', chat.id, { config: { providerId } })

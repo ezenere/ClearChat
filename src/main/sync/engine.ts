@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { AgentEvent, ApiMessage, MessageMeta, Session, StoredMessage } from '@shared/types'
+import type { AgentEvent, MessageMeta, Session, StoredMessage } from '@shared/types'
 import {
   OFFICIAL_SYNC_URL,
   type ChatHostInfo,
@@ -26,6 +26,8 @@ import {
   type TakeoverOptions
 } from '@shared/sync'
 import { ATTACHMENT_FILE_RE } from '@shared/attachments'
+import { ROOT_KEY, type BranchSel } from '@shared/branches'
+import { compareVersions, parseVersion } from '@shared/updates'
 import {
   aadRecord,
   aadWrap,
@@ -70,6 +72,7 @@ import { ensureSyncSchema, setTracking, wipeSyncState, withApply } from './schem
 import {
   applyRemote,
   attachmentFiles,
+  branchSelFromColumn,
   buildLocal,
   canonical,
   deleteLocal,
@@ -79,9 +82,14 @@ import {
   isRecordType,
   listLocalIds,
   merge3,
+  messageFromPlain,
   normalizeNegativeSeqs,
+  parentIdFromColumn,
+  parentIdToColumn,
   rowMessage,
   sameJson,
+  sameRecordPlain,
+  sessionFromPlain,
   type ApplyResult,
   type LocalRecord,
   type Plain,
@@ -235,6 +243,57 @@ const CONTENT_ORDER = (a: PushItem, b: PushItem): number => {
   return rank(a) - rank(b)
 }
 
+/** branchSel com os ids de mensagem trocados (cópia de chat); entradas de fora da cópia saem. */
+function remapBranchSel(sel: BranchSel, msgMap: Map<string, string>): BranchSel {
+  const out: BranchSel = {}
+  for (const [k, v] of Object.entries(sel)) {
+    const nk = k === ROOT_KEY ? k : msgMap.get(k)
+    if (!nk) continue
+    if (v === null) out[nk] = null
+    else {
+      const nv = msgMap.get(v)
+      if (nv) out[nk] = nv
+    }
+  }
+  return out
+}
+
+/** meta_json com `subSessionId` (delegate_task) apontando para a sessão copiada. */
+function remapSubSession(metaJson: string, idMap: Map<string, string>): string {
+  try {
+    const meta = JSON.parse(metaJson) as MessageMeta
+    const sub = meta?.subSessionId ? idMap.get(meta.subSessionId) : undefined
+    return sub ? JSON.stringify({ ...meta, subSessionId: sub }) : metaJson
+  } catch {
+    return metaJson
+  }
+}
+
+/** Primeira versão do app que conhece versões de mensagens (ramos) — protocolo 1.2.0. */
+export const BRANCHING_MIN_VERSION = '0.7.0'
+
+/**
+ * Aparelhos que podem hospedar chats (desktop com can_host, fora este) numa versão do app anterior
+ * aos ramos (§4.3.8: como host, o regenerar antigo apaga as outras versões). Versão ilegível não
+ * conta (sem falso alarme).
+ */
+export function outdatedHosts(devices: SyncDevice[]): { name: string; appVersion: string }[] {
+  return devices
+    .filter(
+      (d) =>
+        !d.current &&
+        d.canHost &&
+        d.client === 'desktop' &&
+        parseVersion(d.appVersion) !== null &&
+        compareVersions(d.appVersion, BRANCHING_MIN_VERSION) < 0
+    )
+    .map((d) => ({ name: d.name, appVersion: d.appVersion }))
+}
+
+/** Releitura da lista de aparelhos (aviso de host desatualizado): no máx. 1×/min; periódica a cada 15 min. */
+const DEVICES_MIN_MS = 60_000
+const DEVICES_EVERY_MS = 15 * 60_000
+
 const MAX_ITEMS = 500
 const MAX_BATCH_BYTES = 6 * 1024 * 1024
 
@@ -267,6 +326,9 @@ export class SyncEngine {
   private started = false
   private destroyed = false
   private skillsBusy: Promise<void> | null = null
+  private outdated: { name: string; appVersion: string }[] = []
+  private devicesAt = 0
+  private devicesTimer: ReturnType<typeof setInterval> | null = null
 
   readonly deps: SyncDeps
 
@@ -430,7 +492,8 @@ export class SyncEngine {
       remember: this.kv('remember') !== '0',
       merge: phase === 'merge' ? this.mergeInfo : null,
       prompts: [...this.prompts],
-      protocolError: this.protocolError
+      protocolError: this.protocolError,
+      outdatedHosts: phase === 'signed-out' ? [] : this.outdated.map((d) => ({ ...d }))
     }
   }
 
@@ -484,6 +547,7 @@ export class SyncEngine {
     this.ws.start()
     const poll = this.deps.timing?.pollMs ?? 400
     this.pollTimer = setInterval(() => this.pollDirty(), poll)
+    this.devicesTimer = setInterval(() => void this.refreshDevices(), DEVICES_EVERY_MS)
     this.scheduleCycle(0)
     this.emitStatus()
   }
@@ -494,7 +558,8 @@ export class SyncEngine {
     if (this.pollTimer) clearInterval(this.pollTimer)
     if (this.pushTimer) clearTimeout(this.pushTimer)
     if (this.retryTimer) clearTimeout(this.retryTimer)
-    this.pollTimer = this.pushTimer = this.retryTimer = null
+    if (this.devicesTimer) clearInterval(this.devicesTimer)
+    this.pollTimer = this.pushTimer = this.retryTimer = this.devicesTimer = null
     this.ws.stop()
     this.host.stop()
   }
@@ -780,6 +845,8 @@ export class SyncEngine {
     this.mergeInfo = null
     this.mergeSnapshot = null
     this.prompts = []
+    this.outdated = []
+    this.devicesAt = 0
     this.emitStatus()
     this.emit({ type: 'sync-data-changed', scopes: ['chats'] })
   }
@@ -859,7 +926,7 @@ export class SyncEngine {
 
   async devices(): Promise<SyncDevice[]> {
     const list = await this.http.get<Record<string, unknown>[]>('/api/v1/devices')
-    return (Array.isArray(list) ? list : []).map((d) => ({
+    const out: SyncDevice[] = (Array.isArray(list) ? list : []).map((d) => ({
       id: String(d.id),
       name: String(d.name ?? ''),
       platform: String(d.platform ?? ''),
@@ -872,6 +939,24 @@ export class SyncEngine {
       online: !!d.online,
       current: !!d.current || d.id === this.deviceId
     }))
+    this.devicesAt = Date.now()
+    const outdated = outdatedHosts(out)
+    if (!sameJson(outdated, this.outdated)) {
+      this.outdated = outdated
+      this.emitStatus()
+    }
+    return out
+  }
+
+  /** Relê a lista de aparelhos para o aviso de host desatualizado (falha = tenta na próxima). */
+  private async refreshDevices(): Promise<void> {
+    if (this.phase() !== 'ready' || Date.now() - this.devicesAt < DEVICES_MIN_MS) return
+    this.devicesAt = Date.now()
+    try {
+      await this.devices()
+    } catch (e) {
+      this.log('lista de aparelhos falhou', errMsg(e))
+    }
   }
 
   async renameDevice(id: string, name: string): Promise<void> {
@@ -1458,11 +1543,16 @@ export class SyncEngine {
     return this.status()
   }
 
-  /** Cópia local de um chat com ids novos (enviada como chat novo pelos triggers). */
+  /**
+   * Cópia local de um chat com ids novos (enviada como chat novo pelos triggers). A árvore de
+   * mensagens é remapeada (parent_id, chaves/valores de branch_sel_json), assim como o
+   * `meta.subSessionId` das mensagens de delegate_task; parent_id NULL (legado) continua NULL.
+   */
   private copyChatAsNew(chatId: string): string {
     const db = this.conn
     const newChat = randomUUID()
     const idMap = new Map<string, string>()
+    const msgMap = new Map<string, string>()
     db.transaction(() => {
       const c = db.prepare('SELECT * FROM chats WHERE id = ?').get(chatId) as Record<
         string,
@@ -1473,6 +1563,14 @@ export class SyncEngine {
         .prepare('SELECT * FROM sessions WHERE chat_id = ? ORDER BY depth, created_at')
         .all(chatId) as Record<string, unknown>[]
       for (const s of sessions) idMap.set(String(s.id), randomUUID())
+      const msgsBySession = new Map<string, Record<string, unknown>[]>()
+      for (const s of sessions) {
+        const msgs = db
+          .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY seq')
+          .all(s.id) as Record<string, unknown>[]
+        msgsBySession.set(String(s.id), msgs)
+        for (const m of msgs) msgMap.set(String(m.id), randomUUID())
+      }
       db.prepare(
         'INSERT INTO chats (id, title, config_json, main_session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
       ).run(
@@ -1485,8 +1583,8 @@ export class SyncEngine {
       )
       for (const s of sessions) {
         db.prepare(
-          `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task, status, created_at, memory_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          `INSERT INTO sessions (id, chat_id, parent_session_id, parent_tool_call_id, depth, model, provider_id, title, task, status, created_at, memory_json, branch_sel_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).run(
           idMap.get(String(s.id)),
           newChat,
@@ -1499,23 +1597,29 @@ export class SyncEngine {
           s.task,
           s.status === 'running' ? 'interrupted' : s.status,
           s.created_at,
-          s.memory_json ?? null
+          s.memory_json ?? null,
+          JSON.stringify(remapBranchSel(branchSelFromColumn(s.branch_sel_json as string), msgMap))
         )
-        const msgs = db.prepare('SELECT * FROM messages WHERE session_id = ?').all(s.id) as Record<
-          string,
-          unknown
-        >[]
-        for (const m of msgs)
+        for (const m of msgsBySession.get(String(s.id)) ?? []) {
+          // mãe: '' (raiz) fica ''; NULL (legado) fica NULL; id de fora da cópia → NULL (derivar)
+          const parent = parentIdFromColumn(m.parent_id as string | null)
+          const meta = m.meta_json as string
           db.prepare(
-            'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+            'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)'
           ).run(
-            randomUUID(),
+            msgMap.get(String(m.id)),
             idMap.get(String(s.id)),
             m.seq,
             m.message_json,
-            m.meta_json,
-            m.created_at
+            remapSubSession(meta, idMap),
+            m.created_at,
+            parent === undefined
+              ? null
+              : parent === null
+                ? parentIdToColumn(null)
+                : (msgMap.get(parent) ?? null)
           )
+        }
       }
     })()
     return newChat
@@ -1679,7 +1783,7 @@ export class SyncEngine {
       } else {
         const base = rec && !rec.deleted ? this.basePlain(rec) : null
         plain = base ? { ...base, ...local.plain } : local.plain
-        if (base && sameJson(plain, base) && rec!.scope === local.scope) {
+        if (base && sameRecordPlain(this.conn, d.type, plain, base) && rec!.scope === local.scope) {
           drop(d.type, d.id, d.mark)
           continue
         }
@@ -2128,7 +2232,12 @@ export class SyncEngine {
         if (!r.plain) continue
         const rec = this.record(r.change.type, r.change.id)
         const local = buildLocal(this.conn, r.change.type, r.change.id)
-        if (!rec || rec.rev !== r.change.rev || !local || !sameJson({ ...local.plain }, r.plain))
+        if (
+          !rec ||
+          rec.rev !== r.change.rev ||
+          !local ||
+          !sameRecordPlain(this.conn, r.change.type, { ...local.plain }, r.plain)
+        )
           this.mergeResult(acc, this.applyPlain(r.change.type, r.change.id, r.plain))
         this.putRecord({
           type: r.change.type,
@@ -2159,32 +2268,12 @@ export class SyncEngine {
     const ver: DivergenceVersion = { sessions: [], messages: {} }
     for (const r of online) {
       if (!r.plain) continue
-      if (r.change.type === 'session') {
-        const p = r.plain
-        ver.sessions.push({
-          id: r.change.id,
-          chatId,
-          parentSessionId: (p.parentSessionId as string) ?? null,
-          parentToolCallId: (p.parentToolCallId as string) ?? null,
-          depth: Number(p.depth ?? 0) as 0 | 1 | 2,
-          model: String(p.model ?? ''),
-          providerId: (p.providerId as string) ?? null,
-          title: String(p.title ?? ''),
-          task: (p.task as string) ?? null,
-          status: 'idle',
-          createdAt: Number(p.createdAt ?? 0)
-        })
-      } else {
-        const p = r.plain
-        const sid = String(p.sessionId)
-        ;(ver.messages[sid] ??= []).push({
-          id: r.change.id,
-          sessionId: sid,
-          seq: Number(p.seq ?? 0),
-          message: p.message as ApiMessage,
-          meta: (p.meta ?? {}) as MessageMeta,
-          createdAt: Number(p.createdAt ?? 0)
-        })
+      // com parentId/branchSel: o visualizador mostra o caminho ativo de cada versão
+      if (r.change.type === 'session')
+        ver.sessions.push({ ...sessionFromPlain(r.change.id, r.plain, chatId), status: 'idle' })
+      else {
+        const m = messageFromPlain(r.change.id, r.plain)
+        ;(ver.messages[m.sessionId] ??= []).push(m)
       }
     }
     for (const list of Object.values(ver.messages)) list.sort((a, b) => a.seq - b.seq)
@@ -2198,20 +2287,7 @@ export class SyncEngine {
       for (const s of sess) {
         const row = buildLocal(this.conn, 'session', s.id)
         if (!row) continue
-        const p = row.plain
-        local.sessions.push({
-          id: s.id,
-          chatId,
-          parentSessionId: (p.parentSessionId as string) ?? null,
-          parentToolCallId: (p.parentToolCallId as string) ?? null,
-          depth: Number(p.depth ?? 0) as 0 | 1 | 2,
-          model: String(p.model ?? ''),
-          providerId: (p.providerId as string) ?? null,
-          title: String(p.title ?? ''),
-          task: (p.task as string) ?? null,
-          status: 'idle',
-          createdAt: Number(p.createdAt ?? 0)
-        })
+        local.sessions.push({ ...sessionFromPlain(s.id, row.plain, chatId), status: 'idle' })
         const msgs = this.conn
           .prepare('SELECT id FROM messages WHERE session_id = ? ORDER BY seq')
           .all(s.id) as { id: string }[]
@@ -2266,7 +2342,7 @@ export class SyncEngine {
         : this.record(type, id)?.deleted
           ? this.record(type, id)!.rev
           : 0
-      if (plain && o?.plain && sameJson(plain, o.plain)) return
+      if (plain && o?.plain && sameRecordPlain(this.conn, type, plain, o.plain)) return
       if (!plain && !o) return
       const rev = baseRev + 1
       const item: PushItem = plain
@@ -2542,7 +2618,7 @@ export class SyncEngine {
         if (r.change.type === 'session') delete x.status
         return x
       }
-      if (!sameJson(strip(l.plain), strip(r.plain))) return false
+      if (!sameRecordPlain(this.conn, r.change.type, strip(l.plain), strip(r.plain))) return false
     }
     return true
   }
@@ -2682,7 +2758,8 @@ export class SyncEngine {
             this.markDirty(type, id, l?.scope ?? null)
           } else if (!rec.deleted && priority === 'local') {
             const l = buildLocal(this.conn, type, id, this.chatExtra(type, id))
-            if (l && !sameJson({ ...(this.basePlain(rec) ?? {}), ...l.plain }, this.basePlain(rec)))
+            const base = this.basePlain(rec)
+            if (l && !sameRecordPlain(this.conn, type, { ...(base ?? {}), ...l.plain }, base))
               this.markDirty(type, id, l.scope)
           }
         }
@@ -3309,6 +3386,7 @@ export class SyncEngine {
       void this.refreshKeys().catch(() => undefined)
     this.host.onWelcome(w)
     if (typeof w.state_cursor === 'number') this.setKv('state_cursor', w.state_cursor)
+    void this.refreshDevices()
     this.scheduleCycle(0)
     this.emitStatus()
   }
@@ -3367,21 +3445,7 @@ export class SyncEngine {
     const out: Session[] = []
     for (const { id } of ids) {
       const l = buildLocal(this.conn, 'session', id)
-      if (!l) continue
-      const p = l.plain
-      out.push({
-        id,
-        chatId,
-        parentSessionId: (p.parentSessionId as string) ?? null,
-        parentToolCallId: (p.parentToolCallId as string) ?? null,
-        depth: Number(p.depth ?? 0) as 0 | 1 | 2,
-        model: String(p.model ?? ''),
-        providerId: (p.providerId as string) ?? null,
-        title: String(p.title ?? ''),
-        task: (p.task as string) ?? null,
-        status: String(p.status ?? 'idle') as Session['status'],
-        createdAt: Number(p.createdAt ?? 0)
-      })
+      if (l) out.push(sessionFromPlain(id, l.plain, chatId))
     }
     return out
   }

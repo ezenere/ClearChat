@@ -23,7 +23,12 @@ import { RetryForm } from './RetryCard'
 import { PendingBar } from './PendingBar'
 import { SkillChip, SkillPickerButton } from '../skills/SkillPicker'
 import { skillsConfigOf } from '../../lib/skills'
-import { HostComposerLine, HostOfflineCard, RemoteHint } from '../sync/ChatHost'
+import {
+  HostComposerLine,
+  HostOfflineCard,
+  OutdatedHostsBanner,
+  RemoteHint
+} from '../sync/ChatHost'
 import { useHostInfo } from '../sync/hooks'
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
@@ -215,6 +220,7 @@ export function Composer({
             </div>
           )}
           {chat && <HostComposerLine chat={chat} sessionId={session.id} />}
+          {chat && session.depth === 0 && <OutdatedHostsBanner />}
           <PendingBar session={session} blocked={blocked} />
           {hostOffline && chat ? (
             <HostOfflineCard chat={chat} />

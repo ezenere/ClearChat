@@ -29,6 +29,7 @@ import {
   syncHandlers
 } from './sync'
 import { emit } from './events'
+import { isBranchEditable, pruneSel, selectionToReach } from '@shared/branches'
 import {
   chatsRepo,
   messagesRepo,
@@ -166,6 +167,13 @@ export function registerIpc(): void {
     // ---- messages ----
     [IPC.messages.update]: (id: string, message: ApiMessage) => {
       const msg = validateMessage(message)
+      // mensagem digitada da principal: editar = nova versão (agent.editBranch), nunca no lugar
+      const cur = messagesRepo.get(id)
+      const owner = cur && sessionsRepo.get(cur.sessionId)
+      if (cur && owner && isBranchEditable(cur, owner.depth))
+        throw new Error(
+          'Mensagens suas na conversa principal não são editadas no lugar: a edição vira uma nova versão (use “Editar” na mensagem).'
+        )
       const local = (): ReturnType<typeof messagesRepo.update> => {
         const m = messagesRepo.update(id, msg)
         emit({ type: 'message-updated', message: m })
@@ -214,9 +222,41 @@ export function registerIpc(): void {
       gateChat(chatOfSession(sessionId), 'stop', { sessionId }, () => runner.stop(sessionId), {
         content: false
       }),
-    [IPC.agent.regenerate]: (sessionId: string) =>
-      gateChat(chatOfSession(sessionId), 'regenerate', { sessionId }, () =>
-        runner.regenerate(sessionId)
+    [IPC.agent.regenerate]: (sessionId: string, messageId?: string) =>
+      gateChat(
+        chatOfSession(sessionId),
+        'branch.regenerate',
+        { sessionId, ...(messageId ? { messageId } : {}) },
+        () => runner.regenerate(sessionId, messageId || undefined),
+        { purpose: 'run' }
+      ),
+    [IPC.agent.editBranch]: (messageId: string, message: ApiMessage) => {
+      const msg = validateMessage(message)
+      return gateChat(
+        chatOfMessage(messageId),
+        'branch.edit',
+        { messageId, message: msg },
+        () => runner.editBranch(messageId, msg),
+        { purpose: 'run' }
+      )
+    },
+    [IPC.agent.selectBranch]: (messageId: string) =>
+      gateChat(
+        chatOfMessage(messageId),
+        'branch.select',
+        { messageId },
+        () => runner.selectBranch(messageId),
+        {
+          purpose: 'edit',
+          // controle remoto: quem grava é o host; devolve a seleção esperada (o sync traz a real)
+          remote: () => {
+            const m = messagesRepo.get(messageId)
+            const s = m && sessionsRepo.get(m.sessionId)
+            if (!m || !s) throw new Error('Mensagem não encontrada.')
+            const all = messagesRepo.listAll(s.id)
+            return { ...s, branchSel: pruneSel(all, selectionToReach(all, s.branchSel, m.id)) }
+          }
+        }
       ),
     [IPC.agent.approve]: (
       requestId: string,

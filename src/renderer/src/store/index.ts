@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type {
   AgentEvent,
+  ApiMessage,
   ApprovalRequest,
   ApprovalSettings,
   AttachmentInfo,
@@ -28,6 +29,7 @@ import { setToolShellInfo } from '@shared/shellInfo'
 import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
 import { trackFailure, type SubFailure } from '../lib/subFailures'
 import type { UpdateStatus } from '@shared/updates'
+import { buildTree, selectionToReach, selEquals } from '@shared/branches'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -190,6 +192,8 @@ interface State {
   >
   /** Versão instalada + última checagem de atualização (null = ainda não carregado). */
   update: UpdateStatus | null
+  /** Aviso "Atualize <dispositivo> para usar versões de mensagens" dispensado (só nesta execução). */
+  outdatedHostsDismissed: boolean
 }
 
 interface Actions {
@@ -273,6 +277,22 @@ interface Actions {
   /** Recarrega domínios alterados por mudanças remotas. */
   reloadScopes(scopes: SyncScope[]): Promise<void>
   dismissChatNotice(chatId: string): void
+  /**
+   * Edita uma mensagem digitada como NOVA VERSÃO (ramo irmão; a atual continua salva) e roda o
+   * agente. false = falhou (toast).
+   */
+  editBranch(sessionId: string, messageId: string, message: ApiMessage): Promise<boolean>
+  /**
+   * Regenera, como nova versão, a resposta do turno que contém `messageId` (padrão: o último).
+   * Resposta só com erros → substitui (decisão do runner).
+   */
+  regenerate(sessionId: string, messageId?: string): Promise<void>
+  /**
+   * Troca a versão ativa para a que passa por `messageId` (otimista; volta se o main recusar —
+   * sessão ocupada ou subagente em segundo plano abaixo da bifurcação). false = recusado.
+   */
+  selectBranch(sessionId: string, messageId: string): Promise<boolean>
+  dismissOutdatedHosts(): void
 }
 
 export type Store = State & Actions
@@ -368,6 +388,7 @@ export const useStore = create<Store>()((set, get) => ({
   remoteSending: {},
   chatNotices: {},
   update: null,
+  outdatedHostsDismissed: false,
 
   async refreshSync() {
     try {
@@ -442,6 +463,71 @@ export const useStore = create<Store>()((set, get) => ({
 
   dismissChatNotice(chatId) {
     set((s) => ({ chatNotices: { ...s.chatNotices, [chatId]: undefined } }))
+  },
+
+  dismissOutdatedHosts() {
+    set({ outdatedHostsDismissed: true })
+  },
+
+  async editBranch(sessionId, messageId, message) {
+    const session = get().sessions[sessionId]
+    if (session) await get().flushConfig(session.chatId)
+    const remote = !!session && get().chatHosts[session.chatId]?.mode === 'remote'
+    set((s) => ({
+      errors: { ...s.errors, [sessionId]: undefined },
+      ...(remote
+        ? {
+            remoteSending: {
+              ...s.remoteSending,
+              [sessionId]: contentText(message.content ?? '') || '…'
+            }
+          }
+        : {})
+    }))
+    const ok = await get()
+      .run(async () => {
+        await api.agent.editBranch(messageId, message)
+        return true
+      }, 'Erro ao enviar a nova versão')
+      .finally(() => {
+        if (remote) set((s) => ({ remoteSending: { ...s.remoteSending, [sessionId]: undefined } }))
+      })
+    return !!ok
+  },
+
+  async regenerate(sessionId, messageId) {
+    const session = get().sessions[sessionId]
+    if (session) await get().flushConfig(session.chatId)
+    set((s) => ({ errors: { ...s.errors, [sessionId]: undefined } }))
+    await get().run(() => api.agent.regenerate(sessionId, messageId), 'Erro ao regenerar')
+  },
+
+  async selectBranch(sessionId, messageId) {
+    const before = get().sessions[sessionId]
+    const msgs = get().messages[sessionId]
+    // otimista: o caminho troca já (a confirmação chega como session-updated / retorno)
+    const optimistic =
+      before && msgs ? selectionToReach(buildTree(msgs), before.branchSel, messageId) : null
+    if (before && optimistic)
+      set((s) => ({
+        sessions: { ...s.sessions, [sessionId]: { ...before, branchSel: optimistic } }
+      }))
+    try {
+      const updated = await api.agent.selectBranch(messageId)
+      if (updated?.id) set((s) => ({ sessions: { ...s.sessions, [updated.id]: updated } }))
+      return true
+    } catch (err) {
+      // desfaz só se nada mais mudou a seleção nesse meio-tempo
+      if (before && optimistic)
+        set((s) => {
+          const cur = s.sessions[sessionId]
+          return cur && selEquals(cur.branchSel, optimistic)
+            ? { sessions: { ...s.sessions, [sessionId]: { ...cur, branchSel: before.branchSel } } }
+            : {}
+        })
+      get().toast(`Não foi possível trocar de versão: ${errorMessage(err)}`, 'error')
+      return false
+    }
   },
 
   async run(fn, label) {

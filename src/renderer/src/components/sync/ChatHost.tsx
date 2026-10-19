@@ -16,8 +16,9 @@ import {
   Zap
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import type { Chat, StoredMessage } from '@shared/types'
+import type { Chat } from '@shared/types'
 import type { DivergenceDetails, DivergenceVersion } from '@shared/sync'
+import { selectionToReach, type BranchSel } from '@shared/branches'
 import { api, errorMessage } from '../../lib/api'
 import { cn, messageText, relativeTime } from '../../lib/format'
 import { useStore } from '../../store'
@@ -27,6 +28,9 @@ import { Tip } from '../ui/Tooltip'
 import { Markdown } from '../chat/Markdown'
 import { connectionLabel } from '../../lib/sync'
 import { useHostInfo, useTakeover, deviceName } from './hooks'
+import { useBranchView } from '../../lib/useBranchView'
+import { branchGroup } from '../../lib/branchView'
+import { BranchSwitcher } from '../chat/BranchSwitcher'
 
 // ---------------- selo no cabeçalho ----------------
 
@@ -309,6 +313,41 @@ export function HostComposerLine({
   )
 }
 
+/**
+ * Aviso acima do composer: um dispositivo desta conta que pode ser host ainda está numa versão sem
+ * versões de mensagens (< 0.7) — se ele executar um chat com versões, pode embaralhá-las.
+ * Dispensável (volta na próxima vez que o app abrir).
+ */
+export function OutdatedHostsBanner(): React.JSX.Element | null {
+  const hosts = useStore((s) => s.sync?.outdatedHosts)
+  const dismissed = useStore((s) => s.outdatedHostsDismissed)
+  const dismiss = useStore((s) => s.dismissOutdatedHosts)
+  if (!hosts?.length || dismissed) return null
+  const names = hosts.map((h) => `${h.name} (${h.appVersion})`)
+  const list =
+    names.length > 1 ? `${names.slice(0, -1).join(', ')} e ${names[names.length - 1]}` : names[0]
+  return (
+    <div
+      data-testid="outdated-hosts"
+      data-stack-extra
+      className="mb-2 flex items-center gap-2 rounded-lg border border-warning/25 bg-warning/[0.06] px-2.5 py-1.5 text-[12px] text-warning"
+    >
+      <TriangleAlert className="size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1">
+        Atualize {list} para usar versões de mensagens com segurança
+      </span>
+      <button
+        type="button"
+        onClick={dismiss}
+        className="opacity-70 hover:opacity-100"
+        aria-label="Dispensar"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  )
+}
+
 /** Rodapé do composer no controle remoto. */
 export function RemoteHint({ chat }: { chat: Chat }): React.JSX.Element | null {
   const info = useHostInfo(chat.id)
@@ -327,6 +366,8 @@ export function RemoteHint({ chat }: { chat: Chat }): React.JSX.Element | null {
 
 // ---------------- divergência ----------------
 
+const EMPTY_MSGS: DivergenceVersion['messages'][string] = []
+
 function VersionView({
   ver,
   mainSessionId
@@ -336,12 +377,25 @@ function VersionView({
 }): React.JSX.Element {
   const main =
     ver.sessions.find((s) => s.id === mainSessionId) ?? ver.sessions.find((s) => s.depth === 0)
-  const msgs: StoredMessage[] = main ? (ver.messages[main.id] ?? []) : []
+  const all = main ? (ver.messages[main.id] ?? EMPTY_MSGS) : EMPTY_MSGS
+  // versões: começa na seleção da versão; ‹ › troca só nesta tela (nada é gravado)
+  const [sel, setSel] = useState<BranchSel | null>(null)
+  const { tree, path: msgs, siblings } = useBranchView(main, all, sel)
   const subs = ver.sessions.filter((s) => s.depth > 0).length
   return (
     <div className="space-y-3">
       {msgs.length === 0 && <p className="text-[12.5px] text-subtle">Sem mensagens.</p>}
       {msgs.map((m) => {
+        const info = siblings.get(m.id)
+        const switcher = info ? (
+          <BranchSwitcher
+            info={info}
+            group={branchGroup(tree, m.id)}
+            local
+            onSelect={(id) => setSel(selectionToReach(tree, sel ?? main?.branchSel, id))}
+            className={m.message.role === 'user' ? 'self-end' : 'self-start'}
+          />
+        ) : null
         const text = messageText(m.message.content as never)
         const calls = m.message.role === 'assistant' ? (m.message.tool_calls ?? []) : []
         if (m.message.role === 'tool')
@@ -357,7 +411,7 @@ function VersionView({
         return (
           <div
             key={m.id}
-            className={cn('flex', m.message.role === 'user' ? 'justify-end' : 'justify-start')}
+            className={cn('flex flex-col', m.message.role === 'user' ? 'items-end' : 'items-start')}
           >
             <div
               className={cn(
@@ -382,6 +436,7 @@ function VersionView({
                 {new Date(m.createdAt).toLocaleString('pt-BR')}
               </div>
             </div>
+            {switcher}
           </div>
         )
       })}
@@ -482,9 +537,9 @@ export function DivergencePanel({ chat }: { chat: Chat }): React.JSX.Element {
           ) : !det ? (
             <Spinner className="size-4" />
           ) : current === 'local' && det.local ? (
-            <VersionView ver={det.local} mainSessionId={chat.mainSessionId} />
+            <VersionView key="local" ver={det.local} mainSessionId={chat.mainSessionId} />
           ) : (
-            <VersionView ver={det.online} mainSessionId={chat.mainSessionId} />
+            <VersionView key="online" ver={det.online} mainSessionId={chat.mainSessionId} />
           )}
         </div>
       </div>

@@ -9,6 +9,7 @@ import {
 import { sessionProviderId } from '@shared/models'
 import type { Chat, Session } from '@shared/types'
 import { selectMessages, useStore } from '../store'
+import { useBranchView } from './useBranchView'
 
 export interface ContextInfo {
   usage: ContextUsage | null
@@ -20,9 +21,13 @@ export interface ContextInfo {
   canCompact: boolean
 }
 
-/** Uso de contexto da sessão: última usage (ou estimativa pós-compactação) ÷ janela. */
+/**
+ * Uso de contexto da sessão: última usage (ou estimativa pós-compactação) ÷ janela — sobre o
+ * caminho ativo (a versão que o agente vê).
+ */
 export function useContextInfo(chat: Chat, session: Session): ContextInfo {
-  const messages = useStore(selectMessages(session.id))
+  const all = useStore(selectMessages(session.id))
+  const messages = useBranchView(session, all).path
   const providerId = sessionProviderId(chat.config, session)
   const models = useStore((s) => s.models[providerId]?.list)
   const loadModels = useStore((s) => s.loadModels)

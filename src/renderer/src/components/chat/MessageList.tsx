@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { splitInterChatText } from '@shared/interChat'
 import { isContextLengthError, isDisplayOnly, latestBoundaryIndex } from '@shared/context'
+import { isBranchEditable, selectionToReach, selEquals, type BranchSel } from '@shared/branches'
 import { messageAttachments, messageSkills } from '@shared/attachments'
 import {
   Fragment,
@@ -39,6 +40,7 @@ import {
   formatCost,
   formatDuration,
   formatTokens,
+  isMac,
   messageText,
   withText
 } from '../../lib/format'
@@ -69,6 +71,15 @@ import {
   formatTime,
   msUntilNextDay
 } from '../../lib/dates'
+import { useBranchView } from '../../lib/useBranchView'
+import {
+  branchGroup,
+  regenerateTargets,
+  subagentsBelow,
+  trailingErrorId
+} from '../../lib/branchView'
+import { useHostInfo } from '../sync/hooks'
+import { BranchSwitcher } from './BranchSwitcher'
 
 // ---------- Bits ----------
 
@@ -391,13 +402,30 @@ function MessageActions({
 function InlineEditor({
   initial,
   onCancel,
-  onSave
+  onSave,
+  mode = 'replace',
+  allowEmpty,
+  hints
 }: {
   initial: string
   onCancel: () => void
   onSave: (text: string) => void
+  /**
+   * 'replace' = edita o histórico salvo no lugar (não reenvia nada). 'branch' = envia como NOVA
+   * VERSÃO da mensagem (a atual continua salva) e o agente responde.
+   */
+  mode?: 'replace' | 'branch'
+  /** Modo 'branch': texto vazio pode ser enviado (a mensagem tem anexos). */
+  allowEmpty?: boolean
+  /** Linhas extras sob o rodapé (avisos do modo 'branch'). */
+  hints?: ReactNode[]
 }): React.JSX.Element {
   const [text, setText] = useState(initial)
+  const branch = mode === 'branch'
+  const canSave = !branch || (text !== initial && (allowEmpty || text.trim() !== ''))
+  const save = (): void => {
+    if (canSave) onSave(text)
+  }
   return (
     <div className="w-full animate-fade-in">
       <AutoTextarea
@@ -411,21 +439,40 @@ function InlineEditor({
             e.stopPropagation()
             onCancel()
           }
-          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) onSave(text)
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+            e.preventDefault()
+            save()
+          }
         }}
         className="field leading-relaxed"
       />
       <div className="mt-2 flex items-center justify-end gap-2">
-        <span className="mr-auto text-[11px] text-subtle">
-          Edita o histórico salvo — não reenvia nada.
+        <span data-testid="editor-note" className="mr-auto text-[11px] text-subtle">
+          {branch
+            ? 'Envia como nova versão — a atual continua salva (‹ › para alternar)'
+            : 'Edita o histórico salvo — não reenvia nada.'}
         </span>
         <Button size="sm" variant="ghost" onClick={onCancel}>
           Cancelar
         </Button>
-        <Button size="sm" variant="primary" onClick={() => onSave(text)}>
-          Salvar
-        </Button>
+        <Tip
+          label={branch ? 'Enviar como nova versão' : 'Salvar'}
+          shortcut={isMac ? '⌘+Enter' : 'Ctrl+Enter'}
+        >
+          <span>
+            <Button size="sm" variant="primary" disabled={!canSave} onClick={save}>
+              {branch ? 'Enviar' : 'Salvar'}
+            </Button>
+          </span>
+        </Tip>
       </div>
+      {hints && hints.length > 0 && (
+        <div data-testid="editor-hints" className="mt-1.5 space-y-0.5 text-[11px] text-faint">
+          {hints.map((h, i) => (
+            <p key={i}>{h}</p>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -434,26 +481,39 @@ function InlineEditor({
 
 function UserMessage({
   msg,
-  canEdit
+  canEdit,
+  ctx
 }: {
   msg: StoredMessage
   canEdit: boolean
+  ctx: Ctx
 }): React.JSX.Element {
   const run = useStore((s) => s.run)
+  const editBranch = useStore((s) => s.editBranch)
   const [editing, setEditing] = useState(false)
   const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
   const hasAttachments =
     messageAttachments(msg.message).length > 0 || messageSkills(msg.message).length > 0
   const kind = msg.meta.kind
+  // mensagem digitada na principal: editar = nova versão (ramo); o resto edita no lugar
+  const branch = isBranchEditable(msg, ctx.depth)
   return (
     <div className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2">
       {editing ? (
         <InlineEditor
           initial={text}
+          mode={branch ? 'branch' : 'replace'}
+          allowEmpty={hasAttachments}
+          hints={branch ? ctx.editHints(msg) : undefined}
           onCancel={() => setEditing(false)}
           onSave={(t) => {
             setEditing(false)
-            void run(() => api.messages.update(msg.id, withText(msg.message, t)), 'Erro ao editar')
+            if (branch) void editBranch(ctx.sessionId, msg.id, withText(msg.message, t))
+            else
+              void run(
+                () => api.messages.update(msg.id, withText(msg.message, t)),
+                'Erro ao editar'
+              )
           }}
         />
       ) : (
@@ -472,7 +532,7 @@ function UserMessage({
               {text}
             </div>
           )}
-          <BubbleFooter msg={msg}>
+          <BubbleFooter msg={msg} branch={ctx.switcher(msg)}>
             <MessageActions
               msg={msg}
               canEdit={canEdit}
@@ -486,16 +546,22 @@ function UserMessage({
   )
 }
 
-/** Linha sob o balão (alinhada à direita): ações no hover + hora sempre visível. */
+/**
+ * Linha sob o balão (alinhada à direita): ‹ i/n › (sempre visível, se houver versões) + ações no
+ * hover + hora sempre visível.
+ */
 function BubbleFooter({
   msg,
+  branch,
   children
 }: {
   msg: StoredMessage
+  branch?: ReactNode
   children: ReactNode
 }): React.JSX.Element {
   return (
     <div className="-mt-0.5 flex min-h-6 items-center justify-end gap-1.5 pr-1">
+      {branch}
       {children}
       <MsgTime ts={msg.createdAt} />
     </div>
@@ -571,9 +637,11 @@ function ErrorRow({
 /** Erro HTTP/do modelo persistido (meta.kind 'error'): só exibição, nunca enviado à API. */
 function ErrorMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React.JSX.Element {
   const run = useStore((s) => s.run)
+  const regenerate = useStore((s) => s.regenerate)
   const text = msg.meta.error ?? messageText(msg.message.content ?? '')
   const canEdit = !ctx.readOnly && !ctx.busy
-  const isLast = msg.id === ctx.lastAssistantId
+  // erro que fecha o caminho: "Tentar de novo" (resposta só com erros → o runner substitui)
+  const isLast = msg.id === ctx.trailingErrorId
   const ctxError = isLast && !ctx.readOnly && !ctx.busy && isContextLengthError(text)
   return (
     <div className="group/msg py-1">
@@ -595,9 +663,7 @@ function ErrorMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React.JSX
             {isLast && (
               <ActionBtn
                 label="Tentar de novo (regenerar)"
-                onClick={() =>
-                  void run(() => api.agent.regenerate(ctx.sessionId), 'Erro ao regenerar')
-                }
+                onClick={() => void regenerate(ctx.sessionId, msg.id)}
               >
                 <RotateCcw className="size-3.5" />
               </ActionBtn>
@@ -784,10 +850,13 @@ function OriginLabel({ children }: { children: ReactNode }): React.JSX.Element {
 /** Mensagem entregue por outro chat (send_to_chat): "De: <título>" com link para o chat de origem. */
 function InterChatMessage({
   msg,
-  canEdit
+  canEdit,
+  branch
 }: {
   msg: StoredMessage
   canEdit: boolean
+  /** ‹ i/n › (versões desta mensagem), se houver. */
+  branch?: ReactNode
 }): React.JSX.Element {
   const run = useStore((s) => s.run)
   const openChat = useStore((s) => s.openChat)
@@ -835,7 +904,7 @@ function InterChatMessage({
           <div className="max-w-[85%] rounded-2xl rounded-br-md border border-accent-strong/30 bg-accent-soft/40 px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg">
             {body}
           </div>
-          <BubbleFooter msg={msg}>
+          <BubbleFooter msg={msg} branch={branch}>
             <MessageActions
               msg={msg}
               canEdit={canEdit}
@@ -994,7 +1063,16 @@ interface Ctx {
   childByToolCall: Map<string, Session>
   /** Aprovações das subárvores dos delegates desta sessão, por âncora (card do delegate). */
   hostedBy: Map<string, ApprovalRequest[]>
-  lastAssistantId: string | null
+  /** Profundidade da sessão (0 = principal). */
+  depth: number
+  /** Última resposta do assistente de cada turno do caminho (onde fica "Regenerar resposta"). */
+  regenTargets: Set<string>
+  /** Erro persistido que fecha o caminho ("Tentar de novo"), ou null. */
+  trailingErrorId: string | null
+  /** ‹ i/n › da mensagem (null = só uma versão). */
+  switcher: (m: StoredMessage) => ReactNode
+  /** Avisos do editor de nova versão (fronteira de compactação, subagentes que serão parados…). */
+  editHints: (m: StoredMessage) => ReactNode[]
 }
 
 function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React.JSX.Element {
@@ -1004,7 +1082,8 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
   const m = msg.message
   const content = m.content ?? ''
   const canEdit = !ctx.readOnly && !ctx.busy
-  const isLast = msg.id === ctx.lastAssistantId
+  // última resposta de um turno: regenerar cria uma nova versão (a atual continua salva)
+  const canRegen = canEdit && ctx.depth === 0 && ctx.regenTargets.has(msg.id)
   return (
     <div className="group/msg animate-slide-up py-2">
       {m.reasoning && <Reasoning text={m.reasoning} id={msg.id} />}
@@ -1047,14 +1126,15 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
       {msg.meta.error && <ErrorRow text={msg.meta.error} />}
       {!editing && (
         <div className="mt-1.5 flex min-h-6 items-center gap-3">
+          {ctx.switcher(msg)}
           <UsageFooter msg={msg} judge={judgeTotals(msg, ctx.results)} />
           <MessageActions
             msg={msg}
             canEdit={canEdit}
             onEdit={() => setEditing(true)}
             onRegenerate={
-              isLast && canEdit
-                ? () => void run(() => api.agent.regenerate(ctx.sessionId), 'Erro ao regenerar')
+              canRegen
+                ? () => void useStore.getState().regenerate(ctx.sessionId, msg.id)
                 : undefined
             }
           />
@@ -1123,6 +1203,22 @@ function Thinking(): React.JSX.Element {
 
 // ---------- Lista ----------
 
+/**
+ * Posição de `node` no conteúdo do `scroller` (soma de offsetTop; não depende da rolagem nem de
+ * transforms — as mensagens recém-montadas entram com animação de deslize, que distorceria o
+ * getBoundingClientRect). Se a cadeia sair do scroller, a origem é outra, mas a mesma nas duas
+ * medidas (antes/depois da troca), que é o que importa.
+ */
+function offsetIn(node: HTMLElement, scroller: HTMLElement): number {
+  let y = 0
+  let cur: HTMLElement | null = node
+  while (cur && cur !== scroller) {
+    y += cur.offsetTop
+    cur = cur.offsetParent as HTMLElement | null
+  }
+  return y
+}
+
 export function MessageList({
   chatId,
   session,
@@ -1135,8 +1231,27 @@ export function MessageList({
   empty?: ReactNode
 }): React.JSX.Element {
   const sessionId = session.id
-  const messages = useStore(selectMessages(sessionId))
+  // todas as versões (árvore); o que aparece é o caminho ativo
+  const allMessages = useStore(selectMessages(sessionId))
   const loaded = useStore((s) => sessionId in s.messages)
+  const selectBranch = useStore((s) => s.selectBranch)
+  const host = useHostInfo(chatId)
+  // Views só de leitura (host offline; subsessão): trocar de versão vale só nesta tela.
+  const localSwitch = readOnly || host?.mode === 'host-offline'
+  const [localSel, setLocalSel] = useState<{
+    sid: string
+    base: BranchSel | undefined
+    sel: BranchSel
+  } | null>(null)
+  // a seleção local cai quando a sincronizada muda (ou ao trocar de sessão / sair do modo leitura)
+  const override =
+    localSwitch &&
+    localSel &&
+    localSel.sid === sessionId &&
+    selEquals(localSel.base, session.branchSel)
+      ? localSel.sel
+      : null
+  const { tree, path: messages, siblings } = useBranchView(session, allMessages, override)
   const draft = useStore((s) => s.drafts[sessionId] ?? null)
   const runs = useStore(selectRuns(sessionId))
   const allApprovals = useStore((s) => s.approvals)
@@ -1147,6 +1262,77 @@ export function MessageList({
   const [showOld, setShowOld] = useState(true)
   const busy = isBusy(session.status)
   const boundary = useMemo(() => latestBoundaryIndex(messages), [messages])
+
+  // ---- troca de versão (‹ i/n ›) ----
+  const scroller = useRef<HTMLDivElement>(null)
+  const pinned = useRef(true)
+  /**
+   * Posição do ‹ i/n › na tela antes da troca: depois dela ele fica no mesmo lugar (e com o foco,
+   * se tinha — o controle é remontado na outra versão).
+   */
+  const switchAnchor = useRef<{ group: string; top: number; focus: boolean } | null>(null)
+  /**
+   * Espaço extra no fim para o ‹ i/n › ficar no lugar quando a versão nova é mais curta; só cobre o
+   * que falta e encolhe conforme a rolagem/o conteúdo voltam a cobrir a tela (trimSpacer).
+   */
+  const spacer = useRef<HTMLDivElement>(null)
+  const trimSpacer = useCallback((): void => {
+    const el = scroller.current
+    const sp = spacer.current
+    if (!el || !sp) return
+    const h = sp.offsetHeight
+    if (!h) return
+    const need = Math.max(0, Math.ceil(el.scrollTop + el.clientHeight - (el.scrollHeight - h)))
+    if (need < h) sp.style.height = need ? `${need}px` : ''
+  }, [])
+  const onSelectBranch = useCallback(
+    (id: string): void => {
+      const group = branchGroup(tree, id)
+      const el = scroller.current?.querySelector<HTMLElement>(
+        `[data-branch-group="${CSS.escape(group)}"]`
+      )
+      const sc = scroller.current
+      switchAnchor.current =
+        el && sc
+          ? {
+              group,
+              top: offsetIn(el, sc) - sc.scrollTop,
+              focus: el.contains(document.activeElement)
+            }
+          : null
+      pinned.current = false
+      if (localSwitch)
+        setLocalSel({
+          sid: sessionId,
+          base: session.branchSel,
+          sel: selectionToReach(tree, override ?? session.branchSel, id)
+        })
+      else void selectBranch(sessionId, id)
+    },
+    [tree, localSwitch, sessionId, session.branchSel, override, selectBranch]
+  )
+  useLayoutEffect(() => {
+    const a = switchAnchor.current
+    const el = scroller.current
+    if (!a || !el) return
+    switchAnchor.current = null
+    const sw = el.querySelector<HTMLElement>(`[data-branch-group="${CSS.escape(a.group)}"]`)
+    if (!sw) return
+    const target = offsetIn(sw, el) - a.top
+    el.scrollTop = target
+    // versão mais curta: o navegador limita a rolagem → completa com o espaço extra (scrollHeight
+    // nunca é menor que a altura visível, por isso pode precisar de mais de uma passada)
+    const sp = spacer.current
+    for (let i = 0; sp && i < 3 && target - el.scrollTop > 0.5; i++) {
+      sp.style.height = `${sp.offsetHeight + Math.ceil(target - el.scrollTop)}px`
+      el.scrollTop = target
+    }
+    if (a.focus) sw.focus({ preventScroll: true })
+  }, [messages])
+  // outra sessão: sem espaço extra
+  useLayoutEffect(() => {
+    if (spacer.current) spacer.current.style.height = ''
+  }, [sessionId])
 
   const ctx = useMemo<Ctx>(() => {
     const results = new Map<string, StoredMessage>()
@@ -1161,15 +1347,48 @@ export function MessageList({
       const key = anchorFor(a.sessionId, a.toolCallId, sessionId, sessions)
       if (key) hostedBy.set(key, [...(hostedBy.get(key) ?? []), a])
     }
-    let lastAssistantId: string | null = null
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (isDisplayOnly(messages[i].meta)) continue
-      if (messages[i].message.role === 'assistant') {
-        lastAssistantId = messages[i].id
-        break
-      }
-      if (messages[i].message.role === 'user' && !messages[i].meta.synthetic) break
-      if (messages[i].meta.kind === 'compaction') break
+    // subagentes em segundo plano ainda rodando (origem → impede trocar a versão acima deles)
+    const busyCalls = Object.values(sessions)
+      .filter((s) => s.parentSessionId === sessionId && s.parentToolCallId && isBusy(s.status))
+      .map((s) => s.parentToolCallId as string)
+    const parentOf = (id: string): string | null => tree.parentOf.get(id) ?? null
+    const pathIndex = new Map(messages.map((m, i) => [m.id, i]))
+    const switchBlocked = (m: StoredMessage): string | null => {
+      if (localSwitch) return null
+      if (busy) return 'Disponível quando o agente terminar'
+      if (subagentsBelow(tree, parentOf(m.id), busyCalls) > 0)
+        return 'Disponível quando os subagentes desta versão terminarem'
+      return null
+    }
+    const switcher = (m: StoredMessage): ReactNode => {
+      const info = siblings.get(m.id)
+      if (!info) return null
+      return (
+        <BranchSwitcher
+          info={info}
+          group={branchGroup(tree, m.id)}
+          onSelect={onSelectBranch}
+          disabledReason={switchBlocked(m)}
+          local={localSwitch}
+        />
+      )
+    }
+    const editHints = (m: StoredMessage): ReactNode[] => {
+      const out: ReactNode[] = []
+      const i = pathIndex.get(m.id) ?? -1
+      if (boundary > 0 && i >= 0 && i < boundary)
+        out.push(
+          'Antes do resumo da conversa: a nova versão não usa o resumo e reenvia o histórico original (pode passar do limite de contexto).'
+        )
+      const n = subagentsBelow(tree, parentOf(m.id), busyCalls)
+      if (n > 0)
+        out.push(
+          <span className="text-warning/90">
+            {n} subagente{n > 1 ? 's' : ''} desta versão {n > 1 ? 'serão parados' : 'será parado'}.
+          </span>
+        )
+      out.push('Mudanças em arquivos feitas pelo agente não são desfeitas.')
+      return out
     }
     return {
       chatId,
@@ -1182,9 +1401,28 @@ export function MessageList({
       allApprovals,
       childByToolCall,
       hostedBy,
-      lastAssistantId
+      depth: session.depth,
+      regenTargets: regenerateTargets(messages),
+      trailingErrorId: trailingErrorId(messages),
+      switcher,
+      editHints
     }
-  }, [messages, sessions, sessionId, chatId, busy, readOnly, runs, allApprovals])
+  }, [
+    messages,
+    sessions,
+    sessionId,
+    chatId,
+    busy,
+    readOnly,
+    runs,
+    allApprovals,
+    tree,
+    siblings,
+    boundary,
+    localSwitch,
+    session.depth,
+    onSelectBranch
+  ])
 
   // Tool calls conhecidas (para não duplicar resultados/aprovações).
   const knownCalls = useMemo(() => {
@@ -1196,9 +1434,7 @@ export function MessageList({
   }, [messages])
 
   // ---- auto-scroll ----
-  const scroller = useRef<HTMLDivElement>(null)
   const inner = useRef<HTMLDivElement>(null)
-  const pinned = useRef(true)
   const [atBottom, setAtBottom] = useState(true)
 
   useLayoutEffect(() => {
@@ -1212,13 +1448,14 @@ export function MessageList({
     const content = inner.current
     if (!el || !content) return
     const ro = new ResizeObserver(() => {
+      trimSpacer()
       if (pinned.current) el.scrollTop = el.scrollHeight
     })
     // border-box: o padding do fim acompanha o composer flutuante (cresce com fila, anexos, texto)
     ro.observe(content, { box: 'border-box' })
     ro.observe(el)
     return () => ro.disconnect()
-  }, [])
+  }, [trimSpacer])
 
   useAnchorRoot(scroller)
 
@@ -1309,6 +1546,7 @@ export function MessageList({
     if (bottom) pinned.current = true
     else if (up) pinned.current = false
     if (bottom !== atBottom) setAtBottom(bottom)
+    trimSpacer()
     updateSticky()
   }
 
@@ -1326,6 +1564,17 @@ export function MessageList({
     ctx.approvals.length === 0
   const canEdit = !readOnly && !busy
 
+  /** Mensagens cujo componente já mostra o ‹ i/n › (balão do usuário, rodapé do assistente). */
+  const nativeSwitcher = (m: StoredMessage): boolean => {
+    const role = m.message.role
+    if (isExtractionMessage(m.meta) || m.meta.kind === 'compaction' || m.meta.kind === 'error')
+      return false
+    if (role === 'assistant') return true
+    if (role !== 'user' || m.meta.synthetic) return false
+    if (m.meta.kind === 'inter-chat') return true
+    if (m.meta.kind === 'subagent-callback' || m.meta.kind === 'parent-message') return false
+    return session.depth === 0
+  }
   const renderMessage = (m: StoredMessage, old: boolean): ReactNode => {
     const role = m.message.role
     // extração de memórias: só exibição (não vai à API), qualquer role
@@ -1334,7 +1583,7 @@ export function MessageList({
       return <CompactionCard key={m.id} msg={m} canEdit={canEdit} stale={old} />
     if (m.meta.kind === 'error') return <ErrorMessage key={m.id} msg={m} ctx={ctx} />
     if (role === 'user' && m.meta.kind === 'inter-chat')
-      return <InterChatMessage key={m.id} msg={m} canEdit={canEdit} />
+      return <InterChatMessage key={m.id} msg={m} canEdit={canEdit} branch={ctx.switcher(m)} />
     if (role === 'user' && m.meta.kind === 'subagent-callback')
       return <CallbackCard key={m.id} msg={m} chatId={chatId} canEdit={canEdit} />
     if (role === 'user' && m.meta.kind === 'parent-message')
@@ -1345,7 +1594,7 @@ export function MessageList({
       if (role === 'tool' && knownCalls.has(m.message.tool_call_id)) return null
       return <SyntheticMessage key={m.id} msg={m} canEdit={canEdit} />
     }
-    if (role === 'user') return <UserMessage key={m.id} msg={m} canEdit={canEdit} />
+    if (role === 'user') return <UserMessage key={m.id} msg={m} canEdit={canEdit} ctx={ctx} />
     if (role === 'assistant') return <AssistantMessage key={m.id} msg={m} ctx={ctx} />
     if (role === 'tool') {
       if (knownCalls.has(m.message.tool_call_id)) return null
@@ -1372,9 +1621,12 @@ export function MessageList({
   const renderItem = (m: StoredMessage, old: boolean): ReactNode => {
     const el = renderMessage(m, old)
     if (!el) return null
+    // outras mensagens com versões (erro, sintética…): ‹ i/n › numa linha pequena acima
+    const row = siblings.has(m.id) && !nativeSwitcher(m) ? ctx.switcher(m) : null
     return (
       <Fragment key={m.id}>
         {starts.has(m.id) && <DaySeparator ts={m.createdAt} now={now} />}
+        {row && <div className="flex justify-start pt-1">{row}</div>}
         {el}
       </Fragment>
     )
@@ -1394,7 +1646,7 @@ export function MessageList({
           ref={inner}
           className="mx-auto w-full max-w-[1920px] px-8 pt-6 pb-[calc(var(--chat-bottom-inset,140px)+24px)]"
         >
-          {loaded && messages.length === 0 && !draft && !busy && empty}
+          {loaded && allMessages.length === 0 && !draft && !busy && empty}
           {oldMsgs.length > 0 && showOld && (
             <div
               data-testid="compacted-old"
@@ -1445,6 +1697,7 @@ export function MessageList({
             />
           )}
         </div>
+        <div ref={spacer} aria-hidden data-testid="branch-spacer" />
       </div>
       <div
         aria-hidden

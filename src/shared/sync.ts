@@ -68,6 +68,12 @@ export interface SyncStatus {
   prompts: SyncPrompt[]
   /** Protocolo incompatível com o servidor (não sincroniza). */
   protocolError: string | null
+  /**
+   * Aparelhos desta conta que podem hospedar chats (desktop, can_host) com app < 0.7.0 — não
+   * conhecem versões de mensagens (ramos): como host, o "regenerar" deles apaga as outras versões.
+   * Vem do GET /devices (atualizado ao conectar e periodicamente). Vazio = nada a avisar.
+   */
+  outdatedHosts: { name: string; appVersion: string }[]
 }
 
 export interface SyncDevice {

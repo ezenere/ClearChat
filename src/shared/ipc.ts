@@ -81,6 +81,8 @@ export const IPC = {
     getQueue: 'agent:getQueue',
     stop: 'agent:stop',
     regenerate: 'agent:regenerate',
+    editBranch: 'agent:editBranch',
+    selectBranch: 'agent:selectBranch',
     approve: 'agent:approve',
     pendingApprovals: 'agent:pendingApprovals',
     previewRequest: 'agent:previewRequest',
@@ -354,7 +356,7 @@ export interface ClearApi {
     list(chatId: string): Promise<Session[]>
     messages(sessionId: string): Promise<StoredMessage[]>
   }
-  /** Edição livre do histórico. */
+  /** Edição livre do histórico (mensagem digitada da principal → `agent.editBranch`). */
   messages: {
     update(id: string, message: ApiMessage): Promise<StoredMessage>
     delete(id: string): Promise<void>
@@ -377,8 +379,22 @@ export interface ClearApi {
     getQueue(sessionId: string): Promise<QueuedMessage[]>
     /** Aborta (cascata para subsessões). */
     stop(sessionId: string): Promise<void>
-    /** Remove mensagens após a última msg do usuário e roda de novo. */
-    regenerate(sessionId: string): Promise<void>
+    /**
+     * Nova versão da resposta do turno que contém `messageId` (padrão: o último turno do caminho
+     * ativo) — a anterior continua salva (‹ › para alternar). Resposta que é só erro é substituída.
+     */
+    regenerate(sessionId: string, messageId?: string): Promise<void>
+    /**
+     * Editar mensagem digitada da sessão principal = nova versão (irmã com o novo texto; anexos e
+     * skills da original) e o agente roda a partir dela. Para o turno em andamento e os
+     * subagentes em segundo plano da parte abandonada.
+     */
+    editBranch(messageId: string, message: ApiMessage): Promise<void>
+    /**
+     * Troca de versão (o caminho ativo passa por `messageId`); emite session-updated. Erro (pt-BR)
+     * com a sessão ocupada ou subagente em segundo plano rodando na parte que muda.
+     */
+    selectBranch(messageId: string): Promise<Session>
     /**
      * Responde um card. Pergunta simples: 'allow' | 'deny'. Card do modo Listas: `items` = decisão
      * por sub-comando pendente (`pattern` = "+ whitelist"/"+ blacklist", salvo na lista global);

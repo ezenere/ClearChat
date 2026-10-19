@@ -7,6 +7,7 @@ import type {
   ApiMessage,
   ApprovalRequest,
   AttachmentInfo,
+  MessageMeta,
   ProcessInfo,
   QuestionAnswer,
   QuestionRequest,
@@ -17,6 +18,7 @@ import type {
   StreamDraft
 } from '@shared/types'
 import type { MemoryExtractionResult } from '@shared/memory'
+import { isBranchEditable, toBranchSel } from '@shared/branches'
 import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import type { ChatHostInfo, ChatHostMode, HostStatus, TakeoverOptions } from '@shared/sync'
 import {
@@ -63,7 +65,12 @@ export interface RunnerAdapter {
   cancelQuestion(id: string): Promise<void>
   retry(id: string): void
   cancelRetry(id: string): void
-  regenerate(sessionId: string): Promise<void>
+  /** Regenerar em ramo (nova versão da resposta do turno que contém `messageId`; padrão: o último). */
+  regenerate(sessionId: string, messageId?: string): Promise<void>
+  /** Nova versão (irmã) de uma mensagem digitada pelo usuário na sessão principal, e roda o turno. */
+  editBranch(messageId: string, message: ApiMessage): Promise<void>
+  /** Torna `messageId` a versão ativa (lança, em pt-BR, com a sessão ocupada). */
+  selectBranch(messageId: string): Promise<Session>
   editMessage(id: string, message: ApiMessage): StoredMessage
   deleteMessage(id: string): Promise<void>
   compact(sessionId: string, opts?: { retry?: boolean }): { scheduled: boolean }
@@ -167,8 +174,30 @@ const CONTENT_CMDS = new Set([
   'smart_override',
   'approval',
   'question',
-  'retry'
+  'retry',
+  'branch.edit',
+  'branch.regenerate',
+  'branch.select'
 ])
+
+/**
+ * Janela de cada ação de conteúdo (§8.6) — no host (comando remoto) e no portão local (gateChat,
+ * quando quem chama não diz): edições no lugar e trocar de versão = 'edit'; o resto roda turno.
+ */
+export const cmdPurpose = (kind: string): 'run' | 'edit' =>
+  kind.startsWith('message.') || kind === 'branch.select' ? 'edit' : 'run'
+
+/**
+ * Kind da ação → kind do comando remoto (§8.6). Controles remotos ≥ 1.2.0 nunca mandam o
+ * `regenerate` antigo: um host < 0.7 recusa `branch.regenerate` (kind desconhecido) em vez de
+ * apagar as outras versões. Os demais (inclusive `branch.edit` / `branch.select`) vão como estão.
+ */
+export const remoteKind = (kind: string): string =>
+  kind === 'regenerate' ? 'branch.regenerate' : kind
+
+/** Resposta do host 0.7 a um `message.edit` de controle remoto antigo numa mensagem do usuário. */
+export const EDIT_NEEDS_UPDATE =
+  'Editar uma mensagem sua agora cria uma nova versão da conversa — atualize o ClearChat neste aparelho para editar.'
 
 export class HostController {
   private states = new Map<string, ServerChatState>()
@@ -914,11 +943,12 @@ export class HostController {
   ): Promise<{ status: string; queued?: boolean; error?: string }> {
     const sk = this.engine.sk
     if (!sk) throw new Error('Conta bloqueada.')
+    const k = remoteKind(kind)
     const name = this.hostName(chatId)
     const cmd_id = randomUUID()
     const env = sealJson(sk.stream, aadCommand(this.engine.userId, chatId, cmd_id), {
       sv: 1,
-      kind,
+      kind: k,
       ...payload
     })
     const result = new Promise<{ status: string; queued?: boolean; error?: string }>(
@@ -936,7 +966,7 @@ export class HostController {
     )
     result.catch(() => undefined)
     try {
-      await this.engine.ws.request('remote.send', { chat_id: chatId, cmd_id, kind, env })
+      await this.engine.ws.request('remote.send', { chat_id: chatId, cmd_id, kind: k, env })
     } catch (e) {
       const p = this.pendingCmds.get(cmd_id)
       if (p) clearTimeout(p.timer)
@@ -1049,6 +1079,64 @@ export class HostController {
     return sid
   }
 
+  /** Mensagem do chat (com a profundidade da sessão) — senão lança. */
+  private messageInChat(
+    messageId: unknown,
+    chatId: string
+  ): { id: string; seq: number; message: ApiMessage; meta: MessageMeta; depth: number } {
+    const id = String(messageId ?? '')
+    const r = this.engine.conn
+      .prepare(
+        `SELECT m.seq, m.message_json, m.meta_json, s.chat_id, s.depth
+           FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.id = ?`
+      )
+      .get(id) as
+      | { seq: number; message_json: string; meta_json: string; chat_id: string; depth: number }
+      | undefined
+    if (!r || r.chat_id !== chatId) throw new Error('Mensagem não pertence a este chat.')
+    const parse = <T>(s: string, d: T): T => {
+      try {
+        return JSON.parse(s) as T
+      } catch {
+        return d
+      }
+    }
+    return {
+      id,
+      seq: r.seq,
+      message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
+      meta: parse<MessageMeta>(r.meta_json, {}),
+      depth: r.depth
+    }
+  }
+
+  /** Checagens antes de abrir a janela (um comando recusado não abre janela à toa). */
+  private validate(chatId: string, kind: string, p: Record<string, unknown>): void {
+    switch (kind) {
+      case 'message.edit': {
+        // §8.6: mensagem digitada pelo usuário na sessão principal só muda como nova versão
+        // (branch.edit) — um controle remoto antigo não pode sobrescrever o histórico
+        const m = this.messageInChat(p.messageId, chatId)
+        if (isBranchEditable(m, m.depth)) throw new Error(EDIT_NEEDS_UPDATE)
+        return
+      }
+      case 'branch.edit': {
+        if (!p.message || typeof p.message !== 'object') throw new Error('Mensagem inválida.')
+        const m = this.messageInChat(p.messageId, chatId)
+        if (!isBranchEditable(m, m.depth))
+          throw new Error('Só mensagens digitadas na conversa principal viram nova versão.')
+        return
+      }
+      case 'branch.regenerate':
+        this.sessionInChat(p.sessionId, chatId)
+        if (p.messageId != null) this.messageInChat(p.messageId, chatId)
+        return
+      case 'branch.select':
+        this.messageInChat(p.messageId, chatId)
+        return
+    }
+  }
+
   private async execute(
     chatId: string,
     kind: string,
@@ -1056,8 +1144,8 @@ export class HostController {
   ): Promise<{ queued?: boolean }> {
     const runner = this.runner
     if (!runner) throw new Error('Este dispositivo não executa chats.')
-    if (CONTENT_CMDS.has(kind))
-      await this.ensureWindow(chatId, kind.startsWith('message.') ? 'edit' : 'run')
+    this.validate(chatId, kind, p)
+    if (CONTENT_CMDS.has(kind)) await this.ensureWindow(chatId, cmdPurpose(kind))
     switch (kind) {
       case 'send':
       case 'force': {
@@ -1106,7 +1194,20 @@ export class HostController {
         else runner.retry(String(p.requestId))
         return {}
       case 'regenerate':
+        // desde 1.2.0: regenerar EM RAMO do último turno (= branch.regenerate sem messageId)
         await runner.regenerate(this.sessionInChat(p.sessionId, chatId))
+        return {}
+      case 'branch.regenerate':
+        await runner.regenerate(
+          this.sessionInChat(p.sessionId, chatId),
+          typeof p.messageId === 'string' && p.messageId ? p.messageId : undefined
+        )
+        return {}
+      case 'branch.edit':
+        await runner.editBranch(String(p.messageId), p.message as ApiMessage)
+        return {}
+      case 'branch.select':
+        await runner.selectBranch(String(p.messageId))
         return {}
       case 'message.edit':
         runner.editMessage(String(p.messageId), p.message as ApiMessage)
@@ -1487,7 +1588,10 @@ export class HostController {
         m.sessions.set(s.id, s.status)
         this.sessionChat.set(s.id, chatId)
         const local = this.sessionWithStatus(s.id, s.status)
-        this.emitM({ type: 'session-updated', session: local ?? s })
+        // a versão ativa ao vivo do host (o registro `session` chega logo depois pelo sync)
+        const live =
+          local && s.branchSel ? { ...local, branchSel: toBranchSel(s.branchSel) } : local
+        this.emitM({ type: 'session-updated', session: live ?? s })
         return
       }
       case 'tool': {
@@ -1774,5 +1878,8 @@ function rejectText(error: string | undefined, host: string): string {
   if (!error) return `O host (${host}) recusou o comando.`
   if (error === 'attachment_missing') return `O host (${host}) não conseguiu baixar um dos anexos.`
   if (error === 'not_host') return `${host} não é mais o host deste chat.`
+  // host < 0.7 não conhece os comandos de versões (§8.6) — e nunca cai no regenerar destrutivo
+  if (/^comando desconhecido: branch\./.test(error))
+    return `O host (${host}) usa uma versão antiga do ClearChat — atualize o app nele para usar versões de mensagens.`
   return error
 }

@@ -1255,22 +1255,39 @@ async function main(): Promise<void> {
     }
   )
 
-  await step('editar / apagar mensagem, regenerar', async () => {
+  await step('editar (nova versão) / apagar mensagem, regenerar', async () => {
     await ensurePanel('Modelo')
-    // editar a primeira mensagem do usuário
+    // editar a primeira mensagem do usuário = NOVA VERSÃO (a original continua salva) + o agente roda
     const firstUser = page.locator('div.group\\/msg').filter({ hasText: 'Use write_file' }).first()
     await firstUser.hover()
     await firstUser.getByRole('button', { name: 'Editar' }).click()
     // durante a edição o texto vira o valor do textarea do editor inline
     const ed = page.locator('div.group\\/msg textarea').first()
+    const send = page.getByRole('button', { name: 'Enviar', exact: true })
+    assert(await send.isDisabled(), 'Enviar desabilitado sem mudança')
     await ed.fill('Mensagem editada pelo e2e')
-    await page.getByRole('button', { name: 'Salvar', exact: true }).click()
+    await send.click()
     await page.getByText('Mensagem editada pelo e2e').waitFor({ timeout: 5000 })
+    await waitIdle()
     let { msgs } = await currentState()
     assert(
-      msgs.some((m) => m.message.content === 'Mensagem editada pelo e2e'),
-      'edição salva'
+      msgs.some((m) => m.message.content === 'Mensagem editada pelo e2e') &&
+        msgs.some(
+          (m) =>
+            typeof m.message.content === 'string' && m.message.content.includes('Use write_file')
+        ),
+      'nova versão salva e a original mantida'
     )
+    const edited = page
+      .locator('div.group\\/msg')
+      .filter({ hasText: 'Mensagem editada pelo e2e' })
+      .first()
+      .getByTestId('branch-switcher')
+    assert((await edited.getAttribute('aria-label')) === 'Versão 2 de 2', '‹ 2/2 ›')
+    await shot('branch-edited')
+    // volta à versão original (o resto do passo usa a fila dela)
+    await edited.getByRole('button', { name: 'Versão anterior' }).click()
+    await page.getByText('FILA-OK').first().waitFor({ timeout: 5000 })
     // apagar a mensagem "da fila"
     const queued = page.locator('div.group\\/msg').filter({ hasText: 'FILA-OK' }).first()
     await queued.hover()
@@ -1629,7 +1646,7 @@ async function main(): Promise<void> {
       .waitFor({ timeout: 10_000 })
     assert((await indicator.count()) === 0, 'indicador some')
     await shot('subagent-approved')
-    // regenerar apaga a subsessão órfã (evento session-deleted → some do seletor)
+    // regenerar = nova versão da resposta: a subsessão da versão anterior continua salva
     const chats = await read<any[]>('chats.list')
     const c2 = chats.find((c) => c.title.startsWith('Use the delegate_task tool to ask'))
     const oldSubs = (await read<any[]>('sessions.list', c2.id)).filter((x) => x.depth > 0)
@@ -1646,7 +1663,11 @@ async function main(): Promise<void> {
     }
     await waitIdle(10_000)
     const now = await read<any[]>('sessions.list', c2.id)
-    for (const o of oldSubs) assert(!now.some((x) => x.id === o.id), 'subsessão antiga apagada')
+    for (const o of oldSubs)
+      assert(
+        now.some((x) => x.id === o.id),
+        'subsessão da versão anterior continua'
+      )
     await shot('regenerated-delegate')
     return `subsessões antigas apagadas: ${oldSubs.length}`
   })
