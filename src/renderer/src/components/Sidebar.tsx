@@ -52,14 +52,14 @@ export function Sidebar(): React.JSX.Element {
 
   return (
     <aside className="flex w-[248px] shrink-0 flex-col border-r border-border bg-surface">
-      <div
-        className={cn(
-          'drag flex h-titlebar shrink-0 items-center gap-2 px-4',
-          isMac && 'justify-end'
+      <div className="drag flex h-titlebar shrink-0 items-center gap-2 px-4">
+        {/* macOS: os botões de fechar/minimizar ocupam o canto esquerdo — só a nuvem, à direita */}
+        {!isMac && (
+          <>
+            <Logo className="size-[18px]" />
+            <span className="text-[13px] font-semibold tracking-tight text-fg/90">ClearChat</span>
+          </>
         )}
-      >
-        <Logo className="size-[18px]" />
-        <span className="text-[13px] font-semibold tracking-tight text-fg/90">ClearChat</span>
         <SyncIndicator />
       </div>
 
