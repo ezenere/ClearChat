@@ -63,6 +63,7 @@ export interface FakeSyncServer {
   userIdOf(email: string): string | undefined
   dropDevice(deviceId: string): void
   closeDevice(deviceId: string, code: number, reason?: string): void
+  /** Simula o dispositivo sem rede: WS recusado no hello e REST autenticado derrubado. */
   setRefuseConnections(deviceId: string, refuse: boolean): void
   setTombstoneFloor(userId: string, seq: number): void
   chatState(userId: string, chatId: string): any
@@ -1272,6 +1273,11 @@ export async function startFakeSyncServer(opts: FakeSyncOptions = {}): Promise<F
     const token = /^Bearer (\S+)$/.exec(req.headers.authorization ?? '')?.[1]
     const { user: u, device: dev } = authFromToken(token)
     ;(res as any).__deviceId = dev.id
+    // dispositivo "sem rede" (setRefuseConnections): REST também não chega
+    if (refused.has(dev.id)) {
+      req.socket.destroy()
+      return 0
+    }
 
     if (method === 'POST' && p === '/auth/logout') {
       revokeDevice(dev, 'logout')

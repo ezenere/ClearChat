@@ -21,6 +21,7 @@ import { ApprovalsSettings } from './approvals/ApprovalsSettings'
 import { WebSearchSettings } from './web/WebSearchSettings'
 import { MemorySettings } from './memory/MemorySettings'
 import { SkillsSettings } from './skills/SkillsSettings'
+import { AccountSettings } from './sync/AccountSettings'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -314,12 +315,13 @@ export function SettingsModal(): React.JSX.Element {
       }}
       title="Configurações"
       width={
-        (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 640
+        (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
       }
     >
-      <div className="mb-5 flex gap-1 border-b border-border">
+      <div className="mb-5 flex gap-0.5 overflow-x-auto border-b border-border">
         {(
           [
+            ['account', 'Conta'],
             ['providers', 'Provedores'],
             ['presets', 'Personas'],
             ['defaults', 'Novos chats'],
@@ -334,7 +336,7 @@ export function SettingsModal(): React.JSX.Element {
             type="button"
             onClick={() => setTab(id)}
             className={cn(
-              '-mb-px border-b-2 px-2.5 pb-2 text-[13px] transition-colors',
+              '-mb-px shrink-0 border-b-2 px-2 pb-2 text-[13px] whitespace-nowrap transition-colors',
               tab === id ? 'border-accent text-fg' : 'border-transparent text-subtle hover:text-fg'
             )}
           >
@@ -343,7 +345,9 @@ export function SettingsModal(): React.JSX.Element {
         ))}
       </div>
 
-      {tab === 'providers' ? (
+      {tab === 'account' ? (
+        <AccountSettings />
+      ) : tab === 'providers' ? (
         <div className="space-y-2.5">
           <p className="mb-3 text-xs text-subtle">
             Endpoints compatíveis com a API da OpenAI (chat/completions), OpenRouter ou a API nativa

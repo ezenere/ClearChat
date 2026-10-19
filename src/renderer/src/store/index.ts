@@ -20,6 +20,7 @@ import type {
 } from '@shared/types'
 import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
 import type { MemoryCollection } from '@shared/memory'
+import type { ChatHostInfo, SyncScope, SyncStatus } from '@shared/sync'
 import { api, errorMessage } from '../lib/api'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { contentText, formatSize } from '@shared/attachments'
@@ -72,7 +73,7 @@ export interface SubFailure {
 }
 
 export type SettingsTab =
-  'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'skills' | 'web'
+  'account' | 'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'skills' | 'web'
 
 export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'files'
 
@@ -185,6 +186,17 @@ interface State {
   skillsFocus: string | null
   /** Skills escolhidas na lâmpada do composer, ainda não enviadas (por sessão; nomes). */
   pendingSkills: Record<string, string[]>
+  /** Sync: conta/conexão (null = ainda não carregado). */
+  sync: SyncStatus | null
+  /** Sync: host de execução / divergência por chat. */
+  chatHosts: Record<string, ChatHostInfo>
+  /** Mensagem indo para o host (controle remoto), por sessão: "enviando…". */
+  remoteSending: Record<string, string | undefined>
+  /** Avisos do sync por chat (ex.: "o dispositivo remoto caiu"). */
+  chatNotices: Record<
+    string,
+    { text: string; kind: 'info' | 'error' | 'success'; at: number } | undefined
+  >
 }
 
 interface Actions {
@@ -257,6 +269,11 @@ interface Actions {
   openMemory(focus?: MemoryFocus | null): void
   /** Executa uma chamada de API; em caso de erro mostra um toast e retorna undefined. */
   run<T>(fn: () => Promise<T>, label?: string): Promise<T | undefined>
+  /** Recarrega estado do sync e hosts dos chats. */
+  refreshSync(): Promise<void>
+  /** Recarrega domínios alterados por mudanças remotas. */
+  reloadScopes(scopes: SyncScope[]): Promise<void>
+  dismissChatNotice(chatId: string): void
 }
 
 export type Store = State & Actions
@@ -345,6 +362,85 @@ export const useStore = create<Store>()((set, get) => ({
   skillsTick: 0,
   skillsFocus: null,
   pendingSkills: {},
+  sync: null,
+  chatHosts: {},
+  remoteSending: {},
+  chatNotices: {},
+
+  async refreshSync() {
+    try {
+      const [status, hosts] = await Promise.all([api.sync.status(), api.sync.chatStates()])
+      set({ sync: status, chatHosts: Object.fromEntries(hosts.map((h) => [h.chatId, h])) })
+    } catch (err) {
+      console.warn('[clearchat] sync:', errorMessage(err))
+    }
+  },
+
+  async reloadScopes(scopes) {
+    const g = get()
+    const tasks: Promise<unknown>[] = []
+    if (scopes.includes('providers')) tasks.push(g.refreshProviders())
+    if (scopes.includes('presets')) tasks.push(g.refreshPresets())
+    if (scopes.includes('settings'))
+      tasks.push(
+        Promise.all(SETTINGS_KEYS.map((k) => api.settings.get<string>(k).catch(() => null))).then(
+          (values) =>
+            set({
+              settings: Object.fromEntries(
+                SETTINGS_KEYS.map((k, i) => [k, values[i] ?? null])
+              ) as unknown as AppSettings
+            })
+        )
+      )
+    if (scopes.includes('approvals'))
+      tasks.push(
+        api.approvals
+          .getSettings()
+          .then((r) => set({ approvalSettings: r }))
+          .catch(() => undefined)
+      )
+    if (scopes.includes('chats'))
+      tasks.push(
+        api.chats
+          .list()
+          .then((chats) => {
+            set((s) => {
+              const ids = new Set(chats.map((c) => c.id))
+              const view =
+                s.view.kind === 'chat' && !ids.has(s.view.chatId)
+                  ? { kind: 'new' as const }
+                  : s.view
+              return { chats: sortChats(chats.map(withPending)), view }
+            })
+          })
+          .catch(() => undefined)
+      )
+    if (scopes.includes('memory')) {
+      set((s) => ({ memoryTick: s.memoryTick + 1 }))
+      tasks.push(g.loadMemoryCollections())
+    }
+    if (scopes.includes('skills')) set((s) => ({ skillsTick: s.skillsTick + 1 }))
+    await Promise.all(tasks)
+    // chat aberto: sessões novas (subagentes vindos do host)
+    const v = get().view
+    if (scopes.includes('chats') && v.kind === 'chat') {
+      const sessions = await api.sessions.list(v.chatId).catch(() => null)
+      if (sessions)
+        set((s) => {
+          const next = { ...s.sessions }
+          for (const ss of sessions)
+            next[ss.id] =
+              s.sessions[ss.id]?.status !== ss.status && s.sessions[ss.id]
+                ? { ...ss, status: s.sessions[ss.id].status }
+                : ss
+          return { sessions: next }
+        })
+    }
+  },
+
+  dismissChatNotice(chatId) {
+    set((s) => ({ chatNotices: { ...s.chatNotices, [chatId]: undefined } }))
+  },
 
   async run(fn, label) {
     try {
@@ -375,6 +471,8 @@ export const useStore = create<Store>()((set, get) => ({
       retries,
       capabilities,
       approvalSettings,
+      syncStatus,
+      hostList,
       ...values
     ] = await Promise.all([
       safe(() => api.providers.list(), [] as Provider[]),
@@ -386,6 +484,8 @@ export const useStore = create<Store>()((set, get) => ({
       safe(() => api.retries.pending(), [] as RetryRequest[]),
       safe(() => api.app.capabilities(), { bwrap: false, ripgrep: false } as AppCapabilities),
       safe(() => api.approvals.getSettings(), normalizeApprovalSettings(null, null)),
+      safe(() => api.sync.status(), null as SyncStatus | null),
+      safe(() => api.sync.chatStates(), [] as ChatHostInfo[]),
       ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
     ])
     const settings = Object.fromEntries(
@@ -403,6 +503,8 @@ export const useStore = create<Store>()((set, get) => ({
       retries,
       capabilities,
       approvalSettings: approvalSettings as ApprovalSettings,
+      sync: syncStatus as SyncStatus | null,
+      chatHosts: Object.fromEntries((hostList as ChatHostInfo[]).map((h) => [h.chatId, h])),
       settings,
       booted: true
     })
@@ -466,6 +568,7 @@ export const useStore = create<Store>()((set, get) => ({
 
   goNew() {
     set({ view: { kind: 'new' } })
+    void api.sync.setActiveChat(null).catch(() => undefined)
   },
 
   async openChat(chatId, sessionId) {
@@ -476,6 +579,7 @@ export const useStore = create<Store>()((set, get) => ({
       view: { kind: 'chat', chatId, sessionId: target },
       subFailures: markFailures(s.subFailures, chatId, target)
     }))
+    void api.sync.setActiveChat(chatId).catch(() => undefined)
     const sessions = await get().run(() => api.sessions.list(chatId), 'Erro ao carregar sessões')
     if (sessions) {
       set((s) => {
@@ -589,16 +693,31 @@ export const useStore = create<Store>()((set, get) => ({
   async send(sessionId, text, attachments, skills) {
     const session = get().sessions[sessionId]
     if (session) await get().flushConfig(session.chatId)
-    set((s) => ({ errors: { ...s.errors, [sessionId]: undefined } }))
-    const res = await get().run(
-      () =>
-        skills?.length
-          ? api.agent.send(sessionId, text, attachments ?? [], skills)
-          : attachments?.length
-            ? api.agent.send(sessionId, text, attachments)
-            : api.agent.send(sessionId, text),
-      'Falha ao enviar'
-    )
+    const remote = !!session && get().chatHosts[session.chatId]?.mode === 'remote'
+    set((s) => ({
+      errors: { ...s.errors, [sessionId]: undefined },
+      ...(remote
+        ? {
+            remoteSending: {
+              ...s.remoteSending,
+              [sessionId]: text || attachments?.map((a) => a.name).join(', ') || '…'
+            }
+          }
+        : {})
+    }))
+    const res = await get()
+      .run(
+        () =>
+          skills?.length
+            ? api.agent.send(sessionId, text, attachments ?? [], skills)
+            : attachments?.length
+              ? api.agent.send(sessionId, text, attachments)
+              : api.agent.send(sessionId, text),
+        remote ? 'O host não recebeu a mensagem' : 'Falha ao enviar'
+      )
+      .finally(() => {
+        if (remote) set((s) => ({ remoteSending: { ...s.remoteSending, [sessionId]: undefined } }))
+      })
     return res !== undefined
   },
 
@@ -757,6 +876,8 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   toast(text, kind = 'info') {
+    // mesmo aviso repetido (ex.: vários chats do mesmo host caíram): um toast só
+    if (get().toasts.some((t) => t.text === text && t.kind === kind)) return
     const id = ++toastSeq
     set((s) => ({ toasts: [...s.toasts.slice(-3), { id, kind, text }] }))
     setTimeout(() => get().dismissToast(id), kind === 'error' ? 6000 : 3000)
@@ -1034,7 +1155,63 @@ function applyEvent(e: AgentEvent): void {
     case 'skills-changed':
       set((s) => ({ skillsTick: s.skillsTick + 1 }))
       break
+    case 'sync-status':
+      set({ sync: e.status })
+      break
+    case 'sync-chat-state':
+      set((s) => ({ chatHosts: { ...s.chatHosts, [e.info.chatId]: e.info } }))
+      break
+    case 'sync-data-changed':
+      scheduleScopes(e.scopes)
+      break
+    case 'chat-deleted':
+      set((s) => {
+        const view =
+          s.view.kind === 'chat' && s.view.chatId === e.chatId ? { kind: 'new' as const } : s.view
+        return {
+          chats: s.chats.filter((c) => c.id !== e.chatId),
+          sessions: Object.fromEntries(
+            Object.entries(s.sessions).filter(([, ss]) => ss.chatId !== e.chatId)
+          ),
+          approvals: s.approvals.filter((a) => a.chatId !== e.chatId),
+          questions: s.questions.filter((q) => q.chatId !== e.chatId),
+          retries: s.retries.filter((r) => r.chatId !== e.chatId),
+          view
+        }
+      })
+      break
+    case 'sync-notice':
+      useStore.getState().toast(e.text, e.kind)
+      if (e.chatId) {
+        const at = Date.now()
+        const cid = e.chatId
+        setTimeout(() => {
+          if (useStore.getState().chatNotices[cid]?.at === at)
+            useStore.getState().dismissChatNotice(cid)
+        }, 5 * 60_000)
+        set((s) => ({
+          chatNotices: {
+            ...s.chatNotices,
+            [e.chatId!]: { text: e.text, kind: e.kind, at: at }
+          }
+        }))
+      }
+      break
   }
+}
+
+// Rajadas de `sync-data-changed` → uma recarga por domínio.
+const pendingScopes = new Set<SyncScope>()
+let scopesTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleScopes(scopes: SyncScope[]): void {
+  for (const sc of scopes) pendingScopes.add(sc)
+  if (scopesTimer) return
+  scopesTimer = setTimeout(() => {
+    scopesTimer = null
+    const list = [...pendingScopes]
+    pendingScopes.clear()
+    void useStore.getState().reloadScopes(list)
+  }, 120)
 }
 
 // Rajadas de `memory-changed` (extração grava várias) → uma recarga só das coleções.

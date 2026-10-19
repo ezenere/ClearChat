@@ -8,6 +8,7 @@ import { RightPanel } from './components/panel/RightPanel'
 import { SettingsModal } from './components/SettingsModal'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
+import { SyncPrompts } from './components/sync/ChatHost'
 import { Spinner } from './components/ui/controls'
 import { TooltipProvider } from './components/ui/Tooltip'
 import { cn } from './lib/format'
@@ -145,6 +146,7 @@ function App(): React.JSX.Element {
           <Main />
           <SettingsModal />
           <RequestPreviewModal />
+          <SyncPrompts />
         </div>
       )}
       <Toasts />

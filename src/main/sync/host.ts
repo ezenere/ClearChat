@@ -390,7 +390,11 @@ export class HostController {
       // janela perdida (tolerância expirou / outro host): conteúdo pendente vira replay
       this.windows.delete(id)
     }
-    if (!s.window) this.endMirrorTurn(id)
+    if (!s.window) {
+      this.endMirrorTurn(id)
+      // a janela de outro fechou: conteúdo local que esperava pode subir agora (replay)
+      if (prev?.window && this.engine.hasPendingContent(id)) this.engine.schedulePush()
+    }
     if (live && event) this.onStateEvent(id, s, prev, event)
     this.emitInfo(id)
   }

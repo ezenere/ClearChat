@@ -28,6 +28,7 @@ import { ToggleRow } from '../panel/fields'
 import { Button, IconButton, Spinner, Switch } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import { useSkillsDiscovery, useSkillsSettings } from './hooks'
+import { CloudSkillsSection, SkillSyncProvider, SkillSyncToggle } from '../sync/CloudSkills'
 
 export function SkillsSettings(): React.JSX.Element {
   const { settings, update } = useSkillsSettings()
@@ -73,94 +74,97 @@ export function SkillsSettings(): React.JSX.Element {
   const project = disc?.locations.find((l) => l.kind === 'project')
 
   return (
-    <div data-testid="skills-settings" className="space-y-4">
-      <div className="flex items-start gap-3">
-        <p className="min-w-0 flex-1 text-xs leading-relaxed text-subtle">
-          Pastas onde o app procura skills (formato Agent Skills / Claude Code: uma subpasta por
-          skill, com um <span className="font-mono text-muted">SKILL.md</span>). A ordem é a
-          precedência — com nomes repetidos vence o primeiro local. Cada chat ou persona liga as
-          skills e escolhe quais usar na aba <span className="text-muted">Tools</span>.
-        </p>
-        <SkillsLocationsInfo />
-        <Button
-          size="sm"
-          variant="secondary"
-          loading={loading}
-          icon={<RefreshCw className="size-3.5" />}
-          onClick={() => reload(true)}
-        >
-          Reescanear
-        </Button>
-      </div>
-      {error && <p className="text-[12px] text-danger">{error}</p>}
-
-      <div className="space-y-2.5">
-        {locs.map((l, i) => (
-          <LocationCard
-            key={l.id}
-            index={i}
-            loc={l}
-            scan={scanOf(l.id)}
-            isDefault={l.path === DEFAULT_SKILLS_DIR}
-            first={i === 0}
-            last={i === locs.length - 1}
-            open={open}
-            onOpen={setOpen}
-            onToggle={(enabled) =>
-              void setLocs(locs.map((x) => (x.id === l.id ? { ...x, enabled } : x)))
-            }
-            onMove={(d) => move(i, d)}
-            onRemove={() => void setLocs(locs.filter((x) => x.id !== l.id))}
-          />
-        ))}
-        {!locs.length && (
-          <p className="rounded-xl border border-dashed border-border px-3 py-3 text-[12.5px] text-subtle">
-            Nenhuma pasta configurada.
+    <SkillSyncProvider>
+      <div data-testid="skills-settings" className="space-y-4">
+        <div className="flex items-start gap-3">
+          <p className="min-w-0 flex-1 text-xs leading-relaxed text-subtle">
+            Pastas onde o app procura skills (formato Agent Skills / Claude Code: uma subpasta por
+            skill, com um <span className="font-mono text-muted">SKILL.md</span>). A ordem é a
+            precedência — com nomes repetidos vence o primeiro local. Cada chat ou persona liga as
+            skills e escolhe quais usar na aba <span className="text-muted">Tools</span>.
           </p>
-        )}
-        <button
-          type="button"
-          onClick={() => void add()}
-          className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-dashed border-border-strong text-[13px] text-subtle transition-colors hover:border-accent/50 hover:bg-accent-soft/30 hover:text-fg"
-        >
-          <FolderPlus className="size-4" /> Adicionar pasta…
-        </button>
-        {!locs.some((l) => l.path === DEFAULT_SKILLS_DIR) && (
+          <SkillsLocationsInfo />
+          <Button
+            size="sm"
+            variant="secondary"
+            loading={loading}
+            icon={<RefreshCw className="size-3.5" />}
+            onClick={() => reload(true)}
+          >
+            Reescanear
+          </Button>
+        </div>
+        {error && <p className="text-[12px] text-danger">{error}</p>}
+
+        <div className="space-y-2.5">
+          {locs.map((l, i) => (
+            <LocationCard
+              key={l.id}
+              index={i}
+              loc={l}
+              scan={scanOf(l.id)}
+              isDefault={l.path === DEFAULT_SKILLS_DIR}
+              first={i === 0}
+              last={i === locs.length - 1}
+              open={open}
+              onOpen={setOpen}
+              onToggle={(enabled) =>
+                void setLocs(locs.map((x) => (x.id === l.id ? { ...x, enabled } : x)))
+              }
+              onMove={(d) => move(i, d)}
+              onRemove={() => void setLocs(locs.filter((x) => x.id !== l.id))}
+            />
+          ))}
+          {!locs.length && (
+            <p className="rounded-xl border border-dashed border-border px-3 py-3 text-[12.5px] text-subtle">
+              Nenhuma pasta configurada.
+            </p>
+          )}
           <button
             type="button"
-            onClick={() =>
-              void setLocs([...locs, { id: 'default', path: DEFAULT_SKILLS_DIR, enabled: true }])
-            }
-            className="text-[11.5px] text-accent-strong hover:underline"
+            onClick={() => void add()}
+            className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-dashed border-border-strong text-[13px] text-subtle transition-colors hover:border-accent/50 hover:bg-accent-soft/30 hover:text-fg"
           >
-            Restaurar a pasta padrão ({DEFAULT_SKILLS_DIR})
+            <FolderPlus className="size-4" /> Adicionar pasta…
           </button>
-        )}
-      </div>
+          {!locs.some((l) => l.path === DEFAULT_SKILLS_DIR) && (
+            <button
+              type="button"
+              onClick={() =>
+                void setLocs([...locs, { id: 'default', path: DEFAULT_SKILLS_DIR, enabled: true }])
+              }
+              className="text-[11.5px] text-accent-strong hover:underline"
+            >
+              Restaurar a pasta padrão ({DEFAULT_SKILLS_DIR})
+            </button>
+          )}
+        </div>
 
-      <div className="rounded-xl border border-border bg-surface/50 px-3.5 py-3">
-        <ToggleRow
-          label="Incluir .claude/skills do diretório raiz do chat"
-          description="Skills de projeto, resolvidas por chat (depois das pastas acima na precedência)"
-          checked={settings.projectSkills}
-          onChange={(projectSkills) => void update({ projectSkills })}
-        />
-        {settings.projectSkills && project && (
-          <div className="mt-3 border-t border-border/70 pt-2.5">
-            <p className="mb-1.5 text-[11px] text-subtle">
-              Chat aberto: <span className="font-mono text-muted">{project.resolved}</span>
-              {!project.exists && ' — pasta não existe'}
+        <div className="rounded-xl border border-border bg-surface/50 px-3.5 py-3">
+          <ToggleRow
+            label="Incluir .claude/skills do diretório raiz do chat"
+            description="Skills de projeto, resolvidas por chat (depois das pastas acima na precedência)"
+            checked={settings.projectSkills}
+            onChange={(projectSkills) => void update({ projectSkills })}
+          />
+          {settings.projectSkills && project && (
+            <div className="mt-3 border-t border-border/70 pt-2.5">
+              <p className="mb-1.5 text-[11px] text-subtle">
+                Chat aberto: <span className="font-mono text-muted">{project.resolved}</span>
+                {!project.exists && ' — pasta não existe'}
+              </p>
+              <SkillList scan={project} open={open} onOpen={setOpen} />
+            </div>
+          )}
+          {settings.projectSkills && !chat && (
+            <p className="mt-2 text-[11px] text-faint">
+              Abra um chat para ver as skills de projeto do diretório raiz dele.
             </p>
-            <SkillList scan={project} open={open} onOpen={setOpen} />
-          </div>
-        )}
-        {settings.projectSkills && !chat && (
-          <p className="mt-2 text-[11px] text-faint">
-            Abra um chat para ver as skills de projeto do diretório raiz dele.
-          </p>
-        )}
+          )}
+        </div>
+        <CloudSkillsSection />
       </div>
-    </div>
+    </SkillSyncProvider>
   )
 }
 
@@ -354,6 +358,11 @@ function SkillRow({
             {s.error && (
               <span className="ml-auto shrink-0 rounded bg-danger/10 px-1.5 py-px text-[10.5px] text-danger/90">
                 inválida
+              </span>
+            )}
+            {!s.error && !s.shadowedBy && (
+              <span className="ml-auto">
+                <SkillSyncToggle skill={s} />
               </span>
             )}
           </div>

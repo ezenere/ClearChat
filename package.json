@@ -31,6 +31,7 @@
     "test:e2e:overlay": "node e2e/chat-overlay.spec.ts",
     "test:e2e:skills": "electron-vite build && node e2e/skills.spec.ts",
     "test:e2e:websearch": "electron-vite build && node e2e/web-search.spec.ts",
+    "test:e2e:sync": "electron-vite build && node e2e/sync.spec.ts",
     "icons": "scripts/icons/render.sh",
     "dist": "npm run typecheck && electron-vite build && electron-builder --linux",
     "dist:appimage": "npm run typecheck && electron-vite build && electron-builder --linux AppImage",

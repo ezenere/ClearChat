@@ -1,4 +1,16 @@
-import { Check, CircleX, Hand, MessageSquarePlus, Pencil, Settings, Trash2, X } from 'lucide-react'
+import {
+  Check,
+  CircleX,
+  GitFork,
+  Hand,
+  MessageSquarePlus,
+  MonitorSmartphone,
+  Pencil,
+  Settings,
+  Trash2,
+  X
+} from 'lucide-react'
+import { SyncIndicator } from './sync/ChatHost'
 import { useMemo, useState } from 'react'
 import type { Chat } from '@shared/types'
 import { cn, isMac, relativeTime } from '../lib/format'
@@ -47,6 +59,7 @@ export function Sidebar(): React.JSX.Element {
       >
         <Logo className="size-[18px]" />
         <span className="text-[13px] font-semibold tracking-tight text-fg/90">ClearChat</span>
+        <SyncIndicator />
       </div>
 
       <div className="px-2.5 pt-1.5 pb-2">
@@ -122,6 +135,7 @@ function ChatItem({
   failures?: string[]
 }): React.JSX.Element {
   const failed = !!failures?.length
+  const host = useStore((s) => s.chatHosts[chat.id])
   const openChat = useStore((s) => s.openChat)
   const renameChat = useStore((s) => s.renameChat)
   const deleteChat = useStore((s) => s.deleteChat)
@@ -199,6 +213,23 @@ function ChatItem({
         </Tip>
       ) : null}
       <span className="min-w-0 flex-1 truncate">{chat.title || 'Novo chat'}</span>
+      {host?.mode === 'diverged' && (
+        <Tip label="Divergente: escolha qual versão manter">
+          <GitFork data-testid="chat-diverged" className="size-3.5 shrink-0 text-danger" />
+        </Tip>
+      )}
+      {(host?.mode === 'remote' || host?.mode === 'host-offline') && (
+        <Tip
+          label={`Executando em ${host.host?.name ?? 'outro dispositivo'}${host.mode === 'host-offline' ? ' (offline)' : ''}`}
+        >
+          <MonitorSmartphone
+            className={cn(
+              'size-3 shrink-0',
+              host.mode === 'host-offline' ? 'text-faint' : 'text-accent-strong/80'
+            )}
+          />
+        </Tip>
+      )}
       {approvals > 1 && (
         <span className="shrink-0 rounded-full bg-warning/20 px-1.5 text-[10.5px] font-semibold text-warning tabular-nums group-hover:hidden">
           {approvals}

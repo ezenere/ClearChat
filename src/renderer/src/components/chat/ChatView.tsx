@@ -43,6 +43,8 @@ import { ContextMeter } from './ContextMeter'
 import { MessageList } from './MessageList'
 import { ProcessesBadge } from './ProcessesBadge'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
+import { DivergencePanel, HostBadge } from '../sync/ChatHost'
+import { useHostInfo } from '../sync/hooks'
 
 function ModelPill({
   providerId,
@@ -379,6 +381,7 @@ export function ChatHeader({
       <SessionSwitcher chatId={chat.id} currentId={session?.id ?? chat.mainSessionId} />
       <ProcessesBadge chatId={chat.id} />
       <AutoApproveBadge chat={chat} />
+      <HostBadge chat={chat} />
     </TopBar>
   )
 }
@@ -452,6 +455,7 @@ export function ChatView({
   sessionId: string
 }): React.JSX.Element {
   const session = useStore((s) => s.sessions[sessionId])
+  const host = useHostInfo(chat.id)
   const addFiles = useStore((s) => s.addFiles)
   const { dropText } = useAttachmentSupport(session)
   const [dragging, setDragging] = useState(false)
@@ -510,7 +514,11 @@ export function ChatView({
         </div>
       )}
       {isSub && <SubBanner chat={chat} session={session} />}
-      <ChatStage chat={chat} session={session} />
+      {host?.mode === 'diverged' ? (
+        <DivergencePanel chat={chat} />
+      ) : (
+        <ChatStage chat={chat} session={session} />
+      )}
     </div>
   )
 }

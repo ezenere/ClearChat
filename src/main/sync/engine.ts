@@ -1079,16 +1079,16 @@ export class SyncEngine {
 
   scheduleCycle(delay = 0): void {
     if (!this.started) return
-    if (this.cycle) {
-      this.cycleAgain = true
-      return
-    }
     if (delay) {
       if (this.retryTimer) return
       this.retryTimer = setTimeout(() => {
         this.retryTimer = null
         this.scheduleCycle(0)
       }, delay)
+      return
+    }
+    if (this.cycle) {
+      this.cycleAgain = true
       return
     }
     this.cycle = this.runCycle().finally(() => {
@@ -1757,7 +1757,8 @@ export class SyncEngine {
       }
       const mode = await this.host.pushModeFor(chatId)
       if (!mode) {
-        this.log('conteúdo do chat aguardando (janela/divergência)', chatId)
+        // janela de outro dispositivo aberta (ou divergente): tenta de novo depois
+        if (!this.host.isDiverged(chatId)) this.scheduleCycle(1500)
         continue
       }
       list.sort((a, b) => CONTENT_ORDER(a.item, b.item))
