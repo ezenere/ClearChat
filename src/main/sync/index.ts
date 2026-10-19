@@ -2,14 +2,13 @@
 // runner, skills, handlers IPC `sync:*` e o "portão" das ações do agente (host local × controle
 // remoto). Ver docs/SYNC_PROTOCOL.md.
 import { app, BrowserWindow, safeStorage, session, shell } from 'electron'
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
 import { hostname } from 'os'
 import { join } from 'path'
 import { randomBytes } from 'crypto'
 import { IPC } from '@shared/ipc'
-import type { ApiMessage, AttachmentInfo, QueuedMessage } from '@shared/types'
+import type { AttachmentInfo, QueuedMessage } from '@shared/types'
 import type { SyncServerKind, TakeoverOptions } from '@shared/sync'
-import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import { emit, onAgentEvent } from '../events'
 import { getDb } from '../db'
 import { chatsRepo, messagesRepo, sessionsRepo } from '../repo'
@@ -245,9 +244,6 @@ export async function initSync(): Promise<void> {
         }
       : undefined
   })
-  if (!existsSync(syncedDir)) {
-    /* criada no primeiro download */
-  }
   // "Reescanear" / locais mudaram → confere as skills acompanhadas
   onAgentEvent((e) => {
     if (e.type === 'skills-changed') void engine?.checkTrackedSkills().catch(() => undefined)
@@ -437,6 +433,3 @@ export function syncHandlers(): Record<string, Handler> {
     }
   }
 }
-
-// re-export para o ipc.ts
-export type { ApiMessage, ApprovalItemDecision }

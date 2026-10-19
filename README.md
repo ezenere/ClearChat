@@ -298,6 +298,31 @@ npm run install:local -- --uninstall
   `<skill name="…" path="…">…</skill>` (card "Skill carregada" com (i) do texto exato). Funciona com fila e
   ⚡; se não der para ler, a mensagem não é enviada (erro legível).
 
+## Conta e sincronização
+
+Opcional. Em **Configurações → Conta** (ou "Entrar" no onboarding) você entra numa conta ClearChat e
+sincroniza provedores, personas, chats, memórias e configurações entre seus dispositivos —
+**cifrado ponta a ponta** (AES-256-GCM, chave derivada da sua senha de criptografia com Argon2id; o
+servidor só guarda dados cifrados). Contrato completo em [`docs/SYNC_PROTOCOL.md`](docs/SYNC_PROTOCOL.md).
+
+- **Servidor**: "ClearChat (clear.ezenere.com)" ou **Self-host** (qualquer instância; validada por
+  `GET <base>/api/info`). `CLEARCHAT_SYNC_URL` sobrepõe (desenvolvimento/testes). "Criar conta" abre o
+  site da instância; com captcha, o app abre a página `/captcha` da própria instância numa janela.
+- **Entrar** = e-mail + código; **desbloquear** = senha de criptografia (ou chave de recuperação → senha
+  nova). "Lembrar neste computador" guarda a chave no chaveiro do sistema (`safeStorage`).
+- **Primeiro login com dados dos dois lados**: "Priorizar online" ou "Priorizar local" (duplicatas — ex.:
+  o mesmo provedor — viram uma só; a versão perdedora é descartada, com aviso).
+- **Host de execução**: cada chat roda num dispositivo (selo "Executando em …" no cabeçalho). Nos outros,
+  o composer vira **controle remoto** (mensagens, ⚡, fila, Parar, aprovações, questionários, editar,
+  regenerar, compactar… vão cifrados ao host) e a resposta aparece **ao vivo**. Host offline → "Executar
+  neste dispositivo" (com aviso forte se o chat usa ferramentas locais; "fixar host" pede confirmação).
+- **Divergência** (duas histórias sem uma ver a outra, ex.: execução offline): o chat mostra as duas
+  versões e você escolhe a que fica online — a outra é **apagada** depois de um aviso claro.
+- **Sem conexão**: o app continua funcionando; as mudanças sobem quando a conexão volta.
+- **Skills**: nada sobe por padrão; "Sincronizar" por skill em Configurações → Skills; nos outros
+  dispositivos aparecem em "Skills na nuvem" e só baixam quando você pede (depois ficam atualizadas).
+- **Anexos** sobem como blobs cifrados e são baixados sob demanda.
+
 ## Anexos
 
 - 📎 no composer (diálogo nativo), arrastar arquivos para o chat ou colar imagens. Imagens
@@ -347,6 +372,9 @@ npm run test:unit   # seletor de modelos (e2e/models.test.ts: grupos por provedo
                     # parse de Exa/Tavily/Brave API com fixtures, ordem + fallback, intervalo, migração, máscara),
                     # skills (e2e/skills.test.ts: parse do SKILL.md, descoberta com precedência/conflitos/projeto,
                     # confinação do skill_read, saídas e limites das tools, config/herança, request e invocação manual),
+                    # sync (e2e/syncCrypto.test.ts: cripto byte a byte contra docs/test-vectors; e2e/syncEngine.test.ts:
+                    # mapeamento dos registros, outbox/idempotência, pull/tombstones, merge, divergência, host e comandos
+                    # remotos contra o servidor falso; e2e/syncFakeServer.test.ts: o próprio servidor falso),
                     # migração CleartChat → ClearChat; rascunho em $CLEARCHAT_TEST_TMP (padrão: tmp do sistema), apagado no fim
 
 # E2E do backend (Playwright `_electron`, chama window.api pelo renderer; faz chamadas reais e baratas ao OpenRouter)
@@ -382,6 +410,17 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-skills-e2e npm run test:e2e:skills
 # E2E da pesquisa na web (UI real, 100% local: provedor e servidor de busca falsos via CLEARCHAT_SEARCH_BASE_*,
 # userData isolado, sem chaves reais; Configurações → Pesquisa na web + pesquisa pelo runner com fallback)
 CLEARCHAT_E2E_DIR=/tmp/clearchat-websearch-e2e npm run test:e2e:websearch
+
+# E2E do sync com DUAS instâncias do app (userData isolados) contra o servidor de sync FALSO
+# (e2e/fakes/syncServer.ts) e um provedor falso — sem key: login pela UI, sync nos dois sentidos, controle
+# remoto com stream ao vivo e aprovação remota, host offline → assumir, troca forçada, divergência, skills,
+# anexos e captcha; screenshots em $CLEARCHAT_E2E_DIR/shots
+CLEARCHAT_E2E_DIR=/tmp/clearchat-sync-e2e npm run test:e2e:sync
+
+# Fumaça contra o servidor de sync REAL (../ClearChatWebsite/backend com MAIL_BACKEND=console; os códigos
+# por e-mail são lidos do log do servidor). Sem as variáveis, pula. test:unit inclui e2e/syncReal.test.ts
+# (motor do sync, sem Electron); este roda dois apps reais:
+CLEARCHAT_SYNC_TEST_URL=http://127.0.0.1:8100 CLEARCHAT_SYNC_TEST_MAIL_LOG=/caminho/api.log npm run test:e2e:sync-real
 
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
 OPENROUTER_API_KEY=sk-or-... CLEARCHAT_E2E_DIR=/tmp/clearchat-ui-e2e npm run test:e2e:ui

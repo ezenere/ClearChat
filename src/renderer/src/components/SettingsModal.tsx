@@ -318,7 +318,7 @@ export function SettingsModal(): React.JSX.Element {
         (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
       }
     >
-      <div className="mb-5 flex gap-0.5 overflow-x-auto border-b border-border">
+      <div className="mb-5 flex gap-0.5 border-b border-border">
         {(
           [
             ['account', 'Conta'],

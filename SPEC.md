@@ -757,3 +757,34 @@ interface SkillsConfig {
 
 ### Testes
 `e2e/skills.test.ts` (em `npm run test:unit`, só pastas temporárias com home injetada): parse (válido, sem frontmatter, não fechado, YAML ruim, sem name/description, campos extras, CRLF/BOM, blocos), descoberta (precedência, sobrescrita, inválidas, projeto, local desligado, local que é a própria skill, link de pasta, cache por mtime), settings/config/herança, ativas (subconjunto), `list_skills`/`skill_load`/`skill_read` (saídas, limites, corte, confinação com `..`/absoluto/symlink), sandbox (`--ro-bind`), request (desligadas → nada; prompt + tools; subagentes; modo texto), invocação manual (part exato, `_skill` removido em openai/anthropic, edição, compactação, corte, erros). `e2e/skills.spec.ts` (`npm run test:e2e:skills`): app real com provedor falso, userData isolado e **HOME temporária** (o `~/.claude/skills` padrão resolve dentro dela) — Configurações → Skills, list_skills → skill_load → skill_read pelo agente, desligadas → nada, seção da aba Tools, lâmpada → picker → chip → part `<skill>` + card, fila, erro legível, subagentes com/sem, editor de personas; screenshots.
+
+## Sync (cliente — `src/main/sync/`, `src/shared/sync.ts`, `components/sync/`)
+
+Contrato do protocolo: `docs/SYNC_PROTOCOL.md` (compartilhado com o servidor). Aqui só o que é do app.
+
+- **Main process** (sem Electron, testável): `crypto.ts` (§3, conferido com `docs/test-vectors`), `records.ts`
+  (entidade ↔ plaintext §4.3; `cwd` de chats/personas fica local), `schema.ts` (tabelas `sync_*` + triggers que
+  marcam `sync_dirty` em toda escrita das tabelas sincronizadas — suspensos ao aplicar mudanças remotas),
+  `engine.ts` (conta/chaves, pull/push com outbox `sync_outbox` e mesmo `push_id` nas tentativas, LWW por campo
+  com merge 3-way contra `sync_records.base`, merge do primeiro login, divergência, blobs, skills),
+  `host.ts` (janela de escrita, troca de host, comandos remotos nos dois sentidos, stream ao vivo publicado/
+  espelhado), `ws.ts`/`http.ts` (clientes), `index.ts` (safeStorage, janela do captcha, adaptador do runner,
+  handlers `sync:*` e o **portão** `gateChat`/`gatedSend`/`gateById` usado pelos handlers do agente).
+- **Portão** (ipc.ts): sync desligado → tudo local, como antes. Chat cujo host é outro dispositivo online →
+  a ação vira comando remoto (`agent.send` → `send`, `forceSend` → `queue.force`, `approve` → `approval`, …) e
+  espera o resultado; host offline → erro legível (composer desabilitado); local → abre a janela
+  (`host.begin`) antes de rodar. Getters (`pendingApprovals`, `questions.pending`, `retries.pending`,
+  `getQueue`, `runningSessions`, `processes.list`) juntam o estado local com o espelho do host.
+- **Eventos novos** (`AgentEvent`): `sync-status`, `sync-chat-state` (`ChatHostInfo`), `sync-data-changed`
+  (domínios para recarregar), `chat-deleted`, `sync-notice` (toast + aviso no chat). Mudanças remotas de
+  sessões/mensagens emitem os eventos de sempre (`session-updated`, `message-added`…).
+- **Settings locais** (nunca sobem): `defaultCwd`, `skillsSettings`, `presetsSeeded`, `migration.*`. Skills
+  baixadas ficam em `<userData>/synced-skills/<nome>` (local do app, depois dos locais do usuário).
+- **Env**: `CLEARCHAT_SYNC_URL` (servidor fixo), `CLEARCHAT_DEVICE_NAME` (nome do dispositivo),
+  `CLEARCHAT_SYNC_FAST=1` (backoff/heartbeat curtos — testes).
+- **UI**: Configurações → **Conta** (servidor, entrar/desbloquear/recuperação, merge, estado do sync,
+  dispositivos, senha, chave de recuperação, skills, sair/bloquear); onboarding com "Entrar"/"Criar conta";
+  selo do host no cabeçalho do chat (popover: assumir, forçar, cancelar troca, fixar host); faixa/cartão no
+  composer (controle remoto, "enviando…", host offline, "o dispositivo remoto caiu"); painel de divergência
+  (duas versões + aviso de descarte); "Sincronizar" por skill e "Skills na nuvem"; indicador na barra lateral.
+

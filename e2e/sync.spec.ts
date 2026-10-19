@@ -135,14 +135,14 @@ interface Inst {
 
 let srv: FakeSyncServer
 
-async function launch(name: string, dir: string): Promise<Inst> {
+async function launch(name: string, dir: string, url?: string): Promise<Inst> {
   mkdirSync(dir, { recursive: true })
   const env: Record<string, string> = {}
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v
   delete env.ELECTRON_RUN_AS_NODE
   delete env.OPENROUTER_API_KEY
   env.CLEARCHAT_USER_DATA = dir
-  env.CLEARCHAT_SYNC_URL = srv.url
+  env.CLEARCHAT_SYNC_URL = url ?? srv.url
   env.CLEARCHAT_SYNC_FAST = '1'
   env.CLEARCHAT_DEVICE_NAME = name
   const app = await electron.launch({ args: [ROOT], env, timeout: 60_000 })
@@ -649,6 +649,27 @@ async function main(): Promise<void> {
     assert(devs.length === 2 && devs.some((d) => d.current), 'dois dispositivos')
     await B.page.keyboard.press('Escape')
   })
+
+  await step(
+    'captcha: instância com Turnstile → janela do captcha → token → código enviado',
+    async () => {
+      const srv2 = await startFakeSyncServer({ captcha: true, name: 'Com captcha' })
+      const email2 = 'captcha@teste.dev'
+      await srv2.createAccount({ email: email2, password: PASSWORD })
+      const C = await launch('Com captcha', join(BASE, 'c'), srv2.url)
+      try {
+        const info = await api(C, 'sync.probeServer')
+        assert(info.captcha === true, 'features.captcha')
+        await api(C, 'sync.requestCode', email2)
+        assert(!!srv2.lastCode(email2), 'código enviado depois do captcha')
+        const req = srv2.requests.find((r) => r.path.endsWith('/auth/code/request'))
+        assert(req?.status === 202, 'turnstile_token aceito')
+      } finally {
+        await C.app.close().catch(() => {})
+        await srv2.close()
+      }
+    }
+  )
 
   const failed = results.filter((r) => !r.ok)
   writeFileSync(join(BASE, 'report.json'), JSON.stringify(results, null, 2))

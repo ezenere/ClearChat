@@ -788,3 +788,90 @@ test('host: comando remoto executado no host, stream ao vivo, queda → host off
   A.eng.destroy()
   B.eng.destroy()
 })
+
+test('conta: trocar senha, nova chave de recuperação e desbloqueio pela chave', async () => {
+  const email = `u${++emailN}-${Date.now()}@teste.dev`
+  await srv.createAccount({ email, password: PASSWORD })
+  const A = device('A')
+  await login(A, email)
+  await settled(A)
+  await assert.rejects(A.eng.changePassword('curta'), /10 caracteres/)
+  await A.eng.changePassword('uma senha nova bem longa')
+  const { recoveryKey } = await A.eng.newRecoveryKey()
+  assert.match(recoveryKey, /^([0-9A-Z]{4}-){8}[0-9A-Z]{4}$/)
+  // outro dispositivo: senha antiga falha, nova funciona
+  const B = device('B')
+  await B.eng.init()
+  await B.eng.requestCode(email)
+  await B.eng.verifyCode(email, srv.lastCode(email)!)
+  await assert.rejects(B.eng.unlock(PASSWORD, true), /incorreta/)
+  await B.eng.unlock('uma senha nova bem longa', true)
+  assert.equal(B.eng.phase(), 'ready')
+  // C: chave de recuperação → senha nova obrigatória
+  const C = device('C')
+  await C.eng.init()
+  await C.eng.requestCode(email)
+  await C.eng.verifyCode(email, srv.lastCode(email)!)
+  await assert.rejects(
+    C.eng.unlockWithRecovery(recoveryKey.slice(0, -1) + 'Z', 'terceira senha longa', true),
+    /incorreta/
+  )
+  await C.eng.unlockWithRecovery(recoveryKey.toLowerCase(), 'terceira senha longa', true)
+  assert.equal(C.eng.phase(), 'ready')
+  // A continua funcionando (a DEK não muda)
+  addProvider(A.conn, { name: 'Depois da troca' })
+  await settled(A)
+  await waitFor(
+    () => C.conn.prepare("SELECT 1 FROM providers WHERE name = 'Depois da troca'").get(),
+    'C recebe'
+  )
+})
+
+test('cursor expirado (410) → resync completo; keys.reset volta a "definir senha" sem derrubar a sessão', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  addProvider(A.conn, { id: 'pa', name: 'Fica' })
+  addProvider(A.conn, { id: 'pb', name: 'Some' })
+  await login(A, email)
+  await settled(A)
+  const B = device('B')
+  await login(B, email)
+  await settled(B)
+  B.eng.stop()
+  A.conn.prepare("DELETE FROM providers WHERE id = 'pb'").run()
+  A.conn.prepare("UPDATE providers SET name = 'Fica (editado)' WHERE id = 'pa'").run()
+  await settled(A)
+  const uid = srv.userIdOf(email)!
+  srv.setTombstoneFloor(uid, Math.max(...srv.records(uid).map((r: any) => r.seq)))
+  B.eng.start()
+  await waitFor(
+    () => !B.conn.prepare("SELECT 1 FROM providers WHERE id = 'pb'").get(),
+    'B apaga o que sumiu online (resync)'
+  )
+  assert.equal(
+    (B.conn.prepare("SELECT name FROM providers WHERE id = 'pa'").get() as any).name,
+    'Fica (editado)'
+  )
+
+  // keys.reset: código fresco + POST /keys/reset
+  const token = (B.eng as any).tokens.access_token
+  await fetch(`${srv.url}/api/v1/auth/reauth/request`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ purpose: 'reset_keys' })
+  })
+  const r = await fetch(`${srv.url}/api/v1/keys/reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({ code: srv.lastCode(email) })
+  })
+  assert.equal(r.status, 204)
+  await waitFor(() => A.eng.phase() === 'keys-not-ready', 'A volta a "definir senha"')
+  await sleep(300)
+  assert.equal(
+    A.eng.status().account?.email,
+    email,
+    'sessão mantida (4403 logo depois do reset não desloga)'
+  )
+  assert.ok(A.conn.prepare("SELECT 1 FROM providers WHERE id = 'pa'").get(), 'dados locais ficam')
+})
