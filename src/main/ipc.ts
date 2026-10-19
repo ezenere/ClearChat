@@ -1,6 +1,6 @@
 // Registro dos handlers IPC (ipcMain.handle) — um para cada canal em `IPC` (src/shared/ipc.ts).
 // Handlers recebem os argumentos posicionais na mesma ordem da API do preload.
-import { BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import {
   ALL_CHANNELS,
   IPC,
@@ -67,6 +67,8 @@ import {
 } from './webSearchConfig'
 import { testWebSearchEngine } from './tools/web'
 import * as skills from './skills'
+import { updateChecker } from './updates'
+import { isReleaseUrl, RELEASES_PAGE, type UpdateStatus } from '@shared/updates'
 import type { SkillsDiscoverOptions, SkillsSettings } from '@shared/skills'
 import type {
   MemoryCollectionInput,
@@ -349,6 +351,17 @@ export function registerIpc(): void {
       ripgrep: ripgrepAvailable(),
       shell: shellInfoLite()
     }),
+
+    // ---- atualizações (só aviso; nada é baixado) ----
+    [IPC.updates.status]: (): UpdateStatus =>
+      updateChecker()?.status() ?? { current: app.getVersion(), state: 'idle' },
+    [IPC.updates.check]: (): Promise<UpdateStatus> | UpdateStatus =>
+      updateChecker()?.check() ?? { current: app.getVersion(), state: 'idle' },
+    [IPC.updates.openRelease]: async () => {
+      // a URL vem do main (resposta do GitHub já validada), nunca do renderer
+      const url = updateChecker()?.status().latest?.url
+      await shell.openExternal(isReleaseUrl(url) ? url : RELEASES_PAGE)
+    },
 
     // ---- questionários (ask_user) ----
     [IPC.questions.answer]: (id: string, answers: unknown) =>

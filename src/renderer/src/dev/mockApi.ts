@@ -10,6 +10,7 @@ import {
   type SkillsSettings
 } from '@shared/skills'
 import type { ClearApi, WebSearchSettingsState } from '@shared/ipc'
+import type { UpdateStatus } from '@shared/updates'
 import { OFFICIAL_SYNC_URL, type SyncStatus } from '@shared/sync'
 import {
   isApiEngine,
@@ -1382,6 +1383,26 @@ export function createMockApi(scenario: string): ClearApi {
           shell: { name: 'zsh' as const, version: '5.9', os: 'Linux' }
         })
     },
+    // ?scenario=update → há versão nova (aviso na sidebar); senão, já na mais recente
+    updates: (() => {
+      const st = (): UpdateStatus =>
+        scenario === 'update'
+          ? {
+              current: '0.6.1',
+              state: 'available',
+              latest: {
+                version: '0.7.0',
+                url: 'https://github.com/ezenere/ClearChat/releases/tag/v0.7.0'
+              },
+              checkedAt: Date.now()
+            }
+          : { current: '0.6.1', state: 'latest', checkedAt: Date.now() }
+      return {
+        status: () => delay(st()),
+        check: () => delay(st(), 700),
+        openRelease: async () => undefined
+      }
+    })(),
     presets: {
       list: () => delay(presets),
       create: async (input) => {

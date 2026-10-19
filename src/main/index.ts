@@ -16,6 +16,7 @@ import {
   setProcessLogDir
 } from './tools/processes'
 import { migrateLegacyData } from './migrate'
+import { initUpdates, shutdownUpdates } from './updates'
 import { setImageProcessor } from './tools/media'
 import { nativeImageProcessor } from './imageResize'
 import { ATTACHMENT_SCHEME, parseAttachmentUrl } from '@shared/attachments'
@@ -154,6 +155,15 @@ app.whenReady().then(() => {
   registerIpc()
   createWindow()
   void initSync().catch((e) => console.error('[clearchat] sync', e))
+  // Aviso de versão nova: consulta a última release no GitHub (poucos segundos após o start + a
+  // cada 6 h). Só avisa — nada é baixado nem instalado. Testes isolados não consultam a rede.
+  initUpdates(
+    {
+      currentVersion: app.getVersion(),
+      onStatus: (status) => emit({ type: 'update-status', status })
+    },
+    { auto: !isolatedUserData }
+  )
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -165,6 +175,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  shutdownUpdates()
   shutdownSync()
   shutdownRunner()
   killAllProcesses()

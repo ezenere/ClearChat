@@ -18,6 +18,7 @@ import { isBusy, useStore } from '../store'
 import { Logo } from './Logo'
 import { Kbd } from './ui/controls'
 import { Tip } from './ui/Tooltip'
+import { UpdateNotice } from './UpdateNotice'
 
 export function Sidebar(): React.JSX.Element {
   const chats = useStore((s) => s.chats)
@@ -102,6 +103,7 @@ export function Sidebar(): React.JSX.Element {
       </nav>
 
       <div className="border-t border-border p-2.5">
+        <UpdateNotice />
         <button
           type="button"
           onClick={() => setSettingsOpen(true)}

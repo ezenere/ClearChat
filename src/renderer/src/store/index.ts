@@ -27,6 +27,7 @@ import { contentText, formatSize } from '@shared/attachments'
 import { setToolShellInfo } from '@shared/shellInfo'
 import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
 import { trackFailure, type SubFailure } from '../lib/subFailures'
+import type { UpdateStatus } from '@shared/updates'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -37,6 +38,8 @@ export interface AppSettings {
   defaultCwd: string | null
   /** Persona selecionada por padrão no Novo chat. */
   defaultPresetId: string | null
+  /** Versão cujo aviso de atualização foi dispensado (local; não sincroniza). */
+  updateDismissedVersion: string | null
 }
 
 export interface ToolRun {
@@ -185,6 +188,8 @@ interface State {
     string,
     { text: string; kind: 'info' | 'error' | 'success'; at: number } | undefined
   >
+  /** Versão instalada + última checagem de atualização (null = ainda não carregado). */
+  update: UpdateStatus | null
 }
 
 interface Actions {
@@ -198,6 +203,12 @@ interface Actions {
   setSetting<K extends keyof AppSettings>(key: K, value: AppSettings[K]): Promise<void>
   /** Várias de uma vez (ex.: o par defaultProviderId + defaultModel). */
   setSettings(patch: Partial<AppSettings>): Promise<void>
+  /** "Verificar atualizações" (Configurações). Falha fica no estado, sem toast. */
+  checkUpdates(): Promise<void>
+  /** "Baixar": abre a página da release no navegador. */
+  openRelease(): Promise<void>
+  /** Dispensa o aviso da sidebar para a versão atual (volta numa versão maior). */
+  dismissUpdate(): Promise<void>
   goNew(): void
   openChat(chatId: string, sessionId?: string): Promise<void>
   openSession(sessionId: string): Promise<void>
@@ -280,7 +291,8 @@ const SETTINGS_KEYS: (keyof AppSettings)[] = [
   'defaultModel',
   'defaultSystemPrompt',
   'defaultCwd',
-  'defaultPresetId'
+  'defaultPresetId',
+  'updateDismissedVersion'
 ]
 
 function sortChats(chats: Chat[]): Chat[] {
@@ -315,7 +327,8 @@ export const useStore = create<Store>()((set, get) => ({
     defaultModel: null,
     defaultSystemPrompt: null,
     defaultCwd: null,
-    defaultPresetId: null
+    defaultPresetId: null,
+    updateDismissedVersion: null
   },
   homeDir: null,
   view: { kind: 'new' },
@@ -354,6 +367,7 @@ export const useStore = create<Store>()((set, get) => ({
   chatHosts: {},
   remoteSending: {},
   chatNotices: {},
+  update: null,
 
   async refreshSync() {
     try {
@@ -461,6 +475,7 @@ export const useStore = create<Store>()((set, get) => ({
       approvalSettings,
       syncStatus,
       hostList,
+      update,
       ...values
     ] = await Promise.all([
       safe(() => api.providers.list(), [] as Provider[]),
@@ -474,6 +489,7 @@ export const useStore = create<Store>()((set, get) => ({
       safe(() => api.approvals.getSettings(), normalizeApprovalSettings(null, null)),
       safe(() => api.sync.status(), null as SyncStatus | null),
       safe(() => api.sync.chatStates(), [] as ChatHostInfo[]),
+      safe(() => api.updates.status(), null as UpdateStatus | null),
       ...SETTINGS_KEYS.map((k) => safe(() => api.settings.get<string>(k), null))
     ])
     const settings = Object.fromEntries(
@@ -494,6 +510,8 @@ export const useStore = create<Store>()((set, get) => ({
       sync: syncStatus as SyncStatus | null,
       chatHosts: Object.fromEntries((hostList as ChatHostInfo[]).map((h) => [h.chatId, h])),
       settings,
+      // um `update-status` pode ter chegado durante o boot: fica o mais recente
+      update: get().update?.checkedAt ? get().update : (update as UpdateStatus | null),
       booted: true
     })
   },
@@ -552,6 +570,25 @@ export const useStore = create<Store>()((set, get) => ({
       () => Promise.all(Object.entries(patch).map(([k, v]) => api.settings.set(k, v))),
       'Erro ao salvar configuração'
     )
+  },
+
+  async checkUpdates() {
+    set((s) => ({ update: s.update ? { ...s.update, state: 'checking' } : s.update }))
+    try {
+      set({ update: await api.updates.check() })
+    } catch (err) {
+      console.warn('[clearchat] atualizações:', errorMessage(err))
+      set((s) => ({ update: s.update ? { ...s.update, state: 'error' } : s.update }))
+    }
+  },
+
+  async openRelease() {
+    await get().run(() => api.updates.openRelease(), 'Erro ao abrir a página da versão')
+  },
+
+  async dismissUpdate() {
+    const v = get().update?.latest?.version
+    if (v) await get().setSetting('updateDismissedVersion', v)
   },
 
   goNew() {
@@ -1145,6 +1182,9 @@ function applyEvent(e: AgentEvent): void {
           view
         }
       })
+      break
+    case 'update-status':
+      set({ update: e.status })
       break
     case 'sync-notice':
       useStore.getState().toast(e.text, e.kind)

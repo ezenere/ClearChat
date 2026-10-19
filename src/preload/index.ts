@@ -59,6 +59,11 @@ const api: ClearApi = {
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
   },
+  updates: {
+    status: () => invoke(IPC.updates.status),
+    check: () => invoke(IPC.updates.check),
+    openRelease: () => invoke(IPC.updates.openRelease)
+  },
   memory: {
     listCollections: () => invoke(IPC.memory.listCollections),
     createCollection: (input) => invoke(IPC.memory.createCollection, input),

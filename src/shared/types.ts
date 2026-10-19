@@ -728,3 +728,5 @@ export type AgentEvent =
   | { type: 'sync-data-changed'; scopes: import('./sync').SyncScope[] }
   /** Sync: aviso para o usuário (toast; `chatId` = aviso também no chat). */
   | { type: 'sync-notice'; kind: 'info' | 'error' | 'success'; text: string; chatId?: string }
+  /** Atualizações: resultado de uma checagem da última release (aviso discreto; nunca toast). */
+  | { type: 'update-status'; status: import('./updates').UpdateStatus }

@@ -11,6 +11,7 @@ import type {
   SyncStatus,
   TakeoverOptions
 } from './sync'
+import type { UpdateStatus } from './updates'
 import type { SkillsDiscoverOptions, SkillsDiscovery, SkillsSettings } from './skills'
 import type {
   Memory,
@@ -98,6 +99,11 @@ export const IPC = {
   },
   app: {
     capabilities: 'app:capabilities'
+  },
+  updates: {
+    status: 'updates:status',
+    check: 'updates:check',
+    openRelease: 'updates:openRelease'
   },
   presets: {
     list: 'presets:list',
@@ -411,6 +417,15 @@ export interface ClearApi {
   }
   app: {
     capabilities(): Promise<AppCapabilities>
+  }
+  /** Aviso de versão nova (SPEC → "Atualizações"): só consulta o GitHub; nada é baixado. */
+  updates: {
+    /** Versão instalada + resultado da última checagem (sem ir à rede). */
+    status(): Promise<UpdateStatus>
+    /** "Verificar atualizações": checa agora. Falha → `state: 'error'` (nunca lança). */
+    check(): Promise<UpdateStatus>
+    /** "Baixar": abre a página da última release no navegador (só URLs do repositório do app). */
+    openRelease(): Promise<void>
   }
   /** Personas (presets de chat). Apagar a persona padrão limpa `defaultPresetId`. */
   presets: {

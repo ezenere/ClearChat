@@ -22,6 +22,7 @@ import { WebSearchSettings } from './web/WebSearchSettings'
 import { MemorySettings } from './memory/MemorySettings'
 import { SkillsSettings } from './skills/SkillsSettings'
 import { AccountSettings } from './sync/AccountSettings'
+import { VersionFooter } from './UpdateNotice'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -314,6 +315,7 @@ export function SettingsModal(): React.JSX.Element {
         setEditingPreset(null)
       }}
       title="Configurações"
+      footer={<VersionFooter />}
       width={
         (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
       }
