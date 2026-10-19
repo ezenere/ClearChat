@@ -537,6 +537,11 @@ export class HostController {
     return [...this.windows].map(([chat_id, w]) => ({ chat_id, epoch: w.epoch }))
   }
 
+  /** Epoch da janela aberta por este dispositivo no chat (null = sem janela → replay). */
+  windowEpoch(chatId: string): number | null {
+    return this.windows.get(chatId)?.epoch ?? null
+  }
+
   subscriptions(): string[] {
     return this.active ? [this.active] : []
   }

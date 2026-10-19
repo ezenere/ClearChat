@@ -1813,6 +1813,7 @@ export class SyncEngine {
   }): Promise<boolean> {
     const body = JSON.parse(row.body) as PushBody
     const meta = JSON.parse(row.meta) as ItemMeta[]
+    if (row.kind === 'content' && row.chat_id) this.refreshContentBody(body, row.chat_id)
     const deleteRow = (): void => {
       this.conn.prepare('DELETE FROM sync_outbox WHERE push_id = ?').run(row.push_id)
     }
@@ -1848,6 +1849,26 @@ export class SyncEngine {
     } finally {
       for (const k of keys) this.inflight.delete(k)
       if (flightKey) this.inflight.delete(flightKey)
+    }
+  }
+
+  /**
+   * `chat_bases`/`host_epochs` de um lote de conteúdo valem no ENVIO, não na montagem: todos os
+   * lotes de um chat grande são montados juntos, e o aceite do anterior (commitBatch → bumpHead)
+   * avança o base_head — com a base da montagem o servidor veria base < head e marcaria uma
+   * divergência falsa (§8.4). Também cobre a outbox reenviada depois de um reinício. A base só
+   * avança quando o conteúdo local reflete o head (os itens do lote seguem em sync_dirty até o
+   * aceite, então mudanças remotas não a movem), logo isso não esconde uma divergência real.
+   */
+  private refreshContentBody(body: PushBody, chatId: string): void {
+    body.chat_bases = { ...(body.chat_bases ?? {}), [chatId]: this.chatRow(chatId).base_head }
+    // epoch: o da janela aberta agora; sem janela (fechou, reinício) o epoch antigo só daria
+    // not_host → vai como replay, que é o que o próximo pushModeFor decidiria
+    const epoch = this.host.windowEpoch(chatId)
+    if (epoch != null) body.host_epochs = { ...(body.host_epochs ?? {}), [chatId]: epoch }
+    else if (body.host_epochs) {
+      delete body.host_epochs[chatId]
+      if (!Object.keys(body.host_epochs).length) delete body.host_epochs
     }
   }
 
@@ -2301,6 +2322,19 @@ export class SyncEngine {
         it.blobs = shas.map((s) => blobIdFromSha256(this.sk!, fromHex(s))).filter((b) => ok.has(b))
     }
     items.sort(CONTENT_ORDER)
+    // limites do push (≤ 500 itens, §7.4): o resolve leva o primeiro pedaço (já na ordem pais →
+    // filhos) — isso limpa a divergência e faz deste dispositivo a base —; o resto vira conteúdo
+    // pendente comum e sai pelo push normal (lotes com o chat_bases do momento do envio)
+    let n = 0
+    let size = 0
+    for (; n < items.length; n++) {
+      const bytes = items[n].env ? items[n].env!.c.length : 64
+      if (n && (n >= MAX_ITEMS || size + bytes > MAX_BATCH_BYTES)) break
+      size += bytes
+    }
+    const first = items.slice(0, n)
+    const rest = items.slice(n)
+    const metaOf = new Map(meta.map((m) => [key(m.type, m.id), m]))
     const res = await this.http.post<{
       results?: { type: string; id: string; rev: number; seq: number }[]
       head?: number
@@ -2310,18 +2344,41 @@ export class SyncEngine {
       divergence_id: d.divergence_id,
       keep: 'local',
       push_id: randomUUID(),
-      items
+      items: first
     })
-    this.commitBatch(
-      meta,
-      { results: res?.results ?? [], head: res?.head ?? 0, chat_heads: res?.chat_heads ?? {} },
-      chatId
-    )
-    this.conn
-      .prepare("DELETE FROM sync_dirty WHERE scope = ? AND type IN ('session', 'message')")
-      .run(chatId)
-    const h = res?.chat_heads?.[chatId] ?? res?.head
-    if (h) this.setChatRow(chatId, { head: h, base_head: h, needs_refetch: 0 })
+    this.conn.transaction(() => {
+      this.commitBatch(
+        first.map((it) => metaOf.get(key(it.type, it.id))!),
+        { results: res?.results ?? [], head: res?.head ?? 0, chat_heads: res?.chat_heads ?? {} },
+        chatId
+      )
+      this.conn
+        .prepare("DELETE FROM sync_dirty WHERE scope = ? AND type IN ('session', 'message')")
+        .run(chatId)
+      // o resto já está nas tabelas locais: o registro passa a ser o online (rev/plaintext que o
+      // resolve usaria como base) e a marca dirty manda o buildBatches transformá-lo no local
+      for (const it of rest) {
+        const o = onlineMap.get(key(it.type, it.id))
+        if (o)
+          this.putRecord({
+            type: it.type,
+            id: it.id,
+            scope: o.change.scope,
+            rev: o.change.rev,
+            seq: o.change.seq,
+            deleted: false,
+            base: o.plain
+          })
+        else if (it.base_rev === 0)
+          this.conn
+            .prepare('DELETE FROM sync_records WHERE type = ? AND id = ?')
+            .run(it.type, it.id)
+        this.markDirty(it.type, it.id, chatId)
+      }
+      const h = res?.chat_heads?.[chatId] ?? res?.head
+      if (h) this.setChatRow(chatId, { head: h, base_head: h, needs_refetch: 0 })
+    })()
+    if (rest.length) this.log('divergência: resolve em partes', first.length, '+', rest.length)
     this.host.clearDiverged(chatId)
     if (res?.state) this.host.onChatState(res.state, false)
     this.scheduleCycle(0)

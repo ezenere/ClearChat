@@ -951,7 +951,9 @@ export async function startFakeSyncServer(opts: FakeSyncOptions = {}): Promise<F
       throw err('invalid_request', { field: 'push_id' })
     const items = body.items
     if (!Array.isArray(items)) throw err('invalid_request', { field: 'items' })
-    if (items.length > MAX_PUSH_ITEMS) throw err('payload_too_large', { max: MAX_PUSH_ITEMS })
+    // como o servidor real: itens demais = corpo inválido (o 413 é para bytes)
+    if (items.length > MAX_PUSH_ITEMS)
+      throw err('invalid_request', { field: 'items', reason: 'too_many', limit: MAX_PUSH_ITEMS })
     for (const it of items) validateItem(it)
     const seen = new Set<string>()
     for (const it of items) {
@@ -1063,7 +1065,8 @@ export async function startFakeSyncServer(opts: FakeSyncOptions = {}): Promise<F
     if (typeof body.push_id === 'string' && u.receipts.has(body.push_id))
       return u.receipts.get(body.push_id)
     const items = Array.isArray(body.items) ? body.items : []
-    if (items.length > MAX_PUSH_ITEMS) throw err('payload_too_large')
+    if (items.length > MAX_PUSH_ITEMS)
+      throw err('invalid_request', { field: 'items', reason: 'too_many', limit: MAX_PUSH_ITEMS })
     for (const it of items) {
       validateItem(it)
       if (it.scope !== chatId) throw err('invalid_request', { reason: 'scope', id: it.id })

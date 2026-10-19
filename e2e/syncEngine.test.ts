@@ -733,6 +733,178 @@ test('divergência: manter local apaga a outra versão; manter online (de outro 
   B.eng.destroy()
 })
 
+// espia os POSTs do motor: corpo copiado no envio + resposta
+interface PostCall {
+  path: string
+  body: any
+  res?: any
+}
+function spyPosts(d: Dev): PostCall[] {
+  const calls: PostCall[] = []
+  const http = (d.eng as any).http
+  const orig = http.post.bind(http)
+  http.post = async (path: string, body?: any, auth?: boolean) => {
+    const c: PostCall = {
+      path,
+      body: body === undefined ? undefined : JSON.parse(JSON.stringify(body))
+    }
+    calls.push(c)
+    c.res = await orig(path, body, auth)
+    return c.res
+  }
+  return calls
+}
+const contentPushes = (calls: PostCall[], chatId: string): PostCall[] =>
+  calls.filter((c) => c.path === '/api/v1/sync/push' && c.body?.chat_bases?.[chatId] !== undefined)
+const resolveCalls = (calls: PostCall[]): PostCall[] =>
+  calls.filter((c) => c.path.endsWith('/divergence/resolve'))
+function addMessages(conn: Database.Database, sessionId: string, n: number, prefix: string): void {
+  conn.transaction(() => {
+    for (let i = 0; i < n; i++) addMessage(conn, sessionId, 'user', `${prefix} ${i}`)
+  })()
+}
+
+test('push em vários lotes do mesmo chat: o 2º lote (da outbox, após reinício) leva a base do aceite do 1º', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const { chatId, sessionId } = addChat(A.conn, 'Grande')
+  addMessage(A.conn, sessionId, 'user', 'início')
+  await login(A, email)
+  await settled(A)
+  A.eng.stop()
+  addMessages(A.conn, sessionId, 620, 'm')
+  const eng = A.eng as any
+  const batches = (await eng.buildBatches()).filter((b: any) => b.kind === 'content')
+  assert.equal(batches.length, 2, '620 mensagens → 2 lotes (≤ 500)')
+  const base0 = eng.chatRow(chatId).base_head
+  assert.ok(base0 > 0)
+  for (const b of batches)
+    A.conn
+      .prepare(
+        'INSERT INTO sync_outbox (push_id, kind, chat_id, body, meta, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      )
+      .run(
+        b.body.push_id,
+        b.kind,
+        chatId,
+        JSON.stringify(b.body),
+        JSON.stringify(b.meta),
+        Date.now()
+      )
+  const calls = spyPosts(A)
+  // 1º lote aceito; o app "reinicia" com o 2º ainda na outbox (gravado com a base antiga)
+  const row1 = A.conn
+    .prepare('SELECT * FROM sync_outbox WHERE push_id = ?')
+    .get(batches[0].body.push_id)
+  assert.equal(await eng.sendBatch(row1), true)
+  const head1 = calls[0].res.chat_heads[chatId]
+  assert.ok(head1 > base0)
+  assert.equal(eng.chatRow(chatId).base_head, head1)
+  const row2 = A.conn
+    .prepare('SELECT body FROM sync_outbox WHERE push_id = ?')
+    .get(batches[1].body.push_id) as any
+  assert.equal(JSON.parse(row2.body).chat_bases[chatId], base0, 'gravado com a base da montagem')
+  A.eng.start()
+  await settled(A)
+  const pushes = contentPushes(calls, chatId)
+  assert.equal(pushes.length, 2)
+  assert.equal(pushes[0].body.chat_bases[chatId], base0)
+  assert.equal(pushes[1].body.chat_bases[chatId], head1, '2º lote com a base devolvida pelo 1º')
+  assert.equal(A.eng.chatInfo(chatId).diverged, null, 'sem divergência falsa')
+  const uid = srv.userIdOf(email)!
+  assert.equal(
+    srv.records(uid).filter((r: any) => r.type === 'message' && r.scope === chatId && !r.deleted)
+      .length,
+    621
+  )
+  A.eng.destroy()
+})
+
+test('divergência: manter local com mais de 500 itens → resolve com o 1º pedaço, o resto pelo push normal', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const { chatId, sessionId } = addChat(A.conn, 'Divergente grande')
+  addMessage(A.conn, sessionId, 'user', 'base')
+  await login(A, email)
+  await settled(A)
+  const B = device('B')
+  await login(B, email)
+  await settled(B)
+  B.eng.stop()
+  addMessages(B.conn, sessionId, 649, 'offline em B')
+  addMessage(A.conn, sessionId, 'assistant', 'online em A')
+  await settled(A)
+  B.eng.start()
+  await waitFor(() => B.eng.chatInfo(chatId).diverged?.self, 'B detecta a divergência')
+  const calls = spyPosts(B)
+  await B.eng.resolveDivergence(chatId, 'local')
+  const res = resolveCalls(calls)
+  assert.equal(res.length, 1)
+  const first = res[0].body.items as any[]
+  assert.equal(first.length, 500)
+  // pais antes dos filhos: tombstones de mensagem, sessões, mensagens, tombstones de sessão
+  assert.equal(first[0].type, 'message')
+  assert.equal(first[0].deleted, true, 'tombstone da mensagem só online')
+  const head = res[0].res.chat_heads[chatId]
+  assert.equal(B.eng.chatInfo(chatId).diverged, null, 'divergência limpa já no resolve')
+  assert.equal((B.eng as any).chatRow(chatId).base_head, head)
+  assert.equal(B.eng.pendingCount() > 0, true, 'o resto ficou pendente')
+  await settled(B)
+  const pushes = contentPushes(calls, chatId)
+  assert.ok(pushes.length >= 1)
+  let base = head
+  for (const p of pushes) {
+    assert.equal(p.body.chat_bases[chatId], base, 'cada lote com a base do aceite anterior')
+    base = p.res.chat_heads[chatId]
+  }
+  const ids = [...first, ...pushes.flatMap((p) => p.body.items)].map((i: any) => i.id)
+  assert.equal(ids.length, 650, '649 locais + tombstone da online (nada igual reenviado)')
+  assert.equal(new Set(ids).size, 650)
+  assert.ok(
+    pushes.flatMap((p) => p.body.items).every((i: any) => i.base_rev === 0 && !i.deleted),
+    'o resto: mensagens novas (base_rev 0)'
+  )
+  await synced(B, A)
+  await waitFor(() => texts(A.conn, sessionId).length === 650, 'A recebe a versão de B inteira')
+  const t = texts(A.conn, sessionId)
+  assert.equal(t[0], 'base')
+  assert.ok(!t.includes('online em A'), 'versão online anterior apagada')
+  assert.equal(A.eng.chatInfo(chatId).diverged, null)
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('divergência: manter local com até 500 itens → uma chamada só (nada pelo push depois)', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const { chatId, sessionId } = addChat(A.conn, 'Divergente pequeno')
+  addMessage(A.conn, sessionId, 'user', 'base')
+  await login(A, email)
+  await settled(A)
+  const B = device('B')
+  await login(B, email)
+  await settled(B)
+  B.eng.stop()
+  addMessages(B.conn, sessionId, 3, 'offline em B')
+  addMessage(A.conn, sessionId, 'assistant', 'online em A')
+  await settled(A)
+  B.eng.start()
+  await waitFor(() => B.eng.chatInfo(chatId).diverged?.self, 'B detecta a divergência')
+  const calls = spyPosts(B)
+  await B.eng.resolveDivergence(chatId, 'local')
+  const res = resolveCalls(calls)
+  assert.equal(res.length, 1)
+  assert.equal(res[0].body.items.length, 4, '3 locais + tombstone da online')
+  assert.equal(B.eng.chatInfo(chatId).diverged, null)
+  await settled(B)
+  assert.equal(contentPushes(calls, chatId).length, 0)
+  await synced(B, A)
+  await waitFor(() => texts(A.conn, sessionId).length === 4, 'A recebe a versão de B')
+  assert.ok(!texts(A.conn, sessionId).includes('online em A'))
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
 function stubRunner(log: any[]): RunnerAdapter {
   const fail = (): never => {
     throw new Error('não usado')
