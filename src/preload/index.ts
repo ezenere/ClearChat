@@ -58,6 +58,13 @@ const api: ClearApi = {
     homeDir: () => invoke(IPC.fs.homeDir),
     mkdir: (path) => invoke(IPC.fs.mkdir, path)
   },
+  viewer: {
+    open: (target) => invoke(IPC.viewer.open, target),
+    check: (chatId, messageId) => invoke(IPC.viewer.check, chatId, messageId),
+    readText: (token) => invoke(IPC.viewer.readText, token),
+    openExternal: (token) => invoke(IPC.viewer.openExternal, token),
+    showInFolder: (token) => invoke(IPC.viewer.showInFolder, token)
+  },
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
   },

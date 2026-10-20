@@ -60,6 +60,7 @@ import { chatsRepo, messagesRepo, providersRepo, sessionsRepo } from '../repo'
 import { getDb } from '../db'
 import { historyStore } from '../historyStore'
 import { parseToolArgs, runLocalTool, shellStateFor } from '../tools'
+import { registerPresented, viewerDevice } from '../fileViewer'
 import {
   abortError,
   truncate,
@@ -209,6 +210,8 @@ interface ToolOutcome {
   askUser?: AskUserRecord
   /** memory_write/rewrite/delete: o que mudou (card da tool). */
   memoryChanges?: MessageMeta['memoryChanges']
+  /** present_file: arquivos apresentados (cards + painel de arquivo). */
+  presentFiles?: MessageMeta['presentFiles']
   durationMs: number
 }
 
@@ -954,6 +957,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
       if (r.approval) tmeta.approval = r.approval
       if (r.askUser) tmeta.askUser = r.askUser
       if (r.memoryChanges?.length) tmeta.memoryChanges = r.memoryChanges
+      if (r.presentFiles) tmeta.presentFiles = r.presentFiles
       if (r.status === 'cancelled') {
         tmeta.synthetic = true
         tmeta.kind = 'tool-cancelled'
@@ -1291,11 +1295,16 @@ async function executeTool(
         out.call()
       }
     })
+    // present_file: concede os arquivos ao protocolo do visualizador + anota o dispositivo
+    const presentFiles = r.meta?.presentFiles
+      ? await registerPresented(r.meta.presentFiles, viewerDevice())
+      : undefined
     return done({
       content: r.content,
       status: r.status,
       shellCwd: r.meta?.shellCwd,
-      ...(r.parts?.length ? { parts: r.parts } : {})
+      ...(r.parts?.length ? { parts: r.parts } : {}),
+      ...(presentFiles ? { presentFiles } : {})
     })
   } catch (e) {
     if (signal.aborted || (e as Error).name === 'AbortError') {

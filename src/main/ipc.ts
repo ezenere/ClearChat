@@ -40,6 +40,15 @@ import {
 } from './repo'
 import { invalidateModels, listModels, testProvider } from './providers'
 import * as fsapi from './fsapi'
+import {
+  checkPresented,
+  grantedPath,
+  openViewerFile,
+  readViewerText,
+  viewerDevice,
+  type ViewerDeps
+} from './fileViewer'
+import type { ViewerTarget } from '@shared/ipc'
 import * as runner from './agent/runner'
 import * as memory from './memory'
 import { answerQuestion } from './agent/questions'
@@ -95,6 +104,20 @@ function remoteProcessGuard(chatId: string): void {
   const e = syncEngine()
   if (e?.active && e.host.mode(chatId) === 'remote')
     throw new Error(`Os processos rodam no host (${e.host.hostName(chatId)}) — gerencie-os por lá.`)
+}
+
+/** Banco + sync para o visualizador de arquivos (fileViewer.ts é sem Electron). */
+const viewerDeps: ViewerDeps = {
+  chat: (id) => chatsRepo.get(id),
+  message: (id) => messagesRepo.get(id),
+  chatOfSession: (sid) => sessionsRepo.get(sid)?.chatId ?? null,
+  localDevice: () => viewerDevice(),
+  remoteHost: (chatId) => {
+    const e = syncEngine()
+    if (!e?.active) return null
+    const mode = e.host.mode(chatId)
+    return mode === 'remote' || mode === 'host-offline' ? e.host.hostName(chatId) : null
+  }
 }
 
 export function registerIpc(): void {
@@ -353,6 +376,17 @@ export function registerIpc(): void {
     },
     [IPC.fs.homeDir]: () => fsapi.homeDir(),
     [IPC.fs.mkdir]: (path: string) => fsapi.mkdir(path),
+
+    // ---- visualizador de arquivos (só a allowlist do main; ver fileViewer.ts) ----
+    [IPC.viewer.open]: (target: ViewerTarget) => openViewerFile(target, viewerDeps),
+    [IPC.viewer.check]: (chatId: string, messageId: string) =>
+      checkPresented(chatId, messageId, viewerDeps),
+    [IPC.viewer.readText]: (token: string) => readViewerText(token),
+    [IPC.viewer.openExternal]: async (token: string) => {
+      const err = await shell.openPath(grantedPath(token))
+      if (err) throw new Error(err)
+    },
+    [IPC.viewer.showInFolder]: (token: string) => shell.showItemInFolder(grantedPath(token)),
 
     // ---- anexos ----
     [IPC.attachments.pick]: async (): Promise<AttachmentPickResult> => {

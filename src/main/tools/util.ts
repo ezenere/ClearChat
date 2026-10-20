@@ -2,7 +2,7 @@ import { promises as fs } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import { LIMITS } from '@shared/limits'
-import type { ContentPart, ModelInfo, StoredMessage } from '@shared/types'
+import type { ContentPart, ModelInfo, PresentFilesRecord, StoredMessage } from '@shared/types'
 import type { MediaContext } from './media'
 import type { HistoryStore } from '../historyStore'
 import type { SkillInfo } from '@shared/skills'
@@ -97,7 +97,7 @@ export interface ChatListEntry {
 export interface ToolResult {
   content: string
   status: 'ok' | 'error'
-  meta?: { shellCwd?: string }
+  meta?: { shellCwd?: string; presentFiles?: PresentFilesRecord }
   /**
    * Conteúdo multimodal (read_file de imagem/PDF): parts persistidos por referência
    * (`clearchat-attachment://…` + `_attachment`). Quando presente, é o conteúdo da mensagem tool;

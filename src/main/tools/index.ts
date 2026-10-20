@@ -5,6 +5,7 @@ import { shell } from './bash'
 import { processList, processLogs, processStart, processStop } from './processes'
 import { editFile, listDir, readFile, writeFile } from './files'
 import { findFiles, searchFiles } from './search'
+import { presentFileTool } from './present'
 import { listModelsTool } from './models'
 import { getChatInfoTool, listChatsTool } from './chats'
 import { readHistoryTool } from './history'
@@ -51,6 +52,7 @@ const IMPLS: Partial<Record<ToolName, Impl>> = {
   read_file: readFile,
   search_files: searchFiles,
   find_files: findFiles,
+  present_file: presentFileTool,
   write_file: writeFile,
   edit_file: editFile,
   shell,

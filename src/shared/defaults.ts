@@ -152,6 +152,8 @@ export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean
       '- Processos que precisam continuar rodando (dev server, emulador, watcher, logcat): process_start (com wait_for para esperar ficar pronto), process_logs (pattern/since_line) e process_stop — nunca `&`/nohup no shell.',
     has('send_to_chat') &&
       '- send_to_chat entrega uma mensagem a outro chat como se fosse o usuário (ids via list_chats). Mensagens vindas de outros chats começam com [Mensagem do chat "…" (id …)].',
+    has('present_file') &&
+      '- Ao terminar algo que o usuário deve ver (relatório, documento, imagem, página, PDF), mostre com present_file em vez de colar o conteúdo inteiro no chat.',
     has('ask_user') &&
       '- ask_user mostra um questionário de múltipla escolha ao usuário: use para decisões com opções claras ou para coletar várias preferências de uma vez; para uma pergunta aberta simples, apenas escreva no chat e encerre o turno.',
     '- Algumas ferramentas exigem aprovação do usuário; se ele negar, não insista — siga sem ela ou pergunte.',

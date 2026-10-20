@@ -39,8 +39,8 @@ export function ApprovalsSettings(): React.JSX.Element {
         Modo padrão de cada item em todos os chats. Cada chat (aba Tools) e cada persona pode
         ajustar; lá a opção igual ao padrão daqui aparece com ★, e quem não ajustou segue este
         padrão. <strong className="text-fg/90">process_stop</strong> nunca pede confirmação: o
-        agente só enxerga e para processos do próprio chat. As demais tools (leitura, histórico,
-        controle de subagentes, perguntas ao usuário) também nunca pedem.
+        agente só enxerga e para processos do próprio chat. As demais tools (leitura, apresentar
+        arquivos, histórico, controle de subagentes, perguntas ao usuário) também nunca pedem.
       </p>
       {APPROVAL_ITEM_GROUPS.map((g) => (
         <div key={g.title} className="space-y-3">

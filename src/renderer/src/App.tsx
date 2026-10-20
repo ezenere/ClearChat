@@ -5,6 +5,8 @@ import { NewChat } from './components/NewChat'
 import { Onboarding } from './components/Onboarding'
 import { RequestPreviewModal } from './components/panel/RequestPreview'
 import { RightPanel } from './components/panel/RightPanel'
+import { FileViewerPane } from './components/viewer/FileViewerPane'
+import { CHAT_MIN_WIDTH, useWidth } from './components/viewer/viewerLayout'
 import { SettingsModal } from './components/SettingsModal'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
@@ -74,13 +76,18 @@ function Main(): React.JSX.Element {
   const session = useStore((s) =>
     s.view.kind === 'chat' ? s.sessions[s.view.sessionId] : undefined
   )
+  // painel de arquivo do chat aberto: [LISTA | CHAT | ARQUIVO | CONFIGS]
+  const activeFile = useStore((s) => (s.view.kind === 'chat' ? s.viewer[s.view.chatId] : undefined))
+  const [rowRef, rowWidth] = useWidth<HTMLDivElement>()
+  const viewerMax = rowWidth - (panelOpen && !narrow ? 384 : 0) - CHAT_MIN_WIDTH
 
   if (view.kind === 'chat' && chat) {
     return (
       <div className="flex min-w-0 flex-1 flex-col">
         <ChatHeader chat={chat} session={session} />
-        <div className="relative flex min-h-0 flex-1">
+        <div ref={rowRef} className="relative flex min-h-0 flex-1">
           <ChatView key={view.sessionId} chat={chat} sessionId={view.sessionId} />
+          {activeFile && <FileViewerPane chat={chat} file={activeFile} maxWidth={viewerMax} />}
           {panelOpen && narrow && (
             <div
               className="absolute inset-0 z-20 animate-fade-in bg-black/40"

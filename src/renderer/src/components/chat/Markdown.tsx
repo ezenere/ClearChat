@@ -99,20 +99,40 @@ const rehypePlugins: React.ComponentProps<typeof ReactMarkdown>['rehypePlugins']
 
 export const Markdown = memo(function Markdown({
   text,
-  streaming
+  streaming,
+  resolveImage
 }: {
   text: string
   streaming?: boolean
+  /**
+   * Visualizador de arquivos: resolve o `src` relativo de uma imagem contra a pasta do arquivo
+   * (protocolo clearchat-file://); null = não mostra. Sem a prop, imagens seguem o padrão.
+   */
+  resolveImage?: (src: string) => string | null
 }): React.JSX.Element {
   // Cercas aninhadas → uma cerca externa mais longa; \[ \] e \( \) → $$ e $; preços escapados.
   const source = useMemo(() => normalizeMath(normalizeFences(text), streaming), [text, streaming])
+  const comps = useMemo<Components>(
+    () =>
+      resolveImage
+        ? {
+            ...components,
+            img: ({ src, alt, title }) => {
+              const raw = typeof src === 'string' ? src : ''
+              const url = /^(https?:|data:)/i.test(raw) ? raw : resolveImage(raw)
+              return url ? (
+                <img src={url} alt={alt ?? ''} title={title} loading="lazy" />
+              ) : (
+                <span className="text-subtle">[imagem: {alt || raw}]</span>
+              )
+            }
+          }
+        : components,
+    [resolveImage]
+  )
   return (
     <div className={cn('md', streaming && 'stream-caret')}>
-      <ReactMarkdown
-        remarkPlugins={remarkPlugins}
-        rehypePlugins={rehypePlugins}
-        components={components}
-      >
+      <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={comps}>
         {source}
       </ReactMarkdown>
     </div>

@@ -39,6 +39,7 @@ import {
   mockPersonaMemory,
   MOCK_COLS
 } from './mockMemory'
+import { createMockViewer, seedViewerScenario } from './mockViewer'
 import type {
   ApprovalSettings,
   AgentEvent,
@@ -658,6 +659,10 @@ export function createMockApi(scenario: string): ClearApi {
 
   const delay = <T>(v: T, ms = 60): Promise<T> =>
     new Promise((r) => setTimeout(() => r(structuredClone(v)), ms))
+
+  // Chat com present_file (cards + painel de arquivo) — ver mockViewer.ts
+  if (scenario !== 'onboarding')
+    seedViewerScenario({ home: HOME, cfg, chats, sessions, messages, files, msg })
 
   // Questionário (ask_user) pendente na sessão s2 — cenário "question" (VITE_CLEAR_MOCK=question)
   type MockOpt = { title: string; icon?: string; description?: string; help?: string }
@@ -1565,6 +1570,7 @@ export function createMockApi(scenario: string): ClearApi {
       compact: () => delay({ scheduled: false }),
       stopSubagents: () => delay(undefined)
     },
+    viewer: createMockViewer({ messages: () => messages, delay }),
     fs: {
       listDir: (p) =>
         delay(

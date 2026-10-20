@@ -20,6 +20,8 @@ import { initUpdates, shutdownUpdates } from './updates'
 import { setImageProcessor } from './tools/media'
 import { nativeImageProcessor } from './imageResize'
 import { ATTACHMENT_SCHEME, parseAttachmentUrl } from '@shared/attachments'
+import { VIEWER_SCHEME } from '@shared/fileViewer'
+import { serveViewerRequest, setViewerDeviceSource } from './fileViewer'
 import {
   attachmentsDir,
   gcAttachments,
@@ -43,8 +45,14 @@ if (isolatedUserData) {
 }
 
 // clearchat-attachment://<sha256>.<ext> → arquivo do store de anexos (miniaturas no renderer).
+// clearchat-file://<token>/<nome> → arquivo da allowlist do visualizador (present_file / aba
+// Arquivos). Sem supportFetchAPI/corsEnabled: o renderer só usa em <img>/<iframe>; texto vem por IPC.
 protocol.registerSchemesAsPrivileged([
-  { scheme: ATTACHMENT_SCHEME, privileges: { standard: true, secure: true, supportFetchAPI: true } }
+  {
+    scheme: ATTACHMENT_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true }
+  },
+  { scheme: VIEWER_SCHEME, privileges: { standard: true, secure: true, stream: true } }
 ])
 
 const THEME_BG = '#0b0b0f'
@@ -137,6 +145,13 @@ app.whenReady().then(() => {
       }
       return new Response('not found', { status: 404 })
     }
+  })
+
+  // Visualizador de arquivos: só tokens emitidos pelo main (ver fileViewer.ts)
+  protocol.handle(VIEWER_SCHEME, (req) => serveViewerRequest(req.url))
+  setViewerDeviceSource(() => {
+    const e = syncEngine()
+    return e?.active && e.deviceId ? { id: e.deviceId, name: e.deviceName } : null
   })
 
   // Shell do usuário (descrição da tool `shell`) + ambiente do -ilc em segundo plano.

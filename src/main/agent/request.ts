@@ -137,7 +137,7 @@ export function hasDelegated(history: StoredMessage[]): boolean {
 
 /**
  * Tools disponíveis para a sessão: habilitadas no chat, na ordem fixa de TOOL_NAMES; delegate só se
- * depth < 2; ask_user só na principal (depth 0). As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
+ * depth < 2; ask_user e present_file só na principal (depth 0). As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
  * num SUBAGENTE, e quando o histórico é informado (request), só depois que ele criou algum
  * subagente: modelos fracos não as confundem com "responder" a quem delegou (o prefixo de cache
  * muda uma vez, no primeiro delegate). A principal as vê sempre (para planejar). Sem histórico
@@ -159,6 +159,8 @@ export function availableTools(
       (n !== 'delegate_task' || session.depth < 2) &&
       // só a sessão principal pergunta ao usuário (subagentes decidem sozinhos)
       (n !== 'ask_user' || session.depth === 0) &&
+      // o visualizador é do usuário: só a principal apresenta arquivos
+      (n !== 'present_file' || session.depth === 0) &&
       (!SUBAGENT_TOOLS.includes(n) || canDelegate)
   )
   // memória: pela config de memória do chat (não por enabledTools), sempre no fim

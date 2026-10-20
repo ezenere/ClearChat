@@ -75,6 +75,7 @@ export type ToolName =
   | 'read_file'
   | 'search_files'
   | 'find_files'
+  | 'present_file'
   | 'write_file'
   | 'edit_file'
   | 'shell'
@@ -498,6 +499,34 @@ export interface MessageMeta {
   }
   /** Mensagem tool de memory_write/memory_rewrite/memory_delete: o que mudou. */
   memoryChanges?: MemoryExtractionResult['changes']
+  // ---- visualizador de arquivos (mensagem tool de present_file) ----
+  /** Arquivos apresentados ao usuário (cards no chat + painel de arquivo). Ver SPEC → present_file. */
+  presentFiles?: PresentFilesRecord
+}
+
+/** Tipo de visualização de um arquivo no painel (SPEC → "Visualizador de arquivos"). */
+export type ViewerKind = 'markdown' | 'html' | 'image' | 'pdf' | 'code' | 'text' | 'binary'
+
+/** Um arquivo de uma chamada de present_file (na ordem pedida pelo modelo). */
+export interface PresentedFile {
+  /** Caminho absoluto NO DISPOSITIVO que rodou a tool (resolvido contra a raiz do chat). */
+  path: string
+  /** Nome real do arquivo (basename). */
+  name: string
+  title?: string
+  description?: string
+  size?: number
+  kind?: ViewerKind
+  /** Erro curto (pt-BR) — o arquivo não foi apresentado ("não encontrado", "é um diretório"…). */
+  error?: string
+}
+
+/** meta.presentFiles: onde os arquivos estão + a lista (cards renderizam só com isto). */
+export interface PresentFilesRecord {
+  /** Dispositivo do sync que rodou a tool (ausente = sync desligado → o dispositivo local). */
+  deviceId?: string
+  deviceName?: string
+  files: PresentedFile[]
 }
 
 export interface StoredMessage {

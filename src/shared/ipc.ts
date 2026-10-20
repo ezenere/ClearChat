@@ -43,7 +43,8 @@ import type {
   Session,
   SmartApproveRecord,
   StoredMessage,
-  ToolName
+  ToolName,
+  ViewerKind
 } from './types'
 
 export const IPC = {
@@ -98,6 +99,13 @@ export const IPC = {
     pickDirectory: 'fs:pickDirectory',
     homeDir: 'fs:homeDir',
     mkdir: 'fs:mkdir'
+  },
+  viewer: {
+    open: 'viewer:open',
+    check: 'viewer:check',
+    readText: 'viewer:readText',
+    openExternal: 'viewer:openExternal',
+    showInFolder: 'viewer:showInFolder'
   },
   app: {
     capabilities: 'app:capabilities'
@@ -282,6 +290,54 @@ export interface FileContent {
   binary: boolean
 }
 
+/**
+ * Arquivo a abrir no visualizador (SPEC → "Visualizador de arquivos"): um arquivo de uma chamada
+ * de present_file (o main confere a mensagem no banco) ou um arquivo escolhido na aba Arquivos.
+ */
+export type ViewerTarget =
+  | { chatId: string; source: 'present'; messageId: string; index: number }
+  | { chatId: string; source: 'browse'; path: string }
+
+/** Concessão aberta: o token dá acesso (clearchat-file://<token>/<nome>) só a este arquivo. */
+export interface ViewerFile {
+  token: string
+  /** URL do protocolo (imagem/PDF/HTML) — o renderer nunca monta caminho. */
+  url: string
+  /** Caminho absoluto (exibição / copiar). */
+  path: string
+  name: string
+  size: number
+  mtime: number
+  kind: ViewerKind
+  mime: string
+  /** Linguagem do highlight.js (código). */
+  language?: string
+  /** Rótulo do tipo ("Documento PDF", "arquivo ZIP (ou docx/xlsx/jar)"…). */
+  typeLabel: string
+}
+
+/** Por que o arquivo não abre aqui. */
+export type ViewerUnavailable =
+  | 'remote' // está em outro dispositivo (host do chat / quem rodou a tool)
+  | 'missing' // não existe mais (ou não é um arquivo comum)
+  | 'denied' // fora do diretório raiz com confinamento / sem permissão
+  | 'invalid' // mensagem/arquivo inexistente na chamada
+
+export type ViewerOpenResult =
+  | { ok: true; file: ViewerFile }
+  | { ok: false; reason: ViewerUnavailable; message: string; deviceName?: string }
+
+/** Estado de cada arquivo de uma chamada de present_file (cards), sem abrir nada. */
+export type ViewerCheck =
+  { ok: true } | { ok: false; reason: ViewerUnavailable; deviceName?: string }
+
+export interface ViewerText {
+  content: string
+  /** Lido só o começo (arquivo > VIEWER_LIMITS.textMaxBytes). */
+  truncated: boolean
+  size: number
+}
+
 export interface CompactOptions {
   /** Depois de compactar, roda o agente de novo (botão "Compactar e tentar de novo"). */
   retry?: boolean
@@ -430,6 +486,17 @@ export interface ClearApi {
     homeDir(): Promise<string>
     /** Cria uma pasta (pai precisa existir; erro se já existir). Retorna o caminho absoluto. */
     mkdir(path: string): Promise<string>
+  }
+  /** Visualizador de arquivos — só arquivos da allowlist do main (ver SPEC). */
+  viewer: {
+    open(target: ViewerTarget): Promise<ViewerOpenResult>
+    /** Estado dos arquivos de uma chamada de present_file (cards: "não encontrado", "no <host>"). */
+    check(chatId: string, messageId: string): Promise<ViewerCheck[]>
+    /** Texto do arquivo concedido (markdown/código/texto), até VIEWER_LIMITS.textMaxBytes. */
+    readText(token: string): Promise<ViewerText>
+    /** shell.openPath / shell.showItemInFolder — só tokens concedidos. */
+    openExternal(token: string): Promise<void>
+    showInFolder(token: string): Promise<void>
   }
   app: {
     capabilities(): Promise<AppCapabilities>

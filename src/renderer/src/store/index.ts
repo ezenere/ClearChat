@@ -19,7 +19,7 @@ import type {
   StoredMessage,
   StreamDraft
 } from '@shared/types'
-import type { AppCapabilities, ApprovalDecision, PresetInput } from '@shared/ipc'
+import type { AppCapabilities, ApprovalDecision, PresetInput, ViewerTarget } from '@shared/ipc'
 import type { MemoryCollection } from '@shared/memory'
 import type { ChatHostInfo, SyncScope, SyncStatus } from '@shared/sync'
 import { api, errorMessage } from '../lib/api'
@@ -30,6 +30,7 @@ import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/ap
 import { trackFailure, type SubFailure } from '../lib/subFailures'
 import type { UpdateStatus } from '@shared/updates'
 import { buildTree, selectionToReach, selEquals } from '@shared/branches'
+import { canAutoOpen } from '../lib/fileSources'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -107,6 +108,36 @@ function savePanelTab(tab: PanelTab): void {
   }
 }
 
+/** Arquivo ativo do visualizador de um chat (painel entre o chat e as configurações). */
+export interface ActiveFile {
+  target: ViewerTarget
+  /** Caminho absoluto (destaque do card / da aba Arquivos). */
+  path: string
+  name: string
+  /** Incrementa em "Recarregar" e ao reabrir o mesmo arquivo. */
+  nonce: number
+}
+
+const VIEWER_WIDTH_KEY = 'clearchat.viewer.width'
+export const VIEWER_DEFAULT_WIDTH = 520
+
+function loadViewerWidth(): number {
+  try {
+    const v = Number(localStorage.getItem(VIEWER_WIDTH_KEY))
+    return Number.isFinite(v) && v >= 240 ? v : VIEWER_DEFAULT_WIDTH
+  } catch {
+    return VIEWER_DEFAULT_WIDTH
+  }
+}
+
+function saveViewerWidth(w: number): void {
+  try {
+    localStorage.setItem(VIEWER_WIDTH_KEY, String(Math.round(w)))
+  } catch {
+    /* armazenamento indisponível: só não lembra */
+  }
+}
+
 /** Anexo no composer: carregando (indo para o store do main) ou pronto para enviar. */
 export interface PendingAttachment {
   id: string
@@ -154,6 +185,10 @@ interface State {
   compactions: Record<string, CompactionState | undefined>
   /** Incrementado a cada resultado de tool num chat (aba Arquivos recarrega). */
   fsTick: Record<string, number>
+  /** Arquivo ativo do visualizador por chat (só nesta execução; ausente = painel fechado). */
+  viewer: Record<string, ActiveFile | undefined>
+  /** Largura do painel de arquivo (px; lembrada em localStorage). */
+  viewerWidth: number
   capabilities: AppCapabilities
   /** Seção do painel Config para rolar até (ex.: 'contexto'). */
   configFocus: string | null
@@ -251,6 +286,13 @@ interface Actions {
   cancelRetry(id: string): Promise<void>
   loadModels(providerId: string, force?: boolean): Promise<void>
   setPanel(open: boolean, tab?: PanelTab): void
+  /** Abre um arquivo no visualizador do chat (vira o arquivo ativo). */
+  openFile(chatId: string, target: ViewerTarget, path: string, name: string): void
+  /** Fecha o painel de arquivo do chat. */
+  closeFile(chatId: string): void
+  /** Recarrega o arquivo ativo do chat. */
+  reloadFile(chatId: string): void
+  setViewerWidth(width: number, persist?: boolean): void
   setSettingsOpen(open: boolean, tab?: SettingsTab): void
   setPreview(sessionId: string | null): void
   toast(text: string, kind?: Toast['kind']): void
@@ -370,6 +412,8 @@ export const useStore = create<Store>()((set, get) => ({
   toasts: [],
   compactions: {},
   fsTick: {},
+  viewer: {},
+  viewerWidth: loadViewerWidth(),
   capabilities: { bwrap: false, ripgrep: false },
   configFocus: null,
   pendingAttachments: {},
@@ -979,6 +1023,27 @@ export const useStore = create<Store>()((set, get) => ({
     if (tab) savePanelTab(tab)
     set((s) => ({ panelOpen: open, panelTab: tab ?? s.panelTab }))
   },
+  openFile(chatId, target, path, name) {
+    set((s) => ({
+      viewer: {
+        ...s.viewer,
+        [chatId]: { target, path, name, nonce: (s.viewer[chatId]?.nonce ?? 0) + 1 }
+      }
+    }))
+  },
+  closeFile(chatId) {
+    set((s) => ({ viewer: { ...s.viewer, [chatId]: undefined } }))
+  },
+  reloadFile(chatId) {
+    set((s) => {
+      const f = s.viewer[chatId]
+      return f ? { viewer: { ...s.viewer, [chatId]: { ...f, nonce: f.nonce + 1 } } } : {}
+    })
+  },
+  setViewerWidth(width, persist) {
+    set({ viewerWidth: width })
+    if (persist) saveViewerWidth(width)
+  },
   setSettingsOpen(open, tab) {
     set((s) => ({ settingsOpen: open, settingsTab: tab ?? s.settingsTab }))
   },
@@ -1141,8 +1206,37 @@ function applyEvent(e: AgentEvent): void {
         const chatId = s.sessions[sid]?.chatId
         const fsTick =
           isToolResult && chatId ? { ...s.fsTick, [chatId]: (s.fsTick[chatId] ?? 0) + 1 } : s.fsTick
-        if (!list) return fsTick === s.fsTick ? {} : { fsTick }
-        return { messages: { ...s.messages, [sid]: upsertMessage(list, e.message) }, fsTick }
+        // present_file acabou de rodar: o 1º arquivo vira o ativo do chat (se dá para abrir aqui)
+        let viewer = s.viewer
+        const rec = e.message.meta.presentFiles
+        if (e.type === 'message-added' && m.role === 'tool' && rec && chatId) {
+          const host = s.chatHosts[chatId]
+          const index = rec.files.findIndex((f) => !f.error)
+          if (
+            index >= 0 &&
+            canAutoOpen(rec, chatId, s.sync?.device?.id, {
+              mode: host?.mode,
+              name: host?.host?.name
+            })
+          ) {
+            const f = rec.files[index]
+            viewer = {
+              ...s.viewer,
+              [chatId]: {
+                target: { chatId, source: 'present', messageId: e.message.id, index },
+                path: f.path,
+                name: f.name,
+                nonce: (s.viewer[chatId]?.nonce ?? 0) + 1
+              }
+            }
+          }
+        }
+        if (!list) return fsTick === s.fsTick && viewer === s.viewer ? {} : { fsTick, viewer }
+        return {
+          messages: { ...s.messages, [sid]: upsertMessage(list, e.message) },
+          fsTick,
+          viewer
+        }
       })
       break
     }

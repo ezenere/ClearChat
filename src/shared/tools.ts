@@ -4,6 +4,7 @@ import type { ToolName } from './types'
 import { LIMITS, MEMORY_LIMITS as ML } from './limits'
 import { ASK_USER_LIMITS as AL } from './askUser'
 import { shellDescriptionPrefix, toolShellInfo, type ShellInfoLite } from './shellInfo'
+import { PRESENT_FILE_LIMITS as PL } from './fileViewer'
 
 const shellDescription = (info: ShellInfoLite | null): string => {
   const p = shellDescriptionPrefix(info)
@@ -44,6 +45,7 @@ export const TOOL_NAMES: ToolName[] = [
   'read_file',
   'search_files',
   'find_files',
+  'present_file',
   'write_file',
   'edit_file',
   'shell',
@@ -94,6 +96,7 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   read_file: 'Ler arquivo',
   search_files: 'Buscar no conteúdo',
   find_files: 'Encontrar arquivos',
+  present_file: 'Apresentar arquivo',
   write_file: 'Escrever arquivo',
   edit_file: 'Editar arquivo',
   shell: 'Terminal (shell)',
@@ -324,6 +327,38 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
       path: { type: 'string', description: 'Pasta base (padrão: diretório raiz).' }
     },
     ['glob']
+  ),
+  present_file: def(
+    'present_file',
+    `Mostra arquivos ao usuário num visualizador ao lado do chat (Markdown renderizado, HTML, imagens, PDF, código com destaque e texto) e como cards clicáveis na conversa, na posição desta chamada. O primeiro arquivo abre no visualizador; os outros ficam disponíveis nos cards. Use ao terminar de gerar/editar algo que o usuário deve ver (relatório, documento, imagem, gráfico, página, PDF) ou para apontar arquivos relevantes. Só leitura (não altera nada) e o conteúdo NÃO volta para você — o resultado só confirma o que foi apresentado. Caminhos relativos resolvem a partir do diretório raiz (mesmas regras de read_file). Até ${PL.maxFiles} arquivos por chamada.`,
+    {
+      files: {
+        type: 'array',
+        description: `Arquivos a apresentar, na ordem (1 a ${PL.maxFiles}).`,
+        minItems: 1,
+        maxItems: PL.maxFiles,
+        items: {
+          type: 'object',
+          properties: {
+            path: {
+              type: 'string',
+              description: 'Caminho do arquivo (relativo ao diretório raiz ou absoluto).'
+            },
+            title: {
+              type: 'string',
+              description: 'Título curto para o card (opcional; sem ele aparece o nome do arquivo).'
+            },
+            description: {
+              type: 'string',
+              description: 'Uma frase dizendo o que é o arquivo (opcional).'
+            }
+          },
+          required: ['path'],
+          additionalProperties: false
+        }
+      }
+    },
+    ['files']
   ),
   write_file: def(
     'write_file',

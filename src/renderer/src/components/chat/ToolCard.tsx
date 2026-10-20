@@ -29,6 +29,7 @@ import {
   ShieldCheck,
   ShieldX,
   Play,
+  Presentation,
   ScrollText,
   Activity,
   MessageCircleQuestion,
@@ -73,6 +74,7 @@ const ICONS: Partial<Record<ToolName, LucideIcon>> = {
   read_file: FileText,
   search_files: FileSearch,
   find_files: FolderSearch,
+  present_file: Presentation,
   write_file: FilePlus,
   edit_file: FilePen,
   shell: Terminal,
@@ -227,6 +229,12 @@ function summary(name: string, args: Record<string, unknown> | null): string {
             : `  · a partir da linha ${o}`
       return pick('path') + range
     }
+    case 'present_file':
+      return Array.isArray(args.files)
+        ? (args.files as unknown[])
+            .map((f) => (typeof f === 'string' ? f : ((f as { path?: string })?.path ?? '')))
+            .join(', ')
+        : pick('path')
     default:
       return pick('path') || (name === 'list_dir' ? '.' : '')
   }

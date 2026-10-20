@@ -58,6 +58,8 @@ import { AutoTextarea, Button, Spinner } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import { CopyButton, Markdown } from './Markdown'
 import { OrphanApproval, ToolCard } from './ToolCard'
+import { PresentFileCards } from '../viewer/PresentFileCards'
+import { presentedFilesOf } from '../../lib/presentFiles'
 import { anchorFor, anchorId } from '../../lib/approvalAnchors'
 import { useAnchorRoot } from '../../lib/useAnchor'
 import { MessageAttachments } from './Attachments'
@@ -1105,6 +1107,22 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
         </div>
       )}
       {m.tool_calls?.map((tc) => {
+        const result = ctx.results.get(tc.id)
+        // present_file: só os cards dos arquivos, sem o cabeçalho de tool (erro/cancelado → card normal)
+        if (
+          tc.function.name === 'present_file' &&
+          (result ? !!result.meta.presentFiles : !!presentedFilesOf(tc.function.arguments))
+        ) {
+          return (
+            <PresentFileCards
+              key={tc.id}
+              chatId={ctx.chatId}
+              args={tc.function.arguments}
+              result={result}
+              pending={!result}
+            />
+          )
+        }
         const sub = ctx.childByToolCall.get(tc.id)
         const approval = ctx.approvals.find((a) => a.toolCallId === tc.id)
         const key = anchorId(ctx.sessionId, tc.id)
@@ -1180,9 +1198,13 @@ const DraftView = memo(function DraftView({
       {(draft.content || (!draft.reasoning && !draft.toolCalls.length)) && (
         <Markdown text={draft.content} streaming={!draft.toolCalls.length} />
       )}
-      {draft.toolCalls.map((tc, i) => (
-        <ToolCard key={tc.id || i} call={tc} streaming sessionBusy chatId={ctx.chatId} />
-      ))}
+      {draft.toolCalls.map((tc, i) =>
+        tc.name === 'present_file' && presentedFilesOf(tc.arguments) ? (
+          <PresentFileCards key={tc.id || i} chatId={ctx.chatId} args={tc.arguments} pending />
+        ) : (
+          <ToolCard key={tc.id || i} call={tc} streaming sessionBusy chatId={ctx.chatId} />
+        )
+      )}
     </div>
   )
 })

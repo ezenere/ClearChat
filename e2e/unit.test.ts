@@ -80,7 +80,7 @@ test('system + env + tools + cache_control na cópia', () => {
     { type: 'text', text: 'leia x', cache_control: { type: 'ephemeral' } }
   ])
   assert.equal(JSON.stringify(hist), before, 'histórico não pode ser mutado')
-  assert.equal(body.tools.length, 24)
+  assert.equal(body.tools.length, 25) // inclui present_file (só na principal)
   // num subagente (sem ask_user: subagentes não perguntam ao usuário), as tools de gerenciar subagentes só aparecem depois do primeiro delegate_task
   const sub1 = buildRequest(mkChat(), { depth: 1, model: 'm' }, hist, orProvider, env).body as any
   assert.equal(sub1.tools.length, 19)

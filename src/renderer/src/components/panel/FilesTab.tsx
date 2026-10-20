@@ -1,25 +1,24 @@
 import {
-  ArrowLeft,
   ChevronRight,
-  File,
-  FileText,
   Folder,
   FolderInput,
   FolderOpen,
   FolderPlus,
   FolderRoot,
   House,
-  RefreshCw
+  RefreshCw,
+  WifiOff
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import type { Chat, DirEntry } from '@shared/types'
-import type { FileContent } from '@shared/ipc'
-import { api, errorMessage } from '../../lib/api'
+import { api } from '../../lib/api'
+import { resourceActions, sourcesFor } from '../../lib/fileSources'
 import { cn, compactPath, formatBytes } from '../../lib/format'
 import { useStore } from '../../store'
 import { Button, IconButton, Spinner } from '../ui/controls'
 import { RootInfo } from '../apiDocs'
-import { CopyButton } from '../chat/Markdown'
+import { useHostInfo } from '../sync/hooks'
+import { fileIcon } from '../viewer/fileIcons'
 
 function join(dir: string, name: string): string {
   return dir.endsWith('/') ? dir + name : `${dir}/${name}`
@@ -122,64 +121,6 @@ export function NewFolderForm({
   )
 }
 
-function Preview({ entry, onBack }: { entry: DirEntry; onBack: () => void }): React.JSX.Element {
-  const [data, setData] = useState<FileContent | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  useEffect(() => {
-    let alive = true
-    api.fs
-      .readFile(entry.path)
-      .then((d) => alive && setData(d))
-      .catch((err) => alive && setError(errorMessage(err)))
-    return () => {
-      alive = false
-    }
-  }, [entry.path])
-  return (
-    <div className="flex h-full flex-col">
-      <div className="flex h-10 shrink-0 items-center gap-1.5 border-b border-border/70 pr-2 pl-2">
-        <button
-          type="button"
-          onClick={onBack}
-          className="rounded-md p-1.5 text-subtle hover:bg-hover hover:text-fg"
-          aria-label="Voltar"
-        >
-          <ArrowLeft className="size-3.5" />
-        </button>
-        <FileText className="size-3.5 shrink-0 text-subtle" />
-        <span className="min-w-0 flex-1 truncate font-mono text-[12px]">{entry.name}</span>
-        <span className="text-[11px] text-faint">{formatBytes(entry.size)}</span>
-        {data && !data.binary && <CopyButton text={data.content} label="" />}
-      </div>
-      <div className="min-h-0 flex-1 overflow-auto">
-        {!data && !error && (
-          <div className="flex items-center gap-2 p-4 text-xs text-subtle">
-            <Spinner /> Carregando…
-          </div>
-        )}
-        {error && <div className="p-4 text-xs text-danger">{error}</div>}
-        {data?.binary && (
-          <div className="p-4 text-xs text-subtle">
-            Arquivo binário — pré-visualização indisponível.
-          </div>
-        )}
-        {data && !data.binary && (
-          <>
-            <pre className="px-4 py-3 font-mono text-[11.5px] leading-[1.65] whitespace-pre text-fg/85">
-              {data.content}
-            </pre>
-            {data.truncated && (
-              <div className="border-t border-border/70 px-4 py-2 text-[11px] text-warning/80">
-                Arquivo grande: exibindo só o início.
-              </div>
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
-
 export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
   const homeDir = useStore((s) => s.homeDir)
   const patchConfig = useStore((s) => s.patchConfig)
@@ -194,8 +135,13 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
     dir: string
     entries?: DirEntry[]
     error?: string
+    offline?: boolean
   } | null>(null)
-  const [file, setFile] = useState<DirEntry | null>(null)
+  // fonte da listagem: local hoje; a do host no controle remoto quando existir (lib/fileSources)
+  const host = useHostInfo(chat.id)
+  const dirSource = sourcesFor(chat.id, host?.mode).dir
+  const active = useStore((s) => s.viewer[chat.id])
+  const openFile = useStore((s) => s.openFile)
   const [prevRoot, setPrevRoot] = useState(root)
   if (prevRoot !== root) {
     setPrevRoot(root)
@@ -205,18 +151,21 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
   const shownDir = confine && !insideRoot(dir, root) ? root : dir
 
   useEffect(() => {
-    let alive = true
-    api.fs
-      .listDir(shownDir)
-      .then((list) => alive && setListing({ dir: shownDir, entries: list }))
-      .catch((err) => alive && setListing({ dir: shownDir, error: errorMessage(err) }))
-    return () => {
-      alive = false
-    }
-  }, [shownDir, tick, reload])
+    const ctl = new AbortController()
+    void dirSource.listDir(chat.id, shownDir, ctl.signal).then((r) => {
+      if (ctl.signal.aborted) return
+      setListing(
+        r.ok
+          ? { dir: shownDir, entries: r.entries }
+          : { dir: shownDir, error: r.message, offline: r.reason === 'host-offline' }
+      )
+    })
+    return () => ctl.abort()
+  }, [shownDir, tick, reload, dirSource, chat.id])
   const current = listing?.dir === shownDir ? listing : null
   const entries = current?.entries ?? null
   const error = current?.error ?? null
+  const offline = !!current?.offline
 
   const sorted = useMemo(
     () =>
@@ -228,7 +177,22 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
     [entries]
   )
 
-  if (file) return <Preview entry={file} onBack={() => setFile(null)} />
+  /** Clique: abre no painel de arquivo (vira o arquivo ativo do chat). */
+  const openInViewer = (e: DirEntry, path: string): void =>
+    openFile(chat.id, { chatId: chat.id, source: 'browse', path }, path, e.name)
+  /** Duplo clique: abre no app padrão do sistema (só arquivos deste computador). */
+  const openInApp = async (path: string): Promise<void> => {
+    const fileSource = sourcesFor(chat.id, host?.mode).file
+    if (!fileSource.capabilities.openNative) return
+    const r = await fileSource.open({ chatId: chat.id, source: 'browse', path })
+    if (!r.ok) {
+      useStore.getState().toast(r.message, 'error')
+      return
+    }
+    const open = resourceActions(fileSource, r.resource).openExternal
+    if (open) await run(() => open(), 'Não foi possível abrir o arquivo')
+    r.resource.dispose()
+  }
 
   const pick = async (): Promise<void> => {
     const d = await run(() => api.fs.pickDirectory(), 'Erro ao escolher pasta')
@@ -331,42 +295,65 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
             <Spinner /> Carregando…
           </div>
         )}
-        {error && <div className="px-2 py-2 text-xs text-danger">{error}</div>}
+        {error &&
+          (offline ? (
+            <div className="flex items-center gap-2 px-2 py-2 text-xs text-subtle">
+              <WifiOff className="size-3.5" /> Host offline — {error}
+            </div>
+          ) : (
+            <div className="px-2 py-2 text-xs text-danger">{error}</div>
+          ))}
         {entries && sorted.length === 0 && (
           <div className="px-2 py-6 text-center text-xs text-subtle">Pasta vazia</div>
         )}
-        {sorted.map((e) => (
-          <button
-            key={e.path || join(shownDir, e.name)}
-            type="button"
-            onClick={() => (e.isDir ? setDir(e.path || join(shownDir, e.name)) : setFile(e))}
-            className="group flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px] hover:bg-hover"
-          >
-            {e.isDir ? (
-              <Folder
-                className="size-3.5 shrink-0 text-accent-strong/70"
-                fill="currentColor"
-                fillOpacity={0.15}
-              />
-            ) : (
-              <File className="size-3.5 shrink-0 text-subtle" />
-            )}
-            <span
+        {sorted.map((e) => {
+          const path = e.path || join(shownDir, e.name)
+          const isActive = !e.isDir && active?.path === path
+          const { icon: FIcon } = fileIcon(e.name)
+          return (
+            <button
+              key={path}
+              type="button"
+              data-testid="files-entry"
+              aria-current={isActive ? 'true' : undefined}
+              title={
+                e.isDir ? undefined : `${e.name} — clique para visualizar, duplo clique abre no app`
+              }
+              onClick={() => (e.isDir ? setDir(path) : openInViewer(e, path))}
+              onDoubleClick={() => !e.isDir && void openInApp(path)}
               className={cn(
-                'min-w-0 flex-1 truncate',
-                e.isDir ? 'text-fg/90' : 'text-fg/75',
-                e.name.startsWith('.') && 'opacity-60'
+                'group flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-[12.5px]',
+                isActive ? 'bg-active text-fg' : 'hover:bg-hover'
               )}
             >
-              {e.name}
-            </span>
-            {!e.isDir && (
-              <span className="shrink-0 text-[10.5px] text-faint tabular-nums">
-                {formatBytes(e.size)}
+              {e.isDir ? (
+                <Folder
+                  className="size-3.5 shrink-0 text-accent-strong/70"
+                  fill="currentColor"
+                  fillOpacity={0.15}
+                />
+              ) : (
+                <FIcon
+                  className={cn('size-3.5 shrink-0', isActive ? 'text-fg/80' : 'text-subtle')}
+                />
+              )}
+              <span
+                className={cn(
+                  'min-w-0 flex-1 truncate',
+                  isActive ? 'text-fg' : e.isDir ? 'text-fg/90' : 'text-fg/75',
+                  e.name.startsWith('.') && 'opacity-60'
+                )}
+              >
+                {e.name}
               </span>
-            )}
-          </button>
-        ))}
+              {!e.isDir && (
+                <span className="shrink-0 text-[10.5px] text-faint tabular-nums">
+                  {formatBytes(e.size)}
+                </span>
+              )}
+            </button>
+          )
+        })}
       </div>
     </div>
   )
