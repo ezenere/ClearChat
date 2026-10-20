@@ -418,8 +418,9 @@ CLEARCHAT_E2E_DIR=/tmp/clearchat-websearch-e2e npm run test:e2e:websearch
 CLEARCHAT_E2E_DIR=/tmp/clearchat-sync-e2e npm run test:e2e:sync
 
 # Fumaça contra o servidor de sync REAL (../ClearChatWebsite/backend com MAIL_BACKEND=console; os códigos
-# por e-mail são lidos do log do servidor). Sem as variáveis, pula. test:unit inclui e2e/syncReal.test.ts
-# (motor do sync, sem Electron); este roda dois apps reais:
+# por e-mail são lidos do log do servidor). Motor do sync, sem Electron (fora do test:unit; exige as variáveis):
+CLEARCHAT_SYNC_TEST_URL=http://127.0.0.1:8100 CLEARCHAT_SYNC_TEST_MAIL_LOG=/caminho/api.log npm run test:sync-real-engine
+# Dois apps reais:
 CLEARCHAT_SYNC_TEST_URL=http://127.0.0.1:8100 CLEARCHAT_SYNC_TEST_MAIL_LOG=/caminho/api.log npm run test:e2e:sync-real
 
 # E2E da UI real (Playwright `_electron` clicando/digitando na interface; screenshots em $CLEARCHAT_E2E_DIR/shots)
