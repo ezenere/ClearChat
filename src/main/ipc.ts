@@ -65,6 +65,7 @@ import * as memory from './memory'
 import { answerQuestion } from './agent/questions'
 import { bwrapAvailable } from './tools/bash'
 import { listProcesses, processLogLines, stopChatProcesses, stopProcess } from './tools/processes'
+import { removeChatToolOutputs } from './tools/toolOutputs'
 import { shellInfoLite } from './tools/shellEnv'
 import { ripgrepAvailable } from './tools/search'
 import { readFile as readFileAsync, stat, writeFile as writeFileAsync } from 'fs/promises'
@@ -220,6 +221,7 @@ export function registerIpc(): void {
       await runner.stopChat(id)
       await stopChatProcesses(id)
       chatsRepo.delete(id)
+      removeChatToolOutputs(id)
     },
 
     // ---- sessions ----

@@ -526,13 +526,28 @@ test('read_file: janela padrão, cabeçalho de arquivo grande, offset/limit, lin
     join(ROOT, 'big.txt'),
     Array.from({ length: 5000 }, (_, i) => `linha ${i + 1}`).join('\n') + '\n'
   )
+  // sem offset/limit: só o início (até o limite de spill, padrão 8.000 chars) + como continuar
   const big = await readFile({ path: 'big.txt' }, ctl({ maxOutput: 100_000 }))
+  assert.equal(big.noSpill, true)
+  assert.ok(big.content.length <= 8000, `len ${big.content.length}`)
+  const bm =
+    /^\[arquivo grande: 5\.000 linhas, [\d,]+ KB — mostrando só o início \(linhas 1–(\d+)\)\. Leia o resto em partes com offset\/limit \(ex\.: offset=(\d+), limit=\d+\) ou localize trechos com search_files\.\]\n1\tlinha 1\n/.exec(
+      big.content
+    )
+  assert.ok(bm, big.content.slice(0, 300))
+  assert.equal(Number(bm![2]), Number(bm![1]) + 1)
+  assert.match(big.content, new RegExp(`\\n${bm![1]}\\tlinha ${bm![1]}$`))
+  // limite de spill maior: até as 2.000 linhas padrão
+  const big2 = await readFile({ path: 'big.txt' }, ctl({ maxOutput: 100_000, spillChars: 100_000 }))
+  assert.match(big2.content, /mostrando só o início \(linhas 1–2\.000\)/)
+  assert.match(big2.content, /\n2000\tlinha 2000$/)
+  assert.ok(!big2.content.includes('2001\t'))
+  // arquivo pequeno (abaixo do limite): inteiro, como antes
+  writeFileSync(join(ROOT, 'medio.txt'), 'x'.repeat(60) + '\n' + 'y'.repeat(60) + '\n')
   assert.match(
-    big.content,
-    /^\[arquivo grande: 5\.000 linhas, [\d,]+ KB — mostrando linhas 1–2\.000\. Use offset\/limit para ler o resto, ou search_files para localizar trechos\.\]\n1\tlinha 1\n/
+    (await readFile({ path: 'medio.txt' }, ctl())).content,
+    /\[fim do arquivo · 2 linhas\]$/
   )
-  assert.match(big.content, /\n2000\tlinha 2000$/)
-  assert.ok(!big.content.includes('2001\t'))
 
   const tail = await readFile({ path: 'big.txt', offset: 4990, limit: 50 }, ctl())
   assert.match(
@@ -545,11 +560,17 @@ test('read_file: janela padrão, cabeçalho de arquivo grande, offset/limit, lin
     /^\[arquivo com 5\.000 linhas .* — mostrando linhas 10–14\. Continue com offset=15\.\]/
   )
 
-  // teto de caracteres: corta em linha inteira e diz por quê
+  // teto de caracteres (maxOutput abaixo do limite de spill): corta em linha inteira
   const capped = await readFile({ path: 'big.txt' }, ctl({ maxOutput: 3000 }))
   assert.ok(capped.content.length <= 3000, `len ${capped.content.length}`)
-  assert.match(capped.content, /limite de caracteres da saída/)
-  assert.match(capped.content, /mostrando linhas 1–\d+ \(/)
+  assert.match(capped.content, /mostrando só o início \(linhas 1–\d+\)/)
+  // com offset/limit: faixa até o teto de saída, dizendo por que parou e de onde continuar
+  const wide = await readFile({ path: 'big.txt', offset: 1, limit: 5000 }, ctl({ maxOutput: 3000 }))
+  assert.ok(wide.content.length <= 3000, `len ${wide.content.length}`)
+  assert.match(
+    wide.content,
+    /mostrando linhas 1–\d+ \(limite de caracteres da saída\)\. Continue com offset=\d+\./
+  )
 
   // linha longa
   writeFileSync(join(ROOT, 'long.txt'), 'x'.repeat(5000) + '\nfim\n')
@@ -566,12 +587,16 @@ test('read_file: janela padrão, cabeçalho de arquivo grande, offset/limit, lin
   assert.equal(bin.status, 'error')
   assert.match(bin.content, /binário \(imagem PNG, 12 B\)/)
 
-  // acima do limite rígido (5 MB): sem offset não lê; com offset lê em streaming
+  // acima de 5 MB: lido em streaming — sem offset, só o início + total de linhas e instruções
   const line = 'y'.repeat(99) + '\n'
   writeFileSync(join(ROOT, 'huge.log'), line.repeat(60_000)) // ~6 MB
   const huge = await readFile({ path: 'huge.log' }, ctl())
-  assert.equal(huge.status, 'error')
-  assert.match(huge.content, /arquivo muito grande: .* MB — não foi lido/)
+  assert.equal(huge.status, 'ok')
+  assert.ok(huge.content.length <= 8000, `len ${huge.content.length}`)
+  assert.match(
+    huge.content,
+    /^\[arquivo grande: 60\.000 linhas, [\d,]+ MB — mostrando só o início \(linhas 1–\d+\)/
+  )
   const part = await readFile({ path: 'huge.log', offset: 59_999, limit: 10 }, ctl())
   assert.match(
     part.content,

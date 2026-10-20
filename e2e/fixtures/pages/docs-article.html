@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <title>Configurando o cliente HTTP | Acme Docs</title>
+    <meta
+      name="description"
+      content="Como configurar timeouts, retries e proxies no cliente HTTP da Acme."
+    />
+    <meta property="article:published_time" content="2025-03-14T10:00:00Z" />
+    <meta property="article:modified_time" content="2025-06-02T08:30:00Z" />
+    <link rel="canonical" href="/docs/v2/http-client" />
+    <link rel="stylesheet" href="/assets/site.css" />
+    <style>
+      .hero {
+        color: red;
+      }
+      body {
+        font-family: sans-serif;
+      }
+    </style>
+    <script>
+      window.dataLayer = window.dataLayer || []
+      function gtag() {
+        dataLayer.push(arguments)
+      }
+      gtag('js', new Date())
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#conteudo">Pular para o conteúdo</a>
+    <div id="cookie-consent" class="cookie-banner">
+      <p>
+        Usamos cookies para melhorar sua experiência. Ao continuar, você concorda com a nossa
+        política de privacidade.
+      </p>
+      <button>Aceitar todos</button>
+      <button>Recusar</button>
+    </div>
+    <header class="site-header">
+      <a href="/" class="logo"><img src="/logo.svg" alt="Acme" /></a>
+      <nav aria-label="Principal">
+        <ul>
+          <li><a href="/produtos">Produtos</a></li>
+          <li><a href="/precos">Preços</a></li>
+          <li><a href="/docs">Documentação</a></li>
+          <li><a href="/blog">Blog</a></li>
+          <li><a href="/suporte">Suporte</a></li>
+          <li><a href="/login">Entrar</a></li>
+        </ul>
+      </nav>
+      <form role="search">
+        <input type="search" placeholder="Buscar na documentação" /><button>Buscar</button>
+      </form>
+    </header>
+    <div class="layout">
+      <nav class="sidebar docs-nav">
+        <h3>Guias</h3>
+        <ul>
+          <li><a href="/docs/v2/intro">Item lateral Alfa: Introdução</a></li>
+          <li><a href="/docs/v2/install">Item lateral Beta: Instalação</a></li>
+          <li><a href="/docs/v2/http-client">Cliente HTTP</a></li>
+          <li><a href="/docs/v2/auth">Autenticação</a></li>
+          <li><a href="/docs/v2/errors">Tratamento de erros</a></li>
+          <li><a href="/docs/v2/pagination">Paginação</a></li>
+          <li><a href="/docs/v2/webhooks">Webhooks</a></li>
+          <li><a href="/docs/v2/rate-limits">Limites de taxa</a></li>
+          <li><a href="/docs/v2/sdk-python">SDK Python</a></li>
+          <li><a href="/docs/v2/sdk-node">SDK Node</a></li>
+          <li><a href="/docs/v2/sdk-go">SDK Go</a></li>
+          <li><a href="/docs/v2/changelog">Changelog</a></li>
+        </ul>
+        <h3>Referência</h3>
+        <ul>
+          <li><a href="/docs/v2/api/clients">Clients</a></li>
+          <li><a href="/docs/v2/api/requests">Requests</a></li>
+          <li><a href="/docs/v2/api/responses">Responses</a></li>
+          <li><a href="/docs/v2/api/streams">Streams</a></li>
+          <li><a href="/docs/v2/api/hooks">Hooks</a></li>
+        </ul>
+      </nav>
+      <main id="conteudo">
+        <nav class="breadcrumbs" aria-label="breadcrumb">
+          <a href="/docs">Docs</a> › <a href="/docs/v2">v2</a> › <span>Cliente HTTP</span>
+        </nav>
+        <article class="doc-content">
+          <header>
+            <h1>Configurando o cliente HTTP</h1>
+            <p class="byline">
+              Por <a href="/autores/marina">Marina Souza</a> · atualizado em
+              <time datetime="2025-06-02">2 de junho de 2025</time>
+            </p>
+          </header>
+          <p>
+            O <code>HttpClient</code> é o ponto de entrada para todas as chamadas à API. Ele mantém
+            um pool de conexões, aplica <strong>retries com backoff exponencial</strong> e respeita
+            os cabeçalhos <code>Retry-After</code> enviados pelo servidor. Veja também o guia de
+            <a href="../v2/errors#retries">tratamento de erros</a> e a
+            <a href="https://example.org/rfc/9110">RFC 9110</a>.
+          </p>
+          <span class="icon" aria-hidden="true">ÍCONE-DECORATIVO</span>
+          <h2 id="instalacao">Instalação</h2>
+          <p>Instale o pacote pelo gerenciador de pacotes do seu projeto:</p>
+          <pre><code class="language-bash">npm install @acme/http --save
+# ou
+pnpm add @acme/http</code></pre>
+          <h2 id="opcoes">Opções</h2>
+          <p>As opções abaixo podem ser passadas ao construtor. Valores em milissegundos.</p>
+          <table class="options">
+            <thead>
+              <tr>
+                <th>Opção</th>
+                <th>Tipo</th>
+                <th>Padrão</th>
+                <th>Descrição</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code>timeout</code></td>
+                <td>number</td>
+                <td>30000</td>
+                <td>Tempo máximo de uma requisição.</td>
+              </tr>
+              <tr>
+                <td><code>retries</code></td>
+                <td>number</td>
+                <td>3</td>
+                <td>Tentativas em erros 5xx e 429.</td>
+              </tr>
+              <tr>
+                <td><code>backoffMs</code></td>
+                <td>number</td>
+                <td>250</td>
+                <td>Espera inicial entre tentativas (dobra a cada uma).</td>
+              </tr>
+              <tr>
+                <td><code>maxSockets</code></td>
+                <td>number</td>
+                <td>64</td>
+                <td>Conexões simultâneas por host | pool.</td>
+              </tr>
+            </tbody>
+          </table>
+          <h2 id="exemplo">Exemplo</h2>
+          <pre class="highlight"><code class="language-ts">import { HttpClient } from '@acme/http'
+
+const client = new HttpClient({
+  baseUrl: 'https://api.acme.dev',
+  timeout: 10_000,
+  retries: 5
+})
+
+const res = await client.get('/v2/orders', { query: { limit: 50 } })
+console.log(res.status, res.data.items.length)</code></pre>
+          <blockquote>
+            <p><strong>Atenção:</strong> nunca desative a verificação de TLS em produção.</p>
+          </blockquote>
+          <h3>Glossário</h3>
+          <dl>
+            <dt>Backoff</dt>
+            <dd>Intervalo crescente entre tentativas.</dd>
+            <dt>Pool</dt>
+            <dd>Conjunto de conexões TCP reutilizadas.</dd>
+          </dl>
+          <figure>
+            <img src="/img/fluxo-retry.png" alt="Diagrama do fluxo de retry" />
+            <figcaption>Fluxo de uma requisição com retries.</figcaption>
+          </figure>
+          <h2 id="proxies">Proxies</h2>
+          <ol>
+            <li>Defina <code>HTTPS_PROXY</code> no ambiente, ou</li>
+            <li>
+              passe <code>proxy: 'http://proxy.local:3128'</code> nas opções;
+              <ul>
+                <li>autenticação básica é suportada na URL;</li>
+                <li>proxies SOCKS exigem o pacote <a href="/docs/v2/socks">@acme/socks</a>.</li>
+              </ul>
+            </li>
+          </ol>
+          <div style="display: none">TEXTO-ESCONDIDO-INLINE</div>
+          <div hidden>SEGREDO-OCULTO</div>
+          <div class="share-buttons">
+            <a href="https://twitter.com/share?u=x">Compartilhar no Twitter</a>
+            <a href="https://www.linkedin.com/share?u=x">Compartilhar no LinkedIn</a>
+          </div>
+          <footer class="doc-footer">
+            <a href="https://github.com/acme/docs/edit/main/http-client.md">Editar esta página</a>
+            <p>Esta página foi útil? Sim / Não</p>
+          </footer>
+        </article>
+      </main>
+      <aside class="toc">
+        <h4>Nesta página</h4>
+        <ul>
+          <li><a href="#instalacao">Instalação</a></li>
+          <li><a href="#opcoes">Opções</a></li>
+          <li><a href="#exemplo">Exemplo</a></li>
+          <li><a href="#proxies">Proxies</a></li>
+        </ul>
+      </aside>
+    </div>
+    <footer class="site-footer">
+      <div class="cols">
+        <ul>
+          <li><a href="/sobre">Sobre nós</a></li>
+          <li><a href="/carreiras">Carreiras</a></li>
+          <li><a href="/imprensa">Imprensa</a></li>
+        </ul>
+        <ul>
+          <li><a href="/termos">Termos de uso</a></li>
+          <li><a href="/privacidade">Privacidade</a></li>
+          <li><a href="/status">Status</a></li>
+        </ul>
+      </div>
+      <p>© 2025 Acme Corp. Todos os direitos reservados. RODAPE-DO-SITE</p>
+    </footer>
+    <script src="/assets/app.js"></script>
+    <noscript>Ative o JavaScript para uma experiência melhor.</noscript>
+  </body>
+</html>

@@ -123,7 +123,8 @@ export async function skillLoadTool(
     const shownLines = content.slice(0, cut).split('\n').length
     content = `${content.slice(0, cut)}\n[… SKILL.md cortado: mostrando ${fmtNum(cut)} de ${fmtNum(raw.length)} caracteres — leia o resto com skill_read {"name": "${s.name}", "path": "SKILL.md", "offset": ${shownLines + 1}}]`
   }
-  return ok(`${skillBlock(s.name, s.dir, content)}${tail}`)
+  // instruções a seguir à risca: nunca vão para arquivo (já limitadas pelo teto de saída)
+  return { ...ok(`${skillBlock(s.name, s.dir, content)}${tail}`), noSpill: true }
 }
 
 export async function skillReadTool(

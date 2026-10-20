@@ -15,6 +15,8 @@ import {
   setProcessListener,
   setProcessLogDir
 } from './tools/processes'
+import { gcToolOutputs, setToolOutputDir } from './tools/toolOutputs'
+import { chatsRepo } from './repo'
 import { migrateLegacyData } from './migrate'
 import { initUpdates, shutdownUpdates } from './updates'
 import { setImageProcessor } from './tools/media'
@@ -168,6 +170,15 @@ app.whenReady().then(() => {
     console.error('[clearchat] gc de logs de processos', e)
   }
   setProcessListener((chatId, processes) => emit({ type: 'processes-updated', chatId, processes }))
+  // Saídas grandes de tools salvas em arquivo: userData/tool-outputs/<chat>/ — poda (idade,
+  // orçamento total e pastas de chats que não existem mais).
+  setToolOutputDir(join(app.getPath('userData'), 'tool-outputs'))
+  try {
+    const gone = gcToolOutputs({ liveChatIds: chatsRepo.list().map((c) => c.id) })
+    if (gone.length) console.log(`[clearchat] saídas de tools antigas apagadas: ${gone.length}`)
+  } catch (e) {
+    console.error('[clearchat] gc de saídas de tools', e)
+  }
 
   initRunner()
   registerIpc()

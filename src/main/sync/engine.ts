@@ -26,6 +26,7 @@ import {
   type TakeoverOptions
 } from '@shared/sync'
 import { ATTACHMENT_FILE_RE } from '@shared/attachments'
+import { removeChatToolOutputs } from '../tools/toolOutputs'
 import { ROOT_KEY, type BranchSel } from '@shared/branches'
 import { compareVersions, parseVersion } from '@shared/updates'
 import {
@@ -1363,7 +1364,10 @@ export class SyncEngine {
       this.emit(e)
       if (e.type === 'message-added' && e.message.message.role === 'assistant')
         this.host.onPersistedAssistant(e.message.sessionId)
-      if (e.type === 'chat-deleted') this.host.forgetChat(e.chatId)
+      if (e.type === 'chat-deleted') {
+        this.host.forgetChat(e.chatId)
+        removeChatToolOutputs(e.chatId) // saídas salvas de tools (só locais)
+      }
       seen.add(e.type)
     }
     if (acc.scopes.size) this.emit({ type: 'sync-data-changed', scopes: [...acc.scopes] })

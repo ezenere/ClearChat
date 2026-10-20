@@ -142,7 +142,13 @@ function summary(name: string, args: Record<string, unknown> | null): string {
     case 'web_search':
       return pick('query')
     case 'browse_url':
-      return pick('url')
+      return [
+        pick('url'),
+        pick('mode') === 'full' && 'página inteira',
+        args.links === true && 'links'
+      ]
+        .filter(Boolean)
+        .join(' · ')
     case 'delegate_task':
       return pick('title') || pick('task')
     case 'search_files': {

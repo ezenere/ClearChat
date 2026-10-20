@@ -10,15 +10,14 @@ import {
   fail,
   fmtNum,
   isBinary,
-  maxOutputOf,
   ok,
   optBool,
   optNumber,
   optString,
   requireString,
+  resolveReadPath,
   resolveToolPath,
   ToolError,
-  truncate,
   type ToolContext,
   type ToolResult
 } from './util'
@@ -178,7 +177,8 @@ export async function searchFiles(
   ctx: ToolContext
 ): Promise<ToolResult> {
   const pattern = requireString(args, 'pattern')
-  const target = await resolveToolPath(ctx, optString(args, 'path'))
+  // como read_file: também alcança as saídas salvas deste chat (arquivos) mesmo com confinação
+  const target = await resolveReadPath(ctx, optString(args, 'path'))
   const glob = optString(args, 'glob')
   const ci = optBool(args, 'case_insensitive')
   const maxResults = Math.min(
@@ -264,7 +264,7 @@ export async function searchFiles(
   const head = capped
     ? `[${fmtNum(results.length)} resultados para /${pattern}/${where} — limite atingido; há mais. Refine o padrão, use path/glob ou aumente max_results (máx. ${LIMITS.searchMaxResults}).]`
     : `[${fmtNum(results.length)} resultado(s) para /${pattern}/${where}]`
-  return ok(truncate(`${head}\n${results.join('\n')}`, maxOutputOf(ctx)))
+  return ok(`${head}\n${results.join('\n')}`)
 }
 
 export async function findFiles(
@@ -322,5 +322,5 @@ export async function findFiles(
   let out = `[${total} arquivo(s) para "${glob}"${where}${found.length > max ? ` — mostrando ${max}` : ''}]\n${shown.join('\n')}`
   if (found.length > max)
     out += `\n[… mais ${capped ? `${fmtNum(found.length - max)}+` : fmtNum(found.length - max)} omitidos — refine o glob ou use path]`
-  return ok(truncate(out, maxOutputOf(ctx)))
+  return ok(out)
 }

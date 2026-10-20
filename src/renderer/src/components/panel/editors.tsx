@@ -1,7 +1,7 @@
 // Editores de ChatConfig independentes de onde a config mora: recebem `cfg` (config completa) e
 // `patch` (patch parcial). Usados pelas abas do painel (config do chat) e pelo editor de personas.
 import { ArrowUpRight, BrainCircuit, RotateCcw } from 'lucide-react'
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import {
   DEFAULT_COMPACT_PROMPT,
   DEFAULT_COMPACT_THRESHOLD,
@@ -17,9 +17,16 @@ import {
   type ParamKey,
   type ParamSupport
 } from '@shared/modelParams'
-import { LIMITS, approxTokens, clampToolOutput } from '@shared/limits'
+import {
+  LIMITS,
+  TOOL_SPILL_SETTING,
+  approxTokens,
+  clampSpillChars,
+  clampToolOutput
+} from '@shared/limits'
 import { currentToolDefinition, TOOL_LABELS, TOOL_NAMES } from '@shared/tools'
 import type { ChatConfig, ChatParams, ToolName } from '@shared/types'
+import { api } from '../../lib/api'
 import { cn, formatTokens, modelMeta } from '../../lib/format'
 import { useStore } from '../../store'
 import {
@@ -747,7 +754,54 @@ export function LimitsSection({ cfg, patch }: CfgProps): React.JSX.Element {
           }
         />
       </div>
+      <SpillField max={max} />
     </Section>
+  )
+}
+
+/**
+ * Limite para salvar saídas grandes em arquivo — setting GLOBAL deste dispositivo
+ * (`toolOutputSpillChars`, não sincronizado), não um campo do ChatConfig.
+ */
+function SpillField({ max }: { max: number }): React.JSX.Element {
+  const run = useStore((s) => s.run)
+  const [value, setValue] = useState<number | undefined>(undefined)
+  useEffect(() => {
+    let alive = true
+    void api.settings.get(TOOL_SPILL_SETTING).then((v) => alive && setValue(clampSpillChars(v)))
+    return () => {
+      alive = false
+    }
+  }, [])
+  const effective = Math.min(value ?? LIMITS.spillThresholdChars, max)
+  return (
+    <div className="mt-3 flex items-center gap-2.5">
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] text-fg/90">Salvar em arquivo acima de</div>
+        <p className="mt-0.5 text-[11.5px] text-subtle">
+          caracteres · global (todos os chats deste dispositivo) · acima disso o modelo recebe um
+          trecho e o caminho do arquivo com a saída completa
+          {effective < (value ?? LIMITS.spillThresholdChars)
+            ? ` · neste chat vale ${effective.toLocaleString('pt-BR')} (saída máx.)`
+            : ''}
+        </p>
+      </div>
+      <NumberInput
+        value={value ?? LIMITS.spillThresholdChars}
+        disabled={value === undefined}
+        step={1000}
+        min={LIMITS.spillThresholdMin}
+        max={LIMITS.spillThresholdMax}
+        int
+        wide
+        label="Salvar saídas em arquivo acima de (caracteres)"
+        onCommit={(v) => {
+          const c = clampSpillChars(v)
+          setValue(c)
+          void run(() => api.settings.set(TOOL_SPILL_SETTING, c))
+        }}
+      />
+    </div>
   )
 }
 

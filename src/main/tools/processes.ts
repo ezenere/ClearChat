@@ -16,6 +16,7 @@ import { LIMITS } from '@shared/limits'
 import type { ProcessInfo } from '@shared/types'
 import { bwrapAvailable, isDir, killGroup, real, sandboxBinds, shellArgv } from './bash'
 import { shellLaunch } from './shellEnv'
+import { setReadableProcessLogDir } from './toolOutputs'
 import {
   fail,
   fmtNum,
@@ -45,6 +46,8 @@ let logDir: string | null = null
 /** index.ts: userData/processes; testes: pasta temporária. */
 export function setProcessLogDir(d: string): void {
   logDir = d
+  // read_file/search_files alcançam os logs do próprio chat mesmo com confineToRoot
+  setReadableProcessLogDir(d)
 }
 
 function ensureLogDir(): string {
@@ -572,7 +575,6 @@ export async function processLogs(
   const limit = clampN(optNumber(args, 'limit'), tail)
   const info = snapshot(p)
   const total = info.lines
-  const max = maxOutputOf(ctx)
 
   const head = [
     `[processo ${label(info)} · ${stateText(info)} · ${fmtNum(total)} linhas]`,
@@ -585,7 +587,8 @@ export async function processLogs(
     notes.push(
       `[a memória guarda as linhas ${fmtNum(p.first)}–${fmtNum(total)}; as ${fmtNum(p.first - 1)} primeiras só no arquivo de log${info.logFile ? ' (use search_files/read_file nele)' : ''}]`
     )
-  const budget = Math.max(1000, max - head.length - 400)
+  // sem teto de caracteres além do de linhas: resultado grande vai para arquivo (runToolImpl)
+  const budget = L.processLogsMaxLines * (L.processMaxLineChars + 64)
   const fmt = (i: number): string => `${p.first + i}\t${p.lines[i]}`
   const out: string[] = []
   let used = 0
@@ -635,9 +638,21 @@ export async function processLogs(
     else footer = `[próximo: since_line=${total} para ler só o que for novo]`
   }
   const partial = cleanLine(p.partial.out || p.partial.err)
-  if (partial && (!re || re.test(partial)) && since === undefined && offset === undefined)
+  const forward = since !== undefined || offset !== undefined
+  if (partial && (!re || re.test(partial)) && !forward)
     out.push(`…\t${partial}  [linha em andamento]`)
-  return ok([head, ...notes, ...out, footer].filter(Boolean).join('\n'))
+  const r = ok([head, ...notes, ...out, footer].filter(Boolean).join('\n'))
+  if (out.length) {
+    // só as linhas vão para o arquivo; estado e rodapé ficam inline (tail: início + fim)
+    const top = [head, ...notes].filter(Boolean).join('\n')
+    r.spill = {
+      head: `${top}\n`,
+      body: out.join('\n'),
+      foot: footer ? `\n${footer}` : '',
+      tail: !forward
+    }
+  }
+  return r
 }
 
 // ---------------- process_list ----------------

@@ -1,9 +1,12 @@
 // list_dir, read_file, write_file, edit_file — com confinação ao diretório raiz e limites de saída.
+// read_file também lê as saídas salvas deste chat (resolveReadPath) e nunca vai para arquivo
+// (noSpill): sem offset/limit devolve só o início de arquivos grandes, com instruções.
 import { createReadStream, promises as fs } from 'fs'
 import { createInterface } from 'readline'
 import { dirname, join } from 'path'
 import { LIMITS } from '@shared/limits'
 import {
+  assertWritable,
   binaryKind,
   displayPath,
   fail,
@@ -14,8 +17,9 @@ import {
   ok,
   optNumber,
   requireString,
+  resolveReadPath,
   resolveToolPath,
-  truncate,
+  spillCharsOf,
   type ToolContext,
   type ToolResult
 } from './util'
@@ -53,7 +57,7 @@ export async function listDir(
   let out = `${dir}  [${fmtNum(nDirs)} pastas, ${fmtNum(entries.length - nDirs)} arquivos]\n${lines.length ? lines.join('\n') : '(vazio)'}`
   if (entries.length > shown.length)
     out += `\n[… mais ${fmtNum(entries.length - shown.length)} entradas omitidas (limite ${max}). Use find_files ou search_files para localizar arquivos em pastas grandes.]`
-  return ok(truncate(out, maxOutputOf(ctx)))
+  return ok(out)
 }
 
 // ---------------- read_file ----------------
@@ -109,7 +113,8 @@ export function renderFileWindow(w: FileWindow): string {
   const why = cutByChars ? ' (limite de caracteres da saída)' : ''
   let header: string
   if (!w.explicit) {
-    header = `[arquivo grande: ${fmtNum(w.totalLines)} linhas, ${fmtSize(w.sizeBytes)} — mostrando ${range}${why}. Use offset/limit para ler o resto, ou search_files para localizar trechos.${longNote}]`
+    const suggest = Math.max(50, rows.length * 3)
+    header = `[arquivo grande: ${fmtNum(w.totalLines)} linhas, ${fmtSize(w.sizeBytes)} — mostrando só o início (${range}). Leia o resto em partes com offset/limit (ex.: offset=${end + 1}, limit=${suggest}) ou localize trechos com search_files.${longNote}]`
   } else {
     const next = end < w.totalLines ? ` Continue com offset=${end + 1}.` : ' Fim do arquivo.'
     header = `[arquivo com ${fmtNum(w.totalLines)} linhas (${fmtSize(w.sizeBytes)}) — mostrando ${range}${why}.${next}${longNote}]`
@@ -151,7 +156,12 @@ export async function readFile(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const path = await resolveToolPath(ctx, requireString(args, 'path'))
+  const r = await readFileImpl(args, ctx)
+  return { ...r, noSpill: true }
+}
+
+async function readFileImpl(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const path = await resolveReadPath(ctx, requireString(args, 'path'))
   const shown = displayPath(ctx.cwd, path)
   const st = await fs.stat(path)
   if (st.isDirectory()) return fail(`Erro: "${shown}" é um diretório (use list_dir).`)
@@ -182,12 +192,6 @@ export async function readFile(
       `Erro: "${shown}" é um arquivo binário (${binaryKind(head)}, ${fmtSize(st.size)}). read_file lê arquivos de texto e, se o modelo aceitar, imagens (png/jpg/webp/gif) e PDF.`
     )
   }
-  if (st.size > LIMITS.readHardMaxBytes && !explicit) {
-    return fail(
-      `[arquivo muito grande: "${shown}" tem ${fmtSize(st.size)} — não foi lido inteiro para não estourar o contexto. ` +
-        'Leia uma faixa com read_file usando offset/limit (ex.: offset=1, limit=200) ou localize o trecho com search_files.]'
-    )
-  }
   const start = Math.max(1, Math.floor(offArg ?? 1))
   const limit = Math.max(1, Math.floor(limArg ?? LIMITS.readDefaultLines))
   let lines: string[]
@@ -202,6 +206,8 @@ export async function readFile(
     lines = all.slice(start - 1, start - 1 + limit)
   }
   if (total === 0) return ok(`[arquivo vazio: ${shown}]`)
+  // sem offset/limit: até o limite de spill (arquivo grande → só o início + instruções);
+  // com offset/limit: a faixa pedida até o teto de saída (maxToolOutputChars), dizendo se há mais
   return ok(
     renderFileWindow({
       lines,
@@ -209,7 +215,7 @@ export async function readFile(
       totalLines: total,
       sizeBytes: st.size,
       explicit,
-      maxChars: maxOutputOf(ctx)
+      maxChars: explicit ? maxOutputOf(ctx) : spillCharsOf(ctx)
     })
   )
 }
@@ -218,7 +224,9 @@ export async function writeFile(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const path = await resolveToolPath(ctx, requireString(args, 'path'))
+  const raw = requireString(args, 'path')
+  const path = await resolveToolPath(ctx, raw)
+  await assertWritable(path, raw)
   const content = requireString(args, 'content', true)
   await fs.mkdir(dirname(path), { recursive: true })
   let existed = true
@@ -238,7 +246,9 @@ export async function editFile(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const path = await resolveToolPath(ctx, requireString(args, 'path'))
+  const raw = requireString(args, 'path')
+  const path = await resolveToolPath(ctx, raw)
+  await assertWritable(path, raw)
   const oldStr = requireString(args, 'old_string', true)
   const newStr = requireString(args, 'new_string', true)
   const replaceAll = args.replace_all === true || args.replace_all === 'true'

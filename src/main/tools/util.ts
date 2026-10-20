@@ -1,11 +1,19 @@
 import { promises as fs } from 'fs'
 import { homedir } from 'os'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path'
-import { LIMITS } from '@shared/limits'
+import { clampSpillChars, LIMITS } from '@shared/limits'
 import type { ContentPart, ModelInfo, PresentFilesRecord, StoredMessage } from '@shared/types'
 import type { MediaContext } from './media'
 import type { HistoryStore } from '../historyStore'
 import type { SkillInfo } from '@shared/skills'
+import {
+  isReadableToolOutput,
+  isToolOutputTarget,
+  isUnderToolOutputs,
+  renderSpilled,
+  writeToolOutput,
+  type SpillParts
+} from './toolOutputs'
 
 export const MAX_OUTPUT: number = LIMITS.maxToolOutputChars
 
@@ -22,6 +30,13 @@ export interface ToolContext {
   confine?: boolean
   /** Teto de caracteres do resultado (ChatConfig.maxToolOutputChars). */
   maxOutput?: number
+  /**
+   * Acima disso (caracteres) o resultado vai inteiro para um arquivo (toolOutputs.ts) e o modelo
+   * recebe um trecho + o caminho (setting `toolOutputSpillChars`; nunca acima de maxOutput).
+   */
+  spillChars?: number
+  /** Id da tool_call (nome do arquivo da saída salva). */
+  toolCallId?: string
   signal: AbortSignal
   /** Saída parcial (ex.: bash) — o chamador faz throttle e emite `tool-running`. */
   onOutput?: (partial: string) => void
@@ -104,6 +119,14 @@ export interface ToolResult {
    * `content` fica como o texto equivalente.
    */
   parts?: ContentPart[]
+  /**
+   * Spill (ver toolOutputs.ts): sem isto, o `content` inteiro é o corpo salvo em arquivo quando
+   * passa do limite. Com isto, só `body` vai ao arquivo (head/foot ficam inline) e `content` é a
+   * versão inline de reserva (usada se não precisar/conseguir salvar). Removido por runToolImpl.
+   */
+  spill?: SpillParts
+  /** Nunca salvar em arquivo (read_file/skill_read/skill_load: já limitam a própria saída). */
+  noSpill?: boolean
 }
 
 export class ToolError extends Error {}
@@ -115,6 +138,10 @@ export const fail = (content: string, meta?: ToolResult['meta']): ToolResult =>
 
 export const maxOutputOf = (ctx: Pick<ToolContext, 'maxOutput'>): number =>
   ctx.maxOutput && ctx.maxOutput > 0 ? ctx.maxOutput : MAX_OUTPUT
+
+/** Limite efetivo para salvar a saída em arquivo: o setting, nunca acima de maxToolOutputChars. */
+export const spillCharsOf = (ctx: Pick<ToolContext, 'maxOutput' | 'spillChars'>): number =>
+  Math.min(clampSpillChars(ctx.spillChars), maxOutputOf(ctx))
 
 /** Número no formato pt-BR (15.234). */
 export const fmtNum = (n: number): string => n.toLocaleString('pt-BR')
@@ -201,6 +228,46 @@ export async function resolveToolPath(
   const abs = resolvePath(ctx.cwd, p)
   if (ctx.confine) await assertInsideRoot(ctx.cwd, abs, typeof p === 'string' && p ? p : abs)
   return abs
+}
+
+/**
+ * Caminho de LEITURA (read_file, search_files): como resolveToolPath, mas com confineToRoot também
+ * aceita as saídas salvas deste chat (toolOutputs.ts) e os logs dos processos dele — só arquivos
+ * comuns, pelo realpath (symlink para fora continua negado). Saída salva que já foi apagada → erro
+ * explicando (em vez de "caminho não encontrado").
+ */
+export async function resolveReadPath(
+  ctx: Pick<ToolContext, 'cwd' | 'confine' | 'chatId'>,
+  p: unknown
+): Promise<string> {
+  const abs = resolvePath(ctx.cwd, p)
+  const original = typeof p === 'string' && p ? p : abs
+  if (isUnderToolOutputs(abs)) {
+    try {
+      await fs.stat(abs)
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT')
+        throw new ToolError(
+          `Erro: a saída salva "${original}" não existe mais (saídas de ferramentas são apagadas após ${LIMITS.spillMaxAgeDays} dias ou quando o chat é apagado). Rode a ferramenta de novo para gerar outra.`
+        )
+    }
+  }
+  if (!ctx.confine) return abs
+  try {
+    await assertInsideRoot(ctx.cwd, abs, original)
+  } catch (e) {
+    if (e instanceof ToolError && (await isReadableToolOutput(ctx.chatId, abs))) return abs
+    throw e
+  }
+  return abs
+}
+
+/** write_file/edit_file: as saídas salvas são somente leitura (com ou sem confinação). */
+export async function assertWritable(abs: string, original?: string): Promise<void> {
+  if (await isToolOutputTarget(abs))
+    throw new ToolError(
+      `Erro: "${original || abs}" é uma saída salva de ferramenta (somente leitura). Grave em outro caminho.`
+    )
 }
 
 /** Caminho para exibição: relativo ao root quando dentro dele. */
@@ -312,8 +379,35 @@ export function abortError(): Error {
 }
 
 /**
+ * Spill (toolOutputs.ts): resultado acima do limite → corpo completo num arquivo do chat e, no
+ * `content`, trecho + caminho + instruções. Erros sem `spill` explícito ficam inline; mídia e
+ * `noSpill` nunca vão para arquivo. Falha ao gravar → `content` original (o teto corta depois).
+ * O texto gerado só depende da saída e do caminho (estável no histórico / cache de prompt).
+ */
+export async function applySpill(r: ToolResult, ctx: ToolContext): Promise<ToolResult> {
+  const { spill, noSpill, ...base } = r
+  if (noSpill || base.parts?.length) return base
+  const parts: SpillParts | null = spill ?? (base.status === 'ok' ? { body: base.content } : null)
+  if (!parts) return base
+  const size = (parts.head?.length ?? 0) + parts.body.length + (parts.foot?.length ?? 0)
+  if (size <= spillCharsOf(ctx)) return base
+  try {
+    const path = await writeToolOutput(ctx.chatId, ctx.toolCallId, parts.body)
+    const excerpt = Math.max(
+      500,
+      Math.min(LIMITS.spillExcerptChars, spillCharsOf(ctx) - 900 - (parts.foot?.length ?? 0))
+    )
+    return { ...base, content: renderSpilled(parts, path, excerpt) }
+  } catch (e) {
+    console.error('[clearchat] spill de saída de tool', e)
+    return base
+  }
+}
+
+/**
  * Executa a implementação de uma tool local: erros viram resultado de texto (status 'error'), abort
- * é relançado (AbortError) e a saída passa pelo teto `maxToolOutputChars` (rede de segurança).
+ * é relançado (AbortError), saídas grandes vão para arquivo (applySpill) e o resultado passa pelo
+ * teto `maxToolOutputChars` (rede de segurança).
  */
 export async function runToolImpl(
   impl: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>,
@@ -321,7 +415,7 @@ export async function runToolImpl(
   ctx: ToolContext
 ): Promise<ToolResult> {
   try {
-    const r = await impl(args, ctx)
+    const r = await applySpill(await impl(args, ctx), ctx)
     // rede de segurança: nenhuma tool devolve mais que o limite configurado
     const max = maxOutputOf(ctx)
     return r.content.length > max ? { ...r, content: truncateHeadTail(r.content, max, 0.5) } : r

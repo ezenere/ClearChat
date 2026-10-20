@@ -25,15 +25,15 @@ import {
   type SearchEngineId
 } from '@shared/webSearchSettings'
 import { LIMITS } from '@shared/limits'
+import { extractPage, formatExtracted, type ExtractMode } from './pageExtract'
 import {
   abortError,
   fail,
-  fmtNum,
-  maxOutputOf,
   ok,
+  optBool,
   optNumber,
+  optString,
   requireString,
-  truncate,
   type ToolContext,
   type ToolResult
 } from './util'
@@ -125,7 +125,8 @@ export async function webSearch(
     getSearchPlan()
   )
   if (waited) ctx.onOutput?.('Pesquisando…')
-  return r.status === 'error' ? r : ok(truncate(r.content, maxOutputOf(ctx)))
+  // grande → arquivo (runToolImpl); erro fica inline
+  return r.status === 'error' ? r : ok(r.content)
 }
 
 // "Testar" (Configurações → Pesquisa na web): UMA pesquisa pequena no buscador, fora do intervalo
@@ -261,65 +262,57 @@ function cleanUserAgent(ua: string): string {
 const BROWSE_TIMEOUT = 25_000
 const SETTLE_MS = 1500
 
-const EXTRACT_JS = `(() => {
-  const clean = (s) => (s || '').replace(/[ \\t]+/g, ' ').replace(/\\n{3,}/g, '\\n\\n').trim();
-  const root = document.querySelector('main, article, [role=main]') || document.body;
-  const text = clean(document.body ? document.body.innerText : '');
-  const seen = new Set();
-  const links = [];
-  for (const a of Array.from((root || document).querySelectorAll('a[href]'))) {
-    const href = a.href;
-    const t = clean(a.innerText || a.getAttribute('aria-label') || a.title || '').slice(0, 120);
-    if (!/^https?:/.test(href) || !t || seen.has(href)) continue;
-    seen.add(href);
-    links.push({ text: t, href });
-    if (links.length >= ${LIMITS.browseMaxLinks}) break;
-  }
-  return { title: document.title || '', url: location.href, text, links };
-})()`
+// HTML renderizado (depois do JS da página) — a extração é pura, no main (pageExtract.ts).
+const GRAB_JS = `(() => ({
+  html: document.documentElement ? document.documentElement.outerHTML.slice(0, ${LIMITS.browseMaxHtmlChars}) : '',
+  url: location.href,
+  title: document.title || ''
+}))()`
 
-export interface PageData {
-  title: string
+export interface LoadedPage {
+  html: string
   url: string
-  text: string
-  links: { text: string; href: string }[]
+  title: string
 }
 
-/** Texto extraído por sessão + URL (paginação via offset sem recarregar a página). */
-const pageCache = new Map<string, { at: number; data: PageData; timedOut: boolean }>()
+/** Página carregada por sessão + URL (trocar mode/links ou usar offset não recarrega). */
+const pageCache = new Map<string, { at: number; page: LoadedPage; timedOut: boolean }>()
 
-function cacheGet(key: string): { data: PageData; timedOut: boolean } | null {
+function cacheGet(key: string): { page: LoadedPage; timedOut: boolean } | null {
   const now = Date.now()
   for (const [k, v] of pageCache) if (now - v.at > LIMITS.browseCacheMs) pageCache.delete(k)
   return pageCache.get(key) ?? null
 }
 
-/** Página `offset…offset+pageChars` do texto extraído, com cabeçalho "caracteres X–Y de Z". */
-export function formatPage(
-  data: PageData,
-  offset: number,
-  pageChars: number,
+function cacheSet(key: string, page: LoadedPage, timedOut: boolean): void {
+  pageCache.delete(key)
+  pageCache.set(key, { at: Date.now(), page, timedOut })
+  while (pageCache.size > LIMITS.browseCacheEntries) {
+    const oldest = pageCache.keys().next().value
+    if (oldest === undefined) break
+    pageCache.delete(oldest)
+  }
+}
+
+/** Texto ao modelo: Markdown do conteúdo (mode main/full) — grande vai para arquivo (runToolImpl). */
+function renderPage(
+  page: LoadedPage,
+  opts: { mode: ExtractMode; links: boolean; offset: number },
   timedOut: boolean,
   fromCache: boolean
 ): string {
-  const text = data.text || '(página sem texto visível)'
-  const total = text.length
-  const start = Math.min(Math.max(0, Math.floor(offset)), total)
-  const end = Math.min(total, start + pageChars)
-  const page = text.slice(start, end)
-  const range =
-    start === 0 && end >= total
-      ? `[texto completo: ${fmtNum(total)} caracteres]`
-      : `[caracteres ${fmtNum(start + 1)}–${fmtNum(end)} de ${fmtNum(total)}${end < total ? ` — continue com offset=${end}` : ' — fim do texto'}]`
-  const warn = timedOut
-    ? `\n[aviso: a página não terminou de carregar em ${BROWSE_TIMEOUT / 1000}s; conteúdo parcial]`
-    : ''
-  const cached = fromCache ? ' (do cache, sem recarregar)' : ''
-  const links =
-    start === 0 && data.links.length
-      ? `\n\n## Links\n${data.links.map((l) => `- [${l.text}](${l.href})`).join('\n')}`
-      : ''
-  return `# ${data.title || '(sem título)'}\nURL: ${data.url}${warn}\n${range}${cached}\n\n${page}${links}`
+  const p = extractPage(page.html, page.url, {
+    mode: opts.mode,
+    links: opts.links,
+    maxLinks: LIMITS.browseMaxLinks
+  })
+  if (!p.title) p.title = page.title
+  return formatExtracted(p, {
+    timedOut,
+    timeoutS: BROWSE_TIMEOUT / 1000,
+    fromCache,
+    offset: opts.offset
+  })
 }
 
 export async function browseUrl(
@@ -327,11 +320,17 @@ export async function browseUrl(
   ctx: ToolContext
 ): Promise<ToolResult> {
   const raw = requireString(args, 'url').trim()
-  const offset = Math.max(0, Math.floor(optNumber(args, 'offset') ?? 0))
-  const pageChars = Math.max(
-    1000,
-    Math.min(LIMITS.browsePageChars, maxOutputOf(ctx) - LIMITS.browseMaxLinks * 160)
-  )
+  const modeArg = optString(args, 'mode')
+  if (modeArg && modeArg !== 'main' && modeArg !== 'full')
+    return fail(
+      'Erro: mode deve ser "main" (padrão: só o conteúdo principal) ou "full" (página inteira).'
+    )
+  const opts = {
+    mode: (modeArg ?? 'main') as ExtractMode,
+    links: optBool(args, 'links'),
+    // legado: antes da saída em arquivo o texto era paginado por offset (caracteres)
+    offset: Math.max(0, Math.floor(optNumber(args, 'offset') ?? 0))
+  }
   let url: URL
   try {
     url = new URL(/^[a-z]+:\/\//i.test(raw) ? raw : `https://${raw}`)
@@ -343,13 +342,10 @@ export async function browseUrl(
   }
   if (ctx.signal.aborted) throw abortError()
   const cacheKey = `${ctx.cacheKey ?? ''}|${url.toString()}`
-  if (offset > 0) {
-    const hit = cacheGet(cacheKey)
-    if (hit)
-      return ok(
-        truncate(formatPage(hit.data, offset, pageChars, hit.timedOut, true), maxOutputOf(ctx))
-      )
-  }
+  // cache só ao reler a mesma página de outro jeito (mode/links/offset); chamada simples recarrega
+  const reuse = opts.offset > 0 || modeArg !== undefined || args.links !== undefined
+  const hit = reuse ? cacheGet(cacheKey) : null
+  if (hit) return ok(renderPage(hit.page, opts, hit.timedOut, true))
 
   const ses = browseSession()
   const win = new BrowserWindow({
@@ -395,8 +391,8 @@ export async function browseUrl(
     ])
     const timedOut = first === 'timeout'
     if (!timedOut) await Promise.race([sleep(SETTLE_MS), aborted])
-    const data = await Promise.race([
-      wc.executeJavaScript(EXTRACT_JS, true) as Promise<PageData>,
+    const page = await Promise.race([
+      wc.executeJavaScript(GRAB_JS, true) as Promise<LoadedPage>,
       sleep(5000).then(() => {
         throw new Error(
           timedOut ? `timeout de ${BROWSE_TIMEOUT / 1000}s` : 'timeout ao extrair conteúdo'
@@ -404,8 +400,8 @@ export async function browseUrl(
       }),
       aborted
     ])
-    pageCache.set(cacheKey, { at: Date.now(), data, timedOut })
-    return ok(truncate(formatPage(data, offset, pageChars, timedOut, false), maxOutputOf(ctx)))
+    cacheSet(cacheKey, page, timedOut)
+    return ok(renderPage(page, opts, timedOut, false))
   } catch (e) {
     if ((e as Error).name === 'AbortError' || ctx.signal.aborted) throw abortError()
     return fail(`Erro ao abrir ${url.toString()}: ${(e as Error).message}`)

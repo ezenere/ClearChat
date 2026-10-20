@@ -13,7 +13,7 @@ const shellDescription = (info: ShellInfoLite | null): string => {
 
 /** Resto da descrição da tool `shell` (o início diz qual shell — ver shellInfo.ts). */
 const SHELL_DESC_REST =
-  'O ambiente do shell de login/interativo do usuário (PATH, nvm etc.) já vem carregado. A primeira chamada começa no diretório raiz; o diretório atual (cd) persiste entre chamadas desta sessão. Retorna stdout+stderr e o código de saída; o comando precisa TERMINAR (há tempo limite). Para algo que deve continuar rodando (servidor, emulador, watcher, logcat), use process_start — nunca `&`/nohup aqui. Saídas longas são cortadas no meio (mantém início e fim): para saídas grandes, redirecione para um arquivo e use grep/head/tail ou read_file com offset/limit.'
+  'O ambiente do shell de login/interativo do usuário (PATH, nvm etc.) já vem carregado. A primeira chamada começa no diretório raiz; o diretório atual (cd) persiste entre chamadas desta sessão. Retorna stdout+stderr e o código de saída; o comando precisa TERMINAR (há tempo limite). Para algo que deve continuar rodando (servidor, emulador, watcher, logcat), use process_start — nunca `&`/nohup aqui. Saída longa vem resumida (início e fim) e fica INTEIRA num arquivo cujo caminho vem no resultado: leia-o em partes com read_file (offset/limit) ou search_files, sem rodar o comando de novo.'
 
 /** Propriedade de JSON Schema (recursiva: arrays de objetos, ex.: ask_user). */
 export interface JsonSchemaProp {
@@ -281,7 +281,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   read_file: def(
     'read_file',
-    `Lê um arquivo de texto — e, se o modelo desta sessão aceitar, imagens (png/jpg/webp/gif) e PDF, que voltam como imagem/documento para você ver (ideal para conferir screenshots que você gerou; imagens grandes são reduzidas). Texto: retorna as linhas numeradas no formato "N\\tconteúdo" e sempre informa o total de linhas. Sem offset/limit lê no máximo ${n(L.readDefaultLines)} linhas; linhas com mais de ${n(L.readMaxLineChars)} caracteres são cortadas e a saída total é limitada. Arquivos acima de ${L.readHardMaxBytes / 1024 / 1024} MB só podem ser lidos em partes (offset/limit). Para arquivos grandes, localize o trecho com search_files e leia só a faixa necessária.`,
+    `Lê um arquivo de texto — e, se o modelo desta sessão aceitar, imagens (png/jpg/webp/gif) e PDF, que voltam como imagem/documento para você ver (ideal para conferir screenshots que você gerou; imagens grandes são reduzidas). Texto: retorna as linhas numeradas no formato "N\\tconteúdo" e sempre informa o total de linhas. Sem offset/limit devolve o arquivo inteiro se for pequeno; se for grande, só o início (cerca de ${n(L.spillThresholdChars)} caracteres) + o total de linhas e como continuar. Com offset/limit lê a faixa pedida (a saída total é limitada; o cabeçalho diz de onde continuar). Linhas com mais de ${n(L.readMaxLineChars)} caracteres são cortadas. Para arquivos grandes, localize o trecho com search_files e leia só a faixa necessária. Também lê as saídas grandes de ferramentas que foram salvas em arquivo (o caminho vem no resultado da ferramenta) e os logs de process_start.`,
     {
       path: {
         type: 'string',
@@ -423,7 +423,7 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   process_logs: def(
     'process_logs',
-    `Lê a saída (stdout+stderr) de um processo de process_start, com as linhas numeradas pela posição no log ("N\ttexto"). Padrão: as últimas ${L.processLogsDefaultLines} linhas. Para acompanhar incrementalmente, passe since_line com o número da última linha já vista (só vem o que é novo). pattern filtra por regex. Informa o estado (rodando / encerrado com código), o total de linhas e o caminho do arquivo com o log completo (a memória guarda só as últimas ${n(L.processBufferLines)} linhas; para buscar no log inteiro use search_files/read_file nesse arquivo).`,
+    `Lê a saída (stdout+stderr) de um processo de process_start, com as linhas numeradas pela posição no log ("N\ttexto"). Padrão: as últimas ${L.processLogsDefaultLines} linhas. Para acompanhar incrementalmente, passe since_line com o número da última linha já vista (só vem o que é novo). pattern filtra por regex. Informa o estado (rodando / encerrado com código), o total de linhas e o caminho do arquivo com o log completo (a memória guarda só as últimas ${n(L.processBufferLines)} linhas; para buscar no log inteiro use search_files/read_file nesse arquivo). Resultado grande é salvo em arquivo (trecho + caminho no resultado).`,
     {
       id: { type: 'string', description: 'Id do processo (ex.: "p1").' },
       pattern: { type: 'string', description: 'Regex para filtrar as linhas.' },
@@ -474,12 +474,19 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   browse_url: def(
     'browse_url',
-    `Abre uma URL em um navegador oculto e retorna o título, o texto visível e (na primeira página) os principais links. O texto vem em páginas de até ${n(L.browsePageChars)} caracteres; o cabeçalho indica "caracteres X–Y de Z" — use offset para ler a continuação (sem recarregar a página).`,
+    `Abre uma URL em um navegador oculto (executa o JavaScript da página) e devolve o CONTEÚDO PRINCIPAL em Markdown compacto: título, URL, descrição, datas, dados estruturados (preço/produto/artigo, quando houver), títulos, parágrafos, listas, tabelas (com os números), blocos de código, citações e links absolutos [texto](url) — sem menus, cabeçalho, rodapé, barras laterais nem banners de cookies. Se o conteúdo principal não for identificado com segurança, devolve a página inteira sem menus e avisa. Página longa: o resultado traz o início e o caminho de um arquivo com o texto COMPLETO — leia o resto com read_file (offset/limit) ou search_files nesse arquivo, em vez de usar curl/python. mode="full" inclui menus/navegação/rodapé (ex.: para achar links do site); links=true acrescenta a lista "Links da página" (até ${L.browseMaxLinks}). Reler a mesma URL com outro mode/links em até 5 min usa a página já carregada.`,
     {
       url: { type: 'string', description: 'URL completa (http/https).' },
-      offset: {
-        type: 'number',
-        description: 'Posição (em caracteres) do texto a partir da qual ler (padrão 0).'
+      mode: {
+        type: 'string',
+        enum: ['main', 'full'],
+        description:
+          '"main" (padrão): só o conteúdo principal. "full": a página inteira, com menus, navegação e rodapé.'
+      },
+      links: {
+        type: 'boolean',
+        description:
+          'Acrescenta a seção "Links da página" com os links da página inteira (menus inclusos). Padrão false.'
       }
     },
     ['url']

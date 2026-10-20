@@ -140,6 +140,10 @@ export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean
     has('edit_file') && '- Leia antes de editar; prefira edit_file a reescrever arquivos inteiros.',
     (has('search_files') || has('read_file')) &&
       '- Proteja o contexto: localize trechos com search_files/find_files e leia arquivos grandes em partes (offset/limit) em vez de inteiros.',
+    has('read_file') &&
+      '- Saídas grandes de ferramentas (shell, browse_url, logs, buscas, listagens) vêm resumidas e ficam INTEIRAS num arquivo cujo caminho vem no resultado: leia o resto com read_file (offset/limit) ou search_files nesse arquivo, em vez de repetir o comando.',
+    has('browse_url') &&
+      '- Para ler páginas web use browse_url (já devolve o conteúdo principal em Markdown) em vez de curl/python no shell.',
     has('list_models') &&
       has('delegate_task') &&
       '- Para escolher o modelo de um subagente, consulte list_models antes de delegate_task. Modelos grátis: só tarefas fáceis e sem dados pessoais; são instáveis — se falharem, use outro modelo.',

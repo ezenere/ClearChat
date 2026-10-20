@@ -38,7 +38,7 @@ import type {
 import type { ModelInfo, Provider } from '@shared/types'
 import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
-import { clampToolOutput, LIMITS } from '@shared/limits'
+import { clampToolOutput, LIMITS, TOOL_SPILL_SETTING } from '@shared/limits'
 import {
   interChatHeader,
   interChatText,
@@ -56,7 +56,7 @@ import {
   resolveContextWindow
 } from '@shared/context'
 import { emit } from '../events'
-import { chatsRepo, messagesRepo, providersRepo, sessionsRepo } from '../repo'
+import { chatsRepo, messagesRepo, providersRepo, sessionsRepo, settingsRepo } from '../repo'
 import { getDb } from '../db'
 import { historyStore } from '../historyStore'
 import { parseToolArgs, runLocalTool, shellStateFor } from '../tools'
@@ -1257,6 +1257,9 @@ async function executeTool(
       cwd: root,
       confine: chat.config.confineToRoot !== false,
       maxOutput: clampToolOutput(chat.config.maxToolOutputChars),
+      // saída grande → userData/tool-outputs/<chat>/<toolCallId>.txt (setting global do dispositivo)
+      spillChars: settingsRepo.get<number>(TOOL_SPILL_SETTING) ?? undefined,
+      toolCallId,
       sandbox,
       ...(roBinds?.length ? { roBinds } : {}),
       ...(skills ? { skills } : {}),

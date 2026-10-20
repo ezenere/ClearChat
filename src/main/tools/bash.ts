@@ -267,6 +267,7 @@ function runShell(
       if (ctx.shell) ctx.shell.dir = endDir
 
       const full = (head + tail).replace(/\s+$/, '')
+      // versão inline de reserva (cortada no teto); a completa vai em `spill` (arquivo se grande)
       const body = truncateHeadTail(
         full,
         Math.max(1000, max - 400),
@@ -278,9 +279,16 @@ function runShell(
         ? `[timeout: processo encerrado após ${fmtNum(timeoutMs)} ms]`
         : `[exit code: ${code ?? (sig ? `sinal ${sig}` : '?')}]`
       const where = endDir !== root ? `\n[cwd: ${endDir}]` : ''
-      const content = `${body ? body + '\n' : '(sem saída)\n'}${status}${where}${notes.length ? '\n' + notes.join('\n') : ''}`
+      const foot = `${status}${where}${notes.length ? '\n' + notes.join('\n') : ''}`
+      const content = `${body ? body + '\n' : '(sem saída)\n'}${foot}`
       const meta = { shellCwd: endDir }
-      resolvePromise(timedOut ? fail(content, meta) : ok(content, meta))
+      const r = timedOut ? fail(content, meta) : ok(content, meta)
+      // saída grande → arquivo (runToolImpl): trecho do início e do fim + status sempre inline
+      const whole = dropped
+        ? `${head}\n[… ${fmtNum(dropped)} caracteres / ${fmtNum(droppedLines)} linhas descartados no meio (saída grande demais para guardar) …]\n${tail.replace(/\s+$/, '')}`
+        : full
+      if (full) r.spill = { body: whole, foot: `\n${foot}`, tail: true }
+      resolvePromise(r)
     }
     child.on('error', (e) => finish(null, null, e))
     child.on('close', (code, sig) => finish(code, sig))

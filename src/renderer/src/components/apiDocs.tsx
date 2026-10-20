@@ -365,12 +365,22 @@ export function MaxOutputInfo(): React.JSX.Element {
         marcador explicando o corte e como ler o resto.
       </p>
       <p>
-        Fixos: <C>read_file</C> lê no máximo {LIMITS.readDefaultLines.toLocaleString('pt-BR')}{' '}
-        linhas sem offset/limit e corta linhas acima de{' '}
+        <strong className="text-fg">Salvar em arquivo</strong> (global, padrão{' '}
+        {LIMITS.spillThresholdChars.toLocaleString('pt-BR')}): resultado maior que isso vai inteiro
+        para <C>userData/tool-outputs/&lt;chat&gt;/&lt;tool_call_id&gt;.txt</C> e o modelo recebe só
+        o início (no <C>shell</C> e nos logs, início e fim — ~
+        {LIMITS.spillExcerptChars.toLocaleString('pt-BR')} caracteres), o tamanho, o caminho e como
+        ler o resto com <C>read_file</C> (offset/limit) ou <C>search_files</C> — que alcançam esses
+        arquivos mesmo com a confinação ligada. Ficam só neste dispositivo, são apagados com o chat
+        e após {LIMITS.spillMaxAgeDays} dias. Erros, <C>read_file</C> e <C>skill_read</C> nunca vão
+        para arquivo.
+      </p>
+      <p>
+        Fixos: <C>read_file</C> sem offset/limit devolve o arquivo inteiro se for pequeno, senão só
+        o início (até o limite acima) e corta linhas acima de{' '}
         {LIMITS.readMaxLineChars.toLocaleString('pt-BR')} caracteres; <C>list_dir</C> até{' '}
         {LIMITS.listMaxEntries} entradas; <C>search_files</C> até {LIMITS.searchMaxResults}{' '}
-        resultados; <C>list_models</C> até {LIMITS.modelsMaxResults} modelos; <C>shell</C> mantém
-        início e fim; <C>browse_url</C> pagina o texto com <C>offset</C>.
+        resultados; <C>list_models</C> até {LIMITS.modelsMaxResults} modelos.
       </p>
       <p className="text-subtle">Não é um campo da request.</p>
     </ApiInfo>

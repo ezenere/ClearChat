@@ -11,7 +11,7 @@ export const LIMITS = {
   readDefaultLines: 2000,
   /** read_file: linhas mais longas que isso são cortadas com marcador. */
   readMaxLineChars: 2000,
-  /** read_file: acima disso (bytes) e sem offset/limit, não lê — devolve tamanho + instruções. */
+  /** read_file: acima disso (bytes) lê em streaming (só a janela pedida; sem offset/limit, o início). */
   readHardMaxBytes: 5 * 1024 * 1024,
 
   /** list_dir: máximo de entradas listadas. */
@@ -35,11 +35,28 @@ export const LIMITS = {
   webMaxResultsCap: 10,
   webSnippetChars: 300,
 
-  /** browse_url: caracteres de texto por página (paginação via offset). */
-  browsePageChars: 12_000,
-  /** browse_url: tempo de cache do texto extraído (por sessão + URL). */
+  /** browse_url: tempo de cache da página carregada (por sessão + URL; trocar mode/links não recarrega). */
   browseCacheMs: 5 * 60_000,
-  browseMaxLinks: 40,
+  /** browse_url: páginas guardadas no cache (as mais antigas saem). */
+  browseCacheEntries: 16,
+  /** browse_url (links: true): máximo de links na seção "Links da página". */
+  browseMaxLinks: 150,
+  /** browse_url: HTML acima disso (caracteres) é cortado antes da extração. */
+  browseMaxHtmlChars: 8_000_000,
+
+  /**
+   * Saídas grandes → arquivo (tools/toolOutputs.ts): resultado com mais caracteres que isso vai
+   * inteiro para um arquivo e o modelo recebe um trecho + caminho. Padrão do setting
+   * `toolOutputSpillChars` (global, deste dispositivo); o efetivo nunca passa de maxToolOutputChars.
+   */
+  spillThresholdChars: 8_000,
+  spillThresholdMin: 2_000,
+  spillThresholdMax: 200_000,
+  /** Trecho mostrado de uma saída salva (início; início 40% + fim 60% no shell/logs). */
+  spillExcerptChars: 2_500,
+  /** Saídas salvas: apagadas no start do app após N dias ou acima do orçamento total (as mais antigas). */
+  spillMaxAgeDays: 7,
+  spillMaxTotalBytes: 512 * 1024 * 1024,
 
   /** shell: fração do limite mantida do início (o resto vem do fim). */
   bashHeadRatio: 0.4,
@@ -92,6 +109,15 @@ export const LIMITS = {
 
 /** Aproximação usada na UI: ~4 caracteres por token. */
 export const approxTokens = (chars: number): number => Math.ceil(chars / 4)
+
+/** Setting global (deste dispositivo, não sincronizado): limite para salvar saídas em arquivo. */
+export const TOOL_SPILL_SETTING = 'toolOutputSpillChars'
+
+/** Normaliza o limite de spill configurado (fallback no padrão). */
+export function clampSpillChars(n: unknown): number {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return LIMITS.spillThresholdChars
+  return Math.round(Math.min(LIMITS.spillThresholdMax, Math.max(LIMITS.spillThresholdMin, n)))
+}
 
 /** Normaliza o limite configurado (fallback no padrão). */
 export function clampToolOutput(n: number | undefined | null): number {
