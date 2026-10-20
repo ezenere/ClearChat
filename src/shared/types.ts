@@ -579,6 +579,10 @@ export interface ApprovalCheckItem {
   note?: string
   /** Pré-preenchimento do "+ whitelist/blacklist" (prefixo `programa sub *` ou o domínio). */
   suggestion: string
+  /** Nível na árvore da decomposição (internos de ssh/sudo/docker exec… = 1, 2…). */
+  depth?: number
+  /** Onde/como o sub-comando roda: "no servidor deploy@host (via ssh)", "via sudo"… */
+  group?: string
 }
 
 export interface ApprovalCheck {

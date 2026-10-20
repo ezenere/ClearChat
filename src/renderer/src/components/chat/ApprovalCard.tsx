@@ -2,9 +2,12 @@
 // por sub-comando (ou a URL) — os já liberados aparecem marcados (✓ whitelist "…"), cada pendente
 // tem [Sim] [Sim + whitelist] [Não] [Não + blacklist]; "+ lista" abre o campo editável
 // pré-preenchido (prefixo `programa sub *` ou o domínio). Só executa quando todos forem "Sim";
-// qualquer "Não" responde na hora (nada roda). "Sim para todos" atalho.
-import { AlertTriangle, Ban, Check, Hand, ShieldCheck } from 'lucide-react'
-import { useState } from 'react'
+// qualquer "Não" responde na hora (nada roda). "Sim para todos" atalho. Decomposição em árvore:
+// os comandos internos de ssh/sudo/docker exec… ficam indentados sob o cabeçalho do grupo
+// ("no servidor deploy@host (via ssh)"), cada um com o próprio veredito.
+import { AlertTriangle, Ban, Check, CornerDownRight, Hand, ShieldCheck } from 'lucide-react'
+import { Fragment, useState } from 'react'
+import { groupHeadings } from '@shared/shellParse'
 import {
   isListItem,
   ITEM_LABEL,
@@ -100,6 +103,7 @@ function ListsPrompt({
     .map((it, index) => ({ it, index }))
     .filter(({ it }) => it.verdict !== 'allow')
   const multi = items.length > 1
+  const heads = groupHeadings(items)
 
   const submit = async (next: Record<number, Choice>): Promise<void> => {
     const decided = pending.filter(({ index }) => next[index])
@@ -143,124 +147,142 @@ function ListsPrompt({
       <div className="mt-2 space-y-1.5">
         {items.map((it, index) => {
           const c = choices[index]
+          const indent = { marginLeft: `${(it.depth ?? 0) * 14}px` }
           return (
-            <div
-              key={index}
-              data-testid="approval-sub"
-              className={cn(
-                'rounded-lg border px-2.5 py-1.5',
-                it.verdict === 'allow'
-                  ? 'border-success/20 bg-success/[0.04]'
-                  : c
-                    ? c.allow
-                      ? 'border-success/25 bg-bg/50'
-                      : 'border-danger/25 bg-bg/50'
-                    : 'border-border bg-bg/60'
+            <Fragment key={index}>
+              {heads[index] && (
+                <div
+                  data-testid="approval-group"
+                  style={indent}
+                  className="flex items-center gap-1 pt-0.5 text-[10.5px] font-medium text-subtle"
+                >
+                  <CornerDownRight className="size-3 shrink-0 text-faint" />
+                  {heads[index]}
+                </div>
               )}
-            >
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                <code className="min-w-0 flex-1 font-mono text-[11.5px] break-all whitespace-pre-wrap text-fg/90">
-                  {it.text || '(vazio)'}
-                </code>
-                {it.verdict === 'allow' ? (
-                  <span
-                    data-testid="sub-whitelisted"
-                    className="inline-flex shrink-0 items-center gap-1 text-[11px] text-success/90"
-                  >
-                    <Check className="size-3" /> whitelist “{it.entry}”
-                  </span>
-                ) : c ? (
-                  <span
-                    className={cn(
-                      'inline-flex shrink-0 items-center gap-1 text-[11px]',
-                      c.allow ? 'text-success/90' : 'text-danger/90'
+              <div
+                data-testid="approval-sub"
+                style={indent}
+                className={cn(
+                  'rounded-lg border px-2.5 py-1.5',
+                  it.verdict === 'allow'
+                    ? 'border-success/20 bg-success/[0.04]'
+                    : c
+                      ? c.allow
+                        ? 'border-success/25 bg-bg/50'
+                        : 'border-danger/25 bg-bg/50'
+                      : 'border-border bg-bg/60'
+                )}
+              >
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <code className="min-w-0 flex-1 font-mono text-[11.5px] break-all whitespace-pre-wrap text-fg/90">
+                    {it.text || '(vazio)'}
+                  </code>
+                  {it.verdict === 'allow' ? (
+                    <span
+                      data-testid="sub-whitelisted"
+                      className="inline-flex shrink-0 items-center gap-1 text-[11px] text-success/90"
+                    >
+                      <Check className="size-3" /> whitelist “{it.entry}”
+                    </span>
+                  ) : c ? (
+                    <span
+                      className={cn(
+                        'inline-flex shrink-0 items-center gap-1 text-[11px]',
+                        c.allow ? 'text-success/90' : 'text-danger/90'
+                      )}
+                    >
+                      {c.allow ? <Check className="size-3" /> : <Ban className="size-3" />}
+                      {c.allow ? 'Sim' : 'Não'}
+                      {c.pattern && ` + ${c.allow ? 'whitelist' : 'blacklist'} “${c.pattern}”`}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => {
+                          const n = { ...choices }
+                          delete n[index]
+                          setChoices(n)
+                        }}
+                        className="ml-1 text-faint underline hover:text-fg"
+                      >
+                        desfazer
+                      </button>
+                    </span>
+                  ) : (
+                    <span className="flex shrink-0 flex-wrap items-center gap-1">
+                      <Button
+                        size="sm"
+                        variant="primary"
+                        className="h-6 px-2"
+                        disabled={busy}
+                        onClick={() => decide(index, { allow: true })}
+                      >
+                        Sim
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="h-6 px-2"
+                        disabled={busy || !!it.reason || !it.suggestion}
+                        title={
+                          it.reason
+                            ? 'Este sub-comando nunca é liberado automaticamente'
+                            : 'Permitir e salvar um padrão na whitelist global'
+                        }
+                        onClick={() => setEditing({ index, list: 'allow' })}
+                      >
+                        Sim + whitelist
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        className="h-6 px-2"
+                        disabled={busy}
+                        onClick={() => decide(index, { allow: false })}
+                      >
+                        Não
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="danger"
+                        className="h-6 px-2"
+                        disabled={busy || !it.suggestion}
+                        title="Negar e salvar um padrão na blacklist global"
+                        onClick={() => setEditing({ index, list: 'deny' })}
+                      >
+                        Não + blacklist
+                      </Button>
+                    </span>
+                  )}
+                </div>
+                {((it.note && it.note !== it.group) || it.reason) && (
+                  <p className="mt-0.5 flex items-start gap-1 text-[10.5px] leading-snug text-subtle">
+                    {it.reason && (
+                      <AlertTriangle className="mt-px size-3 shrink-0 text-warning/90" />
                     )}
-                  >
-                    {c.allow ? <Check className="size-3" /> : <Ban className="size-3" />}
-                    {c.allow ? 'Sim' : 'Não'}
-                    {c.pattern && ` + ${c.allow ? 'whitelist' : 'blacklist'} “${c.pattern}”`}
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => {
-                        const n = { ...choices }
-                        delete n[index]
-                        setChoices(n)
-                      }}
-                      className="ml-1 text-faint underline hover:text-fg"
-                    >
-                      desfazer
-                    </button>
-                  </span>
-                ) : (
-                  <span className="flex shrink-0 flex-wrap items-center gap-1">
-                    <Button
-                      size="sm"
-                      variant="primary"
-                      className="h-6 px-2"
-                      disabled={busy}
-                      onClick={() => decide(index, { allow: true })}
-                    >
-                      Sim
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      className="h-6 px-2"
-                      disabled={busy || !!it.reason || !it.suggestion}
-                      title={
-                        it.reason
-                          ? 'Este sub-comando nunca é liberado automaticamente'
-                          : 'Permitir e salvar um padrão na whitelist global'
-                      }
-                      onClick={() => setEditing({ index, list: 'allow' })}
-                    >
-                      Sim + whitelist
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      className="h-6 px-2"
-                      disabled={busy}
-                      onClick={() => decide(index, { allow: false })}
-                    >
-                      Não
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="danger"
-                      className="h-6 px-2"
-                      disabled={busy || !it.suggestion}
-                      title="Negar e salvar um padrão na blacklist global"
-                      onClick={() => setEditing({ index, list: 'deny' })}
-                    >
-                      Não + blacklist
-                    </Button>
-                  </span>
+                    <span>
+                      {[
+                        it.note !== it.group && it.note,
+                        it.reason && `pergunta sempre: ${it.reason}`
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                  </p>
+                )}
+                {editing?.index === index && (
+                  <ListEntryEditor
+                    item={item}
+                    list={editing.list}
+                    initial={it.suggestion}
+                    onCancel={() => setEditing(null)}
+                    onConfirm={(pattern) =>
+                      decide(index, { allow: editing.list === 'allow', pattern })
+                    }
+                  />
                 )}
               </div>
-              {(it.note || it.reason) && (
-                <p className="mt-0.5 flex items-start gap-1 text-[10.5px] leading-snug text-subtle">
-                  {it.reason && <AlertTriangle className="mt-px size-3 shrink-0 text-warning/90" />}
-                  <span>
-                    {[it.note, it.reason && `pergunta sempre: ${it.reason}`]
-                      .filter(Boolean)
-                      .join(' · ')}
-                  </span>
-                </p>
-              )}
-              {editing?.index === index && (
-                <ListEntryEditor
-                  item={item}
-                  list={editing.list}
-                  initial={it.suggestion}
-                  onCancel={() => setEditing(null)}
-                  onConfirm={(pattern) =>
-                    decide(index, { allow: editing.list === 'allow', pattern })
-                  }
-                />
-              )}
-            </div>
+            </Fragment>
           )
         })}
       </div>

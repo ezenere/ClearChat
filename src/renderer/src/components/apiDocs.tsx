@@ -464,7 +464,10 @@ export function AutoApproveInfo(): React.JSX.Element {
         Resultados enviados ao modelo como <C>{'role: "tool"'}</C>: negado →{' '}
         <C>O usuário negou: &lt;sub-comando&gt;</C> (pergunta simples:{' '}
         <C>O usuário negou a execução desta ferramenta.</C>); blacklist →{' '}
-        <C>{'Bloqueado pela blacklist (comandos): "<entrada>" casou com "<sub-comando>"'}</C>.
+        <C>{'Bloqueado pela blacklist (comandos): "<entrada>" casou com "<sub-comando>"'}</C>. Num
+        comando interno (ssh, sudo, docker exec…) o contexto vem junto:{' '}
+        <C>{'… — no servidor deploy@host (via ssh)'}</C> /{' '}
+        <C>{'… casou com "rm -rf x" (no servidor deploy@host (via ssh))'}</C>.
       </p>
     </ApiInfo>
   )

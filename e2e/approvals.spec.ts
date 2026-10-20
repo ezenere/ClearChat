@@ -12,7 +12,9 @@
 // pré-preenchido (`git log *`) editado → salva na lista global, o pendente restante com "Sim" →
 // executa; a chamada seguinte com o mesmo padrão roda sem card ("Liberado pela whitelist"); "Não +
 // blacklist" → resultado "O usuário negou: …"; depois a blacklist bloqueia sem perguntar;
-// Configurações → Aprovações (modos globais, tabelas e "Testar comando").
+// decomposição em árvore (ssh com comandos remotos + sudo: card com cabeçalhos "no servidor …",
+// "Não" na conexão → nada roda; `rm -rf` remoto bloqueado pela blacklist — host `.invalid`, nada
+// é executado); Configurações → Aprovações (modos globais, tabelas e "Testar comando" com ssh).
 import {
   _electron as electron,
   type ElectronApplication,
@@ -401,6 +403,56 @@ async function main(): Promise<void> {
     }
   )
 
+  await step(
+    'ssh: card em árvore (conexão + comandos remotos + sudo); blacklist no remoto',
+    async () => {
+      const host = 'deploy@exemplo.invalid'
+      await sendMessage(
+        `rode: ssh -t ${host} 'cd /srv/app && git log -n 1 && sudo systemctl restart app'`
+      )
+      const card = approvalCard()
+      await card.waitFor({ timeout: 15_000 })
+      const subs = card.getByTestId('approval-sub')
+      const texts = await subs.locator('code').allInnerTexts()
+      assert(
+        texts.join(' | ') ===
+          `ssh -t ${host} | cd /srv/app | git log -n 1 | sudo systemctl restart app | systemctl restart app`,
+        `itens ${texts.join(' | ')}`
+      )
+      const groups = await card.getByTestId('approval-group').allInnerTexts()
+      assert(
+        groups.join(' | ') === `no servidor ${host} (via ssh) | via sudo`,
+        `grupos ${groups.join(' | ')}`
+      )
+      await subs.nth(2).getByTestId('sub-whitelisted').getByText('git log *').waitFor()
+      await card.scrollIntoViewIfNeeded()
+      await shotOf(card, 'card-ssh-arvore')
+      // "+ whitelist" da conexão sugere só o destino
+      await subs.nth(0).getByRole('button', { name: 'Sim + whitelist' }).click()
+      const input = card.getByRole('textbox', { name: 'Padrão da whitelist' })
+      assert((await input.inputValue()) === `ssh ${host}`, `sugestão ${await input.inputValue()}`)
+      await card.getByRole('button', { name: 'Cancelar' }).click()
+      await subs.nth(0).getByRole('button', { name: 'Não', exact: true }).click()
+      await waitIdle()
+      let { msgs } = await chatState()
+      let tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+      assert(
+        tool.message.content === `O usuário negou: ssh -t ${host}` &&
+          tool.meta.toolStatus === 'denied',
+        `conteúdo ${tool.message.content}`
+      )
+      await sendMessage(`rode: ssh ${host} 'cd /srv && rm -rf /srv/old'`)
+      await waitIdle()
+      ;({ msgs } = await chatState())
+      tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
+      assert(
+        tool.message.content ===
+          `Bloqueado pela blacklist (comandos): "rm -rf *" casou com "rm -rf /srv/old" (no servidor ${host} (via ssh))`,
+        `conteúdo ${tool.message.content}`
+      )
+    }
+  )
+
   await step('Configurações → Aprovações: modos, tabelas e "Testar comando"', async () => {
     await page.getByRole('button', { name: 'Configurações' }).first().click()
     const dlg = page.getByRole('dialog')
@@ -415,6 +467,25 @@ async function main(): Promise<void> {
     await items.nth(0).getByText('✓ liberado').waitFor()
     assert((await items.count()) === 3, `3 itens (${await items.count()})`)
     await tester.getByText(/sh lendo comandos da entrada/).waitFor()
+    // ssh: conexão + comandos remotos agrupados sob "no servidor …"
+    await tester
+      .getByRole('textbox')
+      .fill("ssh -p 2222 deploy@exemplo.invalid 'git log -n 5 | head -3; sudo -u app make deploy'")
+    await tester.getByTestId('tester-group').first().waitFor()
+    const tgroups = await tester.getByTestId('tester-group').allInnerTexts()
+    assert(
+      tgroups.join(' | ') ===
+        'no servidor deploy@exemplo.invalid:2222 (via ssh) | via sudo (como app)',
+      `grupos ${tgroups.join(' | ')}`
+    )
+    assert((await items.count()) === 5, `5 itens (${await items.count()})`)
+    await items.nth(1).getByText('✓ liberado').waitFor()
+    await items
+      .nth(0)
+      .getByText(/sugestão: ssh -p 2222 deploy@exemplo.invalid/)
+      .waitFor()
+    await tester.scrollIntoViewIfNeeded()
+    await shotOf(tester, 'tester-ssh-arvore')
     // itens de arquivo/agentes no global, padrão Sempre permitir; sem ★ (é aqui que se define)
     for (const it of ['writeFile', 'editFile', 'sendToChat', 'delegate']) {
       const opt = root

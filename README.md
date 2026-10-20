@@ -214,10 +214,14 @@ npm run install:local -- --uninstall
 - Cada chat (aba Tools) e persona pode ajustar: a opção igual ao padrão global tem uma **★**. Sem ajuste, o
   chat segue o global (a opção ★ aparece marcada e acompanha se o global mudar); escolher a opção ★ volta a
   seguir o global, escolher outra fixa o modo naquele chat.
-- **Listas** (globais): o comando é desmontado em sub-comandos (`|`, `&&`, `;`, `$(…)`, `bash -c`, `sudo`…);
-  blacklist bloqueia tudo (precede), whitelist libera, o resto vira um card com **Sim / Sim + whitelist /
-  Não / Não + blacklist** por sub-comando ("+ lista" sugere `git push *`, editável). `eval`, `xargs`,
-  `find -exec`, redirecionamento para arquivo e o que o parser não entende sempre perguntam. Páginas:
+- **Listas** (globais): o comando é desmontado em sub-comandos (`|`, `&&`, `;`, `$(…)`, `bash -c`…) e,
+  recursivamente, o que roda dentro de `ssh host '…'` (também heredoc/`bash -s`), `sudo`, `docker exec`,
+  `kubectl exec`, `xargs`, `watch`… (em árvore: "no servidor deploy@host (via ssh)"); blacklist bloqueia
+  tudo (precede, inclusive comandos remotos), whitelist libera só se a conexão/o wrapper **e** cada comando
+  interno casarem (`ssh deploy@host` libera conectar; `sudo` só com o comando, ex. `sudo apt update *`); o
+  resto vira um card com **Sim / Sim + whitelist / Não / Não + blacklist** por sub-comando ("+ lista"
+  sugere `git push *` ou `ssh user@host`, editável). `eval`, `find -exec`, redirecionamento para arquivo,
+  comando remoto montado com expansão local e o que o parser não entende sempre perguntam. Páginas:
   domínio (`github.com`, `*.github.com`) ou prefixo de URL. "Testar comando/URL" mostra a decomposição.
 
 ## Smart-Approve

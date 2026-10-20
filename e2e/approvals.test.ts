@@ -172,7 +172,6 @@ test('parser: construtos não analisáveis → sempre pergunta (unsafe)', () => 
     'find . -name x -exec rm {} \\;',
     'find . -execdir ls \\;',
     'find . -ok rm {} \\;',
-    'ls | xargs rm',
     'diff <(ls a) <(ls b)',
     'tee >(gzip > x.gz) < f',
     'alias ll="ls -l"',
@@ -186,7 +185,6 @@ test('parser: construtos não analisáveis → sempre pergunta (unsafe)', () => 
     'echo "unterminated',
     '(ls',
     'ls )',
-    'sh <<EOF\nrm -rf /\nEOF',
     'cat <<EOF\n$(whoami)\nEOF',
     'echo $(( $(id -u) + 1 ))',
     'fd x --exec rm',
@@ -821,4 +819,392 @@ test('★ padrão global: escolher a opção do global = sem override (segue o g
   assert.deepEqual(src, { pages: 'smart' })
   // seguindo o global, o chat acompanha quando o global muda
   assert.equal(effectiveMode({}, { ...global, commands: 'always' }, 'commands'), 'always')
+})
+
+// ======================= decomposição: comandos que executam outro código =======================
+
+const tree = (s: string): string[] =>
+  analyzeShell(s).commands.map(
+    (c) => `${'  '.repeat(c.depth ?? 0)}${c.tokens.join(' ')}${c.unsafe ? ' !' : ''}`
+  )
+const ssh0 = (s: string): ShellCommand => only(s).find((c) => c.role === 'ssh')!
+
+test('ssh: opções com/sem argumento, -o, -J, -l, --, opções depois do destino', () => {
+  assert.deepEqual(tree("ssh -t deploy@host 'cd /srv && make'"), [
+    'ssh -t deploy@host',
+    '  cd /srv',
+    '  make'
+  ])
+  const p = ssh0('ssh -p 2222 -i ~/.ssh/k -o StrictHostKeyChecking=no -J bastion me@h ls -la')
+  assert.deepEqual(p.tokens, [
+    'ssh',
+    '-p',
+    '2222',
+    '-i',
+    '~/.ssh/k',
+    '-o',
+    'StrictHostKeyChecking=no',
+    '-J',
+    'bastion',
+    'me@h'
+  ])
+  assert.equal(p.note, 'conexão — os comandos remotos estão abaixo')
+  // casamento: opções normalizadas (-p2222 → -p 2222), inofensivas (-t -q -v -C…) fora
+  assert.deepEqual(ssh0('ssh -tq -p2222 -oBatchMode=yes me@h uptime').match, [
+    'ssh',
+    '-p',
+    '2222',
+    '-o',
+    'BatchMode=yes',
+    'me@h'
+  ])
+  assert.deepEqual(ssh0('ssh -At h uptime').match, ['ssh', '-A', 'h'], '-A (agent) conta')
+  const inner = only('ssh -l root -p 22 -J jump h uptime').find((c) => c.depth === 1)!
+  assert.equal(inner.group, 'no servidor root@h:22 (via ssh, salto jump)')
+  // opções depois do destino (o ssh relê) e `--`
+  assert.deepEqual(tree('ssh h -p 2222 -t uptime'), ['ssh h -p 2222 -t', '  uptime'])
+  assert.deepEqual(ssh0('ssh h -p 2222 uptime').match, ['ssh', '-p', '2222', 'h'])
+  assert.deepEqual(tree('ssh -- h ls -la'), ['ssh -- h', '  ls -la'])
+  assert.deepEqual(tree('ssh h -- ls -la'), ['ssh h --', '  ls -la'])
+  // o comando remoto é JUNTADO com espaços (como o ssh faz) e reanalisado no servidor
+  assert.deepEqual(tree('ssh h ls -la "my dir"'), ['ssh h', '  ls -la my dir'])
+  assert.deepEqual(tree('ssh h echo "a;" rm x'), ['ssh h', '  echo a', '  rm x'])
+  // sem destino: comando comum; opção desconhecida: nunca automático
+  assert.deepEqual(tree('ssh -V'), ['ssh -V'])
+  assert.ok(only('ssh -Z h ls')[0].unsafe!.includes('-Z'))
+  assert.ok(only('ssh $OPTS h ls')[0].unsafe, 'opção/destino de expansão sem aspas')
+})
+
+test('ssh: aspas, escapes, pipes, cadeias', () => {
+  assert.deepEqual(tree("cmd1 && ssh host 'a; b' | tee x"), [
+    'cmd1',
+    'ssh host',
+    '  a',
+    '  b',
+    'tee x'
+  ])
+  assert.deepEqual(tree("ssh h 'ps aux | grep node || echo none'"), [
+    'ssh h',
+    '  ps aux',
+    '  grep node',
+    '  echo none'
+  ])
+  // aspas internas: escapadas em aspas duplas / concatenadas em simples
+  assert.deepEqual(tree('ssh h "echo \\"a b\\" && rm \'c d\'"'), [
+    'ssh h',
+    '  echo a b',
+    '  rm c d'
+  ])
+  assert.deepEqual(tree("ssh h 'echo '\\''x y'\\'''"), ['ssh h', '  echo x y'])
+  // "sudo …" remoto: sudo + interno, dois níveis abaixo
+  assert.deepEqual(tree('ssh h "sudo systemctl restart app"'), [
+    'ssh h',
+    '  sudo systemctl restart app',
+    '    systemctl restart app'
+  ])
+  assert.deepEqual(tree('ssh h "bash -c \'cd /x && ls\'"'), ['ssh h', '  cd /x', '  ls'])
+  // como no ssh de verdade: sem aspas extras, o servidor recebe `bash -c cd /x && ls`
+  assert.deepEqual(tree("ssh h bash -c 'cd /x && ls'"), ['ssh h', '  cd', '  ls'])
+  // $(…) em aspas SIMPLES é do servidor (analisado lá)
+  const r = only("ssh h 'echo $(whoami)'")
+  assert.deepEqual(
+    r.map((c) => [c.tokens.join(' '), c.depth ?? 0, c.note ?? '']),
+    [
+      ['ssh h', 0, 'conexão — os comandos remotos estão abaixo'],
+      ['whoami', 1, 'dentro de $(…)'],
+      ['echo $(…)', 1, '']
+    ]
+  )
+})
+
+test('ssh: expansão local, heredoc, bash -s, entrada, interativo, túnel', () => {
+  // variável/substituição LOCAL monta o texto remoto → nunca automático
+  assert.match(only('ssh h "echo $HOME"')[1].unsafe!, /expansão local/)
+  const sub = only('ssh h "rm $(cat list)"')
+  assert.equal(sub[0].tokens.join(' '), 'cat list', 'a substituição local também é analisada')
+  assert.match(sub[2].unsafe!, /substituição de comando local/)
+  // heredoc com aspas: o corpo é o script do servidor
+  assert.deepEqual(tree("ssh h <<'EOF'\ncd /srv\ngit pull\nEOF"), [
+    'ssh h',
+    '  cd /srv',
+    '  git pull'
+  ])
+  assert.match(ssh0("ssh h <<'EOF'\nls\nEOF").note!, /heredoc/)
+  // sem aspas: \$ desescapado; $VAR local → nunca automático
+  assert.deepEqual(tree('ssh h <<EOF\necho \\$HOME\nEOF'), ['ssh h', '  echo $HOME'])
+  assert.deepEqual(tree('ssh h <<EOF\necho $HOME\nEOF'), ['ssh h', '  echo $HOME !'])
+  // bash -s lendo o heredoc; heredoc antes de um pipe (corpo lido depois)
+  assert.deepEqual(tree("ssh h bash -s <<'EOF' | tee log\nuptime\nrm -rf /tmp/x\nEOF"), [
+    'ssh h',
+    '  uptime',
+    '  rm -rf /tmp/x',
+    'tee log'
+  ])
+  assert.deepEqual(tree("ssh h 'cat > /tmp/f' <<'EOF'\ndata\nEOF"), ['ssh h', '  cat !'])
+  assert.deepEqual(tree("ssh h python3 <<'EOF'\nprint(1)\nEOF"), ['ssh h', '  python3 !'])
+  // entrada desconhecida → nunca automático
+  assert.deepEqual(tree('echo ls | ssh h'), ['echo ls', 'ssh h', '  (entrada) !'])
+  assert.deepEqual(tree('ssh h < script.sh'), ['ssh h', '  (entrada) !'])
+  assert.deepEqual(tree('cat x | ssh h bash -s'), ['cat x', 'ssh h', '  bash -s !'])
+  // interativo (sem comando, sem entrada): só a conexão, com a nota
+  assert.deepEqual(tree('ssh deploy@host'), ['ssh deploy@host'])
+  assert.match(ssh0('ssh deploy@host').note!, /sessão interativa/)
+  assert.match(ssh0('ssh -N -L 8080:localhost:80 h').note!, /túnel/)
+  // -o que executa comando local / esconde o comando remoto
+  assert.match(ssh0("ssh -o ProxyCommand='nc %h %p' h ls").unsafe!, /ProxyCommand/)
+  assert.match(ssh0('ssh -o RemoteCommand=id h').unsafe!, /esconde o comando remoto/)
+  // erro de sintaxe no remoto → item opaco, nunca automático
+  const bad = only("ssh h 'echo \"x'")
+  assert.equal(bad.length, 2)
+  assert.match(bad[1].unsafe!, /não foi possível analisar o comando de ssh/)
+})
+
+test('ssh dentro de ssh até o limite de profundidade', () => {
+  assert.deepEqual(tree('ssh a "ssh b \'ssh c ls\'"'), [
+    'ssh a',
+    '  ssh b',
+    '    ssh c',
+    '      ls'
+  ])
+  const deep = tree('ssh a "ssh b \'ssh c \\"ssh d \\\\\\"ssh e ls\\\\\\"\\"\'"')
+  assert.deepEqual(deep.slice(0, 5), [
+    'ssh a',
+    '  ssh b',
+    '    ssh c',
+    '      ssh d',
+    '        ssh e'
+  ])
+  assert.equal(deep[5], '          ls !', `máx. ${4} camadas`)
+  assert.match(
+    only('ssh a "ssh b \'ssh c \\"ssh d \\\\\\"ssh e ls\\\\\\"\\"\'"')[5].unsafe!,
+    /máx\. 4/
+  )
+})
+
+test('wrappers: sudo/doas/su, env/timeout/nice, xargs, docker/kubectl exec, watch, script', () => {
+  assert.deepEqual(tree('sudo -u postgres psql -c "select 1"'), [
+    'sudo -u postgres psql -c select 1',
+    '  psql -c select 1'
+  ])
+  assert.equal(only('sudo -u postgres psql')[1].group, 'via sudo (como postgres)')
+  assert.deepEqual(tree('sudo -e /etc/hosts'), ['sudo -e /etc/hosts'], 'sudoedit não executa')
+  assert.deepEqual(tree("sudo -s <<'EOF'\napt update\nEOF"), ['sudo -s', '  apt update'])
+  assert.deepEqual(tree("su - postgres -c 'pg_dump db | gzip'"), [
+    'su - postgres -c pg_dump db | gzip',
+    '  pg_dump db',
+    '  gzip'
+  ])
+  assert.equal(only("su -c 'id' app")[1].group, 'como app (via su)')
+  assert.deepEqual(tree('env FOO=1 timeout 5 nice -n 3 ionice -c 3 nohup ssh h uptime'), [
+    'ssh h',
+    '  uptime'
+  ])
+  // xargs: o interno recebe os argumentos da entrada (…)
+  assert.deepEqual(tree("find . -name '*.log' | xargs -0 rm -f"), ['find . -name *.log', 'rm -f …'])
+  assert.equal(only('ls | xargs rm')[1].note, 'via xargs (argumentos da entrada)')
+  assert.deepEqual(tree('ls | xargs'), ['ls', 'echo …'])
+  assert.deepEqual(tree('ls | xargs -I{} mv {} /tmp/{}.bak'), ['ls', 'mv … /tmp/….bak'])
+  assert.ok(tree("ls | xargs -I{} sh -c 'echo {}'")[1].endsWith('!'), 'entrada dentro do script')
+  assert.ok(tree('ls | xargs ssh h')[2].endsWith('!'), 'comando remoto vindo da entrada')
+  // docker / compose / kubectl
+  assert.deepEqual(tree("docker exec -it web sh -c 'cd /app && npm test'"), [
+    'docker exec -it web',
+    '  cd /app',
+    '  npm test'
+  ])
+  const d = only('docker exec -it -u root web id')[0]
+  assert.deepEqual(d.match, ['docker', 'exec', '-u', 'root', 'web'])
+  assert.equal(only('docker exec web id')[1].group, 'no container web (docker exec)')
+  assert.deepEqual(tree('docker compose -f x.yml exec -T db psql -U me'), [
+    'docker compose -f x.yml exec -T db',
+    '  psql -U me'
+  ])
+  assert.equal(only('docker compose exec db id')[1].group, 'no serviço db (docker compose exec)')
+  assert.deepEqual(tree('docker ps -a'), ['docker ps -a'], 'outros subcomandos: comum')
+  const k = only("kubectl -n prod exec -it api -c app -- bash -c 'env | grep X'")
+  assert.deepEqual(
+    k.map((c) => c.tokens.join(' ')),
+    ['kubectl -n prod exec -it api -c app --', 'env', 'grep X']
+  )
+  assert.deepEqual(k[0].match, ['kubectl', '-n', 'prod', 'exec', '-c', 'app', 'api'])
+  assert.equal(k[1].group, 'no pod api (container app) (kubectl exec, namespace prod)')
+  assert.ok(only('kubectl exec api ls x')[0].unsafe, 'sem "--" com comando: nunca automático')
+  // watch (juntado, em sh -c) / script -c
+  assert.deepEqual(tree("watch -n 2 'ps aux | grep node'"), ['ps aux', 'grep node'])
+  assert.deepEqual(tree('watch -x ls -la'), ['ls -la'])
+  assert.deepEqual(tree("script -q -c 'make test' /dev/null"), ['make test'])
+  assert.match(only("script -c 'make' out.log")[0].unsafe!, /out\.log/)
+  assert.deepEqual(tree('script -q /dev/null make test'), ['make test'], 'forma BSD (macOS)')
+  // cadeia longa
+  assert.deepEqual(tree("sudo docker exec -i web bash -s <<'EOF' | cat\nls\nEOF"), [
+    'sudo docker exec -i web bash -s',
+    '  docker exec -i web',
+    '    ls',
+    'cat'
+  ])
+})
+
+test('listas × decomposição: blacklist alcança o interno; whitelist exige wrapper + internos', () => {
+  const deny = { allow: [], deny: ['rm -rf *'] }
+  for (const c of [
+    "ssh h 'rm -rf /'",
+    'ssh h "cd / && rm -rf /"',
+    "ssh h <<'EOF'\nrm -rf /\nEOF",
+    "ssh h bash -s <<'EOF'\nrm -rf /\nEOF",
+    'ssh a "ssh b \'sudo rm -rf /\'"',
+    "docker exec web sh -c 'rm -rf /'",
+    'kubectl exec api -- rm -rf /',
+    'find / | xargs rm -rf'
+  ]) {
+    const ev = evaluateCommand('commands', c, deny)
+    assert.ok(ev.blocked, `deveria bloquear: ${c}`)
+  }
+  const b = evaluateCommand('commands', "ssh deploy@h 'rm -rf /srv'", deny)
+  assert.equal(b.blocked!.text, 'rm -rf /srv')
+  assert.equal(b.blocked!.where, 'no servidor deploy@h (via ssh)')
+  assert.equal(
+    blockedText('commands', b.blocked!),
+    'Bloqueado pela blacklist (comandos): "rm -rf *" casou com "rm -rf /srv" (no servidor deploy@h (via ssh))'
+  )
+  // blacklist no destino: bloqueia qualquer conexão a ele
+  assert.ok(
+    evaluateCommand('commands', 'ssh prod-db uptime', { allow: [], deny: ['ssh prod-db'] }).blocked
+  )
+  // whitelist: conexão (sem o comando remoto) + cada comando remoto
+  const allow = { allow: ['ssh ezenere@172.16.1.7', 'git pull', 'ls *'], deny: [] }
+  const ok = evaluateCommand('commands', "ssh -t ezenere@172.16.1.7 'cd /srv && git pull'", {
+    ...allow,
+    allow: [...allow.allow, 'cd *']
+  })
+  assert.equal(ok.allAllowed, true)
+  assert.deepEqual(
+    ok.check.items.map((i) => [i.text, i.verdict, i.entry, i.depth ?? 0]),
+    [
+      ['ssh -t ezenere@172.16.1.7', 'allow', 'ssh ezenere@172.16.1.7', 0],
+      ['cd /srv', 'allow', 'cd *', 1],
+      ['git pull', 'allow', 'git pull', 1]
+    ]
+  )
+  const part = evaluateCommand('commands', "ssh ezenere@172.16.1.7 'git pull && make'", allow)
+  assert.equal(part.allAllowed, false)
+  assert.deepEqual(
+    part.check.items.map((i) => i.verdict),
+    ['allow', 'allow', 'ask']
+  )
+  assert.equal(part.check.items[2].group, 'no servidor ezenere@172.16.1.7 (via ssh)')
+  // só os internos liberados não bastam: a conexão também precisa casar
+  assert.equal(evaluateCommand('commands', "ssh outro 'git pull'", allow).allAllowed, false)
+  // opções relevantes contam: -p 2222 precisa estar no padrão (ou *)
+  assert.equal(
+    evaluateCommand('commands', 'ssh -p 2222 ezenere@172.16.1.7 ls', allow).allAllowed,
+    false
+  )
+  assert.equal(
+    evaluateCommand('commands', 'ssh -p 2222 deploy@h ls', {
+      allow: ['ssh -p 2222 deploy@h', 'ls *'],
+      deny: []
+    }).allAllowed,
+    true
+  )
+  assert.equal(
+    evaluateCommand('commands', 'ssh -p 2222 deploy@h ls', {
+      allow: ['ssh * deploy@h', 'ls *'],
+      deny: []
+    }).allAllowed,
+    true
+  )
+  // padrão antigo `ssh h *` continua liberando a CONEXÃO, mas não mais o comando remoto
+  const legacy = evaluateCommand('commands', 'ssh h rm x', { allow: ['ssh h *'], deny: [] })
+  assert.deepEqual(
+    legacy.check.items.map((i) => i.verdict),
+    ['allow', 'ask']
+  )
+  // interativo: a conexão liberada basta
+  assert.equal(evaluateCommand('commands', 'ssh ezenere@172.16.1.7', allow).allAllowed, true)
+  // remoto não analisável → nunca automático, mesmo com tudo liberado
+  const opaque = evaluateCommand('commands', 'echo ls | ssh ezenere@172.16.1.7', {
+    allow: ['ssh *', 'echo *'],
+    deny: []
+  })
+  assert.equal(opaque.allAllowed, false)
+  assert.match(opaque.check.items[2].reason!, /entrada/)
+  assert.equal(
+    evaluateCommand('commands', 'ssh h "ls $DIR"', { allow: ['ssh *', 'ls *'], deny: [] })
+      .allAllowed,
+    false
+  )
+  // docker exec: container + interno
+  assert.equal(
+    evaluateCommand('commands', 'docker exec -it web npm test', {
+      allow: ['docker exec web', 'npm test *'],
+      deny: []
+    }).allAllowed,
+    true
+  )
+})
+
+test('sudo/doas/su: whitelist só com o comando específico (nunca por padrão amplo)', () => {
+  const run = (cmd: string, allow: string[]): string[] =>
+    evaluateCommand('commands', cmd, { allow, deny: [] }).check.items.map((i) => i.verdict)
+  assert.deepEqual(run('sudo apt update', ['sudo *', 'apt *']), ['ask', 'allow'], 'sudo * não vale')
+  assert.deepEqual(run('sudo -u x apt update', ['sudo -u x *', 'apt *']), ['ask', 'allow'])
+  assert.deepEqual(run('sudo apt update', ['sudo apt *', 'apt *']), ['allow', 'allow'])
+  assert.deepEqual(run('sudo -u pg psql', ['sudo -u * psql', 'psql']), ['allow', 'allow'])
+  assert.deepEqual(run("su -c 'id' app", ["su -c 'id' app", 'id']), ['allow', 'allow'])
+  assert.deepEqual(run("su -c 'id' app", ['su *', 'id']), ['ask', 'allow'])
+  // blacklist ampla continua valendo
+  assert.ok(evaluateCommand('commands', 'sudo ls', { allow: [], deny: ['sudo *'] }).blocked)
+  assert.match(broadPatternWarning('sudo *')!, /não libera nada/)
+  assert.match(broadPatternWarning('ssh *')!, /QUALQUER servidor/)
+})
+
+test('sugestões: ssh = destino; container = exec + alvo; internos = normal', () => {
+  const sug = (cmd: string): string[] =>
+    evaluateCommand('commands', cmd, { allow: [], deny: [] }).check.items.map((i) => i.suggestion)
+  assert.deepEqual(sug("ssh -t ezenere@172.16.1.7 'git pull origin main && ls -la'"), [
+    'ssh ezenere@172.16.1.7',
+    'git pull *',
+    'ls *'
+  ])
+  assert.deepEqual(sug('ssh -p 2222 deploy@host uptime'), ['ssh -p 2222 deploy@host', 'uptime'])
+  assert.deepEqual(sug('docker exec -it web npm test'), ['docker exec web', 'npm test *'])
+  assert.deepEqual(sug('sudo -u postgres psql -l'), ['sudo -u postgres psql *', 'psql *'])
+  assert.equal(suggestCommandPattern(['sudo', '-u', 'postgres', 'psql']), 'sudo -u postgres psql')
+  assert.deepEqual(sug('ls | xargs rm -f'), ['ls', 'rm *'])
+})
+
+test('Smart-Approve: o juiz vê a decomposição ({{commands}})', async () => {
+  const { commandsBlock } = await import('../src/shared/smartApprove.ts')
+  const { describeShell, groupHeadings } = await import('../src/shared/shellParse.ts')
+  const t = describeShell("ssh deploy@h 'cd /srv && sudo rm -rf x'")
+  assert.equal(
+    t,
+    [
+      '- ssh deploy@h   (conexão — os comandos remotos estão abaixo)',
+      '  [no servidor deploy@h (via ssh)]',
+      '  - cd /srv',
+      '  - sudo rm -rf x',
+      '    [via sudo]',
+      '    - rm -rf x'
+    ].join('\n')
+  )
+  assert.match(
+    commandsBlock('shell', { command: 'ssh h "ls $X"' }),
+    /never automatic: .*expansão local/
+  )
+  assert.match(
+    commandsBlock('process_start', { command: 'ssh h uptime' }),
+    /^\nDecomposed commands/
+  )
+  assert.equal(commandsBlock('web_search', { query: 'x' }), '')
+  assert.equal(commandsBlock('shell', { command: '' }), '')
+  assert.deepEqual(
+    groupHeadings([
+      {},
+      { depth: 1, group: 'g' },
+      { depth: 2, group: 's' },
+      { depth: 1, group: 'g' }
+    ]),
+    [null, 'g', 's', null]
+  )
 })

@@ -341,6 +341,11 @@ export function broadPatternWarning(pattern: string): string | null {
   const p = parsePattern(pattern.trim())
   if (!p || p.length !== 2 || !p[1].any || p[0].any) return null
   const prog = p[0].parts.join('*')
+  const base = baseName(prog)
+  if (base === 'ssh')
+    return `"${prog} *" libera a conexão a QUALQUER servidor (os comandos remotos continuam avaliados um a um). Prefira o destino: "${prog} usuario@host".`
+  if (ELEVATE.has(base))
+    return `"${prog} *" não libera nada na whitelist: ${prog} só é liberado por uma entrada com o comando (ex.: "${prog} apt update *"). Na blacklist, bloqueia qualquer ${prog}.`
   return `"${prog} *" libera QUALQUER uso de ${prog} (ex.: ${EXAMPLES[baseName(prog)] ?? `${prog} com qualquer argumento`}). Prefira um subcomando: "${prog} <sub> *".`
 }
 
@@ -359,7 +364,6 @@ const EXAMPLES: Record<string, string> = {
   sed: 'sed -i, sed "1e comando" (executa comandos)',
   awk: 'awk \'BEGIN{system("…")}\' (executa comandos)',
   tar: 'tar --to-command="…" (executa comandos)',
-  ssh: 'ssh host qualquer-comando',
   rg: 'rg --pre "…" (executa comandos)',
   vim: 'vim (pode executar comandos)',
   less: 'less (pode executar comandos com !)'
@@ -442,8 +446,12 @@ export function suggestCommandPattern(tokens: string[]): string {
   if (!tokens.length) return ''
   const q = shellQuote
   if ((tokens[0] === 'sudo' || tokens[0] === 'doas') && tokens.length > 1) {
-    const i = tokens.findIndex((t, k) => k > 0 && !t.startsWith('-'))
-    if (i > 0) return `${q(tokens[0])} ${suggestCommandPattern(tokens.slice(i))}`
+    // mantém as opções (`sudo -u postgres psql …` → `sudo -u postgres psql *`)
+    const i = elevateCommandIndex(tokens)
+    if (i > 0 && i < tokens.length)
+      return [tokens[0], ...tokens.slice(1, i), suggestCommandPattern(tokens.slice(i))]
+        .map((t, k) => (k === i ? t : q(t)))
+        .join(' ')
   }
   const prog = tokens[0]
   if (tokens.length === 1) return q(prog)
@@ -535,22 +543,96 @@ export function matchUrlEntry(entry: string, url: URL): boolean {
 // ---------------- avaliação contra as listas ----------------
 
 export interface ListEvaluation {
-  /** Bloqueado pela blacklist (comando inteiro / a URL). */
-  blocked?: { text: string; entry: string }
+  /** Bloqueado pela blacklist (comando inteiro / a URL). `where`: contexto do sub-comando. */
+  blocked?: { text: string; entry: string; where?: string }
   check: ApprovalCheck
   /** Todos os itens liberados pela whitelist. */
   allAllowed: boolean
 }
 
+/** Programas que elevam privilégio: o item próprio só casa com entrada que nomeia o comando. */
+const ELEVATE = new Set(['sudo', 'doas', 'su'])
+const ELEVATE_ARG: Record<string, string> = { sudo: 'uUgpChDrtTR', doas: 'uC' }
+
+/** Índice do comando depois das opções de sudo/doas (tokens ou tokens de padrão). */
+function elevateCommandIndex(tokens: string[]): number {
+  const withArg = ELEVATE_ARG[baseName(tokens[0])] ?? ''
+  let i = 1
+  while (i < tokens.length && tokens[i].startsWith('-')) {
+    const t = tokens[i]
+    if (t === '--') return i + 1
+    if (
+      /^--(user|group|host|prompt|close-from|chdir|role|type|other-user|command-timeout)$/.test(t)
+    )
+      i++
+    else if (/^-[A-Za-z]+$/.test(t) && withArg.includes(t[t.length - 1])) i++
+    i++
+  }
+  return i
+}
+
+/**
+ * Whitelist do item próprio de sudo/doas/su (decisão: elevar privilégio nunca é liberado por um
+ * padrão amplo): a entrada precisa nomear o comando — `sudo apt update *` vale; `sudo *`,
+ * `sudo -u x *` não. su: precisa de `-c <script literal>`. A blacklist casa normalmente.
+ */
+export function isSpecificElevatePattern(pattern: string): boolean {
+  const p = parsePattern(pattern.trim())
+  if (!p || !p.length || p[0].any || p[0].parts.length !== 1) return false
+  const lit = (t: (typeof p)[number] | undefined): boolean => !!t && !t.any && t.parts.length === 1
+  const prog = baseName(p[0].parts[0])
+  if (prog === 'su') {
+    const k = p.findIndex((t) => lit(t) && /^(-c|--command|-C|--session-command)$/.test(t.parts[0]))
+    return k > 0 && lit(p[k + 1])
+  }
+  // opções literais são puladas como no comando; o comando precisa ser literal (sem *)
+  const withArg = ELEVATE_ARG[prog] ?? ''
+  let k = 1
+  while (k < p.length) {
+    if (!lit(p[k])) return false // `*` antes do comando casaria qualquer comando
+    const v = p[k].parts[0]
+    if (!v.startsWith('-')) break
+    if (v === '--') {
+      k++
+      break
+    }
+    if (
+      /^--(user|group|host|prompt|close-from|chdir|role|type|other-user|command-timeout)$/.test(
+        v
+      ) ||
+      (/^-[A-Za-z]+$/.test(v) && withArg.includes(v[v.length - 1]))
+    )
+      k++ // argumento da opção (pode ser *: `sudo -u * apt update`)
+    k++
+  }
+  return lit(p[k])
+}
+
+/** Texto de um item com o contexto (resultado para o agente: "rm x — no servidor h (via ssh)"). */
+export function checkItemLabel(it: { text: string; group?: string }): string {
+  return it.group ? `${it.text} — ${it.group}` : it.text
+}
+
 function subItem(c: ShellCommand, list: ApprovalList): ApprovalCheckItem {
   const text = c.tokens.length ? c.tokens.map(shellQuote).join(' ') : c.text
+  const tokens = c.match ?? c.tokens
+  const suggestion =
+    c.role === 'ssh' || c.role === 'container'
+      ? tokens.map(shellQuote).join(' ')
+      : c.role === 'elevate' && baseName(c.tokens[0] ?? '') === 'su'
+        ? text
+        : suggestCommandPattern(c.tokens)
   const base = {
     text,
-    suggestion: suggestCommandPattern(c.tokens),
-    ...(c.note ? { note: c.note } : {})
+    suggestion,
+    ...(c.note ? { note: c.note } : {}),
+    ...(c.depth ? { depth: c.depth } : {}),
+    ...(c.group ? { group: c.group } : {})
   }
   if (c.unsafe) return { ...base, verdict: 'ask', reason: c.unsafe }
-  const entry = list.allow.find((p) => matchCommandPattern(p, c.tokens))
+  const entry = list.allow.find(
+    (p) => matchCommandPattern(p, tokens) && (c.role !== 'elevate' || isSpecificElevatePattern(p))
+  )
   return entry ? { ...base, verdict: 'allow', entry } : { ...base, verdict: 'ask' }
 }
 
@@ -565,11 +647,20 @@ export function evaluateCommand(
     ? a.commands
     : [{ tokens: [], text: command.trim() || '(vazio)', unsafe: 'comando vazio' } as ShellCommand]
   for (const c of cmds) {
-    const entry = list.deny.find((p) => matchCommandPattern(p, c.tokens, { basenameProgram: true }))
+    // blacklist: o comando como escrito E (wrappers) a forma de casamento sem o comando interno
+    const entry = list.deny.find(
+      (p) =>
+        matchCommandPattern(p, c.tokens, { basenameProgram: true }) ||
+        (!!c.match && matchCommandPattern(p, c.match, { basenameProgram: true }))
+    )
     if (entry) {
       const items = cmds.map((x) => subItem(x, list))
       return {
-        blocked: { text: c.tokens.map(shellQuote).join(' ') || c.text, entry },
+        blocked: {
+          text: c.tokens.map(shellQuote).join(' ') || c.text,
+          entry,
+          ...(c.group ? { where: c.group } : {})
+        },
         check: { item, items },
         allAllowed: false
       }
@@ -631,8 +722,11 @@ export function evaluateLists(
   }
 }
 
-export function blockedText(item: ApprovalListItem, b: { text: string; entry: string }): string {
-  return `Bloqueado pela blacklist (${ITEM_LIST_NAME[item]}): "${b.entry}" casou com "${b.text}"`
+export function blockedText(
+  item: ApprovalListItem,
+  b: { text: string; entry: string; where?: string }
+): string {
+  return `Bloqueado pela blacklist (${ITEM_LIST_NAME[item]}): "${b.entry}" casou com "${b.text}"${b.where ? ` (${b.where})` : ''}`
 }
 
 export function userDeniedText(text: string): string {

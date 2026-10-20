@@ -6,6 +6,7 @@
 // modelo escolhido). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
 // Qualquer erro, tempo esgotado ou resposta ambígua do juiz → pergunta ao usuário (nunca libera).
 import { contentText } from './attachments'
+import { describeShell } from './shellParse'
 import { activeHistory, isDisplayOnly } from './context'
 import {
   DEFAULT_SMART_APPROVE_LABELS,
@@ -37,6 +38,10 @@ export const SMART_APPROVE_DEFAULTS = {
 export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
   { key: 'tool', desc: 'nome da tool (ex.: shell)' },
   { key: 'args', desc: 'argumentos da chamada (JSON formatado)' },
+  {
+    key: 'commands',
+    desc: 'shell/process_start: a decomposição do comando (ssh, sudo, bash -c… desmontados, com o contexto); vazio nas outras tools'
+  },
   { key: 'cwd', desc: 'diretório raiz do chat' },
   { key: 'confine', desc: 'tools de arquivo confinadas à raiz (yes/no)' },
   { key: 'sandbox', desc: 'shell em sandbox (yes/no)' },
@@ -262,12 +267,27 @@ export interface JudgeContext {
   history: StoredMessage[]
 }
 
+/**
+ * `{{commands}}`: decomposição do comando de shell/process_start (o que o modo Listas avalia — ver
+ * describeShell), para o juiz ver os comandos remotos/sob sudo/no container e não só `ssh`.
+ * Outras tools (ou comando vazio): "" — o template padrão fica igual ao de antes.
+ */
+export function commandsBlock(tool: string, args: unknown): string {
+  if (tool !== 'shell' && tool !== 'process_start') return ''
+  const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
+  const cmd = typeof a.command === 'string' ? a.command : ''
+  const text = cmd.trim() ? describeShell(cmd) : ''
+  if (!text) return ''
+  return `\nDecomposed commands (parsed by the app; indented lines run inside the line above):\n${text}\n`
+}
+
 /** Valores dos placeholders para uma chamada. */
 export function judgeVars(sa: SmartApproveConfig, ctx: JudgeContext): Record<string, string> {
   const l = sa.labels
   return {
     tool: String(ctx.tool),
     args: prettyArgs(ctx.args),
+    commands: commandsBlock(ctx.tool, ctx.args),
     cwd: ctx.cwd,
     confine: ctx.confine ? 'yes' : 'no',
     sandbox: ctx.sandbox ? 'yes' : 'no',

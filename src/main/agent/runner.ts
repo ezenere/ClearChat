@@ -20,6 +20,7 @@ import { normalizeSmartApprove, overrideMessageText, smartRejectText } from '@sh
 import {
   approvalRoute,
   blockedText,
+  checkItemLabel,
   effectiveMode,
   evaluateLists,
   isListItem,
@@ -1061,8 +1062,9 @@ async function listsGate(
       ...(allowed.length ? { allowed } : {})
     }
     if (ev.blocked) {
+      const { text, entry, where } = ev.blocked
       return {
-        record: { ...record, blocked: ev.blocked },
+        record: { ...record, blocked: { text: where ? `${text} — ${where}` : text, entry } },
         outcome: { content: blockedText(item, ev.blocked), status: 'denied' }
       }
     }
@@ -1092,8 +1094,8 @@ async function listsGate(
       const allow = d ? d.allow : outcome.kind === 'allow'
       if (d?.pattern?.trim())
         entries.push({ item, list: allow ? 'allow' : 'deny', entry: d.pattern.trim() })
-      if (allow) userAllowed.push(it.text)
-      else denied ??= it.text
+      if (allow) userAllowed.push(checkItemLabel(it))
+      else denied ??= checkItemLabel(it)
     }
     if (entries.length) {
       try {
@@ -1103,7 +1105,7 @@ async function listsGate(
       }
     }
     if (denied !== undefined || outcome.kind === 'deny') {
-      const text = denied ?? pending[0]?.it.text ?? ''
+      const text = denied ?? (pending[0] ? checkItemLabel(pending[0].it) : '')
       return {
         record: { ...record, denied: text, ...(userAllowed.length ? { userAllowed } : {}) },
         outcome: { content: userDeniedText(text), status: 'denied' }

@@ -1,10 +1,10 @@
 // Configurações → Aprovações: modo GLOBAL por item (Sempre / Smart-Approve / Listas ou Perguntar)
 // — é aqui que se define o padrão (★ na aba Tools) — e as listas
 // globais (whitelist/blacklist) de comandos, processos e páginas, com busca, edição e "Testar".
-import { Ban, Check, CircleHelp, Pencil, Plus, Search, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { Ban, Check, CircleHelp, CornerDownRight, Pencil, Plus, Search, Trash2 } from 'lucide-react'
+import { Fragment, useState } from 'react'
 import { APPROVAL_ITEM_GROUPS, evaluateLists, ITEM_LABEL, ITEM_TOOL } from '@shared/approvalPolicy'
-import { analyzeShell } from '@shared/shellParse'
+import { analyzeShell, groupHeadings } from '@shared/shellParse'
 import type { ApprovalItem, ApprovalListItem, ApprovalMode } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
@@ -237,6 +237,7 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
     ? evaluateLists(item, isPages ? { url: text } : { command: text }, lists)
     : null
   const parseError = !isPages && text.trim() ? analyzeShell(text).error : undefined
+  const heads = ev ? groupHeadings(ev.check.items) : []
   return (
     <div data-testid="approval-tester" className="rounded-lg border border-border bg-bg/30 p-3">
       <div className="mb-1.5 flex items-center gap-1.5 text-[12px] font-medium text-fg/90">
@@ -262,35 +263,47 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
             </p>
           )}
           {ev.check.items.map((it, i) => (
-            <div
-              key={i}
-              data-testid="tester-item"
-              className="flex items-start gap-2 rounded-md bg-bg/60 px-2 py-1"
-            >
-              <span
-                className={cn(
-                  'mt-px shrink-0 text-[10.5px] font-medium',
-                  it.verdict === 'allow' ? 'text-success/90' : 'text-warning/90'
-                )}
+            <Fragment key={i}>
+              {heads[i] && (
+                <div
+                  data-testid="tester-group"
+                  style={{ marginLeft: `${(it.depth ?? 0) * 14}px` }}
+                  className="flex items-center gap-1 pt-0.5 text-[10.5px] font-medium text-subtle"
+                >
+                  <CornerDownRight className="size-3 shrink-0 text-faint" />
+                  {heads[i]}
+                </div>
+              )}
+              <div
+                data-testid="tester-item"
+                style={{ marginLeft: `${(it.depth ?? 0) * 14}px` }}
+                className="flex items-start gap-2 rounded-md bg-bg/60 px-2 py-1"
               >
-                {it.verdict === 'allow' ? '✓ liberado' : 'pergunta'}
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="block font-mono text-[11.5px] break-all text-fg/90">
-                  {it.text || '(vazio)'}
+                <span
+                  className={cn(
+                    'mt-px shrink-0 text-[10.5px] font-medium',
+                    it.verdict === 'allow' ? 'text-success/90' : 'text-warning/90'
+                  )}
+                >
+                  {it.verdict === 'allow' ? '✓ liberado' : 'pergunta'}
                 </span>
-                <span className="block text-[10.5px] text-faint">
-                  {[
-                    it.entry && `whitelist “${it.entry}”`,
-                    it.note,
-                    it.reason && `nunca automático: ${it.reason}`,
-                    it.suggestion && `sugestão: ${it.suggestion}`
-                  ]
-                    .filter(Boolean)
-                    .join(' · ')}
+                <span className="min-w-0 flex-1">
+                  <span className="block font-mono text-[11.5px] break-all text-fg/90">
+                    {it.text || '(vazio)'}
+                  </span>
+                  <span className="block text-[10.5px] text-faint">
+                    {[
+                      it.entry && `whitelist “${it.entry}”`,
+                      it.note !== it.group && it.note,
+                      it.reason && `nunca automático: ${it.reason}`,
+                      it.suggestion && `sugestão: ${it.suggestion}`
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </span>
                 </span>
-              </span>
-            </div>
+              </div>
+            </Fragment>
           ))}
           {!ev.blocked && (
             <p className="text-[11px] text-subtle">
