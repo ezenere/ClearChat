@@ -131,7 +131,12 @@ export function compactionMessageText(
  * - nativeTools=false: o texto é o único canal — inclui os schemas e o formato
  *   `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` que o runner faz parse.
  */
-export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean): string {
+export function defaultToolsPrompt(
+  tools: ToolDefinition[],
+  nativeTools: boolean,
+  /** subagent: a sessão é um subagente (orientação de irmãos com message_subagent). */
+  opts: { subagent?: boolean } = {}
+): string {
   if (tools.length === 0) return ''
 
   const has = (name: string): boolean => tools.some((t) => t.function.name === name)
@@ -149,7 +154,10 @@ export function defaultToolsPrompt(tools: ToolDefinition[], nativeTools: boolean
       '- Para escolher o modelo de um subagente, consulte list_models antes de delegate_task. Modelos grátis: só tarefas fáceis e sem dados pessoais; são instáveis — se falharem, use outro modelo.',
     has('delegate_task') &&
       has('wait_subagents') &&
-      '- Subagentes em segundo plano (delegate_task com background=true) rodam em paralelo e o resultado chega sozinho como mensagem; sem mais nada a fazer, encerre o turno — você é acordado quando eles terminarem (wait_subagents só se o próximo passo do mesmo turno depende do resultado). Use message_subagent para atualizar um subagente.',
+      '- Subagentes em segundo plano (delegate_task com background=true) rodam em paralelo e o resultado chega sozinho como mensagem; sem mais nada a fazer, encerre o turno — você é acordado quando eles terminarem (wait_subagents só se o próximo passo do mesmo turno depende do resultado). Use message_subagent para atualizar um subagente. Subagentes irmãos podem trocar mensagens entre si (veja com check_subagents messages=true).',
+    opts.subagent &&
+      has('message_subagent') &&
+      `- Subagentes irmãos (mesmo agente pai; veja check_subagents) podem se coordenar direto com message_subagent: no máximo ${LIMITS.siblingMaxPerWindow} mensagens por minuto por par, sem wait_for_reply; broadcast=true pergunta a todos os irmãos ativos — ao receber um broadcast, responda (direto, nunca com outro broadcast) só se for com você. Prefira terminar a sua tarefa; no resto, quem coordena é o agente pai.`,
     has('read_history') &&
       '- Depois de uma compactação, use read_history para recuperar detalhes do histórico original que não estejam no resumo.',
     has('process_start') &&

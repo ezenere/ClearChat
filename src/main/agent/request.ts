@@ -135,17 +135,44 @@ export function hasDelegated(history: StoredMessage[]): boolean {
   )
 }
 
+/** Tools de subagentes que também valem entre irmãos (mesmo agente pai) — ver availableTools. */
+const SIBLING_TOOLS: ToolName[] = ['check_subagents', 'message_subagent']
+
+/**
+ * A sessão tem irmãos (outras subsessões do mesmo agente pai)? O runner registra (banco); sem
+ * registro (testes puros) = nunca.
+ */
+type SiblingsSource = (session: { id: string; parentSessionId: string }) => boolean
+let siblingsSource: SiblingsSource = () => false
+export function setSiblingsSource(fn: SiblingsSource): void {
+  siblingsSource = fn
+}
+
+/** Subagente com irmãos (precisa de id + parentSessionId; sem eles = não). */
+function hasSiblings(session: SessionRef): boolean {
+  return (
+    session.depth > 0 &&
+    !!session.id &&
+    !!session.parentSessionId &&
+    siblingsSource({ id: session.id, parentSessionId: session.parentSessionId })
+  )
+}
+
+type SessionRef = Pick<Session, 'depth'> & { id?: string; parentSessionId?: string | null }
+
 /**
  * Tools disponíveis para a sessão: habilitadas no chat, na ordem fixa de TOOL_NAMES; delegate só se
  * depth < 2; ask_user e present_file só na principal (depth 0). As de gerenciar subagentes (check/wait/cancel/message) só com delegate_task disponível;
  * num SUBAGENTE, e quando o histórico é informado (request), só depois que ele criou algum
  * subagente: modelos fracos não as confundem com "responder" a quem delegou (o prefixo de cache
  * muda uma vez, no primeiro delegate). A principal as vê sempre (para planejar). Sem histórico
- * (execução de tool), é permissivo.
+ * (execução de tool), é permissivo. Exceção — irmãos: um subagente (qualquer profundidade) que tem
+ * irmãos recebe check_subagents + message_subagent (se habilitadas) para se coordenar com eles,
+ * mesmo sem ter delegado (o prefixo de cache muda uma vez, quando surge o primeiro irmão).
  */
 export function availableTools(
   chat: Chat,
-  session: Pick<Session, 'depth'>,
+  session: SessionRef,
   history?: StoredMessage[]
 ): ToolName[] {
   const enabled = new Set(chat.config.enabledTools ?? [])
@@ -153,6 +180,9 @@ export function availableTools(
     enabled.has('delegate_task') &&
     session.depth < 2 &&
     (!history || session.depth === 0 || hasDelegated(history))
+  let siblings: boolean | undefined // calculado só se preciso (consulta o banco)
+  const siblingOk = (n: ToolName): boolean =>
+    SIBLING_TOOLS.includes(n) && (siblings ??= hasSiblings(session))
   const base = TOOL_NAMES.filter(
     (n) =>
       enabled.has(n) &&
@@ -161,7 +191,7 @@ export function availableTools(
       (n !== 'ask_user' || session.depth === 0) &&
       // o visualizador é do usuário: só a principal apresenta arquivos
       (n !== 'present_file' || session.depth === 0) &&
-      (!SUBAGENT_TOOLS.includes(n) || canDelegate)
+      (!SUBAGENT_TOOLS.includes(n) || canDelegate || siblingOk(n))
   )
   // memória: pela config de memória do chat (não por enabledTools), sempre no fim
   const memory = memoryToolsSource(chat, session).filter((n) => !base.includes(n))
@@ -250,7 +280,10 @@ export function systemContent(
   add(skillsSupportPrompt(chat, session) ?? '')
   if (cfg.toolsInPrompt) {
     const defs = toolDefinitions(availableTools(chat, session, history))
-    add(cfg.toolsPromptText ?? defaultToolsPrompt(defs, cfg.nativeTools))
+    add(
+      cfg.toolsPromptText ??
+        defaultToolsPrompt(defs, cfg.nativeTools, { subagent: session.depth > 0 })
+    )
   }
   return s
 }

@@ -607,7 +607,7 @@ export function MessageInfo({
   )
 }
 
-/** (i) de mensagens que não foram digitadas aqui: outro chat, agente pai, resultado de subagente. */
+/** (i) de mensagens que não foram digitadas aqui: outro chat, agente pai, irmão, resultado de subagente. */
 function originInfo(msg: StoredMessage): { title: string; body: React.ReactNode } | null {
   const k = msg.meta.kind
   if (k === 'inter-chat')
@@ -637,6 +637,35 @@ function originInfo(msg: StoredMessage): { title: string; body: React.ReactNode 
           <C>{'role: "user"'}</C>, com o cabeçalho <C>[Mensagem do agente pai]</C> na primeira
           linha.
         </p>
+      )
+    }
+  if (k === 'sibling-message' || k === 'sibling-broadcast')
+    return {
+      title:
+        k === 'sibling-broadcast'
+          ? 'Broadcast de um subagente irmão'
+          : 'Mensagem de um subagente irmão',
+      body: (
+        <>
+          <p>
+            Enviada por outro subagente do mesmo agente pai com <C>message_subagent</C>
+            {k === 'sibling-broadcast' ? (
+              <>
+                {' '}
+                (<C>broadcast=true</C>: a mesma mensagem foi a todos os irmãos ativos; só o
+                destinatário responde)
+              </>
+            ) : null}
+            . Vai no histórico deste subagente como <C>{'role: "user"'}</C>, com um cabeçalho do app
+            na primeira linha dizendo de quem veio.
+          </p>
+          <p className="text-subtle">
+            Entre irmãos: no máximo {LIMITS.siblingMaxPerWindow} mensagens por minuto por par (
+            {LIMITS.siblingBroadcastMaxPerWindow} broadcasts por remetente), sem esperar resposta. O
+            agente pai não vê estas mensagens no histórico dele, mas pode listá-las com{' '}
+            <C>check_subagents</C> (<C>messages=true</C>).
+          </p>
+        </>
       )
     }
   if (k === 'subagent-callback')

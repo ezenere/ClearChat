@@ -252,7 +252,8 @@ const DISPLAY_ONLY = ['error', 'memory-extraction']
 /**
  * Mensagem que ABRE um turno ("prompt"): role user, não é fronteira de compactação, não é o
  * resultado sintético de tools em modo texto (`synthetic` sem kind) e não é só de exibição. Cobre
- * as digitadas, 'queued', 'forced', 'inter-chat', 'subagent-callback' e 'parent-message'.
+ * as digitadas, 'queued', 'forced', 'inter-chat', 'subagent-callback', 'parent-message' e as de
+ * subagentes irmãos ('sibling-message' / 'sibling-broadcast').
  */
 export function isPromptMessage(m: TurnMessage): boolean {
   if (m.message.role !== 'user') return false

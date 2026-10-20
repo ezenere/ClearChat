@@ -614,8 +614,18 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   check_subagents: def(
     'check_subagents',
-    'Lista os subagentes desta sessão: id, título, modelo, estado, duração, última atividade e se o resultado já foi entregue. Não use para esperar: se não há mais nada a fazer, encerre o turno — os resultados chegam sozinhos e te acordam.',
-    {}
+    'Lista os subagentes desta sessão: id, título, modelo, estado, duração, última atividade e se o resultado já foi entregue. Num subagente, lista também os IRMÃOS (criados pelo mesmo agente pai), com quem dá para falar por message_subagent. messages=true lista as mensagens que os seus subagentes trocaram diretamente entre si (hora, de → para, texto cortado; id filtra por um subagente). Não use para esperar: se não há mais nada a fazer, encerre o turno — os resultados chegam sozinhos e te acordam.',
+    {
+      messages: {
+        type: 'boolean',
+        description:
+          'Listar as mensagens trocadas entre os seus subagentes (irmãos entre si) em vez dos estados (padrão false).'
+      },
+      id: {
+        type: 'string',
+        description: 'Com messages=true: só as mensagens enviadas ou recebidas por este subagente.'
+      }
+    }
   ),
   wait_subagents: def(
     'wait_subagents',
@@ -637,20 +647,34 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   message_subagent: def(
     'message_subagent',
-    'Envia uma mensagem a um subagente que VOCÊ criou com delegate_task (direto ou descendente) — ex.: para avisar de mudanças. Não serve para responder a quem te delegou uma tarefa (para isso, apenas responda). Rodando: entra no próximo passo dele; ocioso ou concluído: ele retoma e a nova resposta final volta como mensagem. Com wait_for_reply=true, aguarda e retorna essa resposta.',
+    `Envia uma mensagem a um subagente que VOCÊ criou com delegate_task (direto ou descendente) — ex.: para avisar de mudanças — ou, se você é um subagente, a um subagente IRMÃO (criado pelo mesmo agente pai; ids em check_subagents). Não serve para responder a quem te delegou uma tarefa (para isso, apenas responda). Rodando: entra no próximo passo dele; ocioso ou concluído: ele retoma e a nova resposta final volta como mensagem a quem o criou. Com wait_for_reply=true (só com os seus subagentes), aguarda e retorna essa resposta. Entre irmãos: no máximo ${L.siblingMaxPerWindow} mensagens por minuto por par, sem wait_for_reply (o irmão responde com message_subagent e a resposta chega como mensagem nova); prefira terminar a sua tarefa e deixar o agente pai coordenar. broadcast=true (sem id) envia a todos os irmãos ativos para descobrir quem trata de algo (máx. ${L.siblingBroadcastMaxPerWindow} por minuto): só o irmão a quem interessa responde, direto. Ao receber um broadcast, responda só se for com você — e nunca com outro broadcast.`,
     {
-      id: { type: 'string', description: 'Id do subagente.' },
+      id: {
+        type: 'string',
+        description: 'Id do subagente (seu ou irmão). Omita com broadcast=true.'
+      },
       message: { type: 'string', description: 'Texto a entregar.' },
       wait_for_reply: {
         type: 'boolean',
-        description: 'Aguardar e retornar a próxima resposta final dele (padrão false).'
+        description:
+          'Aguardar e retornar a próxima resposta final dele (padrão false; não vale com irmãos nem broadcast).'
       },
       timeout_s: {
         type: 'number',
         description: `Espera máxima em segundos com wait_for_reply (padrão ${L.subagentWaitDefaultS}).`
+      },
+      broadcast: {
+        type: 'boolean',
+        description:
+          'Enviar a todos os seus irmãos ativos (rodando ou aguardando) em vez de a um id (padrão false).'
+      },
+      include_finished: {
+        type: 'boolean',
+        description:
+          'Com broadcast: também retoma irmãos ociosos/concluídos (cada um roda de novo e gasta tokens; padrão false).'
       }
     },
-    ['id', 'message']
+    ['message']
   ),
   ask_user: def(
     'ask_user',

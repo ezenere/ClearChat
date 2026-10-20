@@ -5,6 +5,7 @@ import type { QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { splitInterChatText } from '@shared/interChat'
+import { splitSiblingText } from '@shared/siblings'
 import {
   isBusy,
   selectPendingAttachments,
@@ -51,6 +52,15 @@ function queueOrigin(item: QueuedMessage): { label: string; text: string } | nul
     }
   if (kind === 'parent-message')
     return { label: 'Agente pai', text: item.text.replace(/^\[Mensagem do agente pai\]\n/, '') }
+  if (kind === 'sibling-message' || kind === 'sibling-broadcast') {
+    const { title, body } = splitSiblingText(item.text)
+    const who = title || 'Subagente'
+    return {
+      label:
+        kind === 'sibling-broadcast' ? `Broadcast do irmão ${who}` : `Mensagem do irmão ${who}`,
+      text: body
+    }
+  }
   if (kind === 'subagent-callback')
     return { label: 'Resultado de subagente', text: item.text.split('\n')[0] }
   return null

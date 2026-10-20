@@ -1666,14 +1666,26 @@ import {
   wouldCreateWaitCycle
 } from '../src/shared/interChat.ts'
 import {
+  areSiblings,
   callbackText,
+  formatSiblingExchanges,
+  formatSiblingList,
   formatSubagentList,
   isDescendant,
   parentMessageText,
   ReportRegistry,
+  resolveMessageTarget,
   resolveSubagentRef,
+  siblingPairKey,
+  SlidingWindowLimiter,
   subtreeIds
 } from '../src/main/agent/subagents.ts'
+import {
+  isSiblingKind,
+  siblingBroadcastText,
+  siblingMessageText,
+  splitSiblingText
+} from '../src/shared/siblings.ts'
 import { compactionNoteWithHistory, COMPACTION_NOTE as NOTE } from '../src/shared/defaults.ts'
 
 /** Histórico com uma fronteira de compactação no meio (#1–#6 resumidas em #7). */
@@ -2085,6 +2097,115 @@ test('subagentes: posse (descendentes), resolução de id e subárvore', () => {
     list,
     /x2 · "Resumo" · m · concluído · bloqueante · duração 1min 5s · resultado devolvido no delegate_task · último: "pronto"/
   )
+})
+
+test('subagentes irmãos: alvo (descendente/irmão), textos, janela deslizante e listagens', () => {
+  const ss = [
+    { id: 'main-0000', parentSessionId: null },
+    { id: 'aaaa-1111', parentSessionId: 'main-0000' },
+    { id: 'aaaa-2222', parentSessionId: 'main-0000' },
+    { id: 'bbbb-3333', parentSessionId: 'aaaa-1111' },
+    { id: 'cccc-4444', parentSessionId: 'aaaa-2222' },
+    { id: 'dddd-5555', parentSessionId: 'aaaa-1111' }
+  ]
+  assert.equal(areSiblings(ss[1], ss[2]), true)
+  assert.equal(areSiblings(ss[1], ss[1]), false)
+  assert.equal(
+    areSiblings(ss[0], { id: 'x', parentSessionId: null }),
+    false,
+    'principais não são irmãs'
+  )
+  const t = resolveMessageTarget(ss, 'aaaa-1111', 'aaaa-2222') as any
+  assert.equal(t.relation, 'sibling')
+  assert.equal(t.target.id, 'aaaa-2222')
+  assert.equal((resolveMessageTarget(ss, 'aaaa-1111', 'bbbb') as any).relation, 'descendant')
+  assert.equal(resolveMessageTarget(ss, 'bbbb-3333', 'cccc-4444'), 'not-owned', 'primo')
+  assert.equal(resolveMessageTarget(ss, 'aaaa-1111', 'main-0000'), 'not-owned', 'pai')
+  assert.equal(resolveMessageTarget(ss, 'aaaa-1111', 'cccc-4444'), 'not-owned', 'sobrinho')
+  assert.equal(resolveMessageTarget(ss, 'aaaa-1111', 'aaaa-1111'), 'not-owned', 'a própria')
+  assert.equal((resolveMessageTarget(ss, 'bbbb-3333', 'dddd') as any).relation, 'sibling')
+  assert.equal(resolveMessageTarget(ss, 'main-0000', 'aaaa'), 'ambiguous')
+  assert.equal(resolveMessageTarget(ss, 'aaaa-1111', 'zzzz-0'), null)
+
+  // textos
+  const m = siblingMessageText('  Testes \n do parser ', 'aaaa-1111', 'oi\nirmão')
+  assert.equal(m, '[Mensagem do subagente irmão "Testes do parser" (aaaa-1111)]\noi\nirmão')
+  assert.deepEqual(splitSiblingText(m), {
+    header: '[Mensagem do subagente irmão "Testes do parser" (aaaa-1111)]',
+    body: 'oi\nirmão',
+    title: 'Testes do parser'
+  })
+  const b = siblingBroadcastText('A', 'aaaa-1111', 'quem?')
+  assert.ok(
+    b.startsWith(
+      '[Broadcast do subagente irmão "A" (aaaa-1111) — responda diretamente (message_subagent para aaaa-1111) só se isto for com você;'
+    )
+  )
+  assert.equal(splitSiblingText(b).body, 'quem?')
+  assert.equal(splitSiblingText('texto livre').header, '')
+  assert.ok(isSiblingKind('sibling-message') && isSiblingKind('sibling-broadcast'))
+  assert.ok(!isSiblingKind('parent-message') && !isSiblingKind(undefined))
+
+  // janela deslizante: 3 por par (sem ordem), segundos até liberar, relógio injetado
+  let now = 1_000_000
+  const lim = new SlidingWindowLimiter(() => now)
+  const k = siblingPairKey('b', 'a')
+  assert.equal(k, siblingPairKey('a', 'b'))
+  assert.equal(lim.take(k, 3, 60_000), 0)
+  now += 10_000
+  assert.equal(lim.take(k, 3, 60_000), 0)
+  assert.equal(lim.take(k, 3, 60_000), 0)
+  now += 5_000
+  assert.equal(lim.take(k, 3, 60_000), 45)
+  assert.equal(lim.take(siblingPairKey('a', 'c'), 3, 60_000), 0, 'outro par')
+  now += 45_000
+  assert.equal(lim.take(k, 3, 60_000), 0, 'a 1ª saiu da janela')
+  assert.equal(lim.take(k, 3, 60_000), 10, 'a próxima a sair (10 s depois da 1ª)')
+  now += 9_500
+  assert.equal(lim.take(k, 3, 60_000), 1, 'arredonda para cima')
+
+  // listagens
+  assert.match(formatSiblingList([]), /nenhum/)
+  const sl = formatSiblingList([{ id: 'aaaa-2222', title: 'B', status: 'running' }])
+  assert.match(sl, /^\[Irmãos \(mesmo agente pai\): 1 — /)
+  assert.match(sl, /\naaaa-2222 · "B" · rodando$/)
+  assert.equal(
+    formatSiblingExchanges([], 'c1'),
+    '[nenhuma mensagem trocada entre os seus subagentes]'
+  )
+  const A = { id: 'aaaaaaaa-1', title: 'A' }
+  const B = { id: 'bbbbbbbb-2', title: 'B' }
+  const C = { id: 'cccccccc-3', title: 'C' }
+  const ex = formatSiblingExchanges(
+    [
+      { at: 2000, from: B, to: [A], broadcast: false, text: 'resposta' },
+      { at: 1000, from: A, to: [B, C], broadcast: true, text: 'quem?' },
+      { at: 3000, from: A, to: [C], broadcast: false, text: 'y'.repeat(900), queued: true }
+    ],
+    'chat-1'
+  )
+  const exl = ex.split('\n')
+  assert.equal(exl[0], '[3 mensagens entre os seus subagentes]')
+  assert.match(
+    exl[1],
+    /"A" \(aaaaaaaa\) → broadcast a 2 irmãos \("B" \(bbbbbbbb\), "C" \(cccccccc\)\): quem\?$/
+  )
+  assert.match(exl[2], /"B" \(bbbbbbbb\) → "A" \(aaaaaaaa\): resposta$/)
+  assert.match(exl[3], /\[na fila\]: y{300}… \(900 caracteres\)$/)
+  assert.match(exl[4], /read_history com chat_id "chat-1"/)
+  // teto total: só as mais recentes
+  const many = Array.from({ length: 80 }, (_, i) => ({
+    at: i,
+    from: A,
+    to: [B],
+    broadcast: false,
+    text: `msg ${i} ${'z'.repeat(200)}`
+  }))
+  const cut = formatSiblingExchanges(many, 'c', 3000)
+  assert.ok(cut.length < 3600)
+  assert.match(cut, /^\[80 mensagens entre os seus subagentes; mostrando as \d+ mais recentes\]/)
+  assert.ok(cut.includes('msg 79 ') && !cut.includes('msg 0 '))
+  assert.ok(formatSiblingExchanges(many, 'c', 1_000_000).split('\n').length === 52, 'máx. 50')
 })
 
 test('trackFailure: só a transição para error vira falha; error na primeira aparição (sync) não', () => {

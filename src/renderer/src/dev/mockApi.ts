@@ -31,6 +31,7 @@ import {
 } from '@shared/branches'
 import { isDisplayOnly } from '@shared/context'
 import { contentText } from '@shared/attachments'
+import { siblingBroadcastText, siblingMessageText } from '@shared/siblings'
 import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
 import {
   createMemoryMock,
@@ -841,6 +842,37 @@ export function createMockApi(scenario: string): ClearApi {
       messages.push(
         msg(sid, { role: 'user', content: `${title} (tarefa de exemplo).` }, { synthetic: true })
       )
+      // mensagens entre irmãos: direta (s3a → s3c) e broadcast (s3a → s3b, s3c)
+      if (sid === 's3c')
+        messages.push(
+          msg(
+            sid,
+            {
+              role: 'user',
+              content: siblingMessageText(
+                'Rodar os testes do parser',
+                's3a',
+                'Vou rodar os testes agora: não limpe o out/ até eu avisar.'
+              )
+            },
+            { kind: 'sibling-message', fromSessionId: 's3a' }
+          )
+        )
+      if (sid === 's3b' || sid === 's3c')
+        messages.push(
+          msg(
+            sid,
+            {
+              role: 'user',
+              content: siblingBroadcastText(
+                'Rodar os testes do parser',
+                's3a',
+                'Alguém está mexendo em src/parser/index.ts?'
+              )
+            },
+            { kind: 'sibling-broadcast', fromSessionId: 's3a', broadcastId: 'bc1' }
+          )
+        )
       if (args) {
         messages.push(
           msg(sid, {

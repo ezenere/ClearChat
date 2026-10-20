@@ -1,5 +1,6 @@
 // Loop do agente por sessão: build → stream → persistir assistant → tools → [fila] → repetir.
 // Ver SPEC.md → "Runner / fila / interrupção".
+import { randomUUID } from 'crypto'
 import type {
   ApiMessage,
   ApprovalRecord,
@@ -76,20 +77,38 @@ import {
 } from '../tools/models'
 import {
   callbackText,
+  formatSiblingExchanges,
+  formatSiblingList,
   formatSubagentList,
   fmtDuration,
   parentMessageText,
   ReportRegistry,
+  resolveMessageTarget,
   resolveSubagentRef,
+  siblingPairKey,
+  SlidingWindowLimiter,
   subtreeIds,
   type Report,
+  type SiblingExchange,
   type SubagentRow
 } from './subagents'
+import {
+  isSiblingKind,
+  siblingBroadcastText,
+  siblingMessageText,
+  splitSiblingText
+} from '@shared/siblings'
 import { listModels } from '../providers'
 import { contentText, isAppPart } from '@shared/attachments'
 import { providerKind } from '@shared/providerKinds'
 import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
-import { availableTools, buildRequest, maskRequest, setProviderNamesSource } from './request'
+import {
+  availableTools,
+  buildRequest,
+  maskRequest,
+  setProviderNamesSource,
+  setSiblingsSource
+} from './request'
 import type { BuiltRequest } from './request'
 import { connectionErrorText, isConnectionFailure, retryAppClosedText } from '@shared/network'
 import {
@@ -513,6 +532,10 @@ function finish(st: RunState, status: SessionStatus): void {
 /** Provedor da sessão: principal = o do chat (atual); subsessão = o fixado ao criá-la. */
 // definições de tools com `provider` ajustado aos provedores configurados (request/preview/estimativa)
 setProviderNamesSource(() => providersRepo.list().map((p) => p.name))
+// subagente com irmãos recebe check_subagents + message_subagent (ver availableTools)
+setSiblingsSource(({ id, parentSessionId }) =>
+  sessionsRepo.children(parentSessionId).some((s) => s.id !== id)
+)
 
 function providerFor(chat: Chat, session: Session): Provider | null {
   return providersRepo.get(sessionProviderId(chat.config, session))
@@ -1227,7 +1250,7 @@ async function executeTool(
       return done(await runDelegate(st, session, chat, toolCallId, args, signal))
     }
     if (name === 'send_to_chat') return done(await runSendToChat(session, chat, args, signal))
-    if (name === 'check_subagents') return done(runCheckSubagents(session, chat))
+    if (name === 'check_subagents') return done(runCheckSubagents(session, chat, args))
     if (name === 'wait_subagents') return done(await runWaitSubagents(session, chat, args, signal))
     if (name === 'cancel_subagent') return done(await runCancelSubagent(session, chat, args))
     if (name === 'message_subagent')
@@ -1944,7 +1967,13 @@ function sessionTail(sessionId: string): string {
   return ''
 }
 
-function runCheckSubagents(session: Session, chat: Chat): Omit<ToolOutcome, 'durationMs'> {
+function runCheckSubagents(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown> = {}
+): Omit<ToolOutcome, 'durationMs'> {
+  if (args.messages === true || args.messages === 'true')
+    return runSiblingExchanges(session, chat, args)
   const kids = sessionsRepo.list(chat.id).filter((s) => s.parentSessionId === session.id)
   const pm = messagesRepo.path(session.id)
   const rows: SubagentRow[] = kids.map((k) => {
@@ -1973,7 +2002,88 @@ function runCheckSubagents(session: Session, chat: Chat): Omit<ToolOutcome, 'dur
       tail: sessionTail(k.id)
     }
   })
-  return { content: formatSubagentList(rows), status: 'ok' }
+  let content = formatSubagentList(rows)
+  // num subagente: os irmãos (mesmo agente pai), com quem ele pode falar por message_subagent
+  if (session.depth > 0 && session.parentSessionId) {
+    const sibs = sessionsRepo.children(session.parentSessionId).filter((s) => s.id !== session.id)
+    content += `\n\n${formatSiblingList(sibs.map((s) => ({ id: s.id, title: s.title, status: s.status })))}`
+  }
+  return {
+    content: truncateHeadTail(content, clampToolOutput(chat.config.maxToolOutputChars), 0.5),
+    status: 'ok'
+  }
+}
+
+/**
+ * check_subagents messages=true: mensagens trocadas entre os filhos da sessão (irmãos entre si).
+ * Fonte: as mensagens 'sibling-message' / 'sibling-broadcast' persistidas nas subsessões de quem
+ * recebeu (+ as ainda na fila delas); um broadcast aparece uma vez, com os destinatários.
+ */
+function runSiblingExchanges(
+  session: Session,
+  chat: Chat,
+  args: Record<string, unknown>
+): Omit<ToolOutcome, 'durationMs'> {
+  const kids = sessionsRepo.children(session.id)
+  let only: string | null = null
+  const ref = typeof args.id === 'string' ? args.id.trim() : ''
+  if (ref) {
+    const res = resolveOwnSubagent(session, chat, ref)
+    if ('error' in res) return { content: res.error, status: 'error' }
+    only = res.ok.id
+  }
+  const byId = new Map(kids.map((k) => [k.id, k]))
+  const refOf = (id: string): { id: string; title: string } => ({
+    id,
+    title: byId.get(id)?.title ?? sessionsRepo.get(id)?.title ?? '(apagado)'
+  })
+  const direct: SiblingExchange[] = []
+  const broadcasts = new Map<string, SiblingExchange>()
+  const add = (to: string, meta: MessageMeta, text: string, at: number, queued: boolean): void => {
+    if (!isSiblingKind(meta.kind) || !meta.fromSessionId) return
+    const body = splitSiblingText(text).body
+    if (meta.kind === 'sibling-broadcast' && meta.broadcastId) {
+      const b = broadcasts.get(meta.broadcastId)
+      if (b) {
+        b.to.push(refOf(to))
+        b.at = Math.min(b.at, at)
+        b.queued = b.queued && queued
+      } else
+        broadcasts.set(meta.broadcastId, {
+          at,
+          from: refOf(meta.fromSessionId),
+          to: [refOf(to)],
+          broadcast: true,
+          text: body,
+          queued
+        })
+      return
+    }
+    direct.push({
+      at,
+      from: refOf(meta.fromSessionId),
+      to: [refOf(to)],
+      broadcast: false,
+      text: body,
+      queued
+    })
+  }
+  for (const k of kids) {
+    for (const m of messagesRepo.path(k.id))
+      if (m.message.role === 'user')
+        add(k.id, m.meta, contentText(m.message.content), m.createdAt, false)
+    for (const q of getQueue(k.id)) if (q.meta) add(k.id, q.meta, q.text, q.createdAt, true)
+  }
+  let items = [...direct, ...broadcasts.values()]
+  if (only) items = items.filter((it) => it.from.id === only || it.to.some((t) => t.id === only))
+  return {
+    content: formatSiblingExchanges(
+      items,
+      chat.id,
+      clampToolOutput(chat.config.maxToolOutputChars)
+    ),
+    status: 'ok'
+  }
 }
 
 const subTitle = (s: Pick<Session, 'title' | 'id'>): string =>
@@ -2118,13 +2228,38 @@ async function runMessageSubagent(
 ): Promise<Omit<ToolOutcome, 'durationMs'>> {
   const ref = typeof args.id === 'string' ? args.id.trim() : ''
   const message = typeof args.message === 'string' ? args.message.trim() : ''
-  if (!ref) return { content: 'Erro: argumento obrigatório "id" ausente.', status: 'error' }
+  const wait = args.wait_for_reply === true || args.wait_for_reply === 'true'
+  if (args.broadcast === true || args.broadcast === 'true') {
+    if (!message)
+      return { content: 'Erro: argumento obrigatório "message" ausente ou vazio.', status: 'error' }
+    return runSiblingBroadcast(session, message, wait, isTrue(args.include_finished))
+  }
+  if (!ref)
+    return {
+      content:
+        'Erro: argumento obrigatório "id" ausente (ou use broadcast=true para todos os irmãos).',
+      status: 'error'
+    }
   if (!message)
     return { content: 'Erro: argumento obrigatório "message" ausente ou vazio.', status: 'error' }
-  const res = resolveOwnSubagent(session, chat, ref)
-  if ('error' in res) return { content: res.error, status: 'error' }
-  const target = res.ok
-  const wait = args.wait_for_reply === true || args.wait_for_reply === 'true'
+  const res = resolveMessageTarget(sessionsRepo.list(chat.id), session.id, ref)
+  if (res === null)
+    return {
+      content: `Erro: subagente não encontrado: "${ref}". Use check_subagents para ver os ids.`,
+      status: 'error'
+    }
+  if (res === 'ambiguous')
+    return {
+      content: `Erro: "${ref}" corresponde a mais de um subagente. Use o id completo.`,
+      status: 'error'
+    }
+  if (res === 'not-owned')
+    return {
+      content: `Erro: "${ref}" não é um subagente desta sessão nem um irmão — message_subagent só alcança os próprios subagentes (diretos ou descendentes) e, num subagente, os irmãos (criados pelo mesmo agente pai). Use check_subagents.`,
+      status: 'error'
+    }
+  if (res.relation === 'sibling') return runSiblingMessage(session, res.target, message, wait)
+  const target = res.target
   const timeoutS = clampWaitS(args.timeout_s)
   const d = deliverToSession(target, parentMessageText(message), {
     kind: 'parent-message',
@@ -2179,6 +2314,126 @@ async function runMessageSubagent(
     default:
       return out(delegateFailureText(target.model, r.error), 'error')
   }
+}
+
+const isTrue = (v: unknown): boolean => v === true || v === 'true'
+
+/** Limite anti pingue-pongue entre irmãos (em memória; `now` injetável nos testes). */
+export const siblingLimiter = new SlidingWindowLimiter()
+const SIBLING_WINDOW_MS = (): number => LIMITS.siblingWindowS * 1000
+
+const NO_SIBLING_WAIT =
+  'Erro: wait_for_reply não vale entre subagentes irmãos (dois irmãos esperando um pelo outro travariam). Envie sem wait_for_reply: o irmão responde com message_subagent e a resposta chega como mensagem nova.'
+
+/**
+ * message_subagent para um irmão (mesmo agente pai): sem wait_for_reply; no máximo
+ * LIMITS.siblingMaxPerWindow mensagens por par na janela (as duas direções somadas). Entrega igual
+ * à do pai (fila se rodando/dormindo; retoma se ocioso/concluído — o resultado dessa retomada vai
+ * ao AGENTE PAI como callback, como toda subsessão retomada).
+ */
+function runSiblingMessage(
+  session: Session,
+  target: Session,
+  message: string,
+  wait: boolean
+): Omit<ToolOutcome, 'durationMs'> {
+  if (wait) return { content: NO_SIBLING_WAIT, status: 'error' }
+  const name = subTitle(target)
+  const retryS = siblingLimiter.take(
+    siblingPairKey(session.id, target.id),
+    LIMITS.siblingMaxPerWindow,
+    SIBLING_WINDOW_MS()
+  )
+  if (retryS)
+    return {
+      content: `Erro: você e o irmão ${name} já trocaram ${LIMITS.siblingMaxPerWindow} mensagens no último minuto (limite anti pingue-pongue). Você poderá enviar outra em ${retryS} s. Melhor: termine a sua tarefa e devolva o resultado — o agente pai coordena o resto.`,
+      status: 'error'
+    }
+  const d = deliverToSession(target, siblingMessageText(session.title, session.id, message), {
+    kind: 'sibling-message',
+    fromSessionId: session.id
+  })
+  return {
+    content: d.queuedId
+      ? `Mensagem enfileirada para o irmão ${name}: ele está rodando e a recebe no próximo passo. Se precisar responder, ele usa message_subagent e a resposta chega como mensagem nova — não espere por ela se puder seguir.`
+      : `Mensagem entregue ao irmão ${name}: ele estava parado e retomou o trabalho (a nova resposta final dele vai ao agente pai). Se precisar responder, ele usa message_subagent e a resposta chega como mensagem nova.`,
+    status: 'ok',
+    subSessionId: target.id
+  }
+}
+
+/**
+ * message_subagent broadcast=true: a mesma mensagem a todos os irmãos ATIVOS (loop vivo: rodando,
+ * dormindo, aguardando aprovação…); com include_finished, também retoma os parados. Limite próprio
+ * por remetente (LIMITS.siblingBroadcastMaxPerWindow) — não gasta a cota dos pares.
+ */
+function runSiblingBroadcast(
+  session: Session,
+  message: string,
+  wait: boolean,
+  includeFinished: boolean
+): Omit<ToolOutcome, 'durationMs'> {
+  if (wait)
+    return {
+      content: NO_SIBLING_WAIT.replace(
+        'entre subagentes irmãos',
+        'com broadcast (nem entre irmãos)'
+      ),
+      status: 'error'
+    }
+  const sibs =
+    session.depth > 0 && session.parentSessionId
+      ? sessionsRepo.children(session.parentSessionId).filter((s) => s.id !== session.id)
+      : []
+  if (!sibs.length)
+    return {
+      content:
+        'Erro: você não tem subagentes irmãos (outras subsessões criadas pelo mesmo agente pai) — não há para quem enviar o broadcast.',
+      status: 'error'
+    }
+  const active = sibs.filter((s) => runs.has(s.id))
+  const stopped = sibs.filter((s) => !runs.has(s.id))
+  const targets = includeFinished ? sibs : active
+  const list = (xs: Session[]): string => xs.map((s) => subTitle(s)).join(', ')
+  if (!targets.length)
+    return {
+      content: `Nenhum irmão ativo agora: o broadcast não foi enviado. Parados (ociosos/concluídos): ${list(stopped)}. Use include_finished=true para retomá-los (cada um roda de novo e gasta tokens) ou envie a um só com id.`,
+      status: 'ok'
+    }
+  const retryS = siblingLimiter.take(
+    `broadcast|${session.id}`,
+    LIMITS.siblingBroadcastMaxPerWindow,
+    SIBLING_WINDOW_MS()
+  )
+  if (retryS)
+    return {
+      content: `Erro: você já enviou ${LIMITS.siblingBroadcastMaxPerWindow} broadcasts no último minuto. Poderá enviar outro em ${retryS} s — ou mande direto a um irmão (message_subagent com id), ou termine a sua tarefa e deixe o agente pai coordenar.`,
+      status: 'error'
+    }
+  const broadcastId = randomUUID()
+  const text = siblingBroadcastText(session.title, session.id, message)
+  const queued: Session[] = []
+  const resumed: Session[] = []
+  for (const t of targets) {
+    const d = deliverToSession(t, text, {
+      kind: 'sibling-broadcast',
+      fromSessionId: session.id,
+      broadcastId
+    })
+    ;(d.queuedId ? queued : resumed).push(t)
+  }
+  const lines = [
+    `Broadcast entregue a ${targets.length} ${targets.length === 1 ? 'irmão' : 'irmãos'}.`,
+    queued.length ? `Na fila (rodando; recebem no próximo passo): ${list(queued)}.` : '',
+    resumed.length
+      ? `Retomados (estavam parados; a nova resposta final de cada um vai ao agente pai): ${list(resumed)}.`
+      : '',
+    !includeFinished && stopped.length
+      ? `Pulados por estarem parados (ociosos/concluídos): ${list(stopped)} — include_finished=true os retomaria.`
+      : '',
+    'Só quem for o destinatário responde, com message_subagent direto a você; a resposta chega como mensagem nova. Siga a sua tarefa enquanto isso.'
+  ]
+  return { content: lines.filter(Boolean).join('\n'), status: 'ok' }
 }
 
 /** Último diretório do shell salvo nesta sessão (restaura o `cd` do bash após reiniciar o app). */

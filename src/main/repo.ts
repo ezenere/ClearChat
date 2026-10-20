@@ -233,6 +233,13 @@ export const sessionsRepo = {
       .all(chatId) as SessionRow[]
     return rows.map(toSession)
   },
+  /** Subsessões criadas diretamente por `parentSessionId` (filhos), na ordem de criação. */
+  children(parentSessionId: string): Session[] {
+    const rows = getDb()
+      .prepare('SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY created_at, rowid')
+      .all(parentSessionId) as SessionRow[]
+    return rows.map(toSession)
+  },
   get(id: string): Session | null {
     const r = getDb().prepare('SELECT * FROM sessions WHERE id = ?').get(id) as
       SessionRow | undefined

@@ -86,6 +86,8 @@ export function describeMessage(
         }
       }
       if (m.meta.kind === 'inter-chat') return { label: 'user [de outro chat]', text }
+      if (m.meta.kind === 'sibling-message' || m.meta.kind === 'sibling-broadcast')
+        return { label: 'user [de subagente irmão]', text }
       return { label: m.meta.synthetic ? 'user (app)' : 'user', text }
     }
     case 'assistant': {

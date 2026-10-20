@@ -568,6 +568,24 @@ app.on('window-all-closed', () => app.quit())
     return info
   })
 
+  await step('4b. subsessão com mensagens de irmãos (direta + broadcast)', async () => {
+    await open('subagents', 'Resumo do artigo')
+    // 3º delegate = s3c "Limpar artefatos de build": recebeu uma direta e um broadcast de s3a
+    await page.getByRole('button', { name: 'Abrir subsessão' }).nth(2).click()
+    await page.getByTestId('sub-banner').waitFor()
+    const sib = page.getByTestId('sibling-message')
+    await sib.first().waitFor({ timeout: 4000 })
+    assert.equal(await sib.count(), 2)
+    const t0 = (await sib.nth(0).innerText()).replace(/\s+/g, ' ')
+    const t1 = (await sib.nth(1).innerText()).replace(/\s+/g, ' ')
+    assert(t0.includes('Mensagem do irmão Rodar os testes do parser'), t0)
+    assert(t0.includes('não limpe o out/') && !t0.includes('[Mensagem do subagente'), t0)
+    assert(t1.includes('Broadcast do irmão Rodar os testes do parser'), t1)
+    assert(t1.includes('Alguém está mexendo') && !t1.includes('[Broadcast do subagente'), t1)
+    await sib.first().scrollIntoViewIfNeeded()
+    await shot('04b-sibling-messages')
+  })
+
   await step(
     '5. questionário substituindo o composer (2 perguntas) → responder → composer',
     async () => {

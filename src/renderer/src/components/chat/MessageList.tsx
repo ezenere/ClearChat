@@ -11,14 +11,17 @@ import {
   Maximize2,
   Minimize2,
   Pencil,
+  Radio,
   RotateCcw,
   MessagesSquare,
   Trash2,
   User,
+  Users,
   X,
   Zap
 } from 'lucide-react'
 import { splitInterChatText } from '@shared/interChat'
+import { isSiblingKind, splitSiblingText } from '@shared/siblings'
 import { isContextLengthError, isDisplayOnly, latestBoundaryIndex } from '@shared/context'
 import { isBranchEditable, selectionToReach, selEquals, type BranchSel } from '@shared/branches'
 import { messageAttachments, messageSkills } from '@shared/attachments'
@@ -920,7 +923,10 @@ function InterChatMessage({
   )
 }
 
-/** Mensagem do agente pai (message_subagent) ou do usuário, numa subsessão. */
+/**
+ * Mensagem do agente pai (message_subagent), de um subagente irmão (mensagem direta ou broadcast)
+ * ou do usuário, numa subsessão.
+ */
 function SubsessionUserMessage({
   msg,
   canEdit,
@@ -928,21 +934,43 @@ function SubsessionUserMessage({
 }: {
   msg: StoredMessage
   canEdit: boolean
-  from: 'you' | 'parent'
+  from: 'you' | 'parent' | 'sibling'
 }): React.JSX.Element {
+  const sibling = useStore((s) =>
+    from === 'sibling' && msg.meta.fromSessionId ? s.sessions[msg.meta.fromSessionId] : undefined
+  )
   const text = msg.message.role === 'user' ? messageText(msg.message.content) : ''
-  const body = from === 'parent' ? text.replace(/^\[Mensagem do agente pai\]\n/, '') : text
+  const split = from === 'sibling' ? splitSiblingText(text) : null
+  const body =
+    from === 'parent'
+      ? text.replace(/^\[Mensagem do agente pai\]\n/, '')
+      : split
+        ? split.body
+        : text
+  const broadcast = msg.meta.kind === 'sibling-broadcast'
+  const siblingName = sibling?.title || split?.title || 'Subagente'
   const hasAttachments =
     messageAttachments(msg.message).length > 0 || messageSkills(msg.message).length > 0
   return (
     <div
-      data-testid={from === 'parent' ? 'parent-message' : 'user-in-sub'}
+      data-testid={
+        from === 'parent'
+          ? 'parent-message'
+          : from === 'sibling'
+            ? 'sibling-message'
+            : 'user-in-sub'
+      }
       className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
     >
       <OriginLabel>
         {from === 'parent' ? (
           <>
             <Bot className="size-3" /> Agente pai
+          </>
+        ) : from === 'sibling' ? (
+          <>
+            {broadcast ? <Radio className="size-3" /> : <Users className="size-3" />}
+            {broadcast ? 'Broadcast do irmão' : 'Mensagem do irmão'} {siblingName}
           </>
         ) : (
           <>
@@ -957,9 +985,9 @@ function SubsessionUserMessage({
         <div
           className={cn(
             'max-w-[85%] rounded-2xl rounded-br-md border px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg',
-            from === 'parent'
-              ? 'border-accent-strong/30 bg-accent-soft/40'
-              : 'border-border bg-elevated'
+            from === 'you'
+              ? 'border-border bg-elevated'
+              : 'border-accent-strong/30 bg-accent-soft/40'
           )}
         >
           {body}
@@ -1599,7 +1627,12 @@ export function MessageList({
     if (role === 'assistant') return true
     if (role !== 'user' || m.meta.synthetic) return false
     if (m.meta.kind === 'inter-chat') return true
-    if (m.meta.kind === 'subagent-callback' || m.meta.kind === 'parent-message') return false
+    if (
+      m.meta.kind === 'subagent-callback' ||
+      m.meta.kind === 'parent-message' ||
+      isSiblingKind(m.meta.kind)
+    )
+      return false
     return session.depth === 0
   }
   const renderMessage = (m: StoredMessage, old: boolean): ReactNode => {
@@ -1615,6 +1648,8 @@ export function MessageList({
       return <CallbackCard key={m.id} msg={m} chatId={chatId} canEdit={canEdit} />
     if (role === 'user' && m.meta.kind === 'parent-message')
       return <SubsessionUserMessage key={m.id} msg={m} canEdit={false} from="parent" />
+    if (role === 'user' && isSiblingKind(m.meta.kind))
+      return <SubsessionUserMessage key={m.id} msg={m} canEdit={false} from="sibling" />
     if (role === 'user' && session.depth > 0 && !m.meta.synthetic)
       return <SubsessionUserMessage key={m.id} msg={m} canEdit={false} from="you" />
     if (m.meta.synthetic && role !== 'assistant') {

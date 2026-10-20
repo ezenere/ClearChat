@@ -438,6 +438,10 @@ export interface MessageMeta {
     | 'inter-chat'
     | 'subagent-callback'
     | 'parent-message'
+    /** Mensagem direta de um subagente irmão (message_subagent), no irmão que recebe. */
+    | 'sibling-message'
+    /** Broadcast de um subagente irmão (message_subagent broadcast=true), em cada irmão que recebe. */
+    | 'sibling-broadcast'
     /** Card da extração de memórias (synthetic, só exibição — NUNCA enviado à API, como 'error'). */
     | 'memory-extraction'
   /** Resposta do assistente cortada pelo usuário. */
@@ -465,7 +469,10 @@ export interface MessageMeta {
   // ---- mensagens entre chats (kind 'inter-chat', no chat de destino) ----
   /** Chat que enviou a mensagem. */
   fromChatId?: string
-  /** Sessão (principal ou subagente) do chat de origem que chamou send_to_chat. */
+  /**
+   * Sessão (principal ou subagente) do chat de origem que chamou send_to_chat; em 'parent-message',
+   * a sessão pai; em 'sibling-message' / 'sibling-broadcast', o irmão que enviou.
+   */
   fromSessionId?: string
   /** Título do chat de origem no momento do envio (exibição se ele for apagado/renomeado). */
   fromChatTitle?: string
@@ -478,6 +485,8 @@ export interface MessageMeta {
   background?: boolean
   /** kind 'subagent-callback': resultado de uma retomada (atualização após nova mensagem). */
   callbackUpdate?: boolean
+  /** kind 'sibling-broadcast': id comum às cópias do mesmo broadcast (uma por irmão). */
+  broadcastId?: string
   // ---- Smart-Approve (mensagem tool) ----
   /** Avaliação do juiz para esta chamada (custo aparece no rodapé da resposta). */
   smartApprove?: SmartApproveRecord

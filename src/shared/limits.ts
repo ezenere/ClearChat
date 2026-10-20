@@ -92,6 +92,17 @@ export const LIMITS = {
   /** wait_subagents / message_subagent (wait_for_reply): espera padrão / máxima, em segundos. */
   subagentWaitDefaultS: 600,
   subagentWaitMaxS: 3600,
+  /**
+   * message_subagent entre irmãos (anti pingue-pongue, só em memória no main): janela deslizante em
+   * segundos; mensagens diretas por PAR de irmãos na janela (as duas direções somadas); broadcasts
+   * por remetente na janela (não gastam a cota dos pares).
+   */
+  siblingWindowS: 60,
+  siblingMaxPerWindow: 3,
+  siblingBroadcastMaxPerWindow: 2,
+  /** check_subagents messages=true: corte por mensagem e máximo de mensagens listadas. */
+  siblingListMsgChars: 300,
+  siblingListMax: 50,
 
   /** Processos em segundo plano (process_*): máximo rodando por chat. */
   processMaxPerChat: 8,
