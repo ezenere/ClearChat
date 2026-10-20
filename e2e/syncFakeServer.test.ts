@@ -405,8 +405,9 @@ test('troca de host, comandos remotos, queda e tolerância', async () => {
   await wa.req('remote.result', { chat_id: X, cmd_id: 'cmd-1', env: env() })
   const result = await wb.wait((f) => f.t === 'remote.result')
   assert.equal(result.cmd_id, 'cmd-1')
-  // versões de mensagens (protocolo 1.2.0): os kinds branch.* passam; kind desconhecido é recusado
-  for (const kind of ['branch.edit', 'branch.regenerate', 'branch.select']) {
+  // versões de mensagens (protocolo 1.2.0) e arquivos do host (1.3.0): os kinds branch.* e fs.*
+  // passam; kind desconhecido é recusado
+  for (const kind of ['branch.edit', 'branch.regenerate', 'branch.select', 'fs.list', 'fs.read']) {
     const cmdId = `cmd-${kind}`
     const r = await wb.req('remote.send', { chat_id: X, cmd_id: cmdId, kind, env: env() })
     assert.equal(r.status, 'delivered', kind)

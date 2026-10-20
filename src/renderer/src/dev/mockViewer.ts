@@ -194,7 +194,7 @@ export function seedViewerScenario(o: {
 export function createMockViewer(o: {
   messages: () => StoredMessage[]
   delay: <T>(v: T, ms?: number) => Promise<T>
-}): ClearApi['viewer'] {
+}): Omit<ClearApi['viewer'], 'saveBytes' | 'openBytes'> {
   // mensagens do mock + as que os E2E injetam por evento (só existem no store)
   const all = (): StoredMessage[] => {
     const st = (
@@ -266,6 +266,174 @@ export function createMockViewer(o: {
     },
     showInFolder: async (token) => {
       calls.push(`reveal:${tokens.get(token)}`)
+    }
+  }
+}
+
+// ---------------- controle remoto: arquivos do host (sync.remoteListDir / remoteReadFile) ----------------
+
+/** Raiz do chat no host simulado ("PC do escritório"). */
+export const MOCK_HOST_ROOT = '/srv/escritorio/vendas'
+
+/** PDF mínimo válido (1 página, texto) com a tabela xref correta. */
+function tinyPdf(text: string): Uint8Array {
+  const objs = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 420 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>',
+    '',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+  ]
+  const stream = `BT /F1 22 Tf 30 110 Td (${text}) Tj ET`
+  objs[3] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`
+  let out = '%PDF-1.4\n'
+  const offsets: number[] = []
+  objs.forEach((o, i) => {
+    offsets.push(out.length)
+    out += `${i + 1} 0 obj\n${o}\nendobj\n`
+  })
+  const xref = out.length
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n`
+  for (const off of offsets) out += `${String(off).padStart(10, '0')} 00000 n \n`
+  out += `trailer\n<< /Size ${objs.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`
+  return new TextEncoder().encode(out)
+}
+
+function pseudoRandom(n: number, header: number[] = []): Uint8Array {
+  const b = new Uint8Array(n)
+  let x = 0x9e3779b9
+  for (let i = 0; i < n; i++) {
+    x ^= x << 13
+    x ^= x >>> 17
+    x ^= x << 5
+    b[i] = x & 0xff
+  }
+  b.set(header)
+  return b
+}
+
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s)
+
+/**
+ * Sistema de arquivos do host simulado + as chamadas do controle remoto (main → sync). Respeita a
+ * raiz/confinamento como o host real (fora → negado), devolve em pedaços de até 512 KiB com atraso
+ * (o painel mostra o progresso) e "Host offline" quando o store diz que o host caiu. Chamadas em
+ * window.__mockRemoteCalls (read:<nome>:<offset>:<length>, list:<pasta>) e as de SO em
+ * window.__mockViewerCalls (save:<nome>:<bytes>, open-temp:<nome>:<bytes>).
+ */
+export function createMockRemoteFs(o: { delay: <T>(v: T, ms?: number) => Promise<T> }): {
+  remoteListDir: ClearApi['sync']['remoteListDir']
+  remoteReadFile: ClearApi['sync']['remoteReadFile']
+  saveBytes: ClearApi['viewer']['saveBytes']
+  openBytes: ClearApi['viewer']['openBytes']
+} {
+  const R = MOCK_HOST_ROOT
+  const mtime = Date.now() - 3_600_000
+  const PNG = Uint8Array.from(
+    atob(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=='
+    ),
+    (c) => c.charCodeAt(0)
+  )
+  const longLog = Array.from(
+    { length: 52_000 },
+    (_, i) => `${String(i + 1).padStart(6, '0')} INFO pedido processado em ${(i * 7) % 300} ms`
+  ).join('\n')
+  const files = new Map<string, Uint8Array>([
+    [`${R}/relatorio-final.pdf`, tinyPdf('Relatorio final - PC do escritorio')],
+    [`${R}/grafico.png`, PNG],
+    [
+      `${R}/pagina.html`,
+      enc(
+        '<!doctype html><html><head><title>Original</title></head><body><h1>Painel do escritório</h1>' +
+          '<img src="https://example.com/rastreio.png" alt="externo">' +
+          '<script>document.title = "script rodou"</script></body></html>'
+      )
+    ],
+    [`${R}/backup.zip`, pseudoRandom(3 * 1024 * 1024 + 4321, [0x50, 0x4b, 0x03, 0x04])],
+    [`${R}/log-grande.txt`, enc(longLog)],
+    [`${R}/dados/notas.md`, enc('# Notas do escritório\n\nTudo certo com os dados.\n')],
+    ['/srv/escritorio/segredo.txt', enc('fora da raiz')]
+  ])
+  const dirs = new Set([R, `${R}/dados`])
+  const calls: string[] = []
+  ;(window as unknown as { __mockRemoteCalls?: string[] }).__mockRemoteCalls = calls
+  const osCalls = (): string[] => {
+    const w = window as unknown as { __mockViewerCalls?: string[] }
+    return (w.__mockViewerCalls ??= [])
+  }
+  const hostOffline = (chatId: string): boolean => {
+    const st = (
+      window as unknown as {
+        __clearStore?: { getState(): { chatHosts: Record<string, { mode?: string }> } }
+      }
+    ).__clearStore?.getState()
+    return st?.chatHosts[chatId]?.mode === 'host-offline'
+  }
+  const offline = {
+    ok: false as const,
+    reason: 'host-offline' as const,
+    message: 'O host (PC do escritório) está offline.',
+    deviceName: 'PC do escritório'
+  }
+  const inside = (p: string): boolean => p === R || p.startsWith(`${R}/`)
+  return {
+    remoteListDir: (chatId, path) => {
+      const dir = path ? path.replace(/\/+$/, '') : R
+      calls.push(`list:${dir}`)
+      if (hostOffline(chatId)) return o.delay(offline)
+      if (!inside(dir))
+        return o.delay({
+          ok: false as const,
+          reason: 'denied' as const,
+          message: 'Acesso negado: a pasta fica fora do diretório raiz do chat.'
+        })
+      if (!dirs.has(dir))
+        return o.delay({
+          ok: false as const,
+          reason: 'missing' as const,
+          message: 'Pasta não encontrada.'
+        })
+      const entries = [
+        ...[...dirs]
+          .filter((d) => d !== dir && d.slice(0, d.lastIndexOf('/')) === dir)
+          .map((d) => ({ name: d.slice(d.lastIndexOf('/') + 1), kind: 'dir' as const, mtime })),
+        ...[...files.entries()]
+          .filter(([p]) => p.slice(0, p.lastIndexOf('/')) === dir)
+          .map(([p, b]) => ({
+            name: p.slice(p.lastIndexOf('/') + 1),
+            kind: 'file' as const,
+            size: b.length,
+            mtime
+          }))
+      ]
+      return o.delay({ ok: true as const, dir, root: R, confine: true, truncated: false, entries })
+    },
+    remoteReadFile: (chatId, path, offset, length) => {
+      calls.push(`read:${fileNameOf(path)}:${offset}:${length}`)
+      if (hostOffline(chatId)) return o.delay(offline)
+      if (!inside(path))
+        return o.delay({
+          ok: false as const,
+          reason: 'denied' as const,
+          message: 'Acesso negado: o arquivo fica fora do diretório raiz do chat.'
+        })
+      const b = files.get(path)
+      if (!b)
+        return o.delay({
+          ok: false as const,
+          reason: 'missing' as const,
+          message: 'Arquivo não encontrado.'
+        })
+      const data = b.slice(offset, offset + Math.min(length, 512 * 1024))
+      return o.delay({ ok: true as const, size: b.length, mtime, offset, data }, 140)
+    },
+    saveBytes: async (name, bytes) => {
+      osCalls().push(`save:${name}:${bytes.length}`)
+      return true
+    },
+    openBytes: async (name, bytes) => {
+      osCalls().push(`open-temp:${name}:${bytes.length}`)
     }
   }
 }

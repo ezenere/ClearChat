@@ -1,6 +1,7 @@
 // Painel de arquivo — coluna entre o chat e o painel de configurações: [LISTA | CHAT | ARQUIVO |
 // CONFIGS]. Mostra o arquivo ativo do chat (present_file / aba Arquivos) com a fonte de bytes do
-// chat (lib/fileSources: local hoje; remota no controle remoto, depois). Divisor redimensionável
+// chat (lib/fileSources: local; remota no controle remoto — baixa do host com progresso, sem
+// "Mostrar na pasta", com "Salvar como…"; trocar de arquivo/chat cancela). Divisor redimensionável
 // (arrastar, ←/→, Home/End, duplo clique = padrão), fechar (X / Esc com o foco no painel).
 // Ver SPEC → "Visualizador de arquivos (present_file)".
 import {
@@ -360,10 +361,35 @@ function PdfView({
   )
 }
 
-function Loading({ label = 'Carregando…' }: { label?: string }): React.JSX.Element {
+function Loading({
+  label = 'Carregando…',
+  progress
+}: {
+  label?: string
+  /** 0..1 (download do host em pedaços); ausente = só o spinner. */
+  progress?: number
+}): React.JSX.Element {
   return (
-    <div className="flex h-full items-center justify-center gap-2 text-xs text-subtle">
-      <Spinner /> {label}
+    <div className="flex h-full flex-col items-center justify-center gap-2.5 text-xs text-subtle">
+      <div className="flex items-center gap-2">
+        <Spinner /> {label}
+      </div>
+      {progress != null && (
+        <div
+          role="progressbar"
+          aria-label="Baixando do host"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress * 100)}
+          data-testid="viewer-progress"
+          className="h-1 w-48 overflow-hidden rounded-full bg-border/70"
+        >
+          <div
+            className="h-full rounded-full bg-accent transition-[width] duration-150"
+            style={{ width: `${Math.min(100, Math.round(progress * 100))}%` }}
+          />
+        </div>
+      )}
     </div>
   )
 }
@@ -580,9 +606,12 @@ export function FileViewerPane({
       <Loading
         label={
           progress
-            ? `Carregando… ${formatBytes(progress.loaded)}${progress.total ? ` de ${formatBytes(progress.total)}` : ''}`
-            : 'Carregando…'
+            ? `${source.id === 'remote' ? 'Baixando do host' : 'Carregando'}… ${formatBytes(progress.loaded)}${progress.total ? ` de ${formatBytes(progress.total)}` : ''}`
+            : source.id === 'remote'
+              ? 'Buscando no host…'
+              : 'Carregando…'
         }
+        progress={progress?.total ? progress.loaded / progress.total : undefined}
       />
     )
   } else if (!result.ok) {
@@ -591,7 +620,12 @@ export function FileViewerPane({
         <Problem
           icon={MonitorSmartphone}
           title={`Arquivo no ${result.deviceName ?? 'outro dispositivo'}`}
-          text="A pré-visualização só funciona no dispositivo onde o arquivo está."
+          text={
+            // fonte remota: o motivo (outro dispositivo que não o host, host/servidor antigo)
+            source.id === 'remote' && result.message
+              ? result.message
+              : 'A pré-visualização só funciona no dispositivo onde o arquivo está.'
+          }
         />
       ) : result.reason === 'host-offline' ? (
         <Problem icon={WifiOff} title="Host offline" text={result.message} />
@@ -601,7 +635,16 @@ export function FileViewerPane({
         <Problem
           icon={CircleAlert}
           title={result.reason === 'missing' ? 'Arquivo não encontrado' : 'Não foi possível abrir'}
-          text={file.path}
+          text={
+            result.reason === 'error' && source.id === 'remote' && result.message ? (
+              <>
+                {result.message}
+                <span className="mt-1 block font-mono text-[11px] text-faint">{file.path}</span>
+              </>
+            ) : (
+              file.path
+            )
+          }
         >
           <Button
             size="sm"
@@ -708,7 +751,7 @@ export function FileViewerPane({
               )}
             </div>
           )}
-          {kind === 'html' && (
+          {kind === 'html' && source.id === 'local' && (
             <label className="ml-1 flex items-center gap-1.5 text-[11px] text-subtle">
               <Switch
                 size="sm"

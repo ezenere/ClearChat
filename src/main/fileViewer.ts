@@ -233,8 +233,14 @@ function presentedFile(
   return { file, rec }
 }
 
-/** Confere o arquivo no disco (confinamento do chat, arquivo comum) → realpath ou indisponível. */
-async function locate(chat: Chat, path: string): Promise<{ real: string } | Unavailable> {
+/**
+ * Confere o arquivo no disco (confinamento do chat, arquivo comum) → realpath ou indisponível.
+ * Exportado: o host aplica as MESMAS regras ao `fs.read` de um controle remoto (sync/remoteFs.ts).
+ */
+export async function locate(
+  chat: { config: Pick<Chat['config'], 'cwd' | 'confineToRoot'> },
+  path: string
+): Promise<{ real: string } | Unavailable> {
   try {
     if (chat.config.confineToRoot !== false) await assertInsideRoot(chat.config.cwd, path, path)
   } catch {

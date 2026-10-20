@@ -1214,10 +1214,17 @@ function applyEvent(e: AgentEvent): void {
           const index = rec.files.findIndex((f) => !f.error)
           if (
             index >= 0 &&
-            canAutoOpen(rec, chatId, s.sync?.device?.id, {
-              mode: host?.mode,
-              name: host?.host?.name
-            })
+            canAutoOpen(
+              rec,
+              chatId,
+              s.sync?.device?.id,
+              {
+                mode: host?.mode,
+                name: host?.host?.name,
+                deviceId: host?.host?.deviceId
+              },
+              s.view.kind === 'chat' && s.view.chatId === chatId
+            )
           ) {
             const f = rec.files[index]
             viewer = {

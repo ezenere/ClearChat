@@ -9,6 +9,7 @@ import { randomBytes } from 'crypto'
 import { IPC } from '@shared/ipc'
 import type { AttachmentInfo, QueuedMessage } from '@shared/types'
 import type { SyncServerKind, TakeoverOptions } from '@shared/sync'
+import { REMOTE_FS_LIMITS, type RemoteDirResult, type RemoteReadResult } from '@shared/remoteFs'
 import { emit, onAgentEvent } from '../events'
 import { getDb } from '../db'
 import { chatsRepo, messagesRepo, sessionsRepo } from '../repo'
@@ -23,6 +24,8 @@ import { SyncEngine, type SecretStore } from './engine'
 import { cmdPurpose, NoHostError, type RunnerAdapter } from './host'
 
 let engine: SyncEngine | null = null
+
+const SYNC_OFF = { ok: false as const, reason: 'error' as const, message: 'Sync desligado.' }
 
 export function syncEngine(): SyncEngine | null {
   return engine
@@ -432,6 +435,28 @@ export function syncHandlers(): Record<string, Handler> {
       const e = engine
       if (!e?.active || e.host.mode(chatId) !== 'remote') return null
       return e.host.mirrorSkills(chatId) ?? []
-    }
+    },
+    // arquivos do host (controle remoto, §8.6 fs.*): resultado estruturado, nunca lança
+    [IPC.sync.remoteListDir]: (
+      chatId: string,
+      path: string
+    ): Promise<RemoteDirResult> | RemoteDirResult =>
+      engine && typeof chatId === 'string'
+        ? engine.host.fsList(chatId, typeof path === 'string' ? path : '')
+        : SYNC_OFF,
+    [IPC.sync.remoteReadFile]: (
+      chatId: string,
+      path: string,
+      offset: number,
+      length: number
+    ): Promise<RemoteReadResult> | RemoteReadResult =>
+      engine && typeof chatId === 'string' && typeof path === 'string'
+        ? engine.host.fsRead(
+            chatId,
+            path,
+            Number(offset),
+            Math.min(Number(length), REMOTE_FS_LIMITS.chunkBytes)
+          )
+        : SYNC_OFF
   }
 }

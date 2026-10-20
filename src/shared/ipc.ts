@@ -12,6 +12,7 @@ import type {
   TakeoverOptions
 } from './sync'
 import type { UpdateStatus } from './updates'
+import type { RemoteDirResult, RemoteReadResult } from './remoteFs'
 import type { SkillsDiscoverOptions, SkillsDiscovery, SkillsSettings } from './skills'
 import type {
   Memory,
@@ -105,7 +106,9 @@ export const IPC = {
     check: 'viewer:check',
     readText: 'viewer:readText',
     openExternal: 'viewer:openExternal',
-    showInFolder: 'viewer:showInFolder'
+    showInFolder: 'viewer:showInFolder',
+    saveBytes: 'viewer:saveBytes',
+    openBytes: 'viewer:openBytes'
   },
   app: {
     capabilities: 'app:capabilities'
@@ -201,7 +204,9 @@ export const IPC = {
     downloadSkills: 'sync:downloadSkills',
     removeCloudSkill: 'sync:removeCloudSkill',
     stopTrackingSkill: 'sync:stopTrackingSkill',
-    hostSkills: 'sync:hostSkills'
+    hostSkills: 'sync:hostSkills',
+    remoteListDir: 'sync:remoteListDir',
+    remoteReadFile: 'sync:remoteReadFile'
   },
   webSearch: {
     getSettings: 'webSearch:getSettings',
@@ -497,6 +502,16 @@ export interface ClearApi {
     /** shell.openPath / shell.showItemInFolder — só tokens concedidos. */
     openExternal(token: string): Promise<void>
     showInFolder(token: string): Promise<void>
+    /**
+     * "Salvar como…" de um arquivo buscado de outro dispositivo: diálogo do main grava os bytes
+     * (até REMOTE_FS_LIMITS.maxFileBytes). false = cancelado.
+     */
+    saveBytes(name: string, bytes: Uint8Array): Promise<boolean>
+    /**
+     * "Abrir no app" de um arquivo buscado de outro dispositivo: grava num temporário
+     * (userData/tmp-viewer/<aleatório>/<nome>, limpo ao abrir/fechar o app) e abre no app padrão.
+     */
+    openBytes(name: string, bytes: Uint8Array): Promise<void>
   }
   app: {
     capabilities(): Promise<AppCapabilities>
@@ -658,6 +673,15 @@ export interface ClearApi {
     stopTrackingSkill(name: string): Promise<void>
     /** Skills do host (controle remoto): null = este dispositivo executa o chat. */
     hostSkills(chatId: string): Promise<{ name: string; description: string }[] | null>
+    /** Controle remoto: lista uma pasta do HOST do chat (`fs.list`, §8.6). Vazio = raiz. */
+    remoteListDir(chatId: string, path: string): Promise<RemoteDirResult>
+    /** Controle remoto: um pedaço de um arquivo do HOST (`fs.read`, §8.6). */
+    remoteReadFile(
+      chatId: string,
+      path: string,
+      offset: number,
+      length: number
+    ): Promise<RemoteReadResult>
   }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void

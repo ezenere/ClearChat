@@ -22,6 +22,7 @@ import { nativeImageProcessor } from './imageResize'
 import { ATTACHMENT_SCHEME, parseAttachmentUrl } from '@shared/attachments'
 import { VIEWER_SCHEME } from '@shared/fileViewer'
 import { serveViewerRequest, setViewerDeviceSource } from './fileViewer'
+import { cleanViewerTemp, setViewerTempDir } from './viewerTemp'
 import {
   attachmentsDir,
   gcAttachments,
@@ -147,7 +148,9 @@ app.whenReady().then(() => {
     }
   })
 
-  // Visualizador de arquivos: só tokens emitidos pelo main (ver fileViewer.ts)
+  // Visualizador de arquivos: só tokens emitidos pelo main (ver fileViewer.ts). Temporários de
+  // arquivos remotos abertos no app: userData/tmp-viewer (limpa o que sobrou da última execução)
+  setViewerTempDir(join(app.getPath('userData'), 'tmp-viewer'))
   protocol.handle(VIEWER_SCHEME, (req) => serveViewerRequest(req.url))
   setViewerDeviceSource(() => {
     const e = syncEngine()
@@ -190,6 +193,7 @@ app.on('window-all-closed', () => {
 })
 
 app.on('before-quit', () => {
+  cleanViewerTemp()
   shutdownUpdates()
   shutdownSync()
   shutdownRunner()

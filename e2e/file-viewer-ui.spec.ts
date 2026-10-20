@@ -8,7 +8,11 @@
 //   selecionado); zoom (botões) muda a escala (markdown e imagem, "Ajustar"); tipo sem prévia com os
 //   dois botões (chamadas de SO registradas no mock); aba Arquivos: clique abre no painel e destaca,
 //   duplo clique abre no app; divisor (teclado e arrastar, largura lembrada); fechar (X e Esc);
-//   trocar de chat mostra o arquivo de cada chat.
+//   trocar de chat mostra o arquivo de cada chat. Controle remoto (o chat passa a rodar no "PC do
+//   escritório", host simulado em mockViewer.ts): present_file abre sozinho buscando do host com
+//   progresso; Salvar como… / Abrir no app presentes e nunca "Mostrar na pasta"; aba Arquivos lista
+//   o host; PDF e HTML por blob URL (HTML sem o toggle de scripts); tipo sem prévia baixa só ao
+//   abrir/salvar; reabrir usa o cache; host offline.
 // Screenshots em $CLEARCHAT_E2E_DIR/shots.
 //
 // Uso:
@@ -392,6 +396,202 @@ app.on('window-all-closed', () => app.quit())
       await cards().evaluateAll((els) => els.filter((e) => e.hasAttribute('data-active')).length),
       0
     )
+  })
+
+  // ---------------- controle remoto: arquivos do host pelo sync (fonte remota) ----------------
+  const HROOT = '/srv/escritorio/vendas'
+  const hostState = (mode: 'remote' | 'host-offline'): Promise<void> =>
+    page.evaluate((m) => {
+      ;(window as any).__clearMockEmit({
+        type: 'sync-chat-state',
+        info: {
+          chatId: 'cpf',
+          mode: m,
+          host: {
+            deviceId: 'dev-escritorio',
+            name: 'PC do escritório',
+            status: m === 'remote' ? 'online' : 'offline',
+            self: false
+          },
+          running: false,
+          pinned: false,
+          epoch: 4,
+          handover: null,
+          diverged: null,
+          usesLocalTools: true,
+          hostCwd: { deviceId: 'dev-escritorio', path: '/srv/escritorio/vendas' },
+          needsCwd: false
+        }
+      })
+    }, mode)
+  const remoteCalls = (): Promise<string[]> =>
+    page.evaluate(() => (window as any).__mockRemoteCalls)
+  const osCalls = (): Promise<string[]> => page.evaluate(() => (window as any).__mockViewerCalls)
+  const toolbarLabels = (): Promise<string[]> =>
+    viewer()
+      .locator('button[aria-label]')
+      .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') ?? ''))
+
+  await step('remoto: present_file abre sozinho buscando do host (progresso)', async () => {
+    await hostState('remote')
+    await page.waitForTimeout(100)
+    await page.evaluate((root) => {
+      const w = window as any
+      const now = Date.now()
+      const files = [
+        { path: `${root}/log-grande.txt`, name: 'log-grande.txt', size: 3_000_000, kind: 'text' },
+        { path: `${root}/grafico.png`, name: 'grafico.png', size: 67, kind: 'image' }
+      ]
+      w.__clearMockEmit({
+        type: 'message-added',
+        message: {
+          id: 'mpr-a',
+          sessionId: 'spf',
+          seq: 9101,
+          createdAt: now,
+          message: {
+            role: 'assistant',
+            content: 'Do PC do escritório:',
+            tool_calls: [
+              {
+                id: 'tpr1',
+                type: 'function',
+                function: {
+                  name: 'present_file',
+                  arguments: JSON.stringify({ files: files.map((f) => ({ path: f.name })) })
+                }
+              }
+            ]
+          },
+          meta: {}
+        }
+      })
+      w.__clearMockEmit({
+        type: 'message-added',
+        message: {
+          id: 'mpr-t',
+          sessionId: 'spf',
+          seq: 9102,
+          createdAt: now,
+          message: { role: 'tool', tool_call_id: 'tpr1', content: 'Apresentado ao usuário: …' },
+          meta: {
+            toolStatus: 'ok',
+            presentFiles: { deviceId: 'dev-escritorio', deviceName: 'PC do escritório', files }
+          }
+        }
+      })
+    }, HROOT)
+    await viewer().waitFor()
+    assert.equal(await viewerName(), 'log-grande.txt')
+    await viewer().getByTestId('viewer-progress').waitFor()
+    const label = await viewer().getByTestId('viewer-body').innerText()
+    assert.match(label, /Baixando do host… .* de /)
+    await shot('10-remote-progress')
+    await viewer().getByTestId('viewer-text').waitFor({ timeout: 15_000 })
+    const reads = (await remoteCalls()).filter((c) => c.startsWith('read:log-grande.txt'))
+    assert.ok(reads.length >= 3, `pedaços: ${reads.length}`)
+    const text = await viewer().getByTestId('viewer-text').innerText()
+    assert.match(text, /^000001 INFO pedido processado/)
+    // ações remotas: Abrir no app + Salvar como…, nunca Mostrar na pasta
+    const labels = await toolbarLabels()
+    assert.ok(labels.includes('Salvar como…'), labels.join(', '))
+    assert.ok(labels.includes('Abrir no app'))
+    assert.ok(!labels.includes('Mostrar na pasta'))
+    await viewer().getByRole('button', { name: 'Salvar como…' }).click()
+    await page.waitForTimeout(200)
+    assert.match((await osCalls()).at(-1) ?? '', /^save:log-grande\.txt:\d+$/)
+    // o card do arquivo do host fica ativo e sem a nota "Arquivo no …"
+    const c = card('log-grande.txt')
+    assert.equal(await c.getAttribute('data-active'), 'true')
+    assert.equal(await c.getByTestId('pf-note').count(), 0)
+    await shot('11-remote-text')
+    return `${reads.length} pedaços`
+  })
+
+  await step('remoto: aba Arquivos lista o host; PDF por blob URL no visualizador', async () => {
+    await page.getByRole('tab', { name: 'Arquivos' }).click()
+    const panel = page.getByTestId('right-panel')
+    await panel.getByTestId('files-remote').waitFor()
+    assert.match(await panel.getByTestId('files-remote').innerText(), /PC do escritório/)
+    // ações locais (raiz/pasta nova) somem no controle remoto
+    assert.equal(await panel.getByRole('button', { name: 'Usar como raiz' }).count(), 0)
+    assert.equal(await panel.getByRole('button', { name: 'Escolher pasta…' }).count(), 0)
+    const entry = (name: string): ReturnType<Page['locator']> =>
+      panel.getByTestId('files-entry').filter({ hasText: name })
+    await entry('relatorio-final.pdf').waitFor()
+    assert.ok((await remoteCalls()).includes(`list:${HROOT}`))
+    assert.equal(await entry('dados').count(), 1)
+    await entry('relatorio-final.pdf').click()
+    const pdf = viewer().getByTestId('viewer-pdf')
+    await pdf.waitFor()
+    const src = (await pdf.getAttribute('src')) ?? ''
+    assert.match(src, /^blob:/)
+    await page.waitForTimeout(1500)
+    await shot('12-remote-pdf')
+    // o PDF carregou no frame (o visualizador do Chromium cria o frame do plugin)
+    const frames = page.frames().map((f) => f.url())
+    return `frames: ${frames.filter((u) => u.startsWith('blob:') || u.includes('pdf')).join(' | ') || '(nenhum)'}`
+  })
+
+  await step('remoto: HTML isolado (blob + CSP), sem o toggle de scripts', async () => {
+    const panel = page.getByTestId('right-panel')
+    await panel.getByTestId('files-entry').filter({ hasText: 'pagina.html' }).click()
+    const frame = viewer().getByTestId('viewer-html')
+    await frame.waitFor()
+    assert.match((await frame.getAttribute('src')) ?? '', /^blob:/)
+    assert.equal(await frame.getAttribute('sandbox'), '')
+    assert.equal(await viewer().getByText('Permitir scripts (isolado)').count(), 0)
+    await page.waitForTimeout(400)
+    await shot('13-remote-html')
+  })
+
+  await step(
+    'remoto: tipo sem prévia → Salvar como… / Abrir arquivo (sem explorador)',
+    async () => {
+      const panel = page.getByTestId('right-panel')
+      await panel.getByTestId('files-entry').filter({ hasText: 'backup.zip' }).click()
+      const pane = viewer().getByTestId('viewer-unsupported')
+      await pane.waitFor()
+      assert.equal(
+        await pane.getByRole('button', { name: 'Mostrar local do arquivo no explorador' }).count(),
+        0
+      )
+      const before = (await remoteCalls()).filter((c) => c.startsWith('read:backup.zip')).length
+      assert.equal(before, 1, 'prévia: só o começo')
+      await pane.getByRole('button', { name: 'Abrir arquivo' }).click()
+      await page.waitForFunction(
+        () =>
+          ((window as any).__mockViewerCalls as string[]).some((c) => c.startsWith('open-temp:')),
+        undefined,
+        { timeout: 15_000 }
+      )
+      assert.match((await osCalls()).at(-1) ?? '', /^open-temp:backup\.zip:3150049$/)
+      await pane.getByRole('button', { name: 'Salvar como…' }).click()
+      await page.waitForTimeout(200)
+      assert.match((await osCalls()).at(-1) ?? '', /^save:backup\.zip:3150049$/)
+      await shot('14-remote-unsupported')
+    }
+  )
+
+  await step('remoto: reabrir usa o cache (só confere tamanho/mtime)', async () => {
+    const panel = page.getByTestId('right-panel')
+    const n0 = (await remoteCalls()).length
+    await panel.getByTestId('files-entry').filter({ hasText: 'relatorio-final.pdf' }).click()
+    await viewer().getByTestId('viewer-pdf').waitFor()
+    const added = (await remoteCalls()).slice(n0).filter((c) => c.startsWith('read:'))
+    assert.deepEqual(added, ['read:relatorio-final.pdf:0:0'])
+  })
+
+  await step('remoto: host offline → estados "Host offline" no painel e na aba', async () => {
+    await hostState('host-offline')
+    await viewer().getByRole('button', { name: 'Recarregar' }).click()
+    const problem = viewer().getByTestId('viewer-problem')
+    await problem.waitFor()
+    assert.match(await problem.innerText(), /Host offline[\s\S]*PC do escritório/)
+    const panel = page.getByTestId('right-panel')
+    await panel.getByRole('button', { name: 'Recarregar' }).click()
+    await panel.getByText(/Host offline —/).waitFor()
+    await shot('15-remote-offline')
   })
 
   await app.close()

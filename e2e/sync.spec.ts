@@ -500,6 +500,77 @@ async function main(): Promise<void> {
   })
 
   await step(
+    'arquivos do host: B navega na aba Arquivos de A e abre arquivos (fs.list / fs.read cifrados)',
+    async () => {
+      // A é o host do "Chat com terminal" (raiz = BASE no disco de A); B é controle remoto
+      const dir = join(BASE, 'remoto')
+      mkdirSync(dir, { recursive: true })
+      writeFileSync(join(dir, 'relatorio.md'), '# Relatório do host\n\nGerado no PC de casa.\n')
+      writeFileSync(
+        join(dir, 'pixel.png'),
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+          'base64'
+        )
+      )
+      writeFileSync(join(dir, 'grande.bin'), Buffer.alloc(1_200_000, 7))
+      const list = await api(B, 'sync.remoteListDir', toolChat.id, '')
+      assert(list.ok && list.root === BASE && list.confine === true, JSON.stringify(list))
+      assert(
+        list.entries.some((e: any) => e.name === 'remoto' && e.kind === 'dir'),
+        'raiz do host listada'
+      )
+      const out = await api(B, 'sync.remoteListDir', toolChat.id, '..')
+      assert(!out.ok && out.reason === 'denied', `fora da raiz negado: ${JSON.stringify(out)}`)
+      // pedaços: o resultado chega como bytes (Uint8Array) pelo IPC
+      const chunk = await B.page.evaluate(
+        async ([id, p]) => {
+          const r = await (window as any).api.sync.remoteReadFile(id, p, 0, 4 * 1024 * 1024)
+          return r.ok
+            ? { ok: true, len: r.data.length, typed: r.data instanceof Uint8Array, size: r.size }
+            : r
+        },
+        [toolChat.id, join(dir, 'grande.bin')] as const
+      )
+      assert(
+        chunk.ok && chunk.typed && chunk.len === 512 * 1024 && chunk.size === 1_200_000,
+        `pedaço de 512 KiB: ${JSON.stringify(chunk)}`
+      )
+      // UI: aba Arquivos de B mostra a raiz do host e abre no painel por blob URL
+      await openChatUi(B, 'Chat com terminal')
+      if (!(await B.page.getByRole('tab', { name: 'Arquivos' }).count()))
+        await B.page.getByRole('button', { name: 'Abrir painel' }).click()
+      await B.page.getByRole('tab', { name: 'Arquivos' }).click()
+      const panel = B.page.getByTestId('right-panel')
+      await panel.getByTestId('files-remote').waitFor({ timeout: 10_000 })
+      await panel.getByTestId('files-entry').filter({ hasText: 'remoto' }).click()
+      await panel.getByTestId('files-entry').filter({ hasText: 'relatorio.md' }).click()
+      const viewer = B.page.getByTestId('file-viewer')
+      await viewer.locator('.md h1').filter({ hasText: 'Relatório do host' }).waitFor({
+        timeout: 15_000
+      })
+      const labels = await viewer
+        .locator('button[aria-label]')
+        .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')))
+      assert(labels.includes('Salvar como…'), `Salvar como… (${labels.join(', ')})`)
+      assert(!labels.includes('Mostrar na pasta'), 'sem Mostrar na pasta')
+      await panel.getByTestId('files-entry').filter({ hasText: 'pixel.png' }).click()
+      const img = viewer.getByTestId('viewer-image')
+      await img.waitFor({ timeout: 15_000 })
+      const loaded = await img.evaluate(async (el: HTMLImageElement) => {
+        if (!el.complete) await new Promise((r) => el.addEventListener('load', r, { once: true }))
+        return { src: el.src.slice(0, 5), w: el.naturalWidth }
+      })
+      assert(
+        loaded.src === 'blob:' && loaded.w === 1,
+        `imagem por blob: (CSP): ${JSON.stringify(loaded)}`
+      )
+      await shot(B, 'arquivos-do-host')
+      return `raiz do host ${list.root}`
+    }
+  )
+
+  await step(
     'divergência: B roda offline, A roda online → divergente; B mantém a sua; A recebe',
     async () => {
       const bDevice = (await status(B)).device.id

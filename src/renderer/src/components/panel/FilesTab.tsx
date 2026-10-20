@@ -6,6 +6,7 @@ import {
   FolderPlus,
   FolderRoot,
   House,
+  MonitorSmartphone,
   RefreshCw,
   WifiOff
 } from 'lucide-react'
@@ -126,8 +127,14 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
   const patchConfig = useStore((s) => s.patchConfig)
   const run = useStore((s) => s.run)
   const tick = useStore((s) => s.fsTick[chat.id] ?? 0)
-  const root = chat.config.cwd
-  const confine = chat.config.confineToRoot !== false
+  // fonte da listagem: local, ou a do HOST no controle remoto (lib/fileSources → remoteFiles)
+  const host = useHostInfo(chat.id)
+  const dirSource = sourcesFor(chat.id, host?.mode).dir
+  const remoteMode = dirSource.id === 'remote'
+  // controle remoto: raiz e confinamento são os do chat NO HOST (vêm com a listagem)
+  const [remoteRoot, setRemoteRoot] = useState<{ root: string; confine: boolean } | null>(null)
+  const root = remoteMode ? (remoteRoot?.root ?? host?.hostCwd?.path ?? '') : chat.config.cwd
+  const confine = remoteMode ? (remoteRoot?.confine ?? true) : chat.config.confineToRoot !== false
   const [dir, setDir] = useState(root)
   const [reload, setReload] = useState(0)
   const [creating, setCreating] = useState(false)
@@ -136,10 +143,8 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
     entries?: DirEntry[]
     error?: string
     offline?: boolean
+    truncated?: boolean
   } | null>(null)
-  // fonte da listagem: local hoje; a do host no controle remoto quando existir (lib/fileSources)
-  const host = useHostInfo(chat.id)
-  const dirSource = sourcesFor(chat.id, host?.mode).dir
   const active = useStore((s) => s.viewer[chat.id])
   const openFile = useStore((s) => s.openFile)
   const [prevRoot, setPrevRoot] = useState(root)
@@ -147,22 +152,40 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
     setPrevRoot(root)
     setDir(root)
   }
+  const [prevMode, setPrevMode] = useState(remoteMode)
+  if (prevMode !== remoteMode) {
+    setPrevMode(remoteMode)
+    setRemoteRoot(null)
+  }
   // Confinado: a navegação nunca sobe acima da raiz.
   const shownDir = confine && !insideRoot(dir, root) ? root : dir
+  // remota sem a raiz do host ainda: pede '' (o host responde com a raiz dele)
+  const requestDir = remoteMode && !remoteRoot ? '' : shownDir
 
   useEffect(() => {
     const ctl = new AbortController()
-    void dirSource.listDir(chat.id, shownDir, ctl.signal).then((r) => {
+    void dirSource.listDir(chat.id, requestDir, ctl.signal).then((r) => {
       if (ctl.signal.aborted) return
+      if (r.ok && r.root !== undefined && dirSource.id === 'remote')
+        setRemoteRoot((cur) =>
+          cur && cur.root === r.root && cur.confine === (r.confine !== false)
+            ? cur
+            : { root: r.root!, confine: r.confine !== false }
+        )
       setListing(
         r.ok
-          ? { dir: shownDir, entries: r.entries }
-          : { dir: shownDir, error: r.message, offline: r.reason === 'host-offline' }
+          ? {
+              dir: requestDir === '' && r.root !== undefined ? r.dir : requestDir,
+              entries: r.entries,
+              truncated: r.truncated
+            }
+          : { dir: requestDir, error: r.message, offline: r.reason === 'host-offline' }
       )
     })
     return () => ctl.abort()
-  }, [shownDir, tick, reload, dirSource, chat.id])
-  const current = listing?.dir === shownDir ? listing : null
+  }, [requestDir, tick, reload, dirSource, chat.id])
+  const current =
+    listing?.dir === requestDir || (remoteMode && listing?.dir === shownDir) ? listing : null
   const entries = current?.entries ?? null
   const error = current?.error ?? null
   const offline = !!current?.offline
@@ -219,36 +242,48 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
             <RefreshCw />
           </IconButton>
         </div>
-        <div className="flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            variant="secondary"
-            className="flex-1"
-            disabled={shownDir === root}
-            icon={<FolderInput className="size-3.5" />}
-            onClick={() => patchConfig(chat.id, { cwd: shownDir })}
+        {remoteMode ? (
+          <div
+            data-testid="files-remote"
+            className="flex items-center gap-1.5 text-[11.5px] text-subtle"
           >
-            Usar como raiz
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="flex-1"
-            icon={<FolderOpen className="size-3.5" />}
-            onClick={() => void pick()}
-          >
-            Escolher pasta…
-          </Button>
-          <IconButton
-            label="Nova pasta…"
-            size="sm"
-            active={creating}
-            onClick={() => setCreating((v) => !v)}
-          >
-            <FolderPlus />
-          </IconButton>
-        </div>
-        {creating && (
+            <MonitorSmartphone className="size-3.5 shrink-0" />
+            <span className="min-w-0 truncate">
+              Arquivos do {host?.host?.name ?? 'host'} — clique para visualizar (baixa pelo sync)
+            </span>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              className="flex-1"
+              disabled={shownDir === root}
+              icon={<FolderInput className="size-3.5" />}
+              onClick={() => patchConfig(chat.id, { cwd: shownDir })}
+            >
+              Usar como raiz
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="flex-1"
+              icon={<FolderOpen className="size-3.5" />}
+              onClick={() => void pick()}
+            >
+              Escolher pasta…
+            </Button>
+            <IconButton
+              label="Nova pasta…"
+              size="sm"
+              active={creating}
+              onClick={() => setCreating((v) => !v)}
+            >
+              <FolderPlus />
+            </IconButton>
+          </div>
+        )}
+        {creating && !remoteMode && (
           <NewFolderForm
             parent={shownDir}
             onCancel={() => setCreating(false)}
@@ -306,6 +341,11 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
         {entries && sorted.length === 0 && (
           <div className="px-2 py-6 text-center text-xs text-subtle">Pasta vazia</div>
         )}
+        {current?.truncated && (
+          <div className="px-2 py-1.5 text-[11px] text-subtle">
+            Pasta grande: mostrando só as primeiras {sorted.length} entradas.
+          </div>
+        )}
         {sorted.map((e) => {
           const path = e.path || join(shownDir, e.name)
           const isActive = !e.isDir && active?.path === path
@@ -317,7 +357,9 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
               data-testid="files-entry"
               aria-current={isActive ? 'true' : undefined}
               title={
-                e.isDir ? undefined : `${e.name} — clique para visualizar, duplo clique abre no app`
+                e.isDir
+                  ? undefined
+                  : `${e.name} — clique para visualizar, duplo clique abre no app${remoteMode ? ' (baixa do host)' : ''}`
               }
               onClick={() => (e.isDir ? setDir(path) : openInViewer(e, path))}
               onDoubleClick={() => !e.isDir && void openInApp(path)}

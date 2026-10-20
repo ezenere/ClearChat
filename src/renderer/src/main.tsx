@@ -4,6 +4,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import App from './App'
 import { installApi } from './lib/api'
+import { setupRemoteSources } from './lib/remoteSourcesSetup'
 
 async function start(): Promise<void> {
   // Mock de desenvolvimento (apenas para screenshots/design sem backend). A condição é
@@ -15,6 +16,8 @@ async function start(): Promise<void> {
     const { useStore } = await import('./store')
     ;(window as unknown as { __clearStore?: typeof useStore }).__clearStore = useStore
   }
+  // fonte remota de arquivos (chat em controle remoto: busca do host pelo sync)
+  setupRemoteSources()
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <App />

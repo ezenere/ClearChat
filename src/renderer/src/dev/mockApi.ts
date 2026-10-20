@@ -39,7 +39,7 @@ import {
   mockPersonaMemory,
   MOCK_COLS
 } from './mockMemory'
-import { createMockViewer, seedViewerScenario } from './mockViewer'
+import { createMockRemoteFs, createMockViewer, seedViewerScenario } from './mockViewer'
 import type {
   ApprovalSettings,
   AgentEvent,
@@ -661,6 +661,8 @@ export function createMockApi(scenario: string): ClearApi {
     new Promise((r) => setTimeout(() => r(structuredClone(v)), ms))
 
   // Chat com present_file (cards + painel de arquivo) — ver mockViewer.ts
+  // (+ arquivos de um host simulado para o controle remoto: sync.remoteListDir / remoteReadFile)
+  const remoteFs = createMockRemoteFs({ delay })
   if (scenario !== 'onboarding')
     seedViewerScenario({ home: HOME, cfg, chats, sessions, messages, files, msg })
 
@@ -1312,7 +1314,10 @@ export function createMockApi(scenario: string): ClearApi {
       downloadSkills: noSync,
       removeCloudSkill: noSync,
       stopTrackingSkill: noSync,
-      hostSkills: () => delay(null)
+      hostSkills: () => delay(null),
+      remoteListDir: (chatId, path) => remoteFs.remoteListDir(chatId, path),
+      remoteReadFile: (chatId, path, offset, length) =>
+        remoteFs.remoteReadFile(chatId, path, offset, length)
     },
     memory: createMemoryMock({
       emit,
@@ -1570,7 +1575,11 @@ export function createMockApi(scenario: string): ClearApi {
       compact: () => delay({ scheduled: false }),
       stopSubagents: () => delay(undefined)
     },
-    viewer: createMockViewer({ messages: () => messages, delay }),
+    viewer: {
+      ...createMockViewer({ messages: () => messages, delay }),
+      saveBytes: (name, bytes) => remoteFs.saveBytes(name, bytes),
+      openBytes: (name, bytes) => remoteFs.openBytes(name, bytes)
+    },
     fs: {
       listDir: (p) =>
         delay(

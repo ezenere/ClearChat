@@ -49,6 +49,8 @@ import {
   type ViewerDeps
 } from './fileViewer'
 import type { ViewerTarget } from '@shared/ipc'
+import { checkedBytes, writeViewerTemp } from './viewerTemp'
+import { safeFileName } from '@shared/remoteFs'
 import * as runner from './agent/runner'
 import * as memory from './memory'
 import { answerQuestion } from './agent/questions'
@@ -56,8 +58,8 @@ import { bwrapAvailable } from './tools/bash'
 import { listProcesses, processLogLines, stopChatProcesses, stopProcess } from './tools/processes'
 import { shellInfoLite } from './tools/shellEnv'
 import { ripgrepAvailable } from './tools/search'
-import { readFile as readFileAsync, stat } from 'fs/promises'
-import { basename } from 'path'
+import { readFile as readFileAsync, stat, writeFile as writeFileAsync } from 'fs/promises'
+import { basename, join } from 'path'
 import { ATTACHMENT_LIMITS } from '@shared/limits'
 import { formatSize } from '@shared/attachments'
 import { saveAttachment } from './attachments'
@@ -387,6 +389,23 @@ export function registerIpc(): void {
       if (err) throw new Error(err)
     },
     [IPC.viewer.showInFolder]: (token: string) => shell.showItemInFolder(grantedPath(token)),
+    // arquivo buscado de outro dispositivo (controle remoto): bytes vêm do renderer
+    [IPC.viewer.saveBytes]: async (name: string, bytes: Uint8Array): Promise<boolean> => {
+      const buf = checkedBytes(bytes)
+      const win = BrowserWindow.getFocusedWindow()
+      const opts: Electron.SaveDialogOptions = {
+        title: 'Salvar como',
+        defaultPath: join(app.getPath('downloads'), safeFileName(name))
+      }
+      const r = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
+      if (r.canceled || !r.filePath) return false
+      await writeFileAsync(r.filePath, buf)
+      return true
+    },
+    [IPC.viewer.openBytes]: async (name: string, bytes: Uint8Array) => {
+      const err = await shell.openPath(writeViewerTemp(name, bytes))
+      if (err) throw new Error(err)
+    },
 
     // ---- anexos ----
     [IPC.attachments.pick]: async (): Promise<AttachmentPickResult> => {

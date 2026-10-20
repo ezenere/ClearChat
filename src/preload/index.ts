@@ -63,7 +63,9 @@ const api: ClearApi = {
     check: (chatId, messageId) => invoke(IPC.viewer.check, chatId, messageId),
     readText: (token) => invoke(IPC.viewer.readText, token),
     openExternal: (token) => invoke(IPC.viewer.openExternal, token),
-    showInFolder: (token) => invoke(IPC.viewer.showInFolder, token)
+    showInFolder: (token) => invoke(IPC.viewer.showInFolder, token),
+    saveBytes: (name, bytes) => invoke(IPC.viewer.saveBytes, name, bytes),
+    openBytes: (name, bytes) => invoke(IPC.viewer.openBytes, name, bytes)
   },
   app: {
     capabilities: () => invoke(IPC.app.capabilities)
@@ -167,7 +169,10 @@ const api: ClearApi = {
     downloadSkills: (names) => invoke(IPC.sync.downloadSkills, names),
     removeCloudSkill: (name) => invoke(IPC.sync.removeCloudSkill, name),
     stopTrackingSkill: (name) => invoke(IPC.sync.stopTrackingSkill, name),
-    hostSkills: (chatId) => invoke(IPC.sync.hostSkills, chatId)
+    hostSkills: (chatId) => invoke(IPC.sync.hostSkills, chatId),
+    remoteListDir: (chatId, path) => invoke(IPC.sync.remoteListDir, chatId, path),
+    remoteReadFile: (chatId, path, offset, length) =>
+      invoke(IPC.sync.remoteReadFile, chatId, path, offset, length)
   },
   onEvent: (cb) => {
     const listener = (_e: IpcRendererEvent, event: AgentEvent): void => cb(event)

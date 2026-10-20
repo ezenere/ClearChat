@@ -190,7 +190,12 @@ export function PresentFileCards({
               <CircleAlert className="size-3" /> Não apresentado: {f.error}
             </>
           )
-        else if (remote && source.id === 'local')
+        // fonte local: qualquer arquivo de outro dispositivo; remota: só o que não está no host
+        // atual (um terceiro dispositivo) — o do host abre no painel, buscado pelo sync
+        else if (
+          remote &&
+          (source.id === 'local' || (check && !check.ok && check.reason === 'remote'))
+        )
           note = (
             <>
               <MonitorSmartphone className="size-3" /> Arquivo no {remote}
@@ -211,6 +216,7 @@ export function PresentFileCards({
         const unavailable = !!note || pending || !result
         // "Mostrar na pasta" só com a capacidade da fonte (nunca para arquivo remoto)
         const reachable = !remote || source.id !== 'local'
+        // remota: "Abrir no app" baixa do host para um temporário e abre
         const caps = source.capabilities
         return (
           <Card

@@ -317,6 +317,15 @@ export const VIEWER_HTML_CSP =
   "script-src 'unsafe-inline'; media-src clearchat-file: data:; font-src data:; " +
   "base-uri 'none'; form-action 'none'"
 
+/**
+ * CSP do HTML vindo de OUTRO dispositivo (controle remoto): servido por blob URL ao mesmo iframe
+ * isolado, com esta política injetada num <meta> (blob: não tem cabeçalho). Sem rede e sem assets
+ * relativos (os bytes estão no host); o documento ainda herda a CSP do app, que barra scripts.
+ */
+export const VIEWER_REMOTE_HTML_CSP =
+  "default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; " +
+  "media-src data:; font-src data:; base-uri 'none'; form-action 'none'"
+
 // ---------------- argumentos / resultado de present_file ----------------
 
 export interface PresentFileRequest {

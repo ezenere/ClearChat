@@ -22,6 +22,13 @@ import { isBranchEditable, toBranchSel } from '@shared/branches'
 import type { ApprovalItemDecision } from '@shared/approvalPolicy'
 import type { ChatHostInfo, ChatHostMode, HostStatus, TakeoverOptions } from '@shared/sync'
 import {
+  REMOTE_FS_LIMITS,
+  type RemoteDirResult,
+  type RemoteFsEntry,
+  type RemoteFsFailure,
+  type RemoteReadResult
+} from '@shared/remoteFs'
+import {
   aadCommand,
   aadCommandResult,
   aadStream,
@@ -39,6 +46,13 @@ import {
   type DraftState
 } from './stream'
 import type { SyncEngine } from './engine'
+import {
+  chatRootFrom,
+  hostListDir,
+  hostReadFile,
+  RemoteFsError,
+  type RemoteFsLimits
+} from './remoteFs'
 
 /** O que o host precisa do runner (o app liga em sync/index.ts; os testes usam um stub). */
 export interface RunnerAdapter {
@@ -143,13 +157,22 @@ interface Publisher {
 
 interface PendingCmd {
   chatId: string
-  resolve: (r: { status: string; queued?: boolean; error?: string }) => void
+  resolve: (r: Record<string, unknown>) => void
   reject: (e: Error) => void
   timer: ReturnType<typeof setTimeout>
 }
 
 /** Comando cujo host não existe (o controle remoto pode rodar localmente). */
 export class NoHostError extends Error {}
+
+/** O comando não teve resultado: o host caiu antes (`host_offline`) ou não respondeu a tempo. */
+export class RemoteFailedError extends Error {
+  code: 'host_offline' | 'command_timeout'
+  constructor(code: 'host_offline' | 'command_timeout', message: string) {
+    super(message)
+    this.code = code
+  }
+}
 
 const BUSY_STATUS = new Set([
   'running',
@@ -179,6 +202,12 @@ const CONTENT_CMDS = new Set([
   'branch.regenerate',
   'branch.select'
 ])
+
+/**
+ * Comandos de arquivos do host (§8.6, desde 1.3.0): só leitura, sem janela (nem dedupe — repetir
+ * é inofensivo), aceitos com o agente rodando. Mesmas regras de raiz/confinamento da aba Arquivos.
+ */
+export const FS_CMDS = new Set(['fs.list', 'fs.read'])
 
 /**
  * Janela de cada ação de conteúdo (§8.6) — no host (comando remoto) e no portão local (gateChat,
@@ -226,6 +255,8 @@ export class HostController {
     string,
     { at: number; list: { name: string; description: string }[] }
   >()
+  /** Tetos de fs.list/fs.read no host (os testes encolhem). */
+  fsLimits: RemoteFsLimits = { ...REMOTE_FS_LIMITS }
 
   private engine: SyncEngine
 
@@ -935,42 +966,62 @@ export class HostController {
 
   // ---------------- comandos remotos: controle remoto → host ----------------
 
+  /**
+   * Cifra e envia um comando ao host e espera o `remote.result` decifrado. Erros crus: o
+   * `WsRequestError` do `remote.send`, ou `RemoteFailedError` (host caiu / sem resposta).
+   */
+  private async commandResult(
+    chatId: string,
+    kind: string,
+    payload: Record<string, unknown>,
+    timeoutMs: number,
+    timeoutText: string
+  ): Promise<Record<string, unknown>> {
+    const sk = this.engine.sk
+    if (!sk) throw new Error('Conta bloqueada.')
+    const cmd_id = randomUUID()
+    const env = sealJson(sk.stream, aadCommand(this.engine.userId, chatId, cmd_id), {
+      sv: 1,
+      kind,
+      ...payload
+    })
+    const result = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingCmds.delete(cmd_id)
+        reject(new RemoteFailedError('command_timeout', timeoutText))
+      }, timeoutMs)
+      this.pendingCmds.set(cmd_id, { chatId, resolve, reject, timer })
+    })
+    result.catch(() => undefined)
+    try {
+      await this.engine.ws.request('remote.send', { chat_id: chatId, cmd_id, kind, env })
+    } catch (e) {
+      const p = this.pendingCmds.get(cmd_id)
+      if (p) clearTimeout(p.timer)
+      this.pendingCmds.delete(cmd_id)
+      throw e
+    }
+    return result
+  }
+
   /** Envia um comando ao host do chat e espera o resultado (accepted / rejected / falha). */
   async sendCommand(
     chatId: string,
     kind: string,
     payload: Record<string, unknown>
   ): Promise<{ status: string; queued?: boolean; error?: string }> {
-    const sk = this.engine.sk
-    if (!sk) throw new Error('Conta bloqueada.')
     const k = remoteKind(kind)
     const name = this.hostName(chatId)
-    const cmd_id = randomUUID()
-    const env = sealJson(sk.stream, aadCommand(this.engine.userId, chatId, cmd_id), {
-      sv: 1,
-      kind: k,
-      ...payload
-    })
-    const result = new Promise<{ status: string; queued?: boolean; error?: string }>(
-      (resolve, reject) => {
-        const timer = setTimeout(() => {
-          this.pendingCmds.delete(cmd_id)
-          reject(
-            new Error(
-              `O host (${name}) não respondeu a tempo — o comando pode não ter sido entregue.`
-            )
-          )
-        }, 40_000)
-        this.pendingCmds.set(cmd_id, { chatId, resolve, reject, timer })
-      }
-    )
-    result.catch(() => undefined)
+    let r: { status: string; queued?: boolean; error?: string }
     try {
-      await this.engine.ws.request('remote.send', { chat_id: chatId, cmd_id, kind: k, env })
+      r = (await this.commandResult(
+        chatId,
+        k,
+        payload,
+        40_000,
+        `O host (${name}) não respondeu a tempo — o comando pode não ter sido entregue.`
+      )) as typeof r
     } catch (e) {
-      const p = this.pendingCmds.get(cmd_id)
-      if (p) clearTimeout(p.timer)
-      this.pendingCmds.delete(cmd_id)
       if (e instanceof WsRequestError) {
         if (e.code === 'host_offline')
           throw new Error(`O host (${name}) está offline.`, { cause: e })
@@ -986,9 +1037,176 @@ export class HostController {
       }
       throw e
     }
-    const r = await result
     if (r.status === 'rejected') throw new Error(rejectText(r.error, name))
     return r
+  }
+
+  // ---------------- arquivos do host (controle remoto → host, §8.6 fs.*) ----------------
+
+  /** Aba Arquivos do host: lista `path` (vazio = raiz do chat no host). Nunca lança. */
+  async fsList(chatId: string, path: string): Promise<RemoteDirResult> {
+    const pre = this.fsPrecheck(chatId)
+    if (pre) return pre
+    try {
+      const r = await this.fsCommand(chatId, 'fs.list', { chatId, path: String(path ?? '') })
+      if (r.status !== 'accepted') return this.fsRejected(chatId, r)
+      if (typeof r.dir !== 'string' || !Array.isArray(r.entries))
+        throw new Error('Resposta inválida do host.')
+      const entries: RemoteFsEntry[] = []
+      for (const x of r.entries as Record<string, unknown>[]) {
+        const name = x && typeof x.name === 'string' ? x.name : ''
+        // nome com separador / NUL / . / .. não vira caminho no controle remoto
+        if (!name || /[/\\\0]/.test(name) || name === '.' || name === '..') continue
+        const num = (v: unknown): number | undefined =>
+          typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined
+        const size = num(x.size)
+        const mtime = num(x.mtime)
+        entries.push({
+          name,
+          kind: x.kind === 'dir' ? 'dir' : 'file',
+          ...(size !== undefined ? { size } : {}),
+          ...(mtime !== undefined ? { mtime } : {})
+        })
+      }
+      return {
+        ok: true,
+        dir: r.dir,
+        root: typeof r.root === 'string' && r.root ? r.root : r.dir,
+        confine: r.confine !== false,
+        truncated: r.truncated === true,
+        entries
+      }
+    } catch (e) {
+      return this.fsFailure(chatId, e)
+    }
+  }
+
+  /** Um pedaço (até REMOTE_FS_LIMITS.chunkBytes) de um arquivo do host. Nunca lança. */
+  async fsRead(
+    chatId: string,
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<RemoteReadResult> {
+    const pre = this.fsPrecheck(chatId)
+    if (pre) return pre
+    try {
+      const r = await this.fsCommand(chatId, 'fs.read', { chatId, path, offset, length })
+      if (r.status !== 'accepted') return this.fsRejected(chatId, r)
+      const size = r.size
+      const mtime = r.mtime
+      if (
+        typeof size !== 'number' ||
+        typeof mtime !== 'number' ||
+        r.offset !== offset ||
+        typeof r.data !== 'string'
+      )
+        throw new Error('Resposta inválida do host.')
+      const data = Buffer.from(r.data, 'base64')
+      if (data.length > Math.max(length, 0)) throw new Error('Resposta inválida do host.')
+      return {
+        ok: true,
+        size,
+        mtime,
+        ...(typeof r.mime === 'string' && r.mime ? { mime: r.mime } : {}),
+        offset,
+        data: new Uint8Array(data.buffer, data.byteOffset, data.length)
+      }
+    } catch (e) {
+      return this.fsFailure(chatId, e)
+    }
+  }
+
+  private fsCommand(
+    chatId: string,
+    kind: 'fs.list' | 'fs.read',
+    payload: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    return this.commandResult(
+      chatId,
+      kind,
+      payload,
+      REMOTE_FS_LIMITS.timeoutMs,
+      `O host (${this.hostName(chatId)}) não respondeu a tempo.`
+    )
+  }
+
+  private fsFail(
+    chatId: string,
+    reason: RemoteFsFailure['reason'],
+    message: string
+  ): RemoteFsFailure {
+    return { ok: false, reason, message, deviceName: this.hostName(chatId) }
+  }
+
+  /** Só com o host online (§8.6): offline/sem conexão viram "Host offline" sem ir à rede. */
+  private fsPrecheck(chatId: string): RemoteFsFailure | null {
+    const mode = this.mode(chatId)
+    const name = this.hostName(chatId)
+    switch (mode) {
+      case 'remote':
+        return null
+      case 'host-offline':
+        return this.fsFail(chatId, 'host-offline', `O host (${name}) está offline.`)
+      case 'offline':
+        return this.fsFail(chatId, 'host-offline', 'Sem conexão com o servidor do sync.')
+      case 'diverged':
+        return this.fsFail(chatId, 'error', 'Este chat está divergente: escolha a versão antes.')
+      case 'local':
+        return this.fsFail(chatId, 'error', 'Este dispositivo executa o chat.')
+      default:
+        return this.fsFail(chatId, 'error', 'Sync desligado.')
+    }
+  }
+
+  private fsRejected(chatId: string, r: Record<string, unknown>): RemoteFsFailure {
+    const name = this.hostName(chatId)
+    const error = typeof r.error === 'string' ? r.error : ''
+    // host < 1.3.0 (app 0.7) não conhece fs.*
+    if (/^comando desconhecido: fs\./.test(error))
+      return this.fsFail(
+        chatId,
+        'unsupported',
+        `O host (${name}) usa uma versão antiga do ClearChat — atualize o app nele para ver os arquivos.`
+      )
+    if (error === 'not_host')
+      return this.fsFail(chatId, 'host-offline', `${name} não é mais o host deste chat.`)
+    if (r.code === 'denied') return this.fsFail(chatId, 'denied', error || 'Acesso negado.')
+    if (r.code === 'missing')
+      return this.fsFail(chatId, 'missing', error || 'Arquivo não encontrado.')
+    return this.fsFail(chatId, 'error', error || `O host (${name}) recusou o pedido.`)
+  }
+
+  private fsFailure(chatId: string, e: unknown): RemoteFsFailure {
+    const name = this.hostName(chatId)
+    if (e instanceof RemoteFailedError)
+      return e.code === 'host_offline'
+        ? this.fsFail(chatId, 'host-offline', `O host (${name}) caiu antes de responder.`)
+        : this.fsFail(chatId, 'error', `O host (${name}) não respondeu a tempo.`)
+    if (e instanceof WsRequestError) {
+      if (e.code === 'host_offline')
+        return this.fsFail(chatId, 'host-offline', `O host (${name}) está offline.`)
+      if (e.code === 'no_host')
+        return this.fsFail(chatId, 'host-offline', 'Este chat não tem host.')
+      if (e.code === 'chat_diverged') {
+        this.markDiverged(chatId, (e.details.diverged as Record<string, unknown>) ?? null)
+        return this.fsFail(chatId, 'error', 'Este chat está divergente: escolha a versão antes.')
+      }
+      // servidor < 1.3.0 recusa o kind desconhecido
+      if (e.code === 'invalid_request')
+        return this.fsFail(
+          chatId,
+          'unsupported',
+          'O servidor do sync ainda não permite ver arquivos do host — atualize o servidor.'
+        )
+      if (e.code === 'disconnected' || e.code === 'timeout')
+        return this.fsFail(
+          chatId,
+          'host-offline',
+          'Sem conexão com o servidor — não foi possível falar com o host.'
+        )
+    }
+    return this.fsFail(chatId, 'error', errMsg(e))
   }
 
   private onRemoteResult(f: Record<string, unknown>): void {
@@ -1000,11 +1218,15 @@ export class HostController {
     const name = this.hostName(p.chatId)
     if (f.t === 'remote.failed') {
       p.reject(
-        new Error(
-          f.code === 'command_timeout'
-            ? `O host (${name}) não respondeu a tempo — a mensagem pode não ter sido entregue.`
-            : `O host (${name}) caiu antes de confirmar — a mensagem pode não ter sido entregue.`
-        )
+        f.code === 'command_timeout'
+          ? new RemoteFailedError(
+              'command_timeout',
+              `O host (${name}) não respondeu a tempo — a mensagem pode não ter sido entregue.`
+            )
+          : new RemoteFailedError(
+              'host_offline',
+              `O host (${name}) caiu antes de confirmar — a mensagem pode não ter sido entregue.`
+            )
       )
       return
     }
@@ -1015,7 +1237,7 @@ export class HostController {
         aadCommandResult(this.engine.userId, p.chatId, cmd),
         f.env as Envelope
       )
-      p.resolve(r as { status: string; queued?: boolean; error?: string })
+      p.resolve(r)
     } catch (e) {
       p.reject(new Error(`Resposta inválida do host: ${errMsg(e)}`))
     }
@@ -1044,14 +1266,18 @@ export class HostController {
       }
     }
     const conn = this.engine.conn
-    const seen = conn
-      .prepare('SELECT result FROM sync_commands_seen WHERE cmd_id = ?')
-      .get(cmdId) as { result: string | null } | undefined
-    if (seen) return reply({ status: 'duplicate' })
-    conn
-      .prepare('INSERT OR IGNORE INTO sync_commands_seen (cmd_id, at) VALUES (?, ?)')
-      .run(cmdId, Date.now())
-    conn.prepare('DELETE FROM sync_commands_seen WHERE at < ?').run(Date.now() - 7 * 86_400_000)
+    const isFs = FS_CMDS.has(kind)
+    // fs.* são leituras: sem dedupe (repetir é inofensivo; um arquivo grande são centenas de pedaços)
+    if (!isFs) {
+      const seen = conn
+        .prepare('SELECT result FROM sync_commands_seen WHERE cmd_id = ?')
+        .get(cmdId) as { result: string | null } | undefined
+      if (seen) return reply({ status: 'duplicate' })
+      conn
+        .prepare('INSERT OR IGNORE INTO sync_commands_seen (cmd_id, at) VALUES (?, ?)')
+        .run(cmdId, Date.now())
+      conn.prepare('DELETE FROM sync_commands_seen WHERE at < ?').run(Date.now() - 7 * 86_400_000)
+    }
     let payload: Record<string, unknown>
     try {
       payload = openJson(
@@ -1065,12 +1291,44 @@ export class HostController {
     const st = this.states.get(chatId)
     if (st?.host && st.host.device_id !== this.me)
       return reply({ status: 'rejected', error: 'not_host' })
+    if (isFs) {
+      try {
+        await reply({ status: 'accepted', ...(await this.executeFs(chatId, kind, payload)) })
+      } catch (e) {
+        await reply({
+          status: 'rejected',
+          error: errMsg(e),
+          ...(e instanceof RemoteFsError ? { code: e.code } : {})
+        })
+      }
+      return
+    }
     try {
       const r = await this.execute(chatId, kind, payload)
       await reply({ status: 'accepted', ...(r.queued !== undefined ? { queued: r.queued } : {}) })
     } catch (e) {
       await reply({ status: 'rejected', error: errMsg(e) })
     }
+  }
+
+  /**
+   * fs.list / fs.read no host: sem janela nem runner; raiz e confinamento do chat NESTE
+   * dispositivo (as regras da aba Arquivos / tools de leitura — sync/remoteFs.ts).
+   */
+  private async executeFs(
+    chatId: string,
+    kind: string,
+    p: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    if (p.chatId !== undefined && p.chatId !== chatId)
+      throw new RemoteFsError('invalid', 'Pedido inválido (chat).')
+    const row = this.engine.conn
+      .prepare('SELECT config_json FROM chats WHERE id = ?')
+      .get(chatId) as { config_json: string } | undefined
+    if (!row) throw new RemoteFsError('missing', 'Chat não encontrado neste dispositivo.')
+    const root = chatRootFrom(row.config_json)
+    if (kind === 'fs.list') return hostListDir(root, p.path, this.fsLimits)
+    return hostReadFile(root, p.path, p.offset, p.length, this.fsLimits)
   }
 
   private sessionInChat(sessionId: unknown, chatId: string): string {

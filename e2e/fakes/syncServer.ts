@@ -294,7 +294,10 @@ const COMMAND_KINDS = new Set([
   'memory.extract',
   'branch.edit',
   'branch.regenerate',
-  'branch.select'
+  'branch.select',
+  // desde 1.3.0: arquivos do host (só leitura, §8.6)
+  'fs.list',
+  'fs.read'
 ])
 const ID_RE = /^[A-Za-z0-9._-]{1,128}$/
 const BLOB_RE = /^[0-9a-f]{64}$/
@@ -1871,6 +1874,8 @@ export async function startFakeSyncServer(opts: FakeSyncOptions = {}): Promise<F
         return ack(c, f, { status: 'delivered' })
       }
       case 'remote.result': {
+        // mesmo teto do remote.send (COMMAND_MAX_BYTES do servidor real vale para o resultado)
+        if (JSON.stringify(f.env).length > COMMAND_MAX) throw err('payload_too_large')
         const key = `${u.id}|${f.cmd_id}`
         const p = pendingCmds.get(key)
         if (p && p.hostDeviceId === dev.id) {

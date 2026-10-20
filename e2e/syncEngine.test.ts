@@ -8,7 +8,19 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import Database from 'better-sqlite3'
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { REMOTE_FS_LIMITS } from '../src/shared/remoteFs'
 import { SCHEMA } from '../src/main/dbSchema'
 import { ensureMemorySchema } from '../src/main/memory/schema'
 import { ensureSearchIndex } from '../src/main/searchIndex'
@@ -1590,4 +1602,168 @@ test('ramos: host executa branch.edit / branch.regenerate / branch.select; recus
   await assert.rejects(send('branch.edit', { messageId: a1, message: msg }), /principal/)
   A.eng.destroy()
   B.eng.destroy()
+})
+
+// ---------------- arquivos do host (fs.list / fs.read, protocolo 1.3.0 — §8.6) ----------------
+
+test('arquivos do host: fs.list / fs.read com as regras de raiz do chat, pedaços, teto, host offline', async () => {
+  const TMP = realpathSync(mkdtempSync(join(tmpdir(), 'cc-remotefs-')))
+  const ROOT = join(TMP, 'proj')
+  const OUT = join(TMP, 'fora')
+  mkdirSync(join(ROOT, 'docs'), { recursive: true })
+  mkdirSync(OUT, { recursive: true })
+  writeFileSync(join(ROOT, 'leia.md'), '# Olá do host\n')
+  writeFileSync(join(ROOT, 'docs', 'nota.txt'), 'nota')
+  // incompressível: o pedaço cheio (512 KiB) precisa caber no teto do remote.result do servidor
+  const big = randomBytes(1_300_000)
+  writeFileSync(join(ROOT, 'grande.bin'), big)
+  writeFileSync(join(OUT, 'segredo.txt'), 'não pode')
+  symlinkSync(join(OUT, 'segredo.txt'), join(ROOT, 'atalho.txt'))
+  symlinkSync(OUT, join(ROOT, 'link-fora'))
+  // esparso de 201 MiB: o host não lê além de REMOTE_FS_LIMITS.maxFileBytes
+  const sparse = join(ROOT, 'enorme.iso')
+  writeFileSync(sparse, '')
+  truncateSync(sparse, 201 * 1024 * 1024)
+  try {
+    const email = await newAccount()
+    const A = device('PC host arquivos', { runner: stubRunner([]) })
+    const { chatId } = addChat(A.conn, 'Arquivos')
+    const setCfg = (cfg: Record<string, unknown>): void => {
+      A.conn
+        .prepare('UPDATE chats SET config_json = ? WHERE id = ?')
+        .run(JSON.stringify({ model: 'fake/m', providerId: '', cwd: ROOT, ...cfg }), chatId)
+    }
+    setCfg({})
+    await login(A, email)
+    await settled(A)
+    await waitFor(() => A.eng.chatInfo(chatId).host?.self, 'A é o host')
+    const B = device('Notebook arquivos', { runner: stubRunner([]) })
+    await login(B, email)
+    await settled(B)
+    await waitFor(() => B.eng.host.mode(chatId) === 'remote', 'B é controle remoto')
+    const seenBefore = (A.conn.prepare('SELECT COUNT(*) AS n FROM sync_commands_seen').get() as any)
+      .n
+
+    // fs.list: '' = raiz do chat NO HOST, pastas primeiro
+    const l = await B.eng.host.fsList(chatId, '')
+    assert.ok(l.ok, JSON.stringify(l))
+    if (!l.ok) return
+    assert.equal(l.dir, ROOT)
+    assert.equal(l.root, ROOT)
+    assert.equal(l.confine, true)
+    assert.equal(l.truncated, false)
+    assert.deepEqual(
+      l.entries.map((e) => `${e.kind}:${e.name}`),
+      [
+        'dir:docs',
+        'dir:link-fora',
+        'file:atalho.txt',
+        'file:enorme.iso',
+        'file:grande.bin',
+        'file:leia.md'
+      ]
+    )
+    assert.equal(l.entries.find((e) => e.name === 'grande.bin')?.size, big.length)
+    const sub = await B.eng.host.fsList(chatId, 'docs')
+    assert.ok(sub.ok && sub.dir === join(ROOT, 'docs') && sub.entries[0].name === 'nota.txt')
+    // fora da raiz (confinado): '..', absoluto, symlink de pasta para fora
+    for (const p of ['..', OUT, join(ROOT, 'link-fora'), `${ROOT}/docs/../../fora`]) {
+      const r = await B.eng.host.fsList(chatId, p)
+      assert.ok(!r.ok && r.reason === 'denied', `${p}: ${JSON.stringify(r)}`)
+      assert.match(r.ok ? '' : r.message, /fora do diretório raiz/)
+    }
+    const miss = await B.eng.host.fsList(chatId, 'nao-existe')
+    assert.ok(!miss.ok && miss.reason === 'missing' && /não encontrada/.test(miss.message))
+
+    // fs.read: começo com mime; pedaços montam o arquivo; pedido grande é cortado no teto
+    const md = await B.eng.host.fsRead(chatId, join(ROOT, 'leia.md'), 0, 1024)
+    assert.ok(md.ok, JSON.stringify(md))
+    if (!md.ok) return
+    assert.equal(Buffer.from(md.data).toString(), '# Olá do host\n')
+    assert.equal(md.mime, 'text/plain; charset=utf-8')
+    assert.equal(md.size, Buffer.byteLength('# Olá do host\n'))
+    const rel = await B.eng.host.fsRead(chatId, 'docs/nota.txt', 0, 100)
+    assert.ok(rel.ok && Buffer.from(rel.data).toString() === 'nota', 'relativo à raiz do host')
+    const parts: Buffer[] = []
+    let off = 0
+    let mtime = -1
+    while (off < big.length) {
+      const r = await B.eng.host.fsRead(chatId, join(ROOT, 'grande.bin'), off, 4 * 1024 * 1024)
+      assert.ok(r.ok, JSON.stringify(r))
+      if (!r.ok) return
+      assert.ok(r.data.length <= REMOTE_FS_LIMITS.chunkBytes, 'pedaço no teto')
+      assert.equal(r.offset, off)
+      assert.equal(r.size, big.length)
+      if (mtime < 0) mtime = r.mtime
+      assert.equal(r.mtime, mtime)
+      assert.equal(r.mime === undefined, off > 0, 'mime só no pedaço do começo')
+      parts.push(Buffer.from(r.data))
+      off += r.data.length
+    }
+    assert.equal(parts.length, Math.ceil(big.length / REMOTE_FS_LIMITS.chunkBytes))
+    assert.ok(Buffer.concat(parts).equals(big), 'arquivo montado = original')
+    const stat0 = await B.eng.host.fsRead(chatId, join(ROOT, 'grande.bin'), 0, 0)
+    assert.ok(stat0.ok && stat0.data.length === 0 && stat0.size === big.length, 'length 0 = stat')
+    const eof = await B.eng.host.fsRead(chatId, join(ROOT, 'grande.bin'), big.length + 10, 100)
+    assert.ok(eof.ok && eof.data.length === 0, 'além do fim: vazio')
+
+    // negados / ausentes
+    const denied = async (p: string): Promise<void> => {
+      const r = await B.eng.host.fsRead(chatId, p, 0, 100)
+      assert.ok(!r.ok && r.reason === 'denied', `${p}: ${JSON.stringify(r)}`)
+    }
+    await denied(join(OUT, 'segredo.txt'))
+    await denied('../fora/segredo.txt')
+    await denied(join(ROOT, 'atalho.txt')) // symlink para fora
+    await denied(join(ROOT, 'link-fora', 'segredo.txt'))
+    for (const p of [join(ROOT, 'docs'), join(ROOT, 'nada.txt')]) {
+      const r = await B.eng.host.fsRead(chatId, p, 0, 100)
+      assert.ok(!r.ok && r.reason === 'missing', `${p}: ${JSON.stringify(r)}`)
+    }
+    const bad = await B.eng.host.fsRead(chatId, join(ROOT, 'leia.md'), -1, 10)
+    assert.ok(!bad.ok && bad.reason === 'error' && /inválido/.test(bad.message))
+
+    // teto do arquivo: nada além de 200 MiB (o pedido que cruza o teto é cortado)
+    const cap = REMOTE_FS_LIMITS.maxFileBytes
+    const near = await B.eng.host.fsRead(chatId, sparse, cap - 10, 1000)
+    assert.ok(near.ok && near.data.length === 10 && near.size === 201 * 1024 * 1024)
+    const over = await B.eng.host.fsRead(chatId, sparse, cap, 1000)
+    assert.ok(!over.ok && over.reason === 'error' && /grande demais/.test(over.message))
+
+    // sem confinamento: o mesmo que a aba Arquivos local já mostra (fora da raiz liberado)
+    setCfg({ confineToRoot: false })
+    const free = await B.eng.host.fsRead(chatId, join(OUT, 'segredo.txt'), 0, 100)
+    assert.ok(free.ok && Buffer.from(free.data).toString() === 'não pode')
+    const freeList = await B.eng.host.fsList(chatId, OUT)
+    assert.ok(freeList.ok && freeList.confine === false)
+    setCfg({})
+
+    // leituras não entram no dedupe nem abrem janela (aceitas com o agente rodando)
+    assert.equal(
+      (A.conn.prepare('SELECT COUNT(*) AS n FROM sync_commands_seen').get() as any).n,
+      seenBefore
+    )
+    assert.equal(A.eng.host.windowOpen(chatId), false)
+    // host < 1.3.0 recusa o kind desconhecido → "atualize o app nele"
+    const old = (B.eng.host as any).fsRejected(chatId, {
+      status: 'rejected',
+      error: 'comando desconhecido: fs.read'
+    })
+    assert.equal(old.reason, 'unsupported')
+    assert.match(old.message, /versão antiga/)
+
+    // host offline → "Host offline" sem ir à rede
+    srv.setRefuseConnections(A.eng.deviceId, true)
+    srv.dropDevice(A.eng.deviceId)
+    await waitFor(() => B.eng.host.mode(chatId) === 'host-offline', 'B vê o host offline')
+    const off1 = await B.eng.host.fsList(chatId, '')
+    assert.ok(!off1.ok && off1.reason === 'host-offline' && off1.deviceName === 'PC host arquivos')
+    const off2 = await B.eng.host.fsRead(chatId, join(ROOT, 'leia.md'), 0, 10)
+    assert.ok(!off2.ok && off2.reason === 'host-offline' && /offline/.test(off2.message))
+    srv.setRefuseConnections(A.eng.deviceId, false)
+    A.eng.destroy()
+    B.eng.destroy()
+  } finally {
+    rmSync(TMP, { recursive: true, force: true })
+  }
 })
