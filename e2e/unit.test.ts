@@ -2247,3 +2247,162 @@ test('trackFailure: só a transição para error vira falha; error na primeira a
     {}
   )
 })
+
+// ---------------- painel: seções recolhíveis (resumos + estado lembrado) ----------------
+import * as cfgSummary from '../src/renderer/src/lib/configSummary.ts'
+import {
+  COLLAPSE_KEY_PREFIX,
+  readCollapse,
+  resetCollapseCache,
+  subscribeCollapse,
+  writeCollapse
+} from '../src/renderer/src/lib/collapse.ts'
+import { normalizeMemoryConfig } from '../src/shared/memory.ts'
+import { normalizeSkillsConfig } from '../src/shared/skills.ts'
+
+test('painel: resumos das seções recolhíveis mostram o que difere do padrão', () => {
+  const base = DEFAULT_CHAT_CONFIG('/home/u/proj', { baseUrl: 'https://openrouter.ai/api/v1' })
+  // parâmetros: padrão = nenhum enviado; ligados → "N alterado(s) · chave valor"
+  assert.deepEqual(cfgSummary.paramsSummary({}), { text: 'padrão', changed: false })
+  assert.deepEqual(cfgSummary.paramsSummary({ temperature: 0.7 }), {
+    text: '1 alterado · temperature 0,7',
+    changed: true
+  })
+  const two = cfgSummary.paramsSummary({ temperature: 0.7, top_p: 0.9, reasoning_effort: 'high' })
+  assert.equal(two.text, '2 alterados · temperature 0,7 · top_p 0,9')
+  // system prompt
+  assert.equal(cfgSummary.systemPromptSummary(base.systemPrompt).changed, false)
+  assert.deepEqual(cfgSummary.systemPromptSummary('Outro'), {
+    text: 'personalizado',
+    changed: true
+  })
+  assert.deepEqual(cfgSummary.systemPromptSummary('  '), { text: 'vazio', changed: true })
+  assert.equal(cfgSummary.systemPromptSummary('Meu padrão', 'Meu padrão').changed, false)
+  // request: cache segue o provedor; body extra conta como alterado
+  assert.deepEqual(cfgSummary.requestSummary(base, true), {
+    text: 'padrão · cache ligado',
+    changed: false
+  })
+  const req = cfgSummary.requestSummary(
+    { ...base, cacheEnabled: false, params: { extraBody: '{"a":1}' } },
+    true
+  )
+  assert.equal(req.text, '2 alterados · cache desligado · body extra')
+  // compactação, raiz, assinatura
+  assert.equal(cfgSummary.compactionSummary(base).changed, false)
+  assert.equal(
+    cfgSummary.compactionSummary({ ...base, autoCompact: true, compactThreshold: 0.7 }).text,
+    '2 alterados · sugere em 70% · automática'
+  )
+  assert.deepEqual(cfgSummary.rootSummary(base, true, 'proj'), { text: 'proj', changed: false })
+  assert.equal(
+    cfgSummary.rootSummary({ ...base, sandboxBash: true, envInPrompt: false }, true, 'proj').text,
+    '2 alterados · sandbox · sem bloco de ambiente'
+  )
+  // sandbox sem bwrap não conta (não tem efeito)
+  assert.equal(cfgSummary.rootSummary({ ...base, sandboxBash: true }, false, 'proj').changed, false)
+  assert.deepEqual(cfgSummary.signatureSummary(undefined), { text: 'ClearChat', changed: false })
+  assert.deepEqual(cfgSummary.signatureSummary('cleartchat'), { text: 'ClearChat', changed: false })
+  assert.deepEqual(cfgSummary.signatureSummary('cline'), { text: 'Cline', changed: true })
+  // tools
+  assert.deepEqual(cfgSummary.approvalsSummary(base), {
+    text: 'segue o padrão global',
+    changed: false
+  })
+  assert.equal(
+    cfgSummary.approvalsSummary({ approvalModes: { commands: 'always', pages: 'smart' } }).text,
+    '2 alterados · Comandos · Páginas'
+  )
+  assert.equal(cfgSummary.smartApproveSummary({}).text, 'sem modelo')
+  assert.equal(
+    cfgSummary.smartApproveSummary({
+      smartApprove: { providerId: 'p1', model: 'openai/gpt-5-mini', timeoutS: 60 } as never
+    }).text,
+    '2 alterados · gpt-5-mini · 60 s'
+  )
+  assert.equal(cfgSummary.toolsSendingSummary(base).changed, false)
+  assert.equal(
+    cfgSummary.toolsSendingSummary({ ...base, nativeTools: false, toolsInPrompt: true }).text,
+    '2 alterados · sem tools nativas · texto no prompt'
+  )
+  assert.equal(cfgSummary.subagentsSummary(base, false, false).changed, false)
+  assert.equal(cfgSummary.subagentsSummary(base, true, false).text, '1 alterado · memória')
+  assert.equal(cfgSummary.limitsSummary(base).changed, false)
+  assert.equal(
+    cfgSummary.limitsSummary({ maxToolOutputChars: 50_000 }).text,
+    '1 alterado · saída máx. 50.000'
+  )
+  const sc = normalizeSkillsConfig({ enabled: true, disabled: ['a', 'b'], subagents: true })
+  assert.equal(
+    cfgSummary.skillsDetailsSummary(sc).text,
+    '2 alterados · 2 desligadas · nos subagentes'
+  )
+  assert.equal(cfgSummary.skillsDetailsSummary(normalizeSkillsConfig(null)).changed, false)
+  // memória
+  const mem = normalizeMemoryConfig(null)
+  assert.deepEqual(cfgSummary.memoryHelpSummary(mem), { text: 'desligadas', changed: false })
+  assert.equal(cfgSummary.memoryExtractionSummary(mem).text, 'manual · modelo do chat')
+  assert.equal(
+    cfgSummary.memoryExtractionSummary({ ...mem, extraction: { ...mem.extraction, auto: true } })
+      .text,
+    '1 alterado · automática'
+  )
+  assert.equal(cfgSummary.memorySubagentsSummary({ ...mem, subagents: true }).changed, true)
+  // helpers
+  assert.equal(cfgSummary.shortModel('anthropic/claude-sonnet-4.5'), 'claude-sonnet-4.5')
+  assert.equal(cfgSummary.baseName('/home/u/proj/'), 'proj')
+  assert.equal(cfgSummary.validateJson(''), null)
+  assert.equal(cfgSummary.validateJson('[1]'), 'Deve ser um objeto JSON')
+  assert.ok(cfgSummary.validateJson('{'))
+})
+
+test('painel: aberto/fechado lembrado em localStorage (clearchat.collapse.<id>), com try/catch', () => {
+  const store = new Map<string, string>()
+  // sem ler o getter nativo do Node (avisaria "localStorage is not available")
+  const prev = Object.getOwnPropertyDescriptor(globalThis, 'localStorage')
+  const setLs = (v: unknown): void => {
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: v,
+      configurable: true,
+      writable: true
+    })
+  }
+  setLs({
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v)
+  })
+  try {
+    resetCollapseCache()
+    assert.equal(readCollapse('params'), null, 'nunca mexida → padrão da seção')
+    let calls = 0
+    const off = subscribeCollapse(() => calls++)
+    writeCollapse('params', true)
+    assert.equal(store.get(`${COLLAPSE_KEY_PREFIX}params`), '1')
+    assert.equal(readCollapse('params'), true)
+    writeCollapse('params', false)
+    assert.equal(store.get('clearchat.collapse.params'), '0')
+    off()
+    writeCollapse('params', true)
+    assert.equal(calls, 2, 'avisa as instâncias montadas até desinscrever')
+    // "recarregar": cache zerado, lê do storage
+    resetCollapseCache()
+    assert.equal(readCollapse('params'), true)
+    // storage que lança (janela privada): não quebra, vale só na sessão
+    setLs({
+      getItem: () => {
+        throw new Error('blocked')
+      },
+      setItem: () => {
+        throw new Error('blocked')
+      }
+    })
+    resetCollapseCache()
+    assert.equal(readCollapse('x'), null)
+    writeCollapse('x', true)
+    assert.equal(readCollapse('x'), true)
+  } finally {
+    if (prev) Object.defineProperty(globalThis, 'localStorage', prev)
+    else delete (globalThis as { localStorage?: unknown }).localStorage
+    resetCollapseCache()
+  }
+})

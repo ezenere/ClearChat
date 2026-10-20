@@ -29,7 +29,8 @@ import {
   ToolsEditor,
   type CfgProps
 } from '../panel/editors'
-import { Section, ToggleRow } from '../panel/fields'
+import { CollapsibleSection, ToggleRow } from '../panel/fields'
+import { baseName, rootSummary } from '../../lib/configSummary'
 import { Button, IconButton, Label } from '../ui/controls'
 import { ModelLabel } from '../ui/ModelLabel'
 import { IconPicker, PresetIcon } from './PresetIcon'
@@ -171,6 +172,7 @@ function PresetChatEditor({
 }): React.JSX.Element {
   const homeDir = useStore((s) => s.homeDir)
   const run = useStore((s) => s.run)
+  const bwrap = useStore((s) => s.capabilities.bwrap)
   const window = useStore(
     (s) => s.models[cfg.providerId]?.list.find((m) => m.id === cfg.model)?.contextLength ?? null
   )
@@ -180,7 +182,16 @@ function PresetChatEditor({
   }
   return (
     <>
-      <Section title="Diretório raiz" aside={<RootInfo side="left" />}>
+      <CollapsibleSection
+        id="root"
+        title="Diretório raiz"
+        summary={rootSummary(
+          cfg,
+          !!bwrap,
+          draft.cwd ? baseName(draft.cwd) : 'escolhido no Novo chat'
+        )}
+        aside={<RootInfo side="left" />}
+      >
         <ToggleRow
           label="Definir diretório raiz"
           description="Desligado: o Novo chat usa a pasta escolhida na hora"
@@ -202,7 +213,7 @@ function PresetChatEditor({
           </div>
         )}
         <RootOptions cfg={cfg} patch={patch} />
-      </Section>
+      </CollapsibleSection>
       <SignatureSection cfg={cfg} patch={patch} />
       <ContextSettingsSection cfg={cfg} patch={patch} knownWindow={window} />
     </>

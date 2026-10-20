@@ -1,11 +1,12 @@
 // Editores de ChatConfig independentes de onde a config mora: recebem `cfg` (config completa) e
 // `patch` (patch parcial). Usados pelas abas do painel (config do chat) e pelo editor de personas.
-import { ArrowUpRight, BrainCircuit, RotateCcw } from 'lucide-react'
+import { ArrowUpRight, BrainCircuit } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import {
   DEFAULT_COMPACT_PROMPT,
   DEFAULT_COMPACT_THRESHOLD,
-  defaultToolsPrompt
+  defaultToolsPrompt,
+  supportsCacheControl
 } from '@shared/defaults'
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import {
@@ -14,6 +15,7 @@ import {
   paramSupport,
   safeExtraBody,
   sortEfforts,
+  type EffortSpec,
   type ParamKey,
   type ParamSupport
 } from '@shared/modelParams'
@@ -48,10 +50,29 @@ import {
 import { AppSignatureField, AppSignatureInfo } from '../AppSignatureField'
 import { AutoTextarea, Switch } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
-import { ExtraBodyEditor, NumberInput, Section, ToggleRow } from './fields'
+import {
+  CollapsibleSection,
+  ExtraBodyEditor,
+  NumberInput,
+  RestoreButton,
+  Section,
+  ToggleRow
+} from './fields'
 import { SmartApproveSection } from './SmartApproveSection'
 import { ChatApprovalSection } from '../approvals/ChatApprovalSection'
 import { memoryConfigOf, memoryWillSend } from '../../lib/memory'
+import { skillsConfigOf } from '../../lib/skills'
+import {
+  validateJson,
+  compactionSummary,
+  limitsSummary,
+  paramsSummary,
+  requestSummary,
+  signatureSummary,
+  subagentsSummary,
+  systemPromptSummary,
+  toolsSendingSummary
+} from '../../lib/configSummary'
 import { useMemoryCollections } from '../memory/hooks'
 import { SkillsSection, SubagentSkillsLine } from '../skills/SkillsSection'
 
@@ -142,8 +163,9 @@ export function ModelInfoLine({
 export function ModelSection({
   cfg,
   patch,
-  note
-}: CfgProps & { note?: ReactNode }): React.JSX.Element {
+  note,
+  children
+}: CfgProps & { note?: ReactNode; children?: ReactNode }): React.JSX.Element {
   return (
     <Section title="Modelo" aside={<ModelFieldInfo side="left" />}>
       <div>
@@ -156,13 +178,20 @@ export function ModelSection({
         </div>
         {note && <div className="mt-1.5">{note}</div>}
       </div>
+      {children}
     </Section>
   )
 }
 
 export function SystemPromptSection({ cfg, patch }: CfgProps): React.JSX.Element {
+  const defaultPrompt = useStore((s) => s.settings.defaultSystemPrompt)
   return (
-    <Section title="System prompt" aside={<SystemPromptInfo side="left" />}>
+    <CollapsibleSection
+      id="system-prompt"
+      title="System prompt"
+      summary={systemPromptSummary(cfg.systemPrompt, defaultPrompt)}
+      aside={<SystemPromptInfo side="left" />}
+    >
       <AutoTextarea
         value={cfg.systemPrompt}
         aria-label="System prompt"
@@ -172,7 +201,7 @@ export function SystemPromptSection({ cfg, patch }: CfgProps): React.JSX.Element
         placeholder="(vazio)"
         className="field text-[12.5px] leading-relaxed"
       />
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -200,6 +229,84 @@ function useParamSupport(cfg: ChatConfig): ParamSupport | null {
   })
 }
 
+/** Níveis de reasoning_effort do modelo (API → tabela → conjunto comum) + ajuste/omissão. */
+function useEffort(cfg: ChatConfig): {
+  kind: ProviderKind
+  support: ParamSupport | null
+  effort: EffortSpec | null
+  levels: NonNullable<ChatParams['reasoning_effort']>[]
+} {
+  const kind = useProviderKind(cfg.providerId)
+  const support = useParamSupport(cfg)
+  // Sem modelo: conjunto comum.
+  const effort = support ? support.effort : effortSpec({ kind, model: cfg.model })
+  const value = cfg.params.reasoning_effort ?? undefined
+  // Níveis desconhecidos: o valor salvo (de outro modelo) continua selecionável
+  const levels = !effort
+    ? []
+    : effort.known || !value || effort.levels.includes(value)
+      ? effort.levels
+      : sortEfforts([...effort.levels, value])
+  return { kind, support, effort, levels }
+}
+
+/**
+ * Raciocínio (reasoning_effort) — fica visível na seção Modelo, logo abaixo do seletor: "padrão"
+ * = não envia (o modelo decide); um nível = envia. Só aparece se o modelo aceita o parâmetro.
+ */
+export function ReasoningField({
+  cfg,
+  patch,
+  scope
+}: CfgProps & { scope: string }): React.JSX.Element | null {
+  const setParam = useSetParam(cfg, patch, scope)
+  const { kind, support, effort, levels } = useEffort(cfg)
+  if (support && !support.supported.includes('reasoning_effort')) return null
+  if (!effort || !levels.length) return null
+  const value = cfg.params.reasoning_effort ?? null
+  const effortAdjust = support?.effortAdjust
+  const opts: (typeof value)[] = [null, ...levels]
+  return (
+    <div data-testid="reasoning-field">
+      <div className="mb-1.5 flex items-center gap-1.5">
+        <span className="text-xs font-medium text-muted">Raciocínio</span>
+        <span className="font-mono text-[10.5px] text-faint">reasoning_effort</span>
+        <ParamInfo name="reasoning_effort" openRouter={kind === 'openrouter'} effort={effort} />
+      </div>
+      <div
+        data-testid="effort-levels"
+        data-source={effort.source}
+        role="group"
+        aria-label="Esforço de raciocínio"
+        className="flex rounded-lg border border-border bg-bg/60 p-0.5"
+      >
+        {opts.map((e) => (
+          <button
+            key={e ?? 'default'}
+            type="button"
+            aria-pressed={value === e}
+            title={
+              e == null ? 'Não envia reasoning_effort — o modelo usa o padrão dele' : undefined
+            }
+            onClick={() => setParam('reasoning_effort', e ?? undefined)}
+            className={cn(
+              'min-w-0 flex-1 truncate rounded-md px-0.5 py-1 text-[11px] transition-colors',
+              value === e ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
+            )}
+          >
+            {e ?? 'padrão'}
+          </button>
+        ))}
+      </div>
+      {value != null && effortAdjust && (
+        <p data-testid="effort-adjust" className="mt-1 text-[11px] text-subtle">
+          {effortAdjust.to ? 'Ajustado' : 'Não enviado'}: {effortAdjust.reason}.
+        </p>
+      )}
+    </div>
+  )
+}
+
 export function ParamsSection({
   cfg,
   patch,
@@ -210,18 +317,9 @@ export function ParamsSection({
   const setParam = useSetParam(cfg, patch, scope)
   const mem = rememberedFor(scope)
   const support = useParamSupport(cfg)
-  // Níveis de reasoning_effort do modelo (API → tabela → conjunto comum). Sem modelo: conjunto comum.
-  const effort = support ? support.effort : effortSpec({ kind, model: cfg.model })
-  const effortValue = cfg.params.reasoning_effort ?? undefined
-  // Níveis desconhecidos: o valor salvo (de outro modelo) continua selecionável
-  const effortLevels = !effort
-    ? []
-    : effort.known || !effortValue || effort.levels.includes(effortValue)
-      ? effort.levels
-      : sortEfforts([...effort.levels, effortValue])
-  const effortAdjust = support?.effortAdjust
   const visible = (k: ParamKey): boolean => !support || support.supported.includes(k)
   const conflicts = support ? conflictOmitted(support) : new Set<ParamKey>()
+  const hiddenSome = NUM_PARAMS.some((p) => !visible(p.key))
   /** Liga um parâmetro; se ele tiver par exclusivo (ex.: temperature/top_p no Claude 4.x), desliga o outro. */
   const turnOn = (key: NumParam, value: number): void => {
     const other = support?.exclusive.flatMap(([a, b]) =>
@@ -232,12 +330,11 @@ export function ParamsSection({
     patch({ params: { ...cfg.params, [key]: value, [other]: null } as unknown as ChatParams })
   }
   return (
-    <Section title="Parâmetros">
+    <CollapsibleSection id="params" title="Parâmetros" summary={paramsSummary(cfg.params)}>
       <p className="-mt-1 text-[11.5px] text-subtle">
         Só os parâmetros ligados entram na request
-        {support && support.supported.length < NUM_PARAMS.length + 1
-          ? ' (os que o modelo não aceita ficam ocultos).'
-          : '.'}
+        {hiddenSome ? ' (os que o modelo não aceita ficam ocultos).' : '.'} O raciocínio fica na
+        seção Modelo.
       </p>
       <div className="space-y-1">
         {NUM_PARAMS.filter((p) => visible(p.key)).map((p) => {
@@ -294,65 +391,8 @@ export function ParamsSection({
             </div>
           )
         })}
-        {visible('reasoning_effort') && (
-          <div className="flex h-8 items-center gap-2.5">
-            <Switch
-              size="sm"
-              checked={cfg.params.reasoning_effort != null}
-              label="Enviar reasoning_effort"
-              onChange={(v) => {
-                if (!v) return setParam('reasoning_effort', undefined)
-                const last = mem.reasoning_effort as ChatParams['reasoning_effort']
-                setParam(
-                  'reasoning_effort',
-                  last && effortLevels.includes(last) ? last : (effort?.default ?? 'medium')
-                )
-              }}
-            />
-            <span
-              className={cn(
-                'min-w-0 flex-1 truncate font-mono text-[12px]',
-                cfg.params.reasoning_effort != null ? 'text-fg/90' : 'text-subtle'
-              )}
-            >
-              reasoning_effort
-            </span>
-            <ParamInfo name="reasoning_effort" openRouter={openRouter} effort={effort} />
-          </div>
-        )}
-        {visible('reasoning_effort') && cfg.params.reasoning_effort != null && (
-          <div className="ml-[38px] animate-fade-in">
-            <div
-              data-testid="effort-levels"
-              data-source={effort?.source}
-              className="flex rounded-lg border border-border bg-bg/60 p-0.5"
-            >
-              {effortLevels.map((e) => (
-                <button
-                  key={e}
-                  type="button"
-                  aria-pressed={cfg.params.reasoning_effort === e}
-                  onClick={() => setParam('reasoning_effort', e)}
-                  className={cn(
-                    'min-w-0 flex-1 truncate rounded-md px-0.5 py-1 text-[11px] transition-colors',
-                    cfg.params.reasoning_effort === e
-                      ? 'bg-active text-fg shadow-sm'
-                      : 'text-subtle hover:text-fg'
-                  )}
-                >
-                  {e}
-                </button>
-              ))}
-            </div>
-            {effortAdjust && (
-              <p data-testid="effort-adjust" className="mt-1 text-[11px] text-subtle">
-                {effortAdjust.to ? 'Ajustado' : 'Não enviado'}: {effortAdjust.reason}.
-              </p>
-            )}
-          </div>
-        )}
       </div>
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -362,8 +402,16 @@ export function RequestExtrasSection({
   scope
 }: CfgProps & { scope: string }): React.JSX.Element {
   const setParam = useSetParam(cfg, patch, scope)
+  const kind = useProviderKind(cfg.providerId)
+  const saved = cfg.params.extraBody
   return (
-    <Section title="Request">
+    <CollapsibleSection
+      id="request"
+      title="Request"
+      summary={requestSummary(cfg, supportsCacheControl(kind))}
+      // JSON salvo inválido (ex.: vindo de outro dispositivo): abre e marca o cabeçalho
+      error={saved && validateJson(saved) ? 'JSON inválido' : null}
+    >
       <ToggleRow
         label="Token caching"
         description="Breakpoints cache_control — depende do modelo/provedor"
@@ -381,17 +429,22 @@ export function RequestExtrasSection({
           onChange={(v) => setParam('extraBody', v)}
         />
       </div>
-    </Section>
+    </CollapsibleSection>
   )
 }
 
-/** Aba Modelo inteira (painel e editor de persona). */
+/**
+ * Aba Modelo inteira (painel e editor de persona): modelo + raciocínio visíveis; system prompt,
+ * parâmetros e request recolhidos (com resumo do que difere do padrão).
+ */
 export function ModelEditor(
   props: CfgProps & { scope: string; modelNote?: ReactNode }
 ): React.JSX.Element {
   return (
     <>
-      <ModelSection cfg={props.cfg} patch={props.patch} note={props.modelNote} />
+      <ModelSection cfg={props.cfg} patch={props.patch} note={props.modelNote}>
+        <ReasoningField {...props} />
+      </ModelSection>
       <SystemPromptSection {...props} />
       <ParamsSection {...props} />
       <RequestExtrasSection {...props} />
@@ -450,8 +503,10 @@ export function RootOptions({
 
 export function SignatureSection({ cfg, patch }: CfgProps): React.JSX.Element {
   return (
-    <Section
+    <CollapsibleSection
+      id="signature"
       title="Assinatura do app"
+      summary={signatureSummary(cfg.appSignature, cfg.appSignatureCustom)}
       aside={<AppSignatureInfo id={cfg.appSignature} custom={cfg.appSignatureCustom} />}
     >
       <AppSignatureField
@@ -459,7 +514,7 @@ export function SignatureSection({ cfg, patch }: CfgProps): React.JSX.Element {
         custom={cfg.appSignatureCustom}
         onChange={(p) => patch(p)}
       />
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -469,7 +524,6 @@ export function ContextSettings({
   patch,
   knownWindow
 }: CfgProps & { knownWindow?: number | null }): React.JSX.Element {
-  const [promptOpen, setPromptOpen] = useState(false)
   const override = cfg.contextWindow != null && cfg.contextWindow > 0
   const prompt = cfg.compactPrompt ?? DEFAULT_COMPACT_PROMPT
   const pct = Math.round((cfg.compactThreshold ?? DEFAULT_COMPACT_THRESHOLD) * 100)
@@ -516,45 +570,56 @@ export function ContextSettings({
         checked={cfg.autoCompact}
         onChange={(autoCompact) => patch({ autoCompact })}
       />
-      <div>
-        <div className="mb-1 flex items-center gap-1.5 text-[11px] text-subtle">
-          <button type="button" onClick={() => setPromptOpen((o) => !o)} className="hover:text-fg">
-            {promptOpen ? '▾' : '▸'} Prompt de compactação
-            {cfg.compactPrompt != null ? ' (personalizado)' : ''}
-          </button>
-          <CompactPromptInfo prompt={prompt} />
-          {cfg.compactPrompt != null && (
-            <button
-              type="button"
-              onClick={() => patch({ compactPrompt: null })}
-              className="ml-auto inline-flex items-center gap-1 hover:text-fg"
-            >
-              <RotateCcw className="size-3" /> Restaurar padrão
-            </button>
-          )}
-        </div>
-        {promptOpen && (
-          <AutoTextarea
-            value={prompt}
-            aria-label="Prompt de compactação"
-            onChange={(e) => patch({ compactPrompt: e.target.value })}
-            minRows={5}
-            maxRows={16}
-            className="field animate-fade-in font-mono text-[11px] leading-relaxed"
-          />
-        )}
-      </div>
+      <CollapsibleSection
+        id="compact-prompt"
+        level="sub"
+        title="Prompt de compactação"
+        summary={
+          cfg.compactPrompt != null
+            ? { text: 'personalizado', changed: true }
+            : { text: 'padrão', changed: false }
+        }
+        aside={
+          <>
+            <CompactPromptInfo prompt={prompt} />
+            {cfg.compactPrompt != null && (
+              <RestoreButton onClick={() => patch({ compactPrompt: null })} />
+            )}
+          </>
+        }
+      >
+        <AutoTextarea
+          value={prompt}
+          aria-label="Prompt de compactação"
+          onChange={(e) => patch({ compactPrompt: e.target.value })}
+          minRows={5}
+          maxRows={16}
+          className="field font-mono text-[11px] leading-relaxed"
+        />
+      </CollapsibleSection>
     </>
   )
 }
 
-export function ContextSettingsSection(
-  props: CfgProps & { knownWindow?: number | null }
-): React.JSX.Element {
+/** Janela / limite / compactação automática / prompt — recolhida (painel: aba Chat; personas). */
+export function ContextSettingsSection({
+  info = true,
+  ...props
+}: CfgProps & {
+  knownWindow?: number | null
+  /** (i) da janela de contexto no cabeçalho (o painel já o mostra na seção Contexto). */
+  info?: boolean
+}): React.JSX.Element {
   return (
-    <Section title="Contexto" aside={<ContextWindowInfo />}>
+    <CollapsibleSection
+      id="compaction"
+      section="contexto-janela"
+      title="Janela e compactação"
+      summary={compactionSummary(props.cfg)}
+      aside={info ? <ContextWindowInfo /> : undefined}
+    >
       <ContextSettings {...props} />
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -568,14 +633,16 @@ export function ToolsListSection({ cfg, patch }: CfgProps): React.JSX.Element {
         : cfg.enabledTools.filter((n) => n !== t)
     })
   const count = TOOL_NAMES.filter((t) => cfg.enabledTools.includes(t)).length
+  // aberta por padrão (é o principal da aba); recolhida, o resumo mostra quantas estão ligadas
   return (
-    <Section
+    <CollapsibleSection
+      id="tools-list"
       title="Ferramentas"
-      aside={
-        <span className="text-[11px] text-subtle tabular-nums">
-          {count}/{TOOL_NAMES.length}
-        </span>
-      }
+      defaultOpen
+      summary={{
+        text: `${count}/${TOOL_NAMES.length} ligadas`,
+        changed: count < TOOL_NAMES.length
+      }}
     >
       <div className="-mx-1.5 space-y-px">
         {TOOL_NAMES.map((t) => {
@@ -605,7 +672,7 @@ export function ToolsListSection({ cfg, patch }: CfgProps): React.JSX.Element {
           )
         })}
       </div>
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -615,7 +682,11 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
   )
   const toolsText = cfg.toolsPromptText ?? defaultToolsPrompt(enabledDefs, cfg.nativeTools)
   return (
-    <Section title="Envio das tools">
+    <CollapsibleSection
+      id="tools-sending"
+      title="Envio das tools"
+      summary={toolsSendingSummary(cfg)}
+    >
       <ToggleRow
         label="Enviar tools nativas"
         description="Campo tools da request"
@@ -637,13 +708,9 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
               ? 'Texto padrão (gerado das tools habilitadas)'
               : 'Texto personalizado'}
             {cfg.toolsPromptText != null && (
-              <button
-                type="button"
-                onClick={() => patch({ toolsPromptText: null })}
-                className="ml-auto inline-flex items-center gap-1 hover:text-fg"
-              >
-                <RotateCcw className="size-3" /> Restaurar padrão
-              </button>
+              <span className="ml-auto">
+                <RestoreButton onClick={() => patch({ toolsPromptText: null })} />
+              </span>
             )}
           </div>
           <AutoTextarea
@@ -656,7 +723,7 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
           />
         </div>
       )}
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -713,8 +780,20 @@ export function SubagentSection({
   chatScope,
   onOpenMemory
 }: CfgProps & { chatScope?: boolean; onOpenMemory?: () => void }): React.JSX.Element {
+  const cols = useMemoryCollections()
+  const mem = memoryConfigOf(cfg)
+  const sc = skillsConfigOf(cfg)
   return (
-    <Section title="Subagentes" aside={<SystemPromptInfo subagent side="left" />}>
+    <CollapsibleSection
+      id="subagents"
+      title="Subagentes"
+      summary={subagentsSummary(
+        cfg,
+        mem.subagents && memoryWillSend(mem, cols),
+        sc.enabled && sc.subagents
+      )}
+      aside={<SystemPromptInfo subagent side="left" />}
+    >
       <SubagentMemoryLine cfg={cfg} chatScope={chatScope} onOpenMemory={onOpenMemory} />
       <SubagentSkillsLine cfg={cfg} chatScope={chatScope} />
       <AutoTextarea
@@ -725,14 +804,19 @@ export function SubagentSection({
         maxRows={14}
         className="field text-[12.5px] leading-relaxed"
       />
-    </Section>
+    </CollapsibleSection>
   )
 }
 
 export function LimitsSection({ cfg, patch }: CfgProps): React.JSX.Element {
   const max = clampToolOutput(cfg.maxToolOutputChars)
   return (
-    <Section title="Limites" aside={<MaxOutputInfo />}>
+    <CollapsibleSection
+      id="limits"
+      title="Limites"
+      summary={limitsSummary(cfg)}
+      aside={<MaxOutputInfo />}
+    >
       <div className="flex items-center gap-2.5">
         <div className="min-w-0 flex-1">
           <div className="text-[13px] text-fg/90">Saída máx. por ferramenta</div>
@@ -755,7 +839,7 @@ export function LimitsSection({ cfg, patch }: CfgProps): React.JSX.Element {
         />
       </div>
       <SpillField max={max} />
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -805,7 +889,11 @@ function SpillField({ max }: { max: number }): React.JSX.Element {
   )
 }
 
-/** Aba Tools inteira (painel e editor de persona). */
+/**
+ * Aba Tools inteira (painel e editor de persona), da mais usada para a menos: ferramentas,
+ * aprovações (recolhida, com resumo), skills; recolhidas: Smart-Approve, subagentes, envio das
+ * tools e limites.
+ */
 export function ToolsEditor({
   chatScope,
   onOpenMemory,
@@ -819,11 +907,11 @@ export function ToolsEditor({
   return (
     <>
       <ToolsListSection {...props} />
+      <ChatApprovalSection {...props} chatScope={chatScope} />
       <SkillsSection {...props} chatScope={chatScope} />
-      <ToolsPromptSection {...props} />
-      <ChatApprovalSection {...props} />
       <SmartApproveSection {...props} />
       <SubagentSection {...props} chatScope={chatScope} onOpenMemory={onOpenMemory} />
+      <ToolsPromptSection {...props} />
       <LimitsSection {...props} />
     </>
   )

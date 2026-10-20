@@ -2,7 +2,7 @@
 // ele decide (os em modo Smart-Approve na seção Aprovações), rótulos, contexto/tempo, prompt +
 // template editáveis e "Testar". Sem liga/desliga: o juiz age nos itens em modo Smart-Approve
 // quando há modelo; sem modelo, esses itens perguntam a você.
-import { AlertTriangle, FlaskConical, RotateCcw, X } from 'lucide-react'
+import { AlertTriangle, FlaskConical, X } from 'lucide-react'
 import { useState } from 'react'
 import { DEFAULT_SMART_APPROVE_PROMPT, DEFAULT_SMART_APPROVE_TEMPLATE } from '@shared/defaults'
 import { providerKind } from '@shared/providerKinds'
@@ -32,8 +32,9 @@ import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { Select } from '../ui/Select'
 import { ApiInfo, C, Tip } from '../ui/Tooltip'
+import { smartApproveSummary } from '../../lib/configSummary'
 import type { CfgProps } from './editors'
-import { NumberInput, Section } from './fields'
+import { CollapsibleSection, NumberInput, RestoreButton } from './fields'
 
 const LABEL_FIELDS: { key: keyof SmartApproveLabels; caption: string }[] = [
   { key: 'approve', caption: 'Aprovar' },
@@ -114,8 +115,6 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
   }
   const labelError = validateLabels(labels)
 
-  const [promptOpen, setPromptOpen] = useState(false)
-  const [testOpen, setTestOpen] = useState(false)
   const [testTool, setTestTool] = useState<ToolName>(SMART_APPROVE_SAMPLE.tool)
   const [testArgs, setTestArgs] = useState(JSON.stringify(SMART_APPROVE_SAMPLE.args, null, 2))
   const [testing, setTesting] = useState(false)
@@ -164,9 +163,18 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
   const customPrompt = sa.prompt != null || sa.template != null
 
   return (
-    <Section
-      title="Smart-Approve"
+    <CollapsibleSection
       id="smart-approve"
+      section="smart-approve"
+      title="Smart-Approve"
+      summary={smartApproveSummary(cfg)}
+      warning={
+        !hasModel && smartItems.length
+          ? `Sem modelo: ${joinItems(smartItems)} ${smartItems.length > 1 ? 'pedem' : 'pede'} sua confirmação`
+          : null
+      }
+      // rascunho de rótulos inválido (não salvo): mantém aberta e marca o cabeçalho
+      error={labelError ? 'rótulos inválidos' : null}
       aside={<SmartRequestInfo cfg={cfg} patch={patch} sa={sa} tool={testTool} args={parsedArgs} />}
     >
       <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
@@ -291,123 +299,108 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
           <span className="text-[12px] text-subtle">s</span>
         </div>
 
-        <div>
-          <div className="mb-1 flex items-center gap-1.5 text-[11px] text-subtle">
-            <button
-              type="button"
-              onClick={() => setPromptOpen((o) => !o)}
-              className="hover:text-fg"
-            >
-              {promptOpen ? '▾' : '▸'} Prompt do juiz{customPrompt ? ' (personalizado)' : ''}
-            </button>
-            {customPrompt && (
-              <button
-                type="button"
-                onClick={() => set({ prompt: null, template: null })}
-                className="ml-auto inline-flex items-center gap-1 hover:text-fg"
+        <CollapsibleSection
+          id="smart-prompt"
+          level="sub"
+          title="Prompt do juiz"
+          summary={
+            customPrompt
+              ? { text: 'personalizado', changed: true }
+              : { text: 'padrão', changed: false }
+          }
+          aside={
+            customPrompt ? (
+              <RestoreButton onClick={() => set({ prompt: null, template: null })} />
+            ) : null
+          }
+        >
+          <div className="animate-fade-in space-y-2">
+            <div>
+              <div className="mb-0.5 text-[10.5px] text-faint">
+                System (<C>{'role: "system"'}</C>)
+              </div>
+              <AutoTextarea
+                value={sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT}
+                aria-label="Prompt do Smart-Approve"
+                onChange={(e) => set({ prompt: e.target.value })}
+                minRows={5}
+                maxRows={16}
+                className="field font-mono text-[11px] leading-relaxed"
+              />
+            </div>
+            <div>
+              <div className="mb-0.5 text-[10.5px] text-faint">
+                Template da mensagem (<C>{'role: "user"'}</C>)
+              </div>
+              <AutoTextarea
+                value={sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE}
+                aria-label="Template do Smart-Approve"
+                onChange={(e) => set({ template: e.target.value })}
+                minRows={5}
+                maxRows={16}
+                className="field font-mono text-[11px] leading-relaxed"
+              />
+            </div>
+            <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
+              <div className="mb-1 text-[10.5px] font-medium text-subtle">
+                Placeholders (system e template)
+              </div>
+              <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
+                {SMART_APPROVE_PLACEHOLDERS.map((p) => (
+                  <div key={p.key} className="contents">
+                    <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
+                    <dd className="text-subtle">{p.desc}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection id="smart-test" level="sub" title="Testar com uma chamada de exemplo">
+          <div className="space-y-2">
+            <Select
+              value={testTool}
+              onChange={(v) => setTestTool(v)}
+              options={TEST_TOOLS.map((t) => ({ value: t, label: `${TOOL_LABELS[t]} · ${t}` }))}
+            />
+            <AutoTextarea
+              value={testArgs}
+              aria-label="Argumentos de exemplo"
+              onChange={(e) => setTestArgs(e.target.value)}
+              minRows={2}
+              maxRows={8}
+              className={cn('field font-mono text-[11px]', argsError && 'border-danger/60')}
+            />
+            <div className="flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="secondary"
+                loading={testing}
+                disabled={!hasModel || !!argsError}
+                icon={<FlaskConical className="size-3.5" />}
+                onClick={() => void runTest()}
               >
-                <RotateCcw className="size-3" /> Restaurar padrão
-              </button>
+                Testar
+              </Button>
+              <span className="text-[11px] text-faint">
+                {argsError
+                  ? 'JSON inválido'
+                  : 'Contexto de exemplo: “As dependências do projeto estão quebradas, reinstale.”'}
+              </span>
+            </div>
+            {testError && <p className="text-[11.5px] text-danger/90">{testError}</p>}
+            {testResult && (
+              <div
+                data-testid="smart-test-result"
+                className="overflow-hidden rounded-lg border border-border"
+              >
+                <SmartApproveLine rec={testResult} pending />
+              </div>
             )}
           </div>
-          {promptOpen && (
-            <div className="animate-fade-in space-y-2">
-              <div>
-                <div className="mb-0.5 text-[10.5px] text-faint">
-                  System (<C>{'role: "system"'}</C>)
-                </div>
-                <AutoTextarea
-                  value={sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT}
-                  aria-label="Prompt do Smart-Approve"
-                  onChange={(e) => set({ prompt: e.target.value })}
-                  minRows={5}
-                  maxRows={16}
-                  className="field font-mono text-[11px] leading-relaxed"
-                />
-              </div>
-              <div>
-                <div className="mb-0.5 text-[10.5px] text-faint">
-                  Template da mensagem (<C>{'role: "user"'}</C>)
-                </div>
-                <AutoTextarea
-                  value={sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE}
-                  aria-label="Template do Smart-Approve"
-                  onChange={(e) => set({ template: e.target.value })}
-                  minRows={5}
-                  maxRows={16}
-                  className="field font-mono text-[11px] leading-relaxed"
-                />
-              </div>
-              <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
-                <div className="mb-1 text-[10.5px] font-medium text-subtle">
-                  Placeholders (system e template)
-                </div>
-                <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
-                  {SMART_APPROVE_PLACEHOLDERS.map((p) => (
-                    <div key={p.key} className="contents">
-                      <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
-                      <dd className="text-subtle">{p.desc}</dd>
-                    </div>
-                  ))}
-                </dl>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div>
-          <button
-            type="button"
-            onClick={() => setTestOpen((o) => !o)}
-            className="text-[11px] text-subtle hover:text-fg"
-          >
-            {testOpen ? '▾' : '▸'} Testar com uma chamada de exemplo
-          </button>
-          {testOpen && (
-            <div className="mt-1.5 animate-fade-in space-y-2">
-              <Select
-                value={testTool}
-                onChange={(v) => setTestTool(v)}
-                options={TEST_TOOLS.map((t) => ({ value: t, label: `${TOOL_LABELS[t]} · ${t}` }))}
-              />
-              <AutoTextarea
-                value={testArgs}
-                aria-label="Argumentos de exemplo"
-                onChange={(e) => setTestArgs(e.target.value)}
-                minRows={2}
-                maxRows={8}
-                className={cn('field font-mono text-[11px]', argsError && 'border-danger/60')}
-              />
-              <div className="flex items-center gap-2">
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  loading={testing}
-                  disabled={!hasModel || !!argsError}
-                  icon={<FlaskConical className="size-3.5" />}
-                  onClick={() => void runTest()}
-                >
-                  Testar
-                </Button>
-                <span className="text-[11px] text-faint">
-                  {argsError
-                    ? 'JSON inválido'
-                    : 'Contexto de exemplo: “As dependências do projeto estão quebradas, reinstale.”'}
-                </span>
-              </div>
-              {testError && <p className="text-[11.5px] text-danger/90">{testError}</p>}
-              {testResult && (
-                <div
-                  data-testid="smart-test-result"
-                  className="overflow-hidden rounded-lg border border-border"
-                >
-                  <SmartApproveLine rec={testResult} pending />
-                </div>
-              )}
-            </div>
-          )}
-        </div>
+        </CollapsibleSection>
       </div>
-    </Section>
+    </CollapsibleSection>
   )
 }

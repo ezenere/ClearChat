@@ -346,6 +346,14 @@ async function ensurePanel(tab: PanelTab): Promise<void> {
   await panelTab(tab).click()
 }
 
+/** Abre a seção recolhível `id` do painel/editor (CollapsibleSection), se estiver fechada. */
+async function expand(scope: Locator, id: string): Promise<void> {
+  const btn = scope.getByTestId(`collapse-${id}`)
+  await btn.scrollIntoViewIfNeeded()
+  if ((await btn.getAttribute('aria-expanded')) !== 'true') await btn.click()
+  await scope.locator(`[data-collapse-id="${id}"][data-open]`).waitFor()
+}
+
 /** Linha de uma persona na aba Personas das Configurações. */
 const presetRow = (name: string): Locator =>
   page.getByTestId('preset-row').filter({ has: page.locator(`span:text-is("${name}")`) })
@@ -421,6 +429,8 @@ async function main(): Promise<void> {
       const aside = page.getByTestId('right-panel')
       await ensurePanel('Modelo')
       await aside.getByRole('combobox').waitFor({ timeout: 5000 })
+      // system prompt, parâmetros e request ficam recolhidos por padrão
+      for (const id of ['system-prompt', 'params', 'request']) await expand(aside, id)
       await aside.getByLabel('System prompt', { exact: true }).waitFor()
       await aside.getByRole('switch', { name: 'Enviar temperature' }).waitFor()
       await aside.getByRole('switch', { name: 'Token caching' }).waitFor()
@@ -431,14 +441,25 @@ async function main(): Promise<void> {
       )
       await shot('tab-modelo')
       await ensurePanel('Chat')
-      await aside.getByLabel('Título do chat').waitFor()
-      for (const t of ['Diretório raiz', 'Assinatura do app', 'Contexto'])
+      // o título é editado no cabeçalho do chat (não há mais campo na aba Chat)
+      assert((await aside.getByLabel('Título do chat').count()) === 0, 'sem título na aba')
+      await page.getByTestId('chat-title').waitFor()
+      for (const t of [
+        'Persona',
+        'Contexto',
+        'Janela e compactação',
+        'Diretório raiz',
+        'Assinatura do app'
+      ])
         await aside.locator('h3', { hasText: t }).waitFor({ timeout: 3000 })
+      await expand(aside, 'root')
+      await aside.getByTestId('chat-root').waitFor()
       await aside.getByRole('switch', { name: 'Bloco de ambiente' }).waitFor()
       await aside.getByRole('button', { name: 'Salvar como persona' }).waitFor()
       await shot('tab-chat')
       await ensurePanel('Tools')
       // (o antigo "Auto-aprovar tudo" saiu: aprovações agora são por modo/listas globais)
+      for (const id of ['tools-sending', 'subagents', 'limits']) await expand(aside, id)
       for (const n of ['Enviar tools nativas', 'Texto das tools no system prompt'])
         await aside.getByRole('switch', { name: n }).waitFor({ timeout: 3000 })
       await aside.getByLabel('System prompt dos subagentes').waitFor()
@@ -782,7 +803,9 @@ async function main(): Promise<void> {
     await ensurePanel('Modelo')
     const aside = page.locator('aside')
     await pickModel(aside.getByRole('combobox'), ALT_MODEL)
-    const sp = aside.locator('textarea').first()
+    await expand(aside, 'system-prompt')
+    await expand(aside, 'params')
+    const sp = aside.getByLabel('System prompt', { exact: true })
     await sp.click()
     await sp.press('End')
     await sp.pressSequentially(' [editado-e2e]')
@@ -812,6 +835,7 @@ async function main(): Promise<void> {
       await pickModel(aside.getByRole('combobox'), TEXT_MODEL)
     }
     await ensurePanel('Tools')
+    await expand(aside, 'tools-sending')
     await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
     await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
     try {
@@ -847,6 +871,7 @@ async function main(): Promise<void> {
     } finally {
       // restaura mesmo se falhar (senão os passos seguintes herdam o modo texto)
       await ensurePanel('Tools')
+      await expand(aside, 'tools-sending')
       await aside.getByRole('switch', { name: 'Enviar tools nativas' }).click()
       await aside.getByRole('switch', { name: 'Texto das tools no system prompt' }).click()
       if (TEXT_MODEL !== MODEL) {
@@ -859,6 +884,7 @@ async function main(): Promise<void> {
   await step('assinatura do app none/cline nos headers do Ver request', async () => {
     await ensurePanel('Chat')
     const aside = page.locator('aside')
+    await expand(aside, 'signature')
     const sel = aside.locator('section', { hasText: 'Assinatura do app' }).locator('button.field')
     await sel.click()
     await page
@@ -1317,6 +1343,7 @@ async function main(): Promise<void> {
       const aside = page.locator('aside')
       await page.getByTestId('context-meter').click() // abre a aba Chat e rola até Contexto
       assert((await panelTab('Chat').getAttribute('aria-selected')) === 'true', 'aba Chat')
+      await expand(aside, 'compaction')
       await aside.getByRole('switch', { name: 'Definir janela manualmente' }).click()
       const win = aside.getByRole('spinbutton', { name: 'Janela de contexto (tokens)' })
       await win.fill('1000')
@@ -1509,12 +1536,14 @@ async function main(): Promise<void> {
     await ensurePanel('Chat')
     const aside = page.getByTestId('right-panel')
     await aside.getByTestId('chat-preset').getByText('Revisor E2E').waitFor({ timeout: 5000 })
-    // título editável na aba Chat
-    await aside.getByLabel('Título do chat').fill('Chat da persona E2E')
-    await aside.getByLabel('Título do chat').press('Enter')
+    // título editável no cabeçalho do chat (clique → campo)
+    await page.getByTestId('chat-title').click()
+    await page.getByLabel('Título do chat').fill('Chat da persona E2E')
+    await page.getByLabel('Título do chat').press('Enter')
     await page.locator('nav').getByText('Chat da persona E2E').waitFor({ timeout: 5000 })
     // ajusta um parâmetro e salva o chat como outra persona, com o diretório raiz
     await ensurePanel('Modelo')
+    await expand(aside, 'params')
     await aside.getByRole('switch', { name: 'Enviar temperature' }).click()
     await aside.getByRole('spinbutton', { name: 'temperature', exact: true }).fill('0.4')
     await ensurePanel('Chat')
@@ -1548,6 +1577,7 @@ async function main(): Promise<void> {
     await presetRow('Revisor E2E').getByRole('button', { name: 'Editar' }).click()
     const ed = dlg.getByTestId('preset-editor')
     await ed.getByLabel('Nome da persona').fill('Revisor E2E 2')
+    await expand(ed, 'system-prompt')
     await ed.getByLabel('System prompt', { exact: true }).fill('System editado nas configurações.')
     await shot('preset-editor')
     await ed.getByRole('tab', { name: 'Tools' }).click()

@@ -6,7 +6,10 @@
 //   aba Memória do painel (selos da persona, ligar coleções, escrita, toggles, extrair agora,
 //   (i) com o índice exato e o estado "Nada de memória vai para a API"; sem "Memória do chat");
 //   editor de personas (seção sem extrair/atualizar); aba Tools (subagentes);
-//   cards das tools de memória (chips → abre a memória; sem "Este chat") e card da extração.
+//   cards das tools de memória (chips → abre a memória; sem "Este chat") e card da extração;
+//   seções recolhíveis do painel (abrir/fechar com mouse e teclado, estado lembrado após recarregar,
+//   resumo "N alterado(s)" quando um parâmetro difere do padrão, JSON inválido mantém a seção aberta
+//   com o erro no cabeçalho, link que foca uma seção a abre).
 // Screenshots em $CLEARCHAT_E2E_DIR/shots (1280x820 e 900x600).
 //
 // Uso:
@@ -70,6 +73,35 @@ async function setSize(w: number, h: number): Promise<void> {
 
 const settings = (): ReturnType<Page['locator']> => page.locator('[role="dialog"]')
 const panel = (): ReturnType<Page['locator']> => page.getByTestId('right-panel')
+
+/** Abre a seção recolhível `id` (CollapsibleSection) dentro de `scope`, se estiver fechada. */
+async function expand(scope: ReturnType<Page['locator']>, id: string): Promise<void> {
+  const btn = scope.getByTestId(`collapse-${id}`)
+  await btn.scrollIntoViewIfNeeded()
+  if ((await btn.getAttribute('aria-expanded')) !== 'true') await btn.click()
+  await scope.locator(`[data-collapse-id="${id}"][data-open]`).waitFor()
+}
+
+/** Esquece o aberto/fechado das seções (localStorage `clearchat.collapse.*`) e recarrega. */
+async function resetCollapse(): Promise<void> {
+  await page.evaluate(() => {
+    for (const k of Object.keys(localStorage))
+      if (k.startsWith('clearchat.collapse.')) localStorage.removeItem(k)
+  })
+  await page.reload()
+  await page.waitForLoadState('domcontentloaded')
+}
+
+async function openPanelTab(chat: string, tab: string): Promise<void> {
+  await page.getByTestId('chat-item').filter({ hasText: chat }).first().click()
+  if (
+    !(await panel()
+      .isVisible()
+      .catch(() => false))
+  )
+    await page.getByRole('button', { name: 'Abrir painel' }).click()
+  await panel().getByRole('tab', { name: tab }).click()
+}
 
 async function openSettingsMemory(): Promise<void> {
   await page.getByRole('button', { name: /^Configurações/ }).click()
@@ -169,6 +201,111 @@ app.on('window-all-closed', () => app.quit())
     await shot('02-tool-busca')
   })
 
+  await step('painel: seções recolhíveis (abrir/fechar, lembrar, resumo, erro)', async () => {
+    await resetCollapse()
+    await openPanelTab('Planejamento do TCC', 'Modelo')
+    const p = panel()
+    const head = (id: string): ReturnType<Page['locator']> => p.getByTestId(`collapse-${id}`)
+    // padrão: avançadas fechadas; modelo e raciocínio visíveis
+    for (const id of ['system-prompt', 'params', 'request'])
+      assert.equal(await head(id).getAttribute('aria-expanded'), 'false', `${id} fechada`)
+    assert.equal(await p.getByLabel('System prompt', { exact: true }).count(), 0)
+    await p.getByTestId('effort-levels').waitFor()
+    // resumo do que difere do padrão: ligar max_tokens → "N alterado(s) · … max_tokens 4.096"
+    const sum = (id: string): ReturnType<Page['locator']> =>
+      p.locator(`[data-collapse-id="${id}"]`).getByTestId('collapse-summary')
+    const before = await sum('params').innerText()
+    await head('params').click()
+    assert.equal(await head('params').getAttribute('aria-expanded'), 'true')
+    await p.getByRole('switch', { name: 'Enviar max_tokens' }).click()
+    await head('params').click()
+    assert.match(await sum('params').innerText(), /alterados? · .*max_tokens 4\.096/)
+    assert.equal(await sum('params').getAttribute('data-changed'), 'true')
+    // teclado: Enter no cabeçalho abre/fecha
+    await head('params').focus()
+    await page.keyboard.press('Enter')
+    assert.equal(await head('params').getAttribute('aria-expanded'), 'true')
+    await p.getByRole('switch', { name: 'Enviar max_tokens' }).click()
+    await head('params').focus()
+    await page.keyboard.press('Space')
+    assert.equal(await head('params').getAttribute('aria-expanded'), 'false')
+    assert.equal(await sum('params').innerText(), before, 'max_tokens desligado → resumo volta')
+    // JSON inválido no body extra: não recolhe e mostra o erro no cabeçalho
+    await expand(p, 'request')
+    const body = p.getByRole('textbox', { name: 'Body extra (JSON)' })
+    await body.fill('{ "provider": ')
+    const err = p.locator('[data-collapse-id="request"]').getByTestId('collapse-error')
+    await err.waitFor()
+    assert.match(await err.innerText(), /JSON inválido/)
+    await head('request').click()
+    assert.equal(await head('request').getAttribute('aria-expanded'), 'true', 'não recolhe')
+    await shot('00-colapso-json-invalido')
+    await body.fill('')
+    await err.waitFor({ state: 'detached' })
+    await head('request').click()
+    assert.equal(await head('request').getAttribute('aria-expanded'), 'false')
+    // lembrado após recarregar: abre o system prompt, recarrega → continua aberto
+    await expand(p, 'system-prompt')
+    await page.reload()
+    await page.waitForLoadState('domcontentloaded')
+    await openPanelTab('Planejamento do TCC', 'Modelo')
+    assert.equal(await head('system-prompt').getAttribute('aria-expanded'), 'true')
+    assert.equal(
+      await page.evaluate(() => localStorage.getItem('clearchat.collapse.system-prompt')),
+      '1'
+    )
+    await p.getByLabel('System prompt', { exact: true }).waitFor()
+    await head('system-prompt').click()
+    // link que foca uma seção a abre (Aprovações → "escolha um modelo na seção Smart-Approve")
+    await panel().getByRole('tab', { name: 'Tools' }).click()
+    assert.equal(await head('smart-approve').getAttribute('aria-expanded'), 'false')
+    await expand(p, 'approvals')
+    await p.getByRole('button', { name: /escolha um modelo na seção Smart-Approve/ }).click()
+    await p.locator('[data-collapse-id="smart-approve"][data-open]').waitFor()
+    await p.getByTestId('smart-approve-model').waitFor()
+    await shot('00-colapso-tools')
+    await head('smart-approve').click()
+    await head('approvals').click()
+  })
+
+  await step('título no cabeçalho (renomear) e aba Chat sem título/raiz duplicados', async () => {
+    await openPanelTab('Planejamento do TCC', 'Chat')
+    const p = panel()
+    // a aba Chat não tem mais o campo de título nem "Alterar…" da raiz
+    assert.equal(await p.getByLabel('Título do chat').count(), 0)
+    assert.equal(await p.getByRole('button', { name: 'Alterar…' }).count(), 0)
+    // título: clique no cabeçalho → campo; Esc cancela, Enter salva
+    const title = page.getByTestId('chat-title')
+    await title.click()
+    const input = page.getByRole('textbox', { name: 'Título do chat' })
+    await input.fill('Rascunho descartado')
+    await input.press('Escape')
+    assert.equal(await title.innerText(), 'Planejamento do TCC')
+    await title.click()
+    await input.fill('TCC renomeado')
+    await input.press('Enter')
+    await page.getByTestId('chat-item').filter({ hasText: 'TCC renomeado' }).waitFor()
+    assert.equal(await title.innerText(), 'TCC renomeado')
+    await title.click()
+    await input.fill('Planejamento do TCC')
+    await input.press('Enter')
+    // raiz: só leitura + link para a aba Arquivos
+    await expand(p, 'root')
+    await p.getByTestId('chat-root').waitFor()
+    await p.getByRole('switch', { name: 'Confinar ferramentas à raiz' }).waitFor()
+    await shot('00-aba-chat')
+    await p
+      .getByTestId('chat-root')
+      .getByRole('button', { name: /Alterar em Arquivos/ })
+      .click()
+    assert.equal(
+      await p.getByRole('tab', { name: 'Arquivos' }).getAttribute('aria-selected'),
+      'true'
+    )
+    await p.getByRole('tab', { name: 'Chat' }).click()
+    await p.getByTestId('collapse-root').click()
+  })
+
   await step('aba Memória: herança da persona', async () => {
     if (
       !(await panel()
@@ -179,6 +316,16 @@ app.on('window-all-closed', () => app.quit())
     await panel().getByRole('tab', { name: 'Memória' }).click()
     const p = panel().getByTestId('memory-panel')
     await p.waitFor()
+    // coleções e índice ficam recolhidos por padrão, com resumo
+    assert.match(
+      await p
+        .locator('[data-collapse-id="memory-collections"]')
+        .getByTestId('collapse-summary')
+        .innerText(),
+      /ativas? · \d\/5 categorias/
+    )
+    await expand(p, 'memory-collections')
+    await expand(p, 'memory-snapshot')
     assert.equal(
       await p
         .getByTestId('memory-col-col-tcc')
@@ -263,6 +410,7 @@ app.on('window-all-closed', () => app.quit())
     assert.equal(await p.getByTestId('memory-col-col-topics').count(), 0)
     await p.getByRole('switch', { name: 'Categoria Tópicos' }).click()
     // toggles
+    await expand(p, 'memory-subagents')
     await p.getByRole('switch', { name: 'Memória nos subagentes (só busca/leitura)' }).click()
     assert.equal(
       await p
@@ -293,6 +441,7 @@ app.on('window-all-closed', () => app.quit())
   await step('aba Memória: extrair agora', async () => {
     const p = panel().getByTestId('memory-panel')
     const before = await page.getByTestId('memory-extraction-card').count()
+    await expand(p, 'memory-extraction')
     const btn = p.getByTestId('memory-extract-now')
     await btn.scrollIntoViewIfNeeded()
     await btn.click()
@@ -328,12 +477,15 @@ app.on('window-all-closed', () => app.quit())
 
   await step('aba Tools: indicador de memória para subagentes', async () => {
     await panel().getByRole('tab', { name: 'Tools' }).click()
+    await expand(panel(), 'subagents')
     const line = panel().getByTestId('subagent-memory')
     await line.scrollIntoViewIfNeeded()
     assert.match(await line.innerText(), /Memória para subagentes: ligada/)
     await shot('09-tools-subagentes')
     await line.getByRole('button', { name: /Memória/ }).click()
     await panel().getByTestId('memory-panel').waitFor()
+    // o link foca a seção Subagentes da aba Memória (aberta)
+    await panel().locator('[data-collapse-id="memory-subagents"][data-open]').waitFor()
   })
 
   await step('Configurações → Memórias: visão geral', async () => {
@@ -493,6 +645,8 @@ app.on('window-all-closed', () => app.quit())
     await settings().getByTestId('preset-editor').getByRole('tab', { name: 'Memória' }).click()
     const sec = settings().getByTestId('preset-memory')
     await sec.waitFor()
+    await expand(sec, 'memory-collections')
+    await expand(sec, 'memory-extraction')
     assert.equal(await sec.getByTestId('memory-extract-now').count(), 0)
     assert.equal(await sec.getByText('Atualizar memória').count(), 0)
     assert.equal(await sec.getByRole('switch', { name: 'Memória do chat' }).count(), 0)

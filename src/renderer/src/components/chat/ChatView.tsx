@@ -136,7 +136,7 @@ function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
 }
 
 function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
-  const setPanel = useStore((s) => s.setPanel)
+  const focusConfig = useStore((s) => s.focusConfig)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const patchConfig = useStore((s) => s.patchConfig)
   const flushConfig = useStore((s) => s.flushConfig)
@@ -309,7 +309,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
               type="button"
               onClick={() => {
                 setOpen(false)
-                setPanel(true, 'tools')
+                focusConfig('aprovacoes')
               }}
               className="flex h-7 w-full items-center gap-1.5 rounded-md px-1.5 text-[12px] text-accent-strong hover:bg-accent-soft"
             >
@@ -329,6 +329,56 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
         </div>
       </Popover>
     </>
+  )
+}
+
+/**
+ * Título do chat no cabeçalho: clique para renomear (Enter/blur salva, Esc cancela). É o lugar do
+ * título (a aba Chat do painel não tem mais o campo; a sidebar também renomeia).
+ */
+function ChatTitle({ chat }: { chat: Chat }): React.JSX.Element {
+  const renameChat = useStore((s) => s.renameChat)
+  const [editing, setEditing] = useState(false)
+  const [text, setText] = useState(chat.title)
+  const commit = (): void => {
+    setEditing(false)
+    const t = text.trim()
+    if (t !== chat.title) void renameChat(chat.id, t)
+  }
+  if (editing)
+    return (
+      <input
+        autoFocus
+        value={text}
+        aria-label="Título do chat"
+        placeholder="Novo chat"
+        onFocus={(e) => e.target.select()}
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
+          if (e.key === 'Escape') {
+            setText(chat.title)
+            setEditing(false)
+          }
+        }}
+        className="no-drag field h-7 w-[260px] max-w-full min-w-0 px-2 py-0 text-[13px] font-medium"
+      />
+    )
+  return (
+    <Tip label="Renomear chat" side="bottom">
+      <button
+        type="button"
+        data-testid="chat-title"
+        onClick={() => {
+          setText(chat.title)
+          setEditing(true)
+        }}
+        className="no-drag -mx-1.5 min-w-0 truncate rounded-md px-1.5 py-0.5 text-[13px] font-medium hover:bg-hover"
+      >
+        {chat.title || 'Novo chat'}
+      </button>
+    </Tip>
   )
 }
 
@@ -371,7 +421,7 @@ export function ChatHeader({
             <span className="truncate text-[13px] font-medium">{sessionLabel(session)}</span>
           </>
         ) : (
-          <span className="truncate text-[13px] font-medium">{chat.title || 'Novo chat'}</span>
+          <ChatTitle key={chat.id} chat={chat} />
         )}
       </div>
       <ModelPill

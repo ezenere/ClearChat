@@ -32,7 +32,7 @@ export function ApprovalPrompt({
   detail?: string
 }): React.JSX.Element {
   const approve = useStore((s) => s.approve)
-  const setPanel = useStore((s) => s.setPanel)
+  const focusConfig = useStore((s) => s.focusConfig)
   const who = fromSubagent ? 'o subagente' : 'o agente'
   if (request.check && isListItem(request.check.item))
     return (
@@ -61,7 +61,7 @@ export function ApprovalPrompt({
       )}
       {request.smartMissing && (
         <div className="mt-2">
-          <SmartMissingNote onConfigure={() => setPanel(true, 'tools')} />
+          <SmartMissingNote onConfigure={() => focusConfig('smart-approve')} />
         </div>
       )}
       {request.smartApprove && (

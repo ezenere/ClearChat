@@ -309,6 +309,14 @@ async function openToolsTab(): Promise<void> {
   await tab.click()
 }
 
+/** Abre a seção recolhível `id` do painel/editor (CollapsibleSection), se estiver fechada. */
+async function expand(scope: Locator, id: string): Promise<void> {
+  const btn = scope.getByTestId(`collapse-${id}`)
+  await btn.scrollIntoViewIfNeeded()
+  if ((await btn.getAttribute('aria-expanded')) !== 'true') await btn.click()
+  await scope.locator(`[data-collapse-id="${id}"][data-open]`).waitFor()
+}
+
 const judgeHits = (): { model: string; body: any }[] => hits.filter((h) => h.model === JUDGE)
 
 // ---------------- passos ----------------
@@ -348,6 +356,14 @@ async function main(): Promise<void> {
     async () => {
       await openToolsTab()
       const panel = page.getByTestId('right-panel')
+      // Aprovações e Smart-Approve ficam recolhidas por padrão (resumo no cabeçalho)
+      assert(
+        (await panel.getByTestId('collapse-smart-approve').getAttribute('aria-expanded')) ===
+          'false',
+        'Smart-Approve recolhida por padrão'
+      )
+      await expand(panel, 'approvals')
+      await expand(panel, 'smart-approve')
       const sec = section()
       await sec.scrollIntoViewIfNeeded()
       await sec
@@ -640,6 +656,7 @@ async function main(): Promise<void> {
   await step('Escrever arquivo: Smart-Approve → juiz; Perguntar → card', async () => {
     await openToolsTab()
     const panel = page.getByTestId('right-panel')
+    await expand(panel, 'approvals')
     const wf = panel.getByTestId('chat-mode-writeFile')
     await wf.getByRole('radio', { name: 'Smart-Approve' }).click()
     await section()
@@ -679,9 +696,10 @@ async function main(): Promise<void> {
 
   await step('Testar (chamada de exemplo) no editor', async () => {
     await openToolsTab()
+    await expand(page.getByTestId('right-panel'), 'smart-approve')
     const sec = section()
     await sec.scrollIntoViewIfNeeded()
-    await sec.getByRole('button', { name: /Testar com uma chamada de exemplo/ }).click()
+    await expand(sec, 'smart-test')
     judgeQueue.push({ text: 'REJECTED\nApaga node_modules sem necessidade.' })
     await sec.getByRole('button', { name: 'Testar', exact: true }).click()
     const res = sec.getByTestId('smart-test-result')
@@ -699,6 +717,7 @@ async function main(): Promise<void> {
     async () => {
       await openToolsTab()
       const panel = page.getByTestId('right-panel')
+      await expand(panel, 'approvals')
       await panel
         .getByTestId('chat-mode-pages')
         .getByRole('radio', { name: 'Sempre permitir' })
@@ -722,7 +741,9 @@ async function main(): Promise<void> {
       assert(cfg.approvalModes?.commands === 'smart', 'comandos continuam smart')
       await badge.getByText('Smart-Approve').waitFor()
       await pop.getByRole('button', { name: /Configurações → Aprovações/ }).waitFor()
-      await page.keyboard.press('Escape')
+      // "Ajustar neste chat" abre o painel na seção Aprovações (aberta)
+      await pop.getByRole('button', { name: /Ajustar neste chat/ }).click()
+      await panel.locator('[data-collapse-id="approvals"][data-open]').waitFor()
       // sem modelo: o selo some (nada roda sem você) e o modo smart pergunta (fail-closed)
       await openToolsTab()
       await section().getByRole('button', { name: 'Remover modelo do Smart-Approve' }).click()
@@ -757,6 +778,8 @@ async function main(): Promise<void> {
       .or(dlg.getByRole('button', { name: 'Tools', exact: true }))
       .first()
       .click()
+    await expand(dlg, 'approvals')
+    await expand(dlg, 'smart-approve')
     const s = dlg.locator('section[data-section="smart-approve"]')
     await s.scrollIntoViewIfNeeded()
     await s.getByText(/Escolha um modelo para poder usar o modo Smart-Approve/).waitFor()

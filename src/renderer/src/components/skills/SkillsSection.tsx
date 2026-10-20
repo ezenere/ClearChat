@@ -1,7 +1,7 @@
 // Seção "Skills" da aba Tools (painel do chat e editor de personas): liga/desliga as skills,
 // restringe a um subconjunto (checklist), prompt de apoio e skills nos subagentes. Os LOCAIS
 // (pastas) são globais — Configurações → Skills.
-import { ArrowUpRight, Lightbulb, RotateCcw, TriangleAlert } from 'lucide-react'
+import { ArrowUpRight, Lightbulb, TriangleAlert } from 'lucide-react'
 import type { SkillsConfig } from '@shared/skills'
 import type { ChatConfig } from '@shared/types'
 import { cn } from '../../lib/format'
@@ -12,12 +12,13 @@ import {
   supportPromptText,
   toggleSkill
 } from '../../lib/skills'
+import { skillsDetailsSummary } from '../../lib/configSummary'
 import { useStore } from '../../store'
 import { SkillsSendInfo, SkillsSubagentsInfo, SkillsSupportInfo } from '../apiDocs'
 import { AutoTextarea, Switch } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import type { CfgProps } from '../panel/editors'
-import { Section, ToggleRow } from '../panel/fields'
+import { CollapsibleSection, RestoreButton, Section, ToggleRow } from '../panel/fields'
 import { useSkillsDiscovery } from './hooks'
 
 export function SkillsSection({
@@ -75,10 +76,22 @@ export function SkillsSection({
             </button>
           </div>
           {error && <p className="text-[11.5px] text-danger">{error}</p>}
+        </div>
+
+        <CollapsibleSection
+          id="skills-details"
+          level="sub"
+          title="Ajustes das skills"
+          summary={skillsDetailsSummary(sc)}
+          focusIds={['skills-subagentes']}
+        >
           {all.length > 0 && (
             <div
               data-testid="skills-checklist"
-              className="-mx-1.5 max-h-[260px] space-y-px overflow-x-hidden overflow-y-auto"
+              className={cn(
+                '-mx-1.5 max-h-[260px] space-y-px overflow-x-hidden overflow-y-auto',
+                !sc.enabled && 'opacity-55'
+              )}
             >
               {all.map((s) => {
                 const on = !off.has(s.name)
@@ -137,61 +150,62 @@ export function SkillsSection({
               })}
             </div>
           )}
-        </div>
 
-        <div className={cn('space-y-2', !sc.enabled && 'opacity-55')}>
-          <ToggleRow
-            label="Prompt de apoio"
-            description="Anexado ao system prompt: diz que há skills e para usar list_skills"
-            checked={sc.supportPrompt.enabled}
-            onChange={(enabled) => set({ ...sc, supportPrompt: { ...sc.supportPrompt, enabled } })}
-            info={<SkillsSupportInfo text={supportText} />}
-          />
-          {sc.supportPrompt.enabled && (
-            <div className="animate-fade-in">
-              <div className="mb-1 flex items-center text-[11px] text-subtle">
-                {sc.supportPrompt.text == null ? 'Texto padrão' : 'Texto personalizado'}
-                {sc.supportPrompt.text != null && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      set({ ...sc, supportPrompt: { ...sc.supportPrompt, text: null } })
-                    }
-                    className="ml-auto inline-flex items-center gap-1 hover:text-fg"
-                  >
-                    <RotateCcw className="size-3" /> Restaurar padrão
-                  </button>
-                )}
+          <div className={cn('space-y-2', !sc.enabled && 'opacity-55')}>
+            <ToggleRow
+              label="Prompt de apoio"
+              description="Anexado ao system prompt: diz que há skills e para usar list_skills"
+              checked={sc.supportPrompt.enabled}
+              onChange={(enabled) =>
+                set({ ...sc, supportPrompt: { ...sc.supportPrompt, enabled } })
+              }
+              info={<SkillsSupportInfo text={supportText} />}
+            />
+            {sc.supportPrompt.enabled && (
+              <div className="animate-fade-in">
+                <div className="mb-1 flex items-center text-[11px] text-subtle">
+                  {sc.supportPrompt.text == null ? 'Texto padrão' : 'Texto personalizado'}
+                  {sc.supportPrompt.text != null && (
+                    <span className="ml-auto">
+                      <RestoreButton
+                        onClick={() =>
+                          set({ ...sc, supportPrompt: { ...sc.supportPrompt, text: null } })
+                        }
+                      />
+                    </span>
+                  )}
+                </div>
+                <AutoTextarea
+                  value={supportText}
+                  aria-label="Prompt de apoio das skills"
+                  onChange={(e) =>
+                    set({
+                      ...sc,
+                      supportPrompt: {
+                        ...sc.supportPrompt,
+                        text:
+                          e.target.value === DEFAULT_SKILLS_SUPPORT_PROMPT ? null : e.target.value
+                      }
+                    })
+                  }
+                  minRows={3}
+                  maxRows={8}
+                  className="field text-[12px] leading-relaxed"
+                />
               </div>
-              <AutoTextarea
-                value={supportText}
-                aria-label="Prompt de apoio das skills"
-                onChange={(e) =>
-                  set({
-                    ...sc,
-                    supportPrompt: {
-                      ...sc.supportPrompt,
-                      text: e.target.value === DEFAULT_SKILLS_SUPPORT_PROMPT ? null : e.target.value
-                    }
-                  })
-                }
-                minRows={3}
-                maxRows={8}
-                className="field text-[12px] leading-relaxed"
-              />
-            </div>
-          )}
-        </div>
+            )}
+          </div>
 
-        <div data-section="skills-subagentes" className={cn(!sc.enabled && 'opacity-55')}>
-          <ToggleRow
-            label="Skills nos subagentes"
-            description="Mesmas tools e prompt de apoio, limitados às skills ativas"
-            checked={sc.subagents}
-            onChange={(subagents) => set({ ...sc, subagents })}
-            info={<SkillsSubagentsInfo />}
-          />
-        </div>
+          <div data-section="skills-subagentes" className={cn(!sc.enabled && 'opacity-55')}>
+            <ToggleRow
+              label="Skills nos subagentes"
+              description="Mesmas tools e prompt de apoio, limitados às skills ativas"
+              checked={sc.subagents}
+              onChange={(subagents) => set({ ...sc, subagents })}
+              info={<SkillsSubagentsInfo />}
+            />
+          </div>
+        </CollapsibleSection>
       </div>
     </Section>
   )

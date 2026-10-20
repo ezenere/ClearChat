@@ -100,7 +100,8 @@ export function ContextMeter({
         aria-label="Contexto em uso"
         onClick={(e) => {
           e.stopPropagation()
-          focusConfig('contexto')
+          // janela desconhecida ("definir janela") → abre direto os ajustes de janela/compactação
+          focusConfig(window ? 'contexto' : 'contexto-janela')
         }}
         className={cn(
           'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[11px] tabular-nums transition-colors hover:bg-hover',

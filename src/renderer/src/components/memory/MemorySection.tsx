@@ -16,6 +16,11 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import {
+  memoryExtractionSummary,
+  memoryHelpSummary,
+  memorySubagentsSummary
+} from '../../lib/configSummary'
+import {
   MEMORY_CATEGORIES,
   MEMORY_CATEGORY_HINTS,
   MEMORY_CATEGORY_LABELS,
@@ -60,7 +65,7 @@ import { ModelPicker } from '../ui/ModelPicker'
 import { Select } from '../ui/Select'
 import { Tip } from '../ui/Tooltip'
 import type { CfgProps } from '../panel/editors'
-import { Section, ToggleRow } from '../panel/fields'
+import { CollapsibleSection, RestoreButton, Section, ToggleRow } from '../panel/fields'
 import { useMemoryCollections, useMemoryPreview } from './hooks'
 import { CollectionIcon } from './MemoryIcon'
 
@@ -121,7 +126,13 @@ export function MemorySection({
         <SendStatus mem={mem} cols={cols} willSend={willSend} />
       </Section>
 
-      <Section title="Coleções" aside={<MemoryCollectionsInfo />}>
+      <CollapsibleSection
+        id="memory-collections"
+        title="Coleções"
+        summary={collectionsSummary(mem, cols, !!persona && differsFromPersona(mem, persona))}
+        warning={collectionsWarning(mem, cols)}
+        aside={<MemoryCollectionsInfo />}
+      >
         <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
           Marque as coleções que o modelo lê; em cada categoria, escolha onde ele grava.
           {persona && (
@@ -145,7 +156,7 @@ export function MemorySection({
           ))}
         </div>
         <ManageLink />
-      </Section>
+      </CollapsibleSection>
 
       <HelpSection mem={mem} text={helpText} onChange={set} />
 
@@ -164,16 +175,43 @@ export function MemorySection({
         />
       )}
 
-      <Section title="Subagentes" id="memoria-subagentes" aside={<MemorySubagentsInfo />}>
+      <CollapsibleSection
+        id="memory-subagents"
+        section="memoria-subagentes"
+        title="Subagentes"
+        summary={memorySubagentsSummary(mem)}
+        aside={<MemorySubagentsInfo />}
+      >
         <ToggleRow
           label="Memória nos subagentes (só busca/leitura)"
           description="memory_search e memory_read — nunca escrita nem índice"
           checked={mem.subagents}
           onChange={(subagents) => set({ ...mem, subagents })}
         />
-      </Section>
+      </CollapsibleSection>
     </div>
   )
+}
+
+/** Cabeçalho da seção Coleções fechada: quantas ativas e em quantas categorias. */
+function collectionsSummary(
+  mem: MemoryConfig,
+  cols: MemoryCollection[],
+  differs: boolean
+): { text: string; changed: boolean } {
+  const active = mem.categories.flatMap((c) => activeInCategory(mem, cols, c)).length
+  const text = `${active} ${active === 1 ? 'ativa' : 'ativas'} · ${mem.categories.length}/${MEMORY_CATEGORIES.length} categorias`
+  return differs ? { text: `ajustada · ${text}`, changed: true } : { text, changed: false }
+}
+
+/** Escrita sem efeito em alguma categoria ligada (o aviso dentro da seção fica oculto fechada). */
+function collectionsWarning(mem: MemoryConfig, cols: MemoryCollection[]): string | null {
+  const bad = MEMORY_CATEGORIES.filter(
+    (c) => mem.categories.includes(c) && writeTargetIssue(mem, cols, c)
+  )
+  return bad.length
+    ? `Escrita sem efeito em: ${bad.map((c) => MEMORY_CATEGORY_LABELS[c]).join(', ')}`
+    : null
 }
 
 function PersonaLine({
@@ -487,9 +525,8 @@ function HelpSection({
   onChange: (m: MemoryConfig) => void
 }): React.JSX.Element {
   const custom = mem.helpPrompt.text != null
-  const [open, setOpen] = useState(false)
   return (
-    <Section title="Instruções">
+    <CollapsibleSection id="memory-help" title="Instruções" summary={memoryHelpSummary(mem)}>
       <ToggleRow
         label="Instruções de memória no system prompt"
         description="Consultar antes de responder, gravar fatos novos, corrigir discrepâncias"
@@ -499,67 +536,59 @@ function HelpSection({
       />
       {mem.helpPrompt.enabled && (
         <PromptEditor
+          id="memory-help-text"
           title="Texto das instruções"
           custom={custom}
-          open={open}
-          setOpen={setOpen}
           value={text}
           onChange={(t) => onChange({ ...mem, helpPrompt: { ...mem.helpPrompt, text: t } })}
           onRestore={() => onChange({ ...mem, helpPrompt: { ...mem.helpPrompt, text: null } })}
         />
       )}
-    </Section>
+    </CollapsibleSection>
   )
 }
 
 function PromptEditor({
+  id,
   title,
   custom,
-  open,
-  setOpen,
   value,
   onChange,
   onRestore,
   info
 }: {
+  id: string
   title: string
   custom: boolean
-  open: boolean
-  setOpen: (v: boolean) => void
   value: string
   onChange: (v: string) => void
   onRestore: () => void
   info?: React.ReactNode
 }): React.JSX.Element {
   return (
-    <div>
-      <div className="mb-1 flex items-center gap-1.5 text-[11px] text-subtle">
-        <button type="button" onClick={() => setOpen(!open)} className="hover:text-fg">
-          {open ? '▾' : '▸'} {title}
-          {custom ? ' (personalizado)' : ''}
-        </button>
-        {info}
-        {custom && (
-          <button
-            type="button"
-            onClick={onRestore}
-            className="ml-auto inline-flex items-center gap-1 hover:text-fg"
-          >
-            <RotateCcw className="size-3" /> Restaurar padrão
-          </button>
-        )}
-      </div>
-      {open && (
-        <AutoTextarea
-          value={value}
-          aria-label={title}
-          onChange={(e) => onChange(e.target.value)}
-          minRows={4}
-          maxRows={14}
-          className="field animate-fade-in font-mono text-[11px] leading-relaxed"
-        />
-      )}
-    </div>
+    <CollapsibleSection
+      id={id}
+      level="sub"
+      title={title}
+      summary={
+        custom ? { text: 'personalizado', changed: true } : { text: 'padrão', changed: false }
+      }
+      aside={
+        <>
+          {info}
+          {custom && <RestoreButton onClick={onRestore} />}
+        </>
+      }
+    >
+      <AutoTextarea
+        value={value}
+        aria-label={title}
+        onChange={(e) => onChange(e.target.value)}
+        minRows={4}
+        maxRows={14}
+        className="field font-mono text-[11px] leading-relaxed"
+      />
+    </CollapsibleSection>
   )
 }
 
@@ -574,7 +603,6 @@ function ExtractionSection({
   willSend: boolean
   onChange: (m: MemoryConfig) => void
 }): React.JSX.Element {
-  const [open, setOpen] = useState(false)
   const [running, setRunning] = useState(false)
   const toast = useStore((s) => s.toast)
   const flushConfig = useStore((s) => s.flushConfig)
@@ -608,8 +636,10 @@ function ExtractionSection({
   }
 
   return (
-    <Section
+    <CollapsibleSection
+      id="memory-extraction"
       title="Extração"
+      summary={memoryExtractionSummary(mem)}
       aside={
         <ExtractionPromptInfo
           prompt={prompt}
@@ -658,10 +688,9 @@ function ExtractionSection({
         )}
       </div>
       <PromptEditor
+        id="memory-extraction-prompt"
         title="Prompt de extração"
         custom={ex.prompt != null}
-        open={open}
-        setOpen={setOpen}
         value={prompt}
         onChange={(t) => setEx({ prompt: t })}
         onRestore={() => setEx({ prompt: null })}
@@ -686,7 +715,7 @@ function ExtractionSection({
           )}
         </>
       )}
-    </Section>
+    </CollapsibleSection>
   )
 }
 
@@ -707,7 +736,18 @@ function SnapshotSection({
   const toast = useStore((s) => s.toast)
   const flushConfig = useStore((s) => s.flushConfig)
   return (
-    <Section title="Índice da sessão" aside={<MemoryRefreshInfo />}>
+    <CollapsibleSection
+      id="memory-snapshot"
+      title="Índice da sessão"
+      summary={
+        !willSend
+          ? 'sem índice'
+          : snapshotAt
+            ? `desde ${formatTime(snapshotAt)}`
+            : 'na próxima request'
+      }
+      aside={<MemoryRefreshInfo />}
+    >
       <div className="flex items-center gap-2.5">
         <p
           data-testid="memory-snapshot"
@@ -744,6 +784,6 @@ function SnapshotSection({
           Atualizar memória
         </Button>
       </div>
-    </Section>
+    </CollapsibleSection>
   )
 }

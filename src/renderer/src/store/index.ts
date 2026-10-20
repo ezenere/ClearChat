@@ -83,6 +83,8 @@ const PANEL_TAB_KEY = 'clearchat.panelTab'
 /** Seção do painel → aba onde ela mora (focusConfig). */
 const SECTION_TAB: Record<string, PanelTab> = {
   contexto: 'chat',
+  'contexto-janela': 'chat',
+  raiz: 'chat',
   'smart-approve': 'tools',
   aprovacoes: 'tools',
   memoria: 'memory',

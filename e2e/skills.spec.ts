@@ -278,6 +278,14 @@ async function ensurePanelTab(tab: string): Promise<void> {
   await t.click()
 }
 
+/** Abre a seção recolhível `id` do painel/editor (CollapsibleSection), se estiver fechada. */
+async function expand(scope: ReturnType<Page['locator']>, id: string): Promise<void> {
+  const btn = scope.getByTestId(`collapse-${id}`)
+  await btn.scrollIntoViewIfNeeded()
+  if ((await btn.getAttribute('aria-expanded')) !== 'true') await btn.click()
+  await scope.locator(`[data-collapse-id="${id}"][data-open]`).waitFor()
+}
+
 // ---------------- passos ----------------
 
 async function main(): Promise<void> {
@@ -438,6 +446,8 @@ async function main(): Promise<void> {
     await ensurePanelTab('Tools')
     const sec = page.getByTestId('skills-panel')
     await sec.scrollIntoViewIfNeeded()
+    // checklist, prompt de apoio e subagentes ficam em "Ajustes das skills" (recolhido)
+    await expand(sec, 'skills-details')
     await sec.getByTestId('skills-checklist').waitFor()
     assert((await sec.locator('[data-skill]').count()) === 4, '4 skills na lista')
     // desliga "planilhas" neste chat
@@ -450,6 +460,7 @@ async function main(): Promise<void> {
       5000,
       'planilhas desligada salva'
     )
+    await expand(page.getByTestId('right-panel'), 'subagents')
     const line = page.getByTestId('subagent-skills')
     assert(/desligadas/.test(await line.innerText()), 'linha de subagentes')
     await shot('chat-skills-section', page.getByTestId('right-panel'))
@@ -565,6 +576,7 @@ async function main(): Promise<void> {
       }
       await openChatUi('Sub true')
       await ensurePanelTab('Tools')
+      await expand(page.getByTestId('right-panel'), 'subagents')
       assert(
         /ligadas/.test(await page.getByTestId('subagent-skills').innerText()),
         'linha: ligadas'

@@ -4,6 +4,7 @@
 import { AlertTriangle, Settings2, Star } from 'lucide-react'
 import {
   APPROVAL_ITEM_GROUPS,
+  APPROVAL_ITEMS,
   effectiveMode,
   ITEM_LABEL,
   ITEM_TOOL,
@@ -12,22 +13,45 @@ import {
 } from '@shared/approvalPolicy'
 import { smartApproveActive } from '@shared/smartApprove'
 import type { ApprovalItem, ApprovalMode } from '@shared/types'
+import { approvalsSummary } from '../../lib/configSummary'
 import { useStore } from '../../store'
 import { AutoApproveInfo } from '../apiDocs'
 import type { CfgProps } from '../panel/editors'
-import { Section } from '../panel/fields'
+import { CollapsibleSection } from '../panel/fields'
 import { ModeSelector, SMART_NEEDS_MODEL } from './ApprovalControls'
 
-export function ChatApprovalSection({ cfg, patch }: CfgProps): React.JSX.Element {
+export function ChatApprovalSection({
+  cfg,
+  patch,
+  chatScope
+}: CfgProps & {
+  /** Painel do chat: o aviso "sem modelo" leva à seção Smart-Approve (focusConfig). */
+  chatScope?: boolean
+}): React.JSX.Element {
   const global = useStore((s) => s.approvalSettings.modes)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
+  const focusConfig = useStore((s) => s.focusConfig)
   const overrides = normalizeChatModes(cfg.approvalModes)
   const judge = smartApproveActive(cfg.smartApprove)
   // escolher a opção ★ (= global) remove o override; outra opção fixa o modo neste chat
   const set = (item: ApprovalItem, mode: ApprovalMode): void =>
     patch({ approvalModes: withChatMode(overrides, item, mode, global) })
+  const smartNoModel = judge
+    ? []
+    : APPROVAL_ITEMS.filter((i) => effectiveMode(cfg, global, i) === 'smart')
   return (
-    <Section title="Aprovações" id="aprovacoes" aside={<AutoApproveInfo />}>
+    <CollapsibleSection
+      id="approvals"
+      title="Aprovações"
+      section="aprovacoes"
+      summary={approvalsSummary(cfg)}
+      warning={
+        smartNoModel.length
+          ? `Em Smart-Approve sem modelo (pedem confirmação): ${smartNoModel.map((i) => ITEM_LABEL[i]).join(', ')}`
+          : null
+      }
+      aside={<AutoApproveInfo />}
+    >
       <p data-testid="approval-star-hint" className="-mt-1 text-[11.5px] leading-snug text-subtle">
         <Star className="mb-0.5 inline size-2.5 fill-current text-accent-strong" /> marca o padrão
         global; escolher a opção com estrela segue o padrão global (muda junto se ele mudar).
@@ -68,7 +92,19 @@ export function ChatApprovalSection({ cfg, patch }: CfgProps): React.JSX.Element
       ))}
       {!judge && (
         <p data-testid="smart-needs-model" className="text-[11px] leading-snug text-faint">
-          Smart-Approve indisponível: escolha um modelo na seção Smart-Approve abaixo.
+          Smart-Approve indisponível:{' '}
+          {chatScope ? (
+            <button
+              type="button"
+              onClick={() => focusConfig('smart-approve')}
+              className="text-accent-strong hover:underline"
+            >
+              escolha um modelo na seção Smart-Approve
+            </button>
+          ) : (
+            'escolha um modelo na seção Smart-Approve'
+          )}
+          .
         </p>
       )}
       <button
@@ -78,6 +114,6 @@ export function ChatApprovalSection({ cfg, patch }: CfgProps): React.JSX.Element
       >
         <Settings2 className="size-3.5" /> Padrões globais e listas (Configurações → Aprovações)
       </button>
-    </Section>
+    </CollapsibleSection>
   )
 }
