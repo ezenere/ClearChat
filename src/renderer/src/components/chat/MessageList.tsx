@@ -116,6 +116,19 @@ function Reasoning({
   }
   const shown: ReasoningView = view === 'closed' && live ? 'box' : view
   const full = shown === 'full'
+  // Caixa compacta enquanto o modelo pensa: acompanha o texto novo só se o usuário está no fim dela
+  // (rolou para cima → não força a rolagem; voltou ao fim → volta a acompanhar).
+  const boxRef = useRef<HTMLDivElement>(null)
+  const stickRef = useRef(true)
+  const onBoxScroll = (): void => {
+    const el = boxRef.current
+    if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24
+  }
+  useLayoutEffect(() => {
+    const el = boxRef.current
+    if (!el || !live || shown !== 'box' || !stickRef.current) return
+    el.scrollTop = el.scrollHeight
+  }, [text, live, shown])
   return (
     <div className="mb-2">
       <div className="group/rsn -ml-1 flex items-center gap-0.5">
@@ -148,6 +161,9 @@ function Reasoning({
       </div>
       {shown !== 'closed' && (
         <div
+          ref={boxRef}
+          onScroll={full ? undefined : onBoxScroll}
+          data-testid="reasoning-box"
           className={cn(
             'mt-1.5 animate-fade-in border-l-2 border-border-strong pl-3.5 text-[12.5px] leading-relaxed whitespace-pre-wrap text-subtle',
             !full && 'max-h-72 overflow-y-auto'
