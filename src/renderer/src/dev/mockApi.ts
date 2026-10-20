@@ -39,7 +39,12 @@ import {
   mockPersonaMemory,
   MOCK_COLS
 } from './mockMemory'
-import { createMockRemoteFs, createMockViewer, seedViewerScenario } from './mockViewer'
+import {
+  createMockRemoteFs,
+  createMockViewer,
+  mockPlatform,
+  seedViewerScenario
+} from './mockViewer'
 import type {
   ApprovalSettings,
   AgentEvent,
@@ -1578,7 +1583,8 @@ export function createMockApi(scenario: string): ClearApi {
     viewer: {
       ...createMockViewer({ messages: () => messages, delay }),
       saveBytes: (name, bytes) => remoteFs.saveBytes(name, bytes),
-      openBytes: (name, bytes) => remoteFs.openBytes(name, bytes)
+      openBytes: (name, bytes) => remoteFs.openBytes(name, bytes),
+      runBytes: (chatId, name, bytes) => remoteFs.runBytes(chatId, name, bytes)
     },
     fs: {
       listDir: (p) =>
@@ -1607,7 +1613,8 @@ export function createMockApi(scenario: string): ClearApi {
         delay({
           bwrap: true,
           ripgrep: true,
-          shell: { name: 'zsh' as const, version: '5.9', os: 'Linux' }
+          shell: { name: 'zsh' as const, version: '5.9', os: 'Linux' },
+          platform: mockPlatform()
         })
     },
     // ?scenario=update → há versão nova (aviso na sidebar); senão, já na mais recente

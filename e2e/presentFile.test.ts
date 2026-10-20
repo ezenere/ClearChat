@@ -406,6 +406,7 @@ test('openViewerFile: mensagem real de present_file, outro dispositivo, confinam
   const ok = await openViewerFile(t(0), deps, reg)
   assert.ok(ok.ok)
   assert.equal(ok.file.kind, 'markdown')
+  assert.deepEqual(ok.file.action, { class: 'document' }, 'ações por tipo (fileActions)')
   assert.equal(ok.file.url, viewerUrl(ok.file.token, 'relatorio.md'))
   assert.equal(grantedPath(ok.file.token, reg), join(ROOT, 'docs', 'relatorio.md'))
   // arquivo com erro / índice inexistente / mensagem de outro chat

@@ -1,7 +1,9 @@
 // Painel de arquivo — coluna entre o chat e o painel de configurações: [LISTA | CHAT | ARQUIVO |
 // CONFIGS]. Mostra o arquivo ativo do chat (present_file / aba Arquivos) com a fonte de bytes do
 // chat (lib/fileSources: local; remota no controle remoto — baixa do host com progresso, sem
-// "Mostrar na pasta", com "Salvar como…"; trocar de arquivo/chat cancela). Divisor redimensionável
+// "Mostrar na pasta", com "Salvar como…"; trocar de arquivo/chat cancela). Ações pela extensão +
+// sistema (resourceActions): executável deste sistema → "Executar…" (confirmação no main); de
+// outro sistema → só "Mostrar na pasta" / "Salvar como…" + nota. Divisor redimensionável
 // (arrastar, ←/→, Home/End, duplo clique = padrão), fechar (X / Esc com o foco no painel).
 // Ver SPEC → "Visualizador de arquivos (present_file)".
 import {
@@ -13,6 +15,7 @@ import {
   FolderOpen,
   Maximize,
   MonitorSmartphone,
+  Play,
   RefreshCw,
   ShieldAlert,
   WifiOff,
@@ -418,17 +421,24 @@ function Problem({
   )
 }
 
-/** Tipo sem visualização: nome, tamanho, tipo + "Mostrar local…" / "Abrir arquivo". */
+/**
+ * Tipo sem visualização: nome, tamanho, tipo + "Mostrar local…" / "Salvar como…" / "Abrir arquivo"
+ * ou "Executar…" (executável deste sistema); executável de outro sistema → a nota, sem abrir/rodar.
+ */
 function Unsupported({
   resource,
   onFolder,
   onSaveAs,
-  onExternal
+  onExternal,
+  onRun,
+  note
 }: {
   resource: ViewerResource
   onFolder?: () => void
   onSaveAs?: () => void
   onExternal?: () => void
+  onRun?: () => void
+  note?: string
 }): React.JSX.Element {
   const { name, size, typeLabel } = resource.info
   const { icon: Icon, tone } = fileIcon(name, 'binary')
@@ -448,6 +458,14 @@ function Unsupported({
         <div className="mt-2 text-xs text-faint">
           Este tipo de arquivo não tem pré-visualização.
         </div>
+        {note && (
+          <div
+            data-testid="viewer-exec-note"
+            className="mt-2 flex items-center justify-center gap-1 text-xs text-warning/85"
+          >
+            <ShieldAlert className="size-3.5 shrink-0" /> {note}
+          </div>
+        )}
       </div>
       <div className="mt-1 flex flex-col gap-2">
         {onFolder && (
@@ -467,6 +485,11 @@ function Unsupported({
             onClick={onExternal}
           >
             Abrir arquivo
+          </Button>
+        )}
+        {onRun && (
+          <Button variant="primary" icon={<Play className="size-3.5" />} onClick={onRun}>
+            Executar…
           </Button>
         )}
       </div>
@@ -559,7 +582,8 @@ export function FileViewerPane({
   const kind = resource?.info.kind
   const fitKind = kind === 'image' || kind === 'pdf'
   const effZoom: number = zoom ?? 1
-  // ações conforme as capacidades da fonte (remota: sem "Mostrar na pasta"; com "Salvar como…")
+  // ações conforme as capacidades da fonte (remota: sem "Mostrar na pasta"; com "Salvar como…") e a
+  // classe do arquivo (executável deste sistema: "Executar…" no lugar de "Abrir no app")
   const acts = resourceActions(source, resource)
   const openExternal = acts.openExternal
     ? () => void run(() => acts.openExternal!(), 'Não foi possível abrir o arquivo')
@@ -569,6 +593,9 @@ export function FileViewerPane({
     : undefined
   const saveAs = acts.saveAs
     ? () => void run(() => acts.saveAs!(), 'Não foi possível salvar o arquivo')
+    : undefined
+  const runFile = acts.run
+    ? () => void run(() => acts.run!(), 'Não foi possível executar o arquivo')
     : undefined
   const zoomable = !!resource && kind !== 'binary'
 
@@ -676,6 +703,8 @@ export function FileViewerPane({
           onFolder={showInFolder}
           onSaveAs={saveAs}
           onExternal={openExternal}
+          onRun={runFile}
+          note={acts.note}
         />
       ) : (
         <TextKinds resource={resource} zoom={effZoom} onOpenExternal={openExternal} />
@@ -763,6 +792,20 @@ export function FileViewerPane({
             </label>
           )}
           <span className="flex-1" />
+          {acts.note && kind !== 'binary' && (
+            <span
+              data-testid="viewer-exec-note"
+              className="mr-1 truncate text-[11px] text-warning/85"
+              title={acts.note}
+            >
+              {acts.note}
+            </span>
+          )}
+          {runFile && (
+            <IconButton label="Executar…" size="xs" onClick={runFile}>
+              <Play />
+            </IconButton>
+          )}
           {openExternal && (
             <IconButton label="Abrir no app" size="xs" onClick={openExternal}>
               <ExternalLink />

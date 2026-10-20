@@ -29,6 +29,7 @@ import {
   viewerTypeLabel,
   viewerUrl
 } from '@shared/fileViewer'
+import { classifyFileAction } from '@shared/fileActions'
 import { assertInsideRoot, binaryKind, isInside, resolvePath } from './tools/util'
 
 export interface ViewerGrant {
@@ -194,6 +195,8 @@ export interface ViewerDeps {
   localDevice(): { id: string; name: string } | null
   /** Nome do host quando o chat roda em OUTRO dispositivo (controle remoto); senão null. */
   remoteHost(chatId: string): string | null
+  /** Sistema deste computador (ações por tipo); padrão `process.platform`. */
+  platform?: string
 }
 
 type Unavailable = Extract<ViewerOpenResult, { ok: false }>
@@ -307,7 +310,11 @@ export async function openViewerFile(
     mime: viewerMime(kind, name, head),
     ...(language ? { language } : {}),
     typeLabel:
-      kind === 'binary' && head.length ? describeBinary(name, head) : viewerTypeLabel(kind, name)
+      kind === 'binary' && head.length ? describeBinary(name, head) : viewerTypeLabel(kind, name),
+    // bit de execução: só conta para arquivo sem extensão no Linux (ver @shared/fileActions)
+    action: classifyFileAction(name, deps.platform ?? process.platform, {
+      localExecutable: (st.mode & 0o111) !== 0
+    })
   }
   return { ok: true, file }
 }

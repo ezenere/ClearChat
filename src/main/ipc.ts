@@ -50,6 +50,15 @@ import {
 } from './fileViewer'
 import type { ViewerTarget } from '@shared/ipc'
 import { checkedBytes, writeViewerTemp } from './viewerTemp'
+import {
+  assertCanOpenLocal,
+  chmodX,
+  runGrantedFile,
+  runRemoteBytes,
+  spawnDetached,
+  whichSync,
+  type RunDeps
+} from './fileRun'
 import { safeFileName } from '@shared/remoteFs'
 import * as runner from './agent/runner'
 import * as memory from './memory'
@@ -119,6 +128,34 @@ const viewerDeps: ViewerDeps = {
     if (!e?.active) return null
     const mode = e.host.mode(chatId)
     return mode === 'remote' || mode === 'host-offline' ? e.host.hostName(chatId) : null
+  }
+}
+
+/** "Executar…" do visualizador: diálogo nativo + processos reais (fileRun.ts é sem Electron). */
+function runDeps(): RunDeps {
+  return {
+    platform: process.platform,
+    which: (cmd) => whichSync(cmd),
+    systemRoot: process.env.SystemRoot,
+    confirm: async ({ message, detail }) => {
+      const win = BrowserWindow.getFocusedWindow()
+      const opts: Electron.MessageBoxOptions = {
+        type: 'warning',
+        title: 'Executar arquivo',
+        message,
+        detail,
+        buttons: ['Cancelar', 'Executar'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true
+      }
+      const r = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+      return r.response === 1
+    },
+    openPath: (p) => shell.openPath(p),
+    spawn: spawnDetached,
+    chmodX,
+    log: (m) => console.log(`[clearchat] executar: ${m}`)
   }
 }
 
@@ -385,7 +422,10 @@ export function registerIpc(): void {
       checkPresented(chatId, messageId, viewerDeps),
     [IPC.viewer.readText]: (token: string) => readViewerText(token),
     [IPC.viewer.openExternal]: async (token: string) => {
-      const err = await shell.openPath(grantedPath(token))
+      const file = grantedPath(token)
+      // executável (deste sistema ou de outro) nunca abre direto: "Executar…" pede confirmação
+      await assertCanOpenLocal(file, process.platform)
+      const err = await shell.openPath(file)
       if (err) throw new Error(err)
     },
     [IPC.viewer.showInFolder]: (token: string) => shell.showItemInFolder(grantedPath(token)),
@@ -406,6 +446,15 @@ export function registerIpc(): void {
       const err = await shell.openPath(writeViewerTemp(name, bytes))
       if (err) throw new Error(err)
     },
+    // "Executar…": o main reclassifica e confirma; só token concedido / chat em controle remoto
+    [IPC.viewer.run]: (token: string) => runGrantedFile(token, runDeps()),
+    [IPC.viewer.runBytes]: (chatId: string, name: string, bytes: Uint8Array) =>
+      runRemoteBytes(
+        name,
+        bytes,
+        typeof chatId === 'string' ? viewerDeps.remoteHost(chatId) : null,
+        runDeps()
+      ),
 
     // ---- anexos ----
     [IPC.attachments.pick]: async (): Promise<AttachmentPickResult> => {
@@ -442,7 +491,8 @@ export function registerIpc(): void {
     [IPC.app.capabilities]: (): AppCapabilities => ({
       bwrap: bwrapAvailable(),
       ripgrep: ripgrepAvailable(),
-      shell: shellInfoLite()
+      shell: shellInfoLite(),
+      platform: process.platform
     }),
 
     // ---- atualizações (só aviso; nada é baixado) ----

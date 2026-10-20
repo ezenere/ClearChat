@@ -108,7 +108,9 @@ export const IPC = {
     openExternal: 'viewer:openExternal',
     showInFolder: 'viewer:showInFolder',
     saveBytes: 'viewer:saveBytes',
-    openBytes: 'viewer:openBytes'
+    openBytes: 'viewer:openBytes',
+    run: 'viewer:run',
+    runBytes: 'viewer:runBytes'
   },
   app: {
     capabilities: 'app:capabilities'
@@ -319,6 +321,11 @@ export interface ViewerFile {
   language?: string
   /** Rótulo do tipo ("Documento PDF", "arquivo ZIP (ou docx/xlsx/jar)"…). */
   typeLabel: string
+  /**
+   * Ações pela extensão + sistema (documento / executável deste sistema / de outro / desconhecido).
+   * Só para a UI: o main reclassifica antes de abrir ou executar.
+   */
+  action: import('./fileActions').FileAction
 }
 
 /** Por que o arquivo não abre aqui. */
@@ -355,6 +362,8 @@ export interface AppCapabilities {
   ripgrep: boolean
   /** Shell do usuário detectado no start (descrição da tool `shell`). */
   shell?: import('./shellInfo').ShellInfoLite
+  /** `process.platform` do main (ações por tipo de arquivo do visualizador). */
+  platform?: string
 }
 
 /** Últimas linhas de um processo em segundo plano (popover da UI). */
@@ -512,6 +521,16 @@ export interface ClearApi {
      * (userData/tmp-viewer/<aleatório>/<nome>, limpo ao abrir/fechar o app) e abre no app padrão.
      */
     openBytes(name: string, bytes: Uint8Array): Promise<void>
+    /**
+     * "Executar…" de um arquivo concedido (executável DESTE sistema): o main reclassifica, pede
+     * confirmação (diálogo nativo, padrão Cancelar) e roda. false = cancelado.
+     */
+    run(token: string): Promise<boolean>
+    /**
+     * "Executar…" de um arquivo buscado do host (chat em controle remoto): confirmação ("veio de
+     * <host>"), cópia temporária privada e roda. false = cancelado.
+     */
+    runBytes(chatId: string, name: string, bytes: Uint8Array): Promise<boolean>
   }
   app: {
     capabilities(): Promise<AppCapabilities>

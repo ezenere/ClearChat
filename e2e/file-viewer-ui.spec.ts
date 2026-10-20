@@ -12,7 +12,9 @@
 //   escritório", host simulado em mockViewer.ts): present_file abre sozinho buscando do host com
 //   progresso; Salvar como… / Abrir no app presentes e nunca "Mostrar na pasta"; aba Arquivos lista
 //   o host; PDF e HTML por blob URL (HTML sem o toggle de scripts); tipo sem prévia baixa só ao
-//   abrir/salvar; reabrir usa o cache; host offline.
+//   abrir/salvar; reabrir usa o cache; host offline. Ações por tipo (mock = Linux): .sh com prévia
+//   de código + "Executar…" (local e do host); .exe do host só "Salvar como…" + "Executável de
+//   Windows" (nada roda: o mock só registra as chamadas).
 // Screenshots em $CLEARCHAT_E2E_DIR/shots.
 //
 // Uso:
@@ -322,6 +324,96 @@ app.on('window-all-closed', () => app.quit())
     assert.equal(calls[calls.length - 1], `open:${VROOT}/notas.txt`)
   })
 
+  /** present_file simulado (evento): `deviceId` = arquivos de outro dispositivo (host). */
+  const emitPresent = (
+    id: string,
+    seq: number,
+    files: { path: string; name: string; size: number; kind: string }[],
+    device?: { deviceId: string; deviceName: string }
+  ): Promise<void> =>
+    page.evaluate(
+      ({ id, seq, files, device }) => {
+        const w = window as any
+        const now = Date.now()
+        w.__clearMockEmit({
+          type: 'message-added',
+          message: {
+            id: `${id}-a`,
+            sessionId: 'spf',
+            seq,
+            createdAt: now,
+            message: {
+              role: 'assistant',
+              content: 'Arquivos:',
+              tool_calls: [
+                {
+                  id: `${id}-c`,
+                  type: 'function',
+                  function: {
+                    name: 'present_file',
+                    arguments: JSON.stringify({ files: files.map((f) => ({ path: f.name })) })
+                  }
+                }
+              ]
+            },
+            meta: {}
+          }
+        })
+        w.__clearMockEmit({
+          type: 'message-added',
+          message: {
+            id: `${id}-t`,
+            sessionId: 'spf',
+            seq: seq + 1,
+            createdAt: now,
+            message: {
+              role: 'tool',
+              tool_call_id: `${id}-c`,
+              content: 'Apresentado ao usuário: …'
+            },
+            meta: { toolStatus: 'ok', presentFiles: { ...(device ?? {}), files } }
+          }
+        })
+      },
+      { id, seq, files, device }
+    )
+  const labelsIn = (loc: ReturnType<Page['locator']>): Promise<string[]> =>
+    loc
+      .locator('button[aria-label]')
+      .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label') ?? ''))
+
+  await step(
+    'script .sh (Linux): prévia como código + "Executar…" (sem "Abrir no app")',
+    async () => {
+      await emitPresent('msh', 9051, [
+        { path: `${VROOT}/deploy.sh`, name: 'deploy.sh', size: 96, kind: 'code' }
+      ])
+      await viewer().waitFor()
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid="viewer-name"]')?.textContent === 'deploy.sh'
+      )
+      const code = viewer().getByTestId('viewer-code')
+      await code.waitFor()
+      assert.match(await code.innerText(), /npm run build/)
+      const labels = await labelsIn(viewer())
+      assert.ok(labels.includes('Executar…'), labels.join(', '))
+      assert.ok(labels.includes('Mostrar na pasta'))
+      assert.ok(!labels.includes('Abrir no app'))
+      // card: as mesmas ações no hover
+      const c = card('deploy.sh')
+      await c.hover()
+      const cardLabels = await labelsIn(c)
+      assert.ok(cardLabels.includes('Executar…') && !cardLabels.includes('Abrir no app'))
+      assert.ok(cardLabels.includes('Mostrar na pasta'))
+      // nada roda no mock: a chamada só é registrada (o main real pede confirmação)
+      await viewer().getByRole('button', { name: 'Executar…' }).click()
+      await page.waitForTimeout(150)
+      const calls = await page.evaluate(() => (window as any).__mockViewerCalls)
+      assert.equal(calls[calls.length - 1], `run:${VROOT}/deploy.sh`)
+      await shot('05a-script-run')
+    }
+  )
+
   await step(
     'aba Arquivos: clique abre no painel e destaca; duplo clique abre no app',
     async () => {
@@ -581,6 +673,73 @@ app.on('window-all-closed', () => app.quit())
     const added = (await remoteCalls()).slice(n0).filter((c) => c.startsWith('read:'))
     assert.deepEqual(added, ['read:relatorio-final.pdf:0:0'])
   })
+
+  await step('remoto: .exe no Linux → só "Salvar como…" + "Executável de Windows"', async () => {
+    const panel = page.getByTestId('right-panel')
+    await panel.getByTestId('files-entry').filter({ hasText: 'instalar.exe' }).click()
+    const pane = viewer().getByTestId('viewer-unsupported')
+    await pane.waitFor()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid="viewer-name"]')?.textContent === 'instalar.exe'
+    )
+    assert.match(
+      await pane.getByTestId('viewer-exec-note').innerText(),
+      /Executável de Windows — não roda neste sistema/
+    )
+    assert.deepEqual(
+      await pane.getByRole('button').evaluateAll((els) => els.map((e) => e.textContent?.trim())),
+      ['Salvar como…']
+    )
+    const labels = await toolbarLabels()
+    assert.ok(labels.includes('Salvar como…'), labels.join(', '))
+    for (const no of ['Abrir no app', 'Executar…', 'Mostrar na pasta'])
+      assert.ok(!labels.includes(no), `${no} não deveria aparecer`)
+    await pane.getByRole('button', { name: 'Salvar como…' }).click()
+    await page.waitForFunction(() =>
+      ((window as any).__mockViewerCalls as string[]).at(-1)?.startsWith('save:instalar')
+    )
+    assert.equal((await osCalls()).at(-1), 'save:instalar.exe:98304')
+    await shot('14a-remote-exe')
+  })
+
+  await step(
+    'remoto: cards do host — .exe só "Salvar como…" com a nota; .sh "Executar…"',
+    async () => {
+      await emitPresent(
+        'mrx',
+        9201,
+        [
+          { path: `${HROOT}/instalar.exe`, name: 'instalar.exe', size: 98304, kind: 'binary' },
+          { path: `${HROOT}/atualizar.sh`, name: 'atualizar.sh', size: 42, kind: 'code' }
+        ],
+        { deviceId: 'dev-escritorio', deviceName: 'PC do escritório' }
+      )
+      const exe = card('instalar.exe')
+      await exe.waitFor()
+      await exe.scrollIntoViewIfNeeded()
+      assert.match(
+        await exe.getByTestId('pf-hint').innerText(),
+        /Executável de Windows — não roda neste sistema/
+      )
+      assert.equal(await exe.getAttribute('data-disabled'), null, 'a nota não desabilita o card')
+      await exe.hover()
+      const exeLabels = (await labelsIn(exe)).filter((l) => !l.includes('no visualizador'))
+      assert.deepEqual(exeLabels, ['Salvar como…'])
+      const sh = card('atualizar.sh')
+      await sh.hover()
+      const shLabels = (await labelsIn(sh)).filter((l) => !l.includes('no visualizador'))
+      assert.deepEqual(shLabels, ['Executar…', 'Salvar como…'])
+      await sh.getByRole('button', { name: /no visualizador/ }).click()
+      await viewer().getByTestId('viewer-code').waitFor()
+      assert.match(await viewer().getByTestId('viewer-code').innerText(), /atualizando/)
+      await viewer().getByRole('button', { name: 'Executar…' }).click()
+      await page.waitForFunction(() =>
+        ((window as any).__mockViewerCalls as string[]).at(-1)?.startsWith('run-temp:')
+      )
+      assert.match((await osCalls()).at(-1) ?? '', /^run-temp:atualizar\.sh:\d+$/)
+      await shot('14b-remote-exec-cards')
+    }
+  )
 
   await step('remoto: host offline → estados "Host offline" no painel e na aba', async () => {
     await hostState('host-offline')

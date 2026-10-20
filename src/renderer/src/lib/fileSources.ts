@@ -12,6 +12,7 @@
 import type { PresentFilesRecord } from '@shared/types'
 import type { ViewerFile } from '@shared/ipc'
 import type { ChatHostMode } from '@shared/sync'
+import { classifyFileAction, otherOsNote, type FileAction } from '@shared/fileActions'
 import { api, errorMessage } from './api'
 import type { DirSource, FileSource, ViewerResource } from './fileResource'
 
@@ -43,13 +44,16 @@ function localResource(file: ViewerFile): ViewerResource {
     assetUrl: (rel) => (file.kind === 'markdown' ? relativeAsset(url, rel) : null),
     openExternal: () => api.viewer.openExternal(token),
     showInFolder: () => api.viewer.showInFolder(token),
+    run: async () => {
+      await api.viewer.run(token)
+    },
     dispose: () => {}
   }
 }
 
 export const localFileSource: FileSource = {
   id: 'local',
-  capabilities: { reveal: true, openNative: true, saveAs: false },
+  capabilities: { reveal: true, openNative: true, saveAs: false, run: true },
   async open(target) {
     try {
       const r = await api.viewer.open(target)
@@ -137,20 +141,64 @@ export function canAutoOpen(
   return !rec.deviceId || !host.deviceId || rec.deviceId === host.deviceId
 }
 
-/** Ações disponíveis para um recurso aberto: capacidade da fonte E a função presente no recurso. */
-export function resourceActions(
-  source: FileSource,
-  resource: ViewerResource | null
-): {
+/** Ações de um arquivo (barra, painel sem prévia, cards, duplo clique da aba Arquivos). */
+export interface FileActions {
   openExternal?: () => Promise<void>
   showInFolder?: () => Promise<void>
   saveAs?: () => Promise<void>
-} {
-  if (!resource) return {}
+  run?: () => Promise<void>
+  /** Executável de outro sistema: "Executável de Windows — não roda neste sistema". */
+  note?: string
+}
+
+/**
+ * Quais ações a classe permite (com as capacidades da fonte): documento/desconhecido → Abrir no
+ * app; executável deste sistema → Executar… (nunca "Abrir no app"); de outro sistema → nem um nem
+ * outro, só "Mostrar na pasta" (local) / "Salvar como…" (remota) + a nota.
+ */
+export function allowedActions(
+  source: FileSource,
+  action: FileAction
+): { openExternal: boolean; showInFolder: boolean; saveAs: boolean; run: boolean; note?: string } {
   const c = source.capabilities
+  const exec = action.class === 'executable-here'
+  const other = action.class === 'executable-other-os'
   return {
-    ...(c.openNative && resource.openExternal ? { openExternal: resource.openExternal } : {}),
-    ...(c.reveal && resource.showInFolder ? { showInFolder: resource.showInFolder } : {}),
-    ...(c.saveAs && resource.saveAs ? { saveAs: resource.saveAs } : {})
+    openExternal: c.openNative && !exec && !other,
+    run: c.run && exec,
+    showInFolder: c.reveal,
+    saveAs: c.saveAs,
+    ...(other ? { note: otherOsNote(action.os) } : {})
+  }
+}
+
+/** Ações de um card antes de abrir o arquivo: classe pelo NOME (o main reclassifica ao agir). */
+export function nameActions(
+  source: FileSource,
+  name: string,
+  platform: string
+): ReturnType<typeof allowedActions> {
+  return allowedActions(source, classifyFileAction(name, platform))
+}
+
+/** Sistema deste computador pelo user agent (antes de `app.capabilities()` chegar). */
+export function uaPlatform(): string {
+  const ua = typeof navigator === 'undefined' ? '' : navigator.userAgent
+  return /Windows/.test(ua) ? 'win32' : /Mac/.test(ua) ? 'darwin' : 'linux'
+}
+
+/**
+ * Ações disponíveis para um recurso aberto: capacidade da fonte, classe do arquivo (vinda do main
+ * para arquivo local — com o bit de execução —, do nome para o remoto) e a função presente no recurso.
+ */
+export function resourceActions(source: FileSource, resource: ViewerResource | null): FileActions {
+  if (!resource) return {}
+  const a = allowedActions(source, resource.info.action)
+  return {
+    ...(a.openExternal && resource.openExternal ? { openExternal: resource.openExternal } : {}),
+    ...(a.run && resource.run ? { run: resource.run } : {}),
+    ...(a.showInFolder && resource.showInFolder ? { showInFolder: resource.showInFolder } : {}),
+    ...(a.saveAs && resource.saveAs ? { saveAs: resource.saveAs } : {}),
+    ...(a.note ? { note: a.note } : {})
   }
 }

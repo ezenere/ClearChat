@@ -5,7 +5,7 @@
 // - Download em pedaços de REMOTE_FS_LIMITS.chunkBytes, alguns em voo ao mesmo tempo, com progresso
 //   e cancelamento (trocar de arquivo/chat aborta). Só o que a prévia usa: imagem/PDF/HTML inteiros,
 //   texto até VIEWER_LIMITS.textMaxBytes, tipo sem prévia só o começo; "Salvar como…" / "Abrir no
-//   app" completam o arquivo na hora.
+//   app" / "Executar…" completam o arquivo na hora.
 // - Cache em memória dos últimos arquivos (teto de quantidade e de bytes); reabrir confere
 //   tamanho + mtime no host (pedido de 0 bytes) antes de usar o cache.
 // - Nunca "Mostrar na pasta": o arquivo não está neste computador.
@@ -21,6 +21,7 @@ import {
   viewerMime,
   viewerTypeLabel
 } from '@shared/fileViewer'
+import { classifyFileAction } from '@shared/fileActions'
 import {
   REMOTE_FS_LIMITS,
   type RemoteDirResult,
@@ -43,6 +44,8 @@ export interface RemoteFsSender {
   readChunk(chatId: string, path: string, offset: number, length: number): Promise<RemoteReadResult>
   saveBytes(name: string, bytes: Uint8Array): Promise<boolean>
   openBytes(name: string, bytes: Uint8Array): Promise<void>
+  /** "Executar…": o main confere o chat em controle remoto, reclassifica, confirma e roda. */
+  runBytes(chatId: string, name: string, bytes: Uint8Array): Promise<boolean>
 }
 
 /** O que a fonte remota precisa do store. */
@@ -54,6 +57,8 @@ export interface RemoteContext {
   host(chatId: string): { deviceId: string | null; name: string } | null
   /** Fonte local: arquivo apresentado por ESTE dispositivo num chat que hoje roda em outro. */
   local?: FileSource
+  /** `process.platform` DESTE computador (ações por tipo; padrão 'linux'). */
+  platform?(): string
 }
 
 export type RemoteOptions = Pick<
@@ -287,7 +292,9 @@ export function createRemoteSources(
       kind,
       mime: viewerMime(kind, name, e.head),
       ...(language ? { language } : {}),
-      typeLabel: viewerTypeLabel(kind, name)
+      typeLabel: viewerTypeLabel(kind, name),
+      // cópia de outro dispositivo: só a extensão (nunca o bit de execução do host)
+      action: classifyFileAction(name, ctx.platform?.() ?? 'linux')
     }
   }
 
@@ -391,6 +398,9 @@ export function createRemoteSources(
           },
           openExternal: async () => {
             await sender.openBytes(name, await ensureFull(chatId, path, key, e))
+          },
+          run: async () => {
+            await sender.runBytes(chatId, name, await ensureFull(chatId, path, key, e))
           }
         })
         return { ok: true, resource }
@@ -422,7 +432,7 @@ export function createRemoteSources(
 
     return {
       id: 'remote',
-      capabilities: { reveal: false, openNative: true, saveAs: true },
+      capabilities: { reveal: false, openNative: true, saveAs: true, run: true },
       open,
       check
     }

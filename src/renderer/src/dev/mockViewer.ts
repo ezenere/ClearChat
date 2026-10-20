@@ -11,6 +11,7 @@ import type {
   ViewerKind
 } from '@shared/types'
 import type { ClearApi, ViewerFile } from '@shared/ipc'
+import { classifyFileAction } from '@shared/fileActions'
 import {
   codeLanguage,
   detectViewerKind,
@@ -45,6 +46,18 @@ const crescimento = (t2 - t1) / t1
 \`\`\`
 `
 
+const DEPLOY_SH =
+  '#!/usr/bin/env bash\nset -euo pipefail\n\nnpm run build\nrsync -a dist/ servidor:/srv/vendas/\necho "publicado"\n'
+
+/** Sistema simulado (`?platform=win32|darwin|linux`; padrão linux) — capabilities e ações por tipo. */
+export function mockPlatform(): string {
+  try {
+    return new URLSearchParams(location.search).get('platform') || 'linux'
+  } catch {
+    return 'linux'
+  }
+}
+
 const NOTES_TXT =
   'Notas da reunião\n\n- dados extraídos do ERP em 30/09\n- valores em milhares de reais\n'
 
@@ -52,7 +65,8 @@ const SIZES: Record<string, number> = {
   'relatorio.md': REPORT_MD.length,
   'grafico-vendas.png': 48_213,
   'dados-brutos.zip': 2_481_920,
-  'notas.txt': NOTES_TXT.length
+  'notas.txt': NOTES_TXT.length,
+  'deploy.sh': DEPLOY_SH.length
 }
 
 const kindOf = (name: string): ViewerKind =>
@@ -194,7 +208,7 @@ export function seedViewerScenario(o: {
 export function createMockViewer(o: {
   messages: () => StoredMessage[]
   delay: <T>(v: T, ms?: number) => Promise<T>
-}): Omit<ClearApi['viewer'], 'saveBytes' | 'openBytes'> {
+}): Omit<ClearApi['viewer'], 'saveBytes' | 'openBytes' | 'runBytes'> {
   // mensagens do mock + as que os E2E injetam por evento (só existem no store)
   const all = (): StoredMessage[] => {
     const st = (
@@ -229,7 +243,8 @@ export function createMockViewer(o: {
       typeLabel:
         kind === 'binary' && name.endsWith('.zip')
           ? 'Arquivo ZIP (ou docx/xlsx/jar)'
-          : viewerTypeLabel(kind, name)
+          : viewerTypeLabel(kind, name),
+      action: classifyFileAction(name, mockPlatform())
     }
   }
   return {
@@ -258,7 +273,9 @@ export function createMockViewer(o: {
           ? REPORT_MD
           : name === 'notas.txt'
             ? NOTES_TXT
-            : `// ${name}\nexport const exemplo = 42\n`
+            : name === 'deploy.sh'
+              ? DEPLOY_SH
+              : `// ${name}\nexport const exemplo = 42\n`
       return o.delay({ content, truncated: false, size: content.length })
     },
     openExternal: async (token) => {
@@ -266,6 +283,11 @@ export function createMockViewer(o: {
     },
     showInFolder: async (token) => {
       calls.push(`reveal:${tokens.get(token)}`)
+    },
+    // "Executar…": nada roda no mock — só registra (o main real confirma num diálogo nativo)
+    run: async (token) => {
+      calls.push(`run:${tokens.get(token)}`)
+      return true
     }
   }
 }
@@ -319,13 +341,15 @@ const enc = (s: string): Uint8Array => new TextEncoder().encode(s)
  * raiz/confinamento como o host real (fora → negado), devolve em pedaços de até 512 KiB com atraso
  * (o painel mostra o progresso) e "Host offline" quando o store diz que o host caiu. Chamadas em
  * window.__mockRemoteCalls (read:<nome>:<offset>:<length>, list:<pasta>) e as de SO em
- * window.__mockViewerCalls (save:<nome>:<bytes>, open-temp:<nome>:<bytes>).
+ * window.__mockViewerCalls (save:<nome>:<bytes>, open-temp:<nome>:<bytes>,
+ * run-temp:<nome>:<bytes> — nada roda de verdade).
  */
 export function createMockRemoteFs(o: { delay: <T>(v: T, ms?: number) => Promise<T> }): {
   remoteListDir: ClearApi['sync']['remoteListDir']
   remoteReadFile: ClearApi['sync']['remoteReadFile']
   saveBytes: ClearApi['viewer']['saveBytes']
   openBytes: ClearApi['viewer']['openBytes']
+  runBytes: ClearApi['viewer']['runBytes']
 } {
   const R = MOCK_HOST_ROOT
   const mtime = Date.now() - 3_600_000
@@ -353,6 +377,9 @@ export function createMockRemoteFs(o: { delay: <T>(v: T, ms?: number) => Promise
     [`${R}/backup.zip`, pseudoRandom(3 * 1024 * 1024 + 4321, [0x50, 0x4b, 0x03, 0x04])],
     [`${R}/log-grande.txt`, enc(longLog)],
     [`${R}/dados/notas.md`, enc('# Notas do escritório\n\nTudo certo com os dados.\n')],
+    // executável de Windows (cabeçalho MZ): no Linux só "Salvar como…" + nota
+    [`${R}/instalar.exe`, pseudoRandom(96 * 1024, [0x4d, 0x5a, 0x90, 0x00])],
+    [`${R}/atualizar.sh`, enc('#!/bin/sh\necho "atualizando o escritório"\n')],
     ['/srv/escritorio/segredo.txt', enc('fora da raiz')]
   ])
   const dirs = new Set([R, `${R}/dados`])
@@ -434,6 +461,10 @@ export function createMockRemoteFs(o: { delay: <T>(v: T, ms?: number) => Promise
     },
     openBytes: async (name, bytes) => {
       osCalls().push(`open-temp:${name}:${bytes.length}`)
+    },
+    runBytes: async (_chatId, name, bytes) => {
+      osCalls().push(`run-temp:${name}:${bytes.length}`)
+      return true
     }
   }
 }

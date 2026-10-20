@@ -65,7 +65,9 @@ const api: ClearApi = {
     openExternal: (token) => invoke(IPC.viewer.openExternal, token),
     showInFolder: (token) => invoke(IPC.viewer.showInFolder, token),
     saveBytes: (name, bytes) => invoke(IPC.viewer.saveBytes, name, bytes),
-    openBytes: (name, bytes) => invoke(IPC.viewer.openBytes, name, bytes)
+    openBytes: (name, bytes) => invoke(IPC.viewer.openBytes, name, bytes),
+    run: (token) => invoke(IPC.viewer.run, token),
+    runBytes: (chatId, name, bytes) => invoke(IPC.viewer.runBytes, chatId, name, bytes)
   },
   app: {
     capabilities: () => invoke(IPC.app.capabilities)

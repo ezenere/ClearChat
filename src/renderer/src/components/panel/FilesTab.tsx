@@ -203,7 +203,10 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
   /** Clique: abre no painel de arquivo (vira o arquivo ativo do chat). */
   const openInViewer = (e: DirEntry, path: string): void =>
     openFile(chat.id, { chatId: chat.id, source: 'browse', path }, path, e.name)
-  /** Duplo clique: abre no app padrão do sistema (só arquivos deste computador). */
+  /**
+   * Duplo clique: abre no app padrão do sistema (remoto: cópia temporária); executável deste
+   * sistema → "Executar…" (confirmação no main); de outro sistema → só avisa.
+   */
   const openInApp = async (path: string): Promise<void> => {
     const fileSource = sourcesFor(chat.id, host?.mode).file
     if (!fileSource.capabilities.openNative) return
@@ -212,8 +215,10 @@ export function FilesTab({ chat }: { chat: Chat }): React.JSX.Element {
       useStore.getState().toast(r.message, 'error')
       return
     }
-    const open = resourceActions(fileSource, r.resource).openExternal
+    const acts = resourceActions(fileSource, r.resource)
+    const open = acts.run ?? acts.openExternal
     if (open) await run(() => open(), 'Não foi possível abrir o arquivo')
+    else if (acts.note) useStore.getState().toast(acts.note, 'info')
     r.resource.dispose()
   }
 

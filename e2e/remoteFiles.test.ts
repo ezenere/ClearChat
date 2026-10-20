@@ -17,7 +17,7 @@ import {
 } from '../src/renderer/src/lib/remoteFiles'
 import type { FileSource } from '../src/renderer/src/lib/fileResource'
 import { VIEWER_LIMITS, VIEWER_REMOTE_HTML_CSP } from '../src/shared/fileViewer'
-import { isExecutableName, safeFileName, type RemoteReadResult } from '../src/shared/remoteFs'
+import { safeFileName, type RemoteReadResult } from '../src/shared/remoteFs'
 import type { PresentFilesRecord } from '../src/shared/types'
 import { cleanViewerTemp, setViewerTempDir, writeViewerTemp } from '../src/main/viewerTemp'
 
@@ -44,6 +44,7 @@ function fakeHost(opts: { chunkCap?: number; delayMs?: number } = {}) {
   const reads: { path: string; offset: number; length: number }[] = []
   const saved: { name: string; bytes: Uint8Array }[] = []
   const opened: { name: string; bytes: Uint8Array }[] = []
+  const ran: { chatId: string; name: string; bytes: Uint8Array }[] = []
   let inFlight = 0
   let maxInFlight = 0
   let failWith: RemoteReadResult | null = null
@@ -91,6 +92,10 @@ function fakeHost(opts: { chunkCap?: number; delayMs?: number } = {}) {
     },
     async openBytes(name, bytes) {
       opened.push({ name, bytes })
+    },
+    async runBytes(chatId, name, bytes) {
+      ran.push({ chatId, name, bytes })
+      return true
     }
   }
   return {
@@ -99,6 +104,7 @@ function fakeHost(opts: { chunkCap?: number; delayMs?: number } = {}) {
     reads,
     saved,
     opened,
+    ran,
     get maxInFlight() {
       return maxInFlight
     },
@@ -151,7 +157,7 @@ test('download em pedaços: progresso, até 3 em voo, bytes montados, imagem vir
   for (let i = 1; i < progress.length; i++) assert.ok(progress[i][0] > progress[i - 1][0])
   assert.deepEqual(progress.at(-1), [png.length, png.length])
   // sem "Mostrar na pasta" para arquivo remoto
-  assert.deepEqual(src.capabilities, { reveal: false, openNative: true, saveAs: true })
+  assert.deepEqual(src.capabilities, { reveal: false, openNative: true, saveAs: true, run: true })
   assert.equal(r.resource.showInFolder, undefined)
   r.resource.dispose()
 })
@@ -372,18 +378,61 @@ test('HTML remoto: CSP do visualizador injetada depois do doctype (bytes preserv
   assert.deepEqual(h.saved[0].bytes, html)
 })
 
-test('temporários do "Abrir no app": pasta própria, 0600, recusa executáveis, teto, limpeza', () => {
+test('ações por tipo (remoto): classe pelo nome e o sistema DESTE computador; Executar… completa o arquivo', async () => {
+  const h = fakeHost()
+  const sh = new TextEncoder().encode('#!/bin/sh\necho oi\n')
+  const exe = pseudo(200_000, [0x4d, 0x5a])
+  h.files.set('/host/raiz/deploy.sh', { bytes: sh, mtime: 1 })
+  h.files.set('/host/raiz/setup.exe', { bytes: exe, mtime: 1 })
+  // sem bit de execução do host: arquivo sem extensão nunca vira executável
+  h.files.set('/host/raiz/ferramenta', { bytes: exe, mtime: 1 })
+  const linux = sources(h, { platform: () => 'linux' }).src
+  const s1 = await linux.open(browse('/host/raiz/deploy.sh'))
+  assert.ok(s1.ok)
+  if (!s1.ok) return
+  assert.equal(s1.resource.info.kind, 'code', 'script: prévia como código')
+  assert.deepEqual(s1.resource.info.action, { class: 'executable-here', method: 'terminal-bash' })
+  await s1.resource.run!()
+  assert.equal(h.ran.length, 1)
+  assert.equal(h.ran[0].chatId, 'c1')
+  assert.equal(h.ran[0].name, 'deploy.sh')
+  assert.deepEqual(h.ran[0].bytes, sh)
+  const e1 = await linux.open(browse('/host/raiz/setup.exe'))
+  assert.ok(e1.ok)
+  if (!e1.ok) return
+  assert.deepEqual(e1.resource.info.action, { class: 'executable-other-os', os: 'Windows' })
+  const n1 = await linux.open(browse('/host/raiz/ferramenta'))
+  assert.ok(n1.ok && n1.resource.info.action.class === 'unknown')
+  // o mesmo .exe num Windows: executável deste sistema; .exe completo ao executar
+  const win = sources(h, { platform: () => 'win32' }).src
+  const e2 = await win.open(browse('/host/raiz/setup.exe'))
+  assert.ok(e2.ok)
+  if (!e2.ok) return
+  assert.deepEqual(e2.resource.info.action, { class: 'executable-here', method: 'open' })
+  await e2.resource.run!()
+  assert.deepEqual(h.ran.at(-1)!.bytes, exe, 'arquivo inteiro (a prévia só buscou o começo)')
+})
+
+test('temporários do "Abrir no app": pasta própria, 0600, recusa executáveis (por sistema), teto, limpeza', () => {
   const dir = join(TMP, 'tmp-viewer')
   setViewerTempDir(dir)
-  const p = writeViewerTemp('../../relatório.pdf', new Uint8Array([1, 2, 3]))
+  const p = writeViewerTemp('../../relatório.pdf', new Uint8Array([1, 2, 3]), dir, 'linux')
   assert.ok(p.startsWith(dir + '/'))
   assert.ok(p.endsWith('/relatório.pdf'))
   assert.deepEqual([...readFileSync(p)], [1, 2, 3])
   if (process.platform !== 'win32') assert.equal(statSync(p).mode & 0o777, 0o600)
-  assert.throws(() => writeViewerTemp('instalar.exe', new Uint8Array(1)), /Salvar como/)
-  assert.throws(() => writeViewerTemp('script.sh', new Uint8Array(1)), /executáveis/)
-  assert.throws(() => writeViewerTemp('a.txt', 'não é Uint8Array' as any), /inválido/)
-  assert.ok(isExecutableName('App.DESKTOP') && !isExecutableName('notas.md'))
+  const w = (name: string, platform: string): string =>
+    writeViewerTemp(name, new Uint8Array(1), dir, platform)
+  // executável de outro sistema / deste sistema / tipo que o app padrão executa
+  assert.throws(() => w('instalar.exe', 'linux'), /Executável de Windows.*Salvar como/)
+  assert.throws(() => w('script.sh', 'linux'), /Executar…/)
+  assert.throws(() => w('instalar.exe', 'win32'), /Executar…/)
+  assert.throws(() => w('App.DESKTOP', 'linux'), /Salvar como/)
+  assert.throws(() => w('macro.vbs', 'win32'), /Salvar como/)
+  assert.throws(() => w('app.js', 'win32'), /Salvar como/)
+  // o mesmo .js no Linux é só código: abre no editor padrão
+  assert.ok(w('app.js', 'linux').endsWith('/app.js'))
+  assert.throws(() => writeViewerTemp('a.txt', 'não é Uint8Array' as any, dir), /inválido/)
   assert.equal(safeFileName('a/b\\c:d?.txt'), 'c_d_.txt')
   assert.equal(safeFileName('..'), 'arquivo')
   cleanViewerTemp()

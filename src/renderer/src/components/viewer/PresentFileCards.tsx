@@ -1,15 +1,31 @@
 // Cards de uma chamada de present_file, no lugar do card de tool (sem cabeçalho): um por arquivo,
 // na posição da chamada dentro da resposta. Clique → abre no painel de arquivo (vira o ativo);
-// "Abrir no app" / "Mostrar na pasta" no hover/foco. Arquivo em outro dispositivo (controle remoto,
-// sync) ou que sumiu → card sem pré-visualização + nota. Ver SPEC → "Visualizador de arquivos".
-import { CircleAlert, ExternalLink, FolderOpen, MonitorSmartphone } from 'lucide-react'
+// no hover/foco, as ações pela extensão + sistema: "Abrir no app" (documento) ou "Executar…"
+// (executável deste sistema), "Mostrar na pasta" (local) / "Salvar como…" (remoto); executável de
+// outro sistema → só as duas últimas + nota. Arquivo em outro dispositivo (controle remoto, sync)
+// ou que sumiu → card sem pré-visualização + nota. Ver SPEC → "Visualizador de arquivos".
+import {
+  CircleAlert,
+  Download,
+  ExternalLink,
+  FolderOpen,
+  MonitorSmartphone,
+  Play,
+  ShieldAlert
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import type { PresentedFile, StoredMessage } from '@shared/types'
 import type { ViewerCheck } from '@shared/ipc'
 import { presentTitleBlock } from '@shared/fileViewer'
 import { presentedFilesOf } from '../../lib/presentFiles'
 import { cn, formatBytes } from '../../lib/format'
-import { presentedPlace, resourceActions, sourcesFor } from '../../lib/fileSources'
+import {
+  nameActions,
+  presentedPlace,
+  resourceActions,
+  sourcesFor,
+  uaPlatform
+} from '../../lib/fileSources'
 import { useStore } from '../../store'
 import { useHostInfo } from '../sync/hooks'
 import { MessageInfo } from '../apiDocs'
@@ -42,17 +58,24 @@ function Card({
   active,
   disabled,
   note,
+  hint,
   onOpen,
   onExternal,
-  onFolder
+  onRun,
+  onFolder,
+  onSaveAs
 }: {
   file: PresentedFile
   active: boolean
   disabled: boolean
   note?: React.ReactNode
+  /** Aviso que não desabilita o card (executável de outro sistema). */
+  hint?: string
   onOpen: () => void
   onExternal?: () => void
+  onRun?: () => void
   onFolder?: () => void
+  onSaveAs?: () => void
 }): React.JSX.Element {
   const { icon: Icon, tone } = fileIcon(file.name, file.kind)
   return (
@@ -94,6 +117,14 @@ function Card({
               {note}
             </span>
           )}
+          {hint && !note && (
+            <span
+              data-testid="pf-hint"
+              className="flex items-center gap-1 text-[11px] text-warning/85"
+            >
+              <ShieldAlert className="size-3" /> {hint}
+            </span>
+          )}
         </span>
         {file.size != null && !note && (
           <span className="shrink-0 text-[10.5px] text-faint tabular-nums">
@@ -101,8 +132,13 @@ function Card({
           </span>
         )}
       </button>
-      {(onExternal || onFolder) && (
+      {(onExternal || onRun || onFolder || onSaveAs) && (
         <div className="flex shrink-0 gap-0.5 opacity-0 transition-opacity group-focus-within/pf:opacity-100 group-hover/pf:opacity-100">
+          {onRun && (
+            <IconButton label="Executar…" size="xs" onClick={onRun}>
+              <Play />
+            </IconButton>
+          )}
           {onExternal && (
             <IconButton label="Abrir no app" size="xs" onClick={onExternal}>
               <ExternalLink />
@@ -111,6 +147,11 @@ function Card({
           {onFolder && (
             <IconButton label="Mostrar na pasta" size="xs" onClick={onFolder}>
               <FolderOpen />
+            </IconButton>
+          )}
+          {onSaveAs && (
+            <IconButton label="Salvar como…" size="xs" onClick={onSaveAs}>
+              <Download />
             </IconButton>
           )}
         </div>
@@ -138,6 +179,7 @@ export function PresentFileCards({
   const myDevice = useStore((s) => s.sync?.device?.id)
   const tick = useStore((s) => s.fsTick[chatId] ?? 0)
   const host = useHostInfo(chatId)
+  const platform = useStore((s) => s.capabilities.platform) ?? uaPlatform()
   const [checks, setChecks] = useState<ViewerCheck[] | null>(null)
   const rec = result?.meta.presentFiles
   const place = rec
@@ -158,9 +200,13 @@ export function PresentFileCards({
   if (!data) return null
   const { files } = data
 
+  /**
+   * Abre o recurso e roda a ação. `primary` = Executar… ou Abrir no app conforme a classe do
+   * RECURSO (local: vem do main, com o bit de execução — o card só sabe o nome).
+   */
   const withResource = async (
     index: number,
-    fn: 'openExternal' | 'showInFolder'
+    fn: 'primary' | 'showInFolder' | 'saveAs'
   ): Promise<void> => {
     if (!result) return
     const r = await source.open({ chatId, source: 'present', messageId: result.id, index })
@@ -168,8 +214,10 @@ export function PresentFileCards({
       useStore.getState().toast(r.message, 'error')
       return
     }
-    const action = resourceActions(source, r.resource)[fn]
+    const acts = resourceActions(source, r.resource)
+    const action = fn === 'primary' ? (acts.run ?? acts.openExternal) : acts[fn]
     if (action) await run(() => action(), 'Não foi possível abrir')
+    else if (acts.note) useStore.getState().toast(acts.note, 'info')
     r.resource.dispose()
   }
 
@@ -216,8 +264,10 @@ export function PresentFileCards({
         const unavailable = !!note || pending || !result
         // "Mostrar na pasta" só com a capacidade da fonte (nunca para arquivo remoto)
         const reachable = !remote || source.id !== 'local'
-        // remota: "Abrir no app" baixa do host para um temporário e abre
-        const caps = source.capabilities
+        // remota: "Abrir no app" / "Executar…" baixam do host para um temporário; ações pela
+        // extensão + sistema (o main reclassifica ao agir)
+        const acts = nameActions(source, f.name, platform)
+        const can = !unavailable && reachable
         return (
           <Card
             key={`${i}:${f.path}`}
@@ -225,6 +275,7 @@ export function PresentFileCards({
             active={!!active && !f.error && active.path === f.path}
             disabled={unavailable}
             note={note}
+            hint={acts.note}
             onOpen={() =>
               result &&
               openFile(
@@ -235,15 +286,13 @@ export function PresentFileCards({
               )
             }
             onExternal={
-              !unavailable && reachable && caps.openNative
-                ? () => void withResource(i, 'openExternal')
-                : undefined
+              can && acts.openExternal ? () => void withResource(i, 'primary') : undefined
             }
+            onRun={can && acts.run ? () => void withResource(i, 'primary') : undefined}
             onFolder={
-              !unavailable && reachable && caps.reveal
-                ? () => void withResource(i, 'showInFolder')
-                : undefined
+              can && acts.showInFolder ? () => void withResource(i, 'showInFolder') : undefined
             }
+            onSaveAs={can && acts.saveAs ? () => void withResource(i, 'saveAs') : undefined}
           />
         )
       })}

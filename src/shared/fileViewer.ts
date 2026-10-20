@@ -131,6 +131,12 @@ const CODE_LANGS: Record<string, string> = {
   sh: 'bash',
   bash: 'bash',
   zsh: 'bash',
+  command: 'bash',
+  // scripts do Windows: prévia como código (sem destaque — fora do conjunto `common`)
+  bat: 'plaintext',
+  cmd: 'plaintext',
+  ps1: 'plaintext',
+  psm1: 'plaintext',
   sql: 'sql',
   yaml: 'yaml',
   yml: 'yaml',

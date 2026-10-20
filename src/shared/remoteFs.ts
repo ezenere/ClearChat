@@ -84,20 +84,3 @@ export function safeFileName(name: string): string {
     .slice(0, 180)
   return base && base !== '.' && base !== '..' ? base : 'arquivo'
 }
-
-/**
- * Extensões que o sistema EXECUTA em vez de abrir (atalhos, scripts, instaladores, apps): "Abrir no
- * app" de um arquivo vindo de outro dispositivo recusa — o usuário pode "Salvar como…" e decidir.
- */
-const EXECUTABLE_EXTS = new Set(
-  (
-    'exe com bat cmd msi msp msc scr pif cpl lnk url ps1 psm1 vbs vbe js jse wsf wsh hta reg ' +
-    'jar app command tool desktop sh bash zsh csh run bin appimage deb rpm pkg dmg scpt workflow'
-  ).split(/\s+/)
-)
-
-export function isExecutableName(name: string): boolean {
-  const base = safeFileName(name).toLowerCase()
-  const i = base.lastIndexOf('.')
-  return i > 0 && EXECUTABLE_EXTS.has(base.slice(i + 1))
-}

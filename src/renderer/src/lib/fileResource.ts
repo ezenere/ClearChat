@@ -24,13 +24,15 @@ export interface ViewerResource {
   /** Link relativo do markdown (imagens) → URL carregável; null = indisponível. */
   assetUrl(rel: string): string | null
   /**
-   * Ações (presentes conforme `FileSource.capabilities`): abrir no app padrão (local: direto;
-   * remota: baixa para um temporário e abre), mostrar na pasta (só local), salvar como… (remota:
-   * diálogo do main grava os bytes buscados).
+   * Ações (presentes conforme `FileSource.capabilities` e a classe em `info.action`): abrir no app
+   * padrão (local: direto; remota: baixa para um temporário e abre), mostrar na pasta (só local),
+   * salvar como… (remota: diálogo do main grava os bytes buscados), executar… (executável deste
+   * sistema; o main reclassifica e pede confirmação).
    */
   openExternal?: () => Promise<void>
   showInFolder?: () => Promise<void>
   saveAs?: () => Promise<void>
+  run?: () => Promise<void>
   /** Libera recursos (blob URLs). Chamado ao trocar de arquivo / fechar. */
   dispose(): void
 }
@@ -56,6 +58,8 @@ export interface FileSourceCapabilities {
   openNative: boolean
   /** "Salvar como…" (remota: diálogo de salvar no main com os bytes buscados). */
   saveAs: boolean
+  /** "Executar…" de executáveis deste sistema (confirmação no main; remota: cópia temporária). */
+  run: boolean
 }
 
 export interface FileSource {
@@ -100,6 +104,7 @@ export function resourceFromBytes(
     assetUrl?: (rel: string) => string | null
     openExternal?: () => Promise<void>
     saveAs?: () => Promise<void>
+    run?: () => Promise<void>
     /** Bytes servidos na blob URL quando diferem dos do arquivo (HTML com a CSP injetada). */
     blob?: Uint8Array
   } = {}
@@ -123,6 +128,7 @@ export function resourceFromBytes(
     assetUrl: opts.assetUrl ?? (() => null),
     ...(opts.openExternal ? { openExternal: opts.openExternal } : {}),
     ...(opts.saveAs ? { saveAs: opts.saveAs } : {}),
+    ...(opts.run ? { run: opts.run } : {}),
     dispose: () => {
       if (url) URL.revokeObjectURL(url)
     }
