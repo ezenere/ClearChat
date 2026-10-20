@@ -9,6 +9,9 @@ export const LIMITS = {
 
   /** read_file: janela padrão (linhas) quando não há offset/limit. */
   readDefaultLines: 2000,
+  /** read_file sem offset/limit: devolve o arquivo inteiro até isso (e até readDefaultLines linhas);
+   * acima, só o início + instruções. Nunca passa de maxToolOutputChars do chat. */
+  readFullMaxChars: 60_000,
   /** read_file: linhas mais longas que isso são cortadas com marcador. */
   readMaxLineChars: 2000,
   /** read_file: acima disso (bytes) lê em streaming (só a janela pedida; sem offset/limit, o início). */

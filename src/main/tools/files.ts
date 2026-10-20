@@ -19,7 +19,6 @@ import {
   requireString,
   resolveReadPath,
   resolveToolPath,
-  spillCharsOf,
   type ToolContext,
   type ToolResult
 } from './util'
@@ -206,8 +205,8 @@ async function readFileImpl(args: Record<string, unknown>, ctx: ToolContext): Pr
     lines = all.slice(start - 1, start - 1 + limit)
   }
   if (total === 0) return ok(`[arquivo vazio: ${shown}]`)
-  // sem offset/limit: até o limite de spill (arquivo grande → só o início + instruções);
-  // com offset/limit: a faixa pedida até o teto de saída (maxToolOutputChars), dizendo se há mais
+  // sem offset/limit: o arquivo inteiro até readFullMaxChars/readDefaultLines (acima → só o início +
+  // instruções); com offset/limit: a faixa pedida até o teto de saída (maxToolOutputChars), dizendo se há mais
   return ok(
     renderFileWindow({
       lines,
@@ -215,7 +214,7 @@ async function readFileImpl(args: Record<string, unknown>, ctx: ToolContext): Pr
       totalLines: total,
       sizeBytes: st.size,
       explicit,
-      maxChars: explicit ? maxOutputOf(ctx) : spillCharsOf(ctx)
+      maxChars: explicit ? maxOutputOf(ctx) : Math.min(LIMITS.readFullMaxChars, maxOutputOf(ctx))
     })
   )
 }

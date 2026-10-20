@@ -165,7 +165,7 @@ test('shell: saída enorme → início + fim inline, status no fim, arquivo com 
   const whole = await runToolImpl(readFile, { path }, ctx())
   assert.match(whole.content, /^\[arquivo grande: 200\.000 linhas/)
   assert.ok(!PATH_RE.test(whole.content))
-  assert.ok(whole.content.length <= 8000)
+  assert.ok(whole.content.length <= 30_000) // teto padrão do chat (maxToolOutputChars)
   // search_files no arquivo salvo
   const s = await runToolImpl(searchFiles, { pattern: '^12345$', path }, ctx())
   assert.equal(s.status, 'ok', s.content)

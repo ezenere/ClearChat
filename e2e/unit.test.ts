@@ -526,22 +526,32 @@ test('read_file: janela padrão, cabeçalho de arquivo grande, offset/limit, lin
     join(ROOT, 'big.txt'),
     Array.from({ length: 5000 }, (_, i) => `linha ${i + 1}`).join('\n') + '\n'
   )
-  // sem offset/limit: só o início (até o limite de spill, padrão 8.000 chars) + como continuar
+  // sem offset/limit: até 2.000 linhas / 60.000 chars (nunca acima do teto do chat) + como continuar
   const big = await readFile({ path: 'big.txt' }, ctl({ maxOutput: 100_000 }))
   assert.equal(big.noSpill, true)
-  assert.ok(big.content.length <= 8000, `len ${big.content.length}`)
+  assert.ok(big.content.length <= 60_000, `len ${big.content.length}`)
   const bm =
-    /^\[arquivo grande: 5\.000 linhas, [\d,]+ KB — mostrando só o início \(linhas 1–(\d+)\)\. Leia o resto em partes com offset\/limit \(ex\.: offset=(\d+), limit=\d+\) ou localize trechos com search_files\.\]\n1\tlinha 1\n/.exec(
+    /^\[arquivo grande: 5\.000 linhas, [\d,]+ KB — mostrando só o início \(linhas 1–([\d.]+)\)\. Leia o resto em partes com offset\/limit \(ex\.: offset=(\d+), limit=\d+\) ou localize trechos com search_files\.\]\n1\tlinha 1\n/.exec(
       big.content
     )
   assert.ok(bm, big.content.slice(0, 300))
-  assert.equal(Number(bm![2]), Number(bm![1]) + 1)
-  assert.match(big.content, new RegExp(`\\n${bm![1]}\\tlinha ${bm![1]}$`))
-  // limite de spill maior: até as 2.000 linhas padrão
-  const big2 = await readFile({ path: 'big.txt' }, ctl({ maxOutput: 100_000, spillChars: 100_000 }))
-  assert.match(big2.content, /mostrando só o início \(linhas 1–2\.000\)/)
-  assert.match(big2.content, /\n2000\tlinha 2000$/)
-  assert.ok(!big2.content.includes('2001\t'))
+  const lastShown = Number(bm![1].replace(/\./g, ''))
+  assert.equal(Number(bm![2]), lastShown + 1)
+  assert.match(big.content, new RegExp(`\\n${lastShown}\\tlinha ${lastShown}$`))
+  // o limite de spill (8.000) não vale para read_file: as 2.000 linhas padrão cabem nos 60.000 chars
+  assert.match(big.content, /mostrando só o início \(linhas 1–2\.000\)/)
+  assert.match(big.content, /\n2000\tlinha 2000$/)
+  assert.ok(!big.content.includes('2001\t'))
+  // poucas linhas mas muito texto: corta nos 60.000 chars (ou no teto do chat, se menor)
+  writeFileSync(
+    join(ROOT, 'largo.txt'),
+    Array.from({ length: 900 }, () => 'z'.repeat(150)).join('\n') + '\n'
+  )
+  const wideFile = await readFile({ path: 'largo.txt' }, ctl({ maxOutput: 100_000 }))
+  assert.ok(wideFile.content.length <= 60_000, `len ${wideFile.content.length}`)
+  assert.match(wideFile.content, /^\[arquivo grande: 900 linhas/)
+  const cappedWide = await readFile({ path: 'largo.txt' }, ctl({ maxOutput: 20_000 }))
+  assert.ok(cappedWide.content.length <= 20_000, `len ${cappedWide.content.length}`)
   // arquivo pequeno (abaixo do limite): inteiro, como antes
   writeFileSync(join(ROOT, 'medio.txt'), 'x'.repeat(60) + '\n' + 'y'.repeat(60) + '\n')
   assert.match(
@@ -592,10 +602,10 @@ test('read_file: janela padrão, cabeçalho de arquivo grande, offset/limit, lin
   writeFileSync(join(ROOT, 'huge.log'), line.repeat(60_000)) // ~6 MB
   const huge = await readFile({ path: 'huge.log' }, ctl())
   assert.equal(huge.status, 'ok')
-  assert.ok(huge.content.length <= 8000, `len ${huge.content.length}`)
+  assert.ok(huge.content.length <= 30_000, `len ${huge.content.length}`) // teto padrão do chat
   assert.match(
     huge.content,
-    /^\[arquivo grande: 60\.000 linhas, [\d,]+ MB — mostrando só o início \(linhas 1–\d+\)/
+    /^\[arquivo grande: 60\.000 linhas, [\d,]+ MB — mostrando só o início \(linhas 1–[\d.]+\)/
   )
   const part = await readFile({ path: 'huge.log', offset: 59_999, limit: 10 }, ctl())
   assert.match(
