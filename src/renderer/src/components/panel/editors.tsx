@@ -50,6 +50,7 @@ import {
 import { AppSignatureField, AppSignatureInfo } from '../AppSignatureField'
 import { AutoTextarea, Switch } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
+import { HelpTip } from '../ui/Tooltip'
 import {
   CollapsibleSection,
   ExtraBodyEditor,
@@ -330,12 +331,15 @@ export function ParamsSection({
     patch({ params: { ...cfg.params, [key]: value, [other]: null } as unknown as ChatParams })
   }
   return (
-    <CollapsibleSection id="params" title="Parâmetros" summary={paramsSummary(cfg.params)}>
-      <p className="-mt-1 text-[11.5px] text-subtle">
-        Só os parâmetros ligados entram na request
-        {hiddenSome ? ' (os que o modelo não aceita ficam ocultos).' : '.'} O raciocínio fica na
-        seção Modelo.
-      </p>
+    <CollapsibleSection
+      id="params"
+      title="Parâmetros"
+      summary={paramsSummary(cfg.params)}
+      help="Só os parâmetros ligados entram na request. O raciocínio fica na seção Modelo."
+    >
+      {hiddenSome && (
+        <p className="-mt-1 text-[11.5px] text-subtle">Os que o modelo não aceita ficam ocultos.</p>
+      )}
       <div className="space-y-1">
         {NUM_PARAMS.filter((p) => visible(p.key)).map((p) => {
           const on = cfg.params[p.key] != null
@@ -414,7 +418,7 @@ export function RequestExtrasSection({
     >
       <ToggleRow
         label="Token caching"
-        description="Breakpoints cache_control — depende do modelo/provedor"
+        help="Breakpoints cache_control — depende do modelo/provedor"
         checked={cfg.cacheEnabled}
         onChange={(cacheEnabled) => patch({ cacheEnabled })}
         info={<CacheInfo />}
@@ -465,7 +469,7 @@ export function RootOptions({
     <>
       <ToggleRow
         label="Confinar ferramentas à raiz"
-        description="Tools de arquivo recusam caminhos fora dela"
+        help="Tools de arquivo recusam caminhos fora dela"
         checked={cfg.confineToRoot !== false}
         onChange={(confineToRoot) => patch({ confineToRoot })}
         info={<ConfineInfo />}
@@ -473,7 +477,7 @@ export function RootOptions({
       {caps.bwrap ? (
         <ToggleRow
           label="Shell em sandbox"
-          description="bubblewrap: só a raiz é gravável; rede liberada"
+          help="bubblewrap: só a raiz é gravável; rede liberada"
           checked={!!cfg.sandboxBash}
           onChange={(sandboxBash) => patch({ sandboxBash })}
           info={<SandboxInfo />}
@@ -486,7 +490,7 @@ export function RootOptions({
       )}
       <ToggleRow
         label="Bloco de ambiente"
-        description="Raiz, SO, shell e regras no system prompt"
+        help="Raiz, SO, shell e regras no system prompt"
         checked={cfg.envInPrompt}
         onChange={(envInPrompt) => patch({ envInPrompt })}
         info={
@@ -531,7 +535,7 @@ export function ContextSettings({
     <>
       <ToggleRow
         label="Definir janela manualmente"
-        description="Para endpoints que não informam o tamanho do contexto"
+        help="Para endpoints que não informam o tamanho do contexto"
         checked={override}
         onChange={(v) => patch({ contextWindow: v ? (knownWindow ?? 128_000) : null })}
       />
@@ -566,7 +570,7 @@ export function ContextSettings({
       </div>
       <ToggleRow
         label="Compactar automaticamente"
-        description="Sessão principal, ao atingir o limite. Subagentes: sempre."
+        help="Sessão principal, ao atingir o limite. Subagentes: sempre."
         checked={cfg.autoCompact}
         onChange={(autoCompact) => patch({ autoCompact })}
       />
@@ -689,14 +693,14 @@ export function ToolsPromptSection({ cfg, patch }: CfgProps): React.JSX.Element 
     >
       <ToggleRow
         label="Enviar tools nativas"
-        description="Campo tools da request"
+        help="Campo tools da request"
         checked={cfg.nativeTools}
         onChange={(nativeTools) => patch({ nativeTools })}
         info={<NativeToolsInfo />}
       />
       <ToggleRow
         label="Texto das tools no system prompt"
-        description="Anexado ao final do system prompt"
+        help="Anexado ao final do system prompt"
         checked={cfg.toolsInPrompt}
         onChange={(toolsInPrompt) => patch({ toolsInPrompt })}
         info={<ToolsInPromptInfo text={toolsText} />}
@@ -861,10 +865,15 @@ function SpillField({ max }: { max: number }): React.JSX.Element {
   return (
     <div className="mt-3 flex items-center gap-2.5">
       <div className="min-w-0 flex-1">
-        <div className="text-[13px] text-fg/90">Salvar em arquivo acima de</div>
+        <div className="flex items-center gap-1.5 text-[13px] text-fg/90">
+          Salvar em arquivo acima de
+          <HelpTip label="Salvar em arquivo acima de">
+            Acima disso o modelo recebe um trecho e o caminho do arquivo com a saída completa. Vale
+            para todos os chats.
+          </HelpTip>
+        </div>
         <p className="mt-0.5 text-[11.5px] text-subtle">
-          caracteres · global (todos os chats) · acima disso o modelo recebe um trecho e o caminho
-          do arquivo com a saída completa
+          caracteres · global (todos os chats)
           {effective < (value ?? LIMITS.spillThresholdChars)
             ? ` · neste chat vale ${effective.toLocaleString('pt-BR')} (saída máx.)`
             : ''}

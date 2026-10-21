@@ -48,6 +48,8 @@ import type {
 import { newAccumulator, streamChat } from './llm'
 import type { BuiltRequest } from './request'
 import { buildSideRequest } from './smartApprove'
+import { SIDE_THINKING } from '@shared/sideReasoning'
+import type { SideMessage } from '@shared/sideCache'
 
 export interface CaptureDeps {
   getChat(chatId: string): Chat | null
@@ -257,7 +259,7 @@ export class ContextCaptureService {
 
   private async callModel(
     chat: Chat,
-    messages: { role: 'system' | 'user'; content: string }[],
+    messages: SideMessage[],
     signal: AbortSignal
   ): Promise<
     | { ok: true; content: string; usage?: Usage; providerId: string; model: string; ms: number }
@@ -275,7 +277,11 @@ export class ContextCaptureService {
       provider,
       model,
       messages,
+      cache: cfg.cache !== false,
       maxTokens: cfg.maxTokens ?? CONTEXT_CAPTURE_LIMITS.defaultMaxTokens,
+      temperature: 0,
+      thinkingTokens: cfg.thinkingTokens,
+      defaultThinkingTokens: SIDE_THINKING.capture,
       chatConfig: chat.config
     })
     const timeout = new AbortController()

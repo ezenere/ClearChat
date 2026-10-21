@@ -3,7 +3,7 @@
 import { ShieldAlert, ShieldCheck, ShieldQuestion, ShieldX } from 'lucide-react'
 import { categoryLabel } from '@shared/smartApprove'
 import type { SmartApproveRecord } from '@shared/types'
-import { cn, formatCost, formatDuration } from '../../lib/format'
+import { cn, formatCost, formatDuration, formatTokens } from '../../lib/format'
 import { useStore } from '../../store'
 import { api } from '../../lib/api'
 import { Button } from '../ui/controls'
@@ -45,6 +45,12 @@ export function SmartApproveInfo({ rec }: { rec: SmartApproveRecord }): React.JS
       {rec.judged && rec.judged.length > 0 && (
         <p>
           Avaliou só o que as listas não decidiram: <C>{rec.judged.join(' · ')}</C>.
+        </p>
+      )}
+      {!!(rec.usage?.cachedTokens || rec.usage?.cacheWriteTokens) && (
+        <p data-testid="smart-cache-usage" className="text-[11px] text-subtle tabular-nums">
+          cache: {formatTokens(rec.usage.cachedTokens ?? 0)} lidos ·{' '}
+          {formatTokens(rec.usage.cacheWriteTokens ?? 0)} escritos
         </p>
       )}
       {rec.error && <p className="text-warning/90">{rec.error}</p>}

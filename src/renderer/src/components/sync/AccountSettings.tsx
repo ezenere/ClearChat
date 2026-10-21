@@ -25,7 +25,7 @@ import { api, errorMessage } from '../../lib/api'
 import { cn, relativeTime } from '../../lib/format'
 import { useStore } from '../../store'
 import { Button, Label, Spinner } from '../ui/controls'
-import { Tip } from '../ui/Tooltip'
+import { HelpTip, Tip } from '../ui/Tooltip'
 import { SecretInput } from '../ProviderForm'
 import { AccountFlow } from './AccountFlow'
 import { connectionLabel } from '../../lib/sync'
@@ -40,16 +40,24 @@ const TONE: Record<string, string> = {
 function Section({
   title,
   children,
-  action
+  action,
+  help
 }: {
   title: string
   children: React.ReactNode
   action?: React.ReactNode
+  /** Ajuda estática da seção → (?) ao lado do título. */
+  help?: React.ReactNode
 }): React.JSX.Element {
   return (
     <section className="space-y-2">
       <div className="flex items-center gap-2">
         <h3 className="text-[11px] font-medium tracking-wide text-subtle uppercase">{title}</h3>
+        {help && (
+          <HelpTip label={title} className="-ml-1">
+            {help}
+          </HelpTip>
+        )}
         <span className="ml-auto">{action}</span>
       </div>
       {children}
@@ -464,12 +472,11 @@ export function AccountSettings(): React.JSX.Element {
         </div>
       )}
 
-      <Section title="Dispositivos">
+      <Section
+        title="Dispositivos"
+        help="Cada chat roda num dispositivo (o host); os outros viram controle remoto enquanto ele está online."
+      >
         <DevicesList status={status} />
-        <p className="text-[11px] text-subtle">
-          Cada chat roda num dispositivo (o host); os outros viram controle remoto enquanto ele está
-          online.
-        </p>
       </Section>
 
       <Section title="Segurança">

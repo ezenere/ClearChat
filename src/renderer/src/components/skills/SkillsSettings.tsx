@@ -26,7 +26,7 @@ import { currentChat, useStore } from '../../store'
 import { SkillsLocationsInfo } from '../apiDocs'
 import { ToggleRow } from '../panel/fields'
 import { Button, IconButton, Spinner, Switch } from '../ui/controls'
-import { Tip } from '../ui/Tooltip'
+import { HelpTip, Tip } from '../ui/Tooltip'
 import { useSkillsDiscovery, useSkillsSettings } from './hooks'
 import { CloudSkillsSection, SkillSyncProvider, SkillSyncToggle } from '../sync/CloudSkills'
 
@@ -76,14 +76,18 @@ export function SkillsSettings(): React.JSX.Element {
   return (
     <SkillSyncProvider>
       <div data-testid="skills-settings" className="space-y-4">
-        <div className="flex items-start gap-3">
-          <p className="min-w-0 flex-1 text-xs leading-relaxed text-subtle">
-            Pastas onde o app procura skills (formato Agent Skills / Claude Code: uma subpasta por
-            skill, com um <span className="font-mono text-muted">SKILL.md</span>). A ordem é a
-            precedência — com nomes repetidos vence o primeiro local. Cada chat ou persona liga as
-            skills e escolhe quais usar na aba <span className="text-muted">Tools</span>.
-          </p>
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs leading-relaxed text-subtle">
+            Pastas onde o app procura skills
+          </span>
+          <HelpTip label="Pastas de skills">
+            Formato Agent Skills / Claude Code: uma subpasta por skill, com um{' '}
+            <span className="font-mono text-muted">SKILL.md</span>. A ordem é a precedência — com
+            nomes repetidos vence o primeiro local. Cada chat ou persona liga as skills e escolhe
+            quais usar na aba <span className="text-muted">Tools</span>.
+          </HelpTip>
           <SkillsLocationsInfo />
+          <span className="flex-1" />
           <Button
             size="sm"
             variant="secondary"
@@ -143,7 +147,7 @@ export function SkillsSettings(): React.JSX.Element {
         <div className="rounded-xl border border-border bg-surface/50 px-3.5 py-3">
           <ToggleRow
             label="Incluir .claude/skills do diretório raiz do chat"
-            description="Skills de projeto, resolvidas por chat (depois das pastas acima na precedência)"
+            help="Skills de projeto, resolvidas por chat (depois das pastas acima na precedência)"
             checked={settings.projectSkills}
             onChange={(projectSkills) => void update({ projectSkills })}
           />

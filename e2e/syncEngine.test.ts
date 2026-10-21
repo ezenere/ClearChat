@@ -1795,7 +1795,16 @@ test('1.4.0: preferências globais (Smart-Approve, título automático, spill) v
   const smart = {
     environment: '172.16.1.7 é teste; produção nunca',
     acceptEditsInRoot: true,
-    capture: { enabled: true, providerId: pid, model: 'resumo/m', maxTokens: 300, lookback: 3 },
+    // 1.4.1: thinkingTokens e cache (opcionais) dentro da coleta
+    capture: {
+      enabled: true,
+      providerId: pid,
+      model: 'resumo/m',
+      maxTokens: 300,
+      lookback: 3,
+      thinkingTokens: 3000,
+      cache: false
+    },
     capturePrompts: {
       prompt: 'PROMPT GLOBAL KEEP APPEND REWRITE',
       template: '{{current}} / {{user}}',
@@ -1807,7 +1816,8 @@ test('1.4.0: preferências globais (Smart-Approve, título automático, spill) v
     model: 'titulo/m',
     useMemory: true,
     maxTokens: 40,
-    prompt: 'Dê um título.'
+    prompt: 'Dê um título.',
+    thinkingTokens: 512 // 1.4.1
   }
   putSetting(A.conn, 'smartApproveDefaults', smart)
   putSetting(A.conn, 'autoTitle', title)
@@ -1875,8 +1885,19 @@ test('1.4.0: config do chat e da persona (capturedContext, acceptEditsInRoot, am
     canDeny: true,
     judgeWhitelisted: true,
     environment: 'ambiente do chat',
-    capture: { enabled: true, providerId: pid, model: 'resumo/m', maxTokens: null, lookback: 2 },
-    capturePrompts: { prompt: null, template: '{{current}} {{user}}', derivePrompt: 'D' }
+    capture: {
+      enabled: true,
+      providerId: pid,
+      model: 'resumo/m',
+      maxTokens: null,
+      lookback: 2,
+      thinkingTokens: 1024,
+      cache: false
+    },
+    capturePrompts: { prompt: null, template: '{{current}} {{user}}', derivePrompt: 'D' },
+    // 1.4.1: tokens de pensamento e cache do prompt do juiz
+    thinkingTokens: 4096,
+    cache: false
   }
   const captured = {
     main: {

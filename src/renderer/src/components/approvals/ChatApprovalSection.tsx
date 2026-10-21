@@ -19,6 +19,7 @@ import { useStore } from '../../store'
 import { AutoApproveInfo } from '../apiDocs'
 import type { CfgProps } from '../panel/editors'
 import { CollapsibleSection } from '../panel/fields'
+import { HelpTip } from '../ui/Tooltip'
 import { ModeSelector, SMART_NEEDS_MODEL } from './ApprovalControls'
 
 export function ChatApprovalSection({
@@ -53,11 +54,13 @@ export function ChatApprovalSection({
           : null
       }
       aside={<AutoApproveInfo />}
+      help={
+        <span data-testid="approval-star-hint">
+          <Star className="mb-0.5 inline size-2.5 fill-current text-accent-strong" /> marca o padrão
+          global; escolher a opção com estrela segue o padrão global (muda junto se ele mudar).
+        </span>
+      }
     >
-      <p data-testid="approval-star-hint" className="-mt-1 text-[11.5px] leading-snug text-subtle">
-        <Star className="mb-0.5 inline size-2.5 fill-current text-accent-strong" /> marca o padrão
-        global; escolher a opção com estrela segue o padrão global (muda junto se ele mudar).
-      </p>
       {APPROVAL_ITEM_GROUPS.map((g) => (
         <div key={g.title} className="space-y-2.5">
           <div className="border-b border-border/50 pb-1 text-[11px] text-subtle">{g.title}</div>
@@ -144,6 +147,11 @@ function AcceptEditsRow({
     <div className="space-y-1 border-t border-border/50 pt-2.5">
       <div className="flex items-baseline gap-2">
         <span className="text-[12.5px] text-fg/90">Aceitar edições dentro da raiz do chat</span>
+        <HelpTip label="Aceitar edições dentro da raiz do chat" className="self-center">
+          Ligado: escrever/editar arquivos cujo caminho (após seguir links) fica dentro da raiz roda
+          sem perguntar e sem o juiz, em qualquer modo. Caminhos protegidos (.env, .git/hooks,
+          ~/.ssh…) continuam perguntando.
+        </HelpTip>
         <span className="font-mono text-[10.5px] text-faint">write_file · edit_file</span>
       </div>
       <div
@@ -177,11 +185,6 @@ function AcceptEditsRow({
           )
         })}
       </div>
-      <p className="text-[11px] leading-snug text-subtle">
-        Ligado: escrever/editar arquivos cujo caminho (após seguir links) fica dentro da raiz roda
-        sem perguntar e sem o juiz, em qualquer modo. Caminhos protegidos (.env, .git/hooks,
-        ~/.ssh…) continuam perguntando.
-      </p>
     </div>
   )
 }

@@ -2,9 +2,10 @@
 // ("Executar mesmo assim"). As regras puras ficam em @shared/smartApprove.
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
 import { providerKind } from '@shared/providerKinds'
+import { planSideCall, sideChatBody, SIDE_THINKING } from '@shared/sideReasoning'
+import { sideCacheNote, sideWireMessages, type SideMessage } from '@shared/sideCache'
 import {
   argsKey,
-  buildJudgeBody,
   buildJudgeMessages,
   mapJudgeDecision,
   parseJudgeOutput,
@@ -20,7 +21,7 @@ import type {
   ToolName
 } from '@shared/types'
 import { newAccumulator, streamChat } from './llm'
-import { filterParams, maskRequest, type BuiltRequest } from './request'
+import { maskRequest, modelInfoFor, type BuiltRequest } from './request'
 import { adapterFor } from './adapters'
 import { buildAnthropicBody } from './adapters/anthropic'
 
@@ -36,47 +37,64 @@ export interface JudgeInput {
 }
 
 /**
- * Request de uma chamada "lateral" (fora do histórico): juiz do Smart-Approve e resumidor da coleta
- * de contexto. System + user, temperatura 0, `maxTokens`, streaming acumulado.
+ * Request de uma chamada "lateral" (fora do histórico): juiz do Smart-Approve, resumidor da coleta
+ * de contexto e título automático. System + user, `maxTokens`, temperatura fixa (opcional),
+ * raciocínio pela política de @shared/sideReasoning (desligado onde dá; obrigatório → esforço
+ * mínimo + `thinkingTokens` somados ao max_tokens), streaming acumulado.
  */
 export function buildSideRequest(input: {
   provider: Provider
   model: string
-  messages: { role: 'system' | 'user'; content: string }[]
+  /** System + user; `cacheAt` = 2º breakpoint do cache (marcador {{cache_break}}). */
+  messages: SideMessage[]
+  /** "Cache do prompt" (juiz/resumidor; título: ausente = desligado). */
+  cache?: boolean
   maxTokens: number
-  chatConfig: Pick<ChatConfig, 'appSignature' | 'appSignatureCustom'>
+  /** Ausente = sem temperature (título). */
+  temperature?: number
+  /** "Tokens de pensamento" da config (null/ausente = `defaultThinkingTokens`). */
+  thinkingTokens?: number | null
+  defaultThinkingTokens: number
+  chatConfig?: Pick<ChatConfig, 'appSignature' | 'appSignatureCustom'>
 }): BuiltRequest {
   const { provider, model, messages } = input
   const signature = resolveAppSignatureHeaders(
-    input.chatConfig.appSignature ?? DEFAULT_APP_SIGNATURE,
-    input.chatConfig.appSignatureCustom
+    input.chatConfig?.appSignature ?? DEFAULT_APP_SIGNATURE,
+    input.chatConfig?.appSignatureCustom
   )
   const kind = providerKind(provider)
   const adapter = adapterFor(kind)
-  // Parâmetros fixos (temperature 0, max_tokens) passam pelo mesmo filtro do chat: modelos que
-  // rejeitam temperature (ex.: claude-sonnet-5-5 nativo → 400) recebem a request sem ele.
-  const support = filterParams(
-    { temperature: SMART_APPROVE_DEFAULTS.temperature, max_tokens: input.maxTokens },
+  // Parâmetros fixos passam pelo mesmo filtro do chat (paramSupport): modelos que rejeitam
+  // temperature (ex.: claude-sonnet-5-5 nativo → 400) recebem a request sem ele.
+  const plan = planSideCall({
     kind,
-    provider.id,
     model,
-    null
-  )
-  let body: Record<string, unknown>
-  if (kind === 'anthropic') {
-    // max_tokens é obrigatório na API nativa (o filtro nunca o tira na Anthropic)
-    body = buildAnthropicBody({ model, messages, params: support.send })
-  } else {
-    body = buildJudgeBody(model, messages, kind === 'openrouter')
-    body.max_tokens = input.maxTokens
-    for (const k of ['temperature', 'max_tokens'] as const) if (!(k in support.send)) delete body[k]
-  }
+    info: modelInfoFor(provider.id, model),
+    maxTokens: input.maxTokens,
+    temperature: input.temperature,
+    thinkingTokens: input.thinkingTokens,
+    defaultThinkingTokens: input.defaultThinkingTokens
+  })
+  // cache ligado + provedor que aceita cache_control: system e parte estável em parts marcadas
+  const wire = sideWireMessages(messages, { cache: !!input.cache, kind, model })
+  const cacheNote = sideCacheNote(wire)
+  const notes = cacheNote ? [...plan.notes, cacheNote] : plan.notes
+  const body =
+    kind === 'anthropic'
+      ? // max_tokens é obrigatório na API nativa (o filtro nunca o tira na Anthropic)
+        buildAnthropicBody({
+          model,
+          messages: wire,
+          params: plan.send,
+          extra: plan.reasoning.thinking ? { thinking: plan.reasoning.thinking } : null
+        })
+      : sideChatBody(kind, model, wire, plan.send)
   return {
     url: adapter.chatUrl(provider.baseUrl),
     headers: adapter.headers(provider, signature),
     body,
     kind,
-    ...(support.notes.length ? { notes: support.notes } : {})
+    ...(notes.length ? { notes } : {})
   }
 }
 
@@ -88,7 +106,11 @@ export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltReque
     provider,
     model: sa.model,
     messages: buildJudgeMessages(sa, input.ctx),
+    cache: sa.cache !== false,
     maxTokens: SMART_APPROVE_DEFAULTS.maxTokens,
+    temperature: SMART_APPROVE_DEFAULTS.temperature,
+    thinkingTokens: sa.thinkingTokens,
+    defaultThinkingTokens: SIDE_THINKING.judge,
     chatConfig: input.chatConfig
   })
 }

@@ -18,16 +18,20 @@ import {
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { Switch } from '../ui/controls'
+import { HelpTip } from '../ui/Tooltip'
 
 export function Section({
   title,
   children,
   aside,
+  help,
   id
 }: {
   title: string
   children: ReactNode
   aside?: ReactNode
+  /** Ajuda estática da seção → (?) ao lado do título. */
+  help?: ReactNode
   id?: string
 }): React.JSX.Element {
   return (
@@ -39,6 +43,7 @@ export function Section({
         <h3 className="text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
           {title}
         </h3>
+        {help && <HelpTip label={title}>{help}</HelpTip>}
         {aside && <div className="ml-auto flex items-center">{aside}</div>}
       </div>
       <div className="space-y-3">{children}</div>
@@ -68,6 +73,8 @@ export interface CollapsibleSectionProps {
   summary?: SectionSummary | string | null
   /** Ícones (i) / ações que ficam visíveis mesmo fechada. */
   aside?: ReactNode
+  /** Ajuda estática da seção → (?) no cabeçalho (visível mesmo fechada), antes do `aside`. */
+  help?: ReactNode
   /** `data-section` (destino de focusConfig): focar abre a seção. */
   section?: string
   /** Outros `data-section` dentro dela que também a abrem ao serem focados. */
@@ -93,6 +100,7 @@ export function CollapsibleSection({
   children,
   summary,
   aside,
+  help,
   section,
   focusIds,
   error,
@@ -176,6 +184,7 @@ export function CollapsibleSection({
       </div>
     </SectionErrorContext.Provider>
   )
+  const helpEl = help && <HelpTip label={title}>{help}</HelpTip>
   const buttonProps = {
     type: 'button' as const,
     id: btnId,
@@ -202,6 +211,7 @@ export function CollapsibleSection({
             />
             {title}
           </button>
+          {helpEl}
           {errorBadge}
           {warnIcon}
           {summaryEl}
@@ -236,7 +246,12 @@ export function CollapsibleSection({
             {summaryEl && <span className="ml-auto flex min-w-0 justify-end">{summaryEl}</span>}
           </button>
         </h3>
-        {aside && <div className="flex shrink-0 items-center">{aside}</div>}
+        {(helpEl || aside) && (
+          <div className="flex shrink-0 items-center gap-1.5">
+            {helpEl}
+            {aside}
+          </div>
+        )}
       </div>
       {body}
     </section>
@@ -248,24 +263,32 @@ export function ToggleRow({
   checked,
   onChange,
   info,
-  description
+  help,
+  status
 }: {
   label: string
   checked: boolean
   onChange: (v: boolean) => void
   info?: ReactNode
-  description?: string
+  /** Ajuda estática (o que a opção faz) → (?) depois do rótulo. "\n" separa parágrafos. */
+  help?: ReactNode
+  /** Linha visível abaixo do rótulo — só estado/aviso (dinâmico), nunca descrição estática. */
+  status?: ReactNode
 }): React.JSX.Element {
   return (
     <div className="flex items-start gap-3">
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-1.5 text-[13px] text-fg/90">
+        {/* inline: num rótulo de duas linhas o (?) e o </> ficam logo depois da última palavra */}
+        <div className="text-[13px] text-fg/90">
           {label}
-          {info}
+          {help && (
+            <HelpTip label={label} className="ml-1.5 -translate-y-px">
+              {help}
+            </HelpTip>
+          )}
+          {info && <span className="ml-1.5 inline-flex -translate-y-px align-middle">{info}</span>}
         </div>
-        {description && (
-          <p className="mt-0.5 text-[11.5px] leading-snug text-subtle">{description}</p>
-        )}
+        {status && <p className="mt-0.5 text-[11.5px] leading-snug text-subtle">{status}</p>}
       </div>
       <div className="pt-0.5">
         <Switch checked={checked} onChange={onChange} label={label} />

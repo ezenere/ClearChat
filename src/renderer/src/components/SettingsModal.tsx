@@ -16,6 +16,7 @@ import { AutoTextarea, Button, Label } from './ui/controls'
 import { Modal } from './ui/layers'
 import { ModelPicker } from './ui/ModelPicker'
 import { Select } from './ui/Select'
+import { HelpTip } from './ui/Tooltip'
 import { ModelInfoLine } from './panel/editors'
 import { ApprovalsSettings } from './approvals/ApprovalsSettings'
 import { WebSearchSettings } from './web/WebSearchSettings'
@@ -200,10 +201,13 @@ function DefaultsSection(): React.JSX.Element {
   return (
     <div className="space-y-4">
       <DefaultPresetField />
-      <p className="text-xs leading-relaxed text-subtle">
-        Padrões de chats novos — valem para os campos que a persona não define (a persona “Padrão”
-        não define nenhum) e quando não há persona.
-      </p>
+      <div className="flex items-center gap-1.5 text-xs leading-relaxed text-subtle">
+        Padrões de chats novos
+        <HelpTip label="Padrões de chats novos">
+          Valem para os campos que a persona não define (a persona “Padrão” não define nenhum) e
+          quando não há persona.
+        </HelpTip>
+      </div>
       <div>
         <Label info={<ModelFieldInfo />}>Modelo padrão</Label>
         <ModelPicker

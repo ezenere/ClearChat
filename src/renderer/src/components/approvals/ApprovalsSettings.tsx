@@ -4,8 +4,8 @@
 import {
   Ban,
   Check,
-  CircleHelp,
   CornerDownRight,
+  FlaskConical,
   Lock,
   Pencil,
   Plus,
@@ -28,7 +28,7 @@ import {
 import { CollapsibleSection, ToggleRow } from '../panel/fields'
 import { AutoTextarea } from '../ui/controls'
 import { useStore } from '../../store'
-import { C } from '../ui/Tooltip'
+import { C, HelpTip } from '../ui/Tooltip'
 import { ListEntryEditor, ModeSelector } from './ApprovalControls'
 
 const ITEM_DESC: Record<ApprovalItem, string> = {
@@ -55,13 +55,36 @@ export function ApprovalsSettings(): React.JSX.Element {
     void update({ modes: { ...settings.modes, [item]: mode } })
   return (
     <div className="space-y-5" data-testid="approvals-settings">
-      <p className="text-xs leading-relaxed text-subtle">
-        Modo padrão de cada item em todos os chats. Cada chat (aba Tools) e cada persona pode
-        ajustar; lá a opção igual ao padrão daqui aparece com ★, e quem não ajustou segue este
-        padrão. <strong className="text-fg/90">process_stop</strong> nunca pede confirmação: o
-        agente só enxerga e para processos do próprio chat. As demais tools (leitura, apresentar
-        arquivos, histórico, controle de subagentes, perguntas ao usuário) também nunca pedem.
-      </p>
+      <div className="flex items-center gap-1.5 text-xs leading-relaxed text-subtle">
+        Modo padrão de cada item em todos os chats.
+        <HelpTip label="Modo padrão de cada item" wide>
+          <p>
+            Cada chat (aba Tools) e cada persona pode ajustar; lá a opção igual ao padrão daqui
+            aparece com ★, e quem não ajustou segue este padrão.{' '}
+            <strong className="text-fg/90">process_stop</strong> nunca pede confirmação: o agente só
+            enxerga e para processos do próprio chat. As demais tools (leitura, apresentar arquivos,
+            histórico, controle de subagentes, perguntas ao usuário) também nunca pedem.
+          </p>
+          <p>
+            <strong className="text-fg/80">Sempre permitir</strong>: roda sem perguntar (a blacklist
+            não vale).
+          </p>
+          <p>
+            <strong className="text-fg/80">Smart-Approve</strong>: o modelo juiz escolhido no chat
+            (aba Tools → Smart-Approve) aprova ou pergunta; em Comandos/Processos/Páginas ele só
+            complementa as listas (blacklist bloqueia, o que a whitelist libera roda sem ele); sem
+            modelo → pergunta.
+          </p>
+          <p>
+            <strong className="text-fg/80">Listas</strong> (Comandos, Processos, Páginas): blacklist
+            bloqueia (tem precedência), whitelist libera, o resto pergunta.
+          </p>
+          <p>
+            <strong className="text-fg/80">Perguntar</strong> (demais itens): cada chamada pede sua
+            confirmação.
+          </p>
+        </HelpTip>
+      </div>
       {APPROVAL_ITEM_GROUPS.map((g) => (
         <div key={g.title} className="space-y-3">
           <div className="border-b border-border/50 pb-1 text-[11.5px] text-subtle">{g.title}</div>
@@ -69,6 +92,9 @@ export function ApprovalsSettings(): React.JSX.Element {
             <div key={item}>
               <div className="mb-1 flex items-baseline gap-2">
                 <span className="text-[13px] font-medium text-fg/90">{ITEM_LABEL[item]}</span>
+                <HelpTip label={ITEM_LABEL[item]} className="self-center">
+                  {ITEM_DESC[item]}
+                </HelpTip>
                 <span className="font-mono text-[10.5px] text-faint">{ITEM_TOOL[item]}</span>
               </div>
               <ModeSelector
@@ -78,21 +104,10 @@ export function ApprovalsSettings(): React.JSX.Element {
                 label={`Modo global: ${ITEM_LABEL[item]}`}
                 testId={`global-mode-${item}`}
               />
-              <p className="mt-1 text-[11px] leading-snug text-subtle">{ITEM_DESC[item]}</p>
             </div>
           ))}
         </div>
       ))}
-      <p className="text-[11px] leading-snug text-subtle">
-        <strong className="text-fg/80">Sempre permitir</strong>: roda sem perguntar (a blacklist não
-        vale). <strong className="text-fg/80">Smart-Approve</strong>: o modelo juiz escolhido no
-        chat (aba Tools → Smart-Approve) aprova ou pergunta; em Comandos/Processos/Páginas ele só
-        complementa as listas (blacklist bloqueia, o que a whitelist libera roda sem ele); sem
-        modelo → pergunta. <strong className="text-fg/80">Listas</strong> (Comandos, Processos,
-        Páginas): blacklist bloqueia (tem precedência), whitelist libera, o resto pergunta.{' '}
-        <strong className="text-fg/80">Perguntar</strong> (demais itens): cada chamada pede sua
-        confirmação.
-      </p>
 
       <SmartDefaults />
 
@@ -347,7 +362,7 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
   return (
     <div data-testid="approval-tester" className="rounded-lg border border-border bg-bg/30 p-3">
       <div className="mb-1.5 flex items-center gap-1.5 text-[12px] font-medium text-fg/90">
-        <CircleHelp className="size-3.5 text-subtle" />
+        <FlaskConical className="size-3.5 text-subtle" />
         {isPages ? 'Testar URL' : 'Testar comando'}
       </div>
       <textarea
@@ -463,13 +478,19 @@ function SmartDefaults(): React.JSX.Element {
       </div>
       <ToggleRow
         label="Aceitar edições dentro da raiz do chat"
-        description="Desligado (padrão). Ligado: write_file/edit_file com caminho (após seguir links) dentro da raiz do chat rodam sem perguntar e sem o juiz. Caminhos protegidos continuam perguntando."
+        help={
+          'Desligado (padrão).\nLigado: write_file/edit_file com caminho (após seguir links) dentro da raiz do chat rodam sem perguntar e sem o juiz. Caminhos protegidos continuam perguntando.'
+        }
         checked={smart.acceptEditsInRoot}
         onChange={(acceptEditsInRoot) => set({ acceptEditsInRoot })}
       />
       <div>
-        <div className="mb-1 text-[12.5px] font-medium text-fg/90">
+        <div className="mb-1 flex items-center gap-1.5 text-[12.5px] font-medium text-fg/90">
           Descrição do ambiente (Smart-Approve)
+          <HelpTip label="Descrição do ambiente (Smart-Approve)">
+            Vai para o juiz de todos os chats (salvo ajuste no chat). Sincroniza entre os seus
+            dispositivos (com o sync ligado).
+          </HelpTip>
         </div>
         <AutoTextarea
           value={env}
@@ -481,10 +502,6 @@ function SmartDefaults(): React.JSX.Element {
           maxRows={10}
           className="field text-[12px] leading-relaxed"
         />
-        <p className="mt-1 text-[11px] leading-snug text-faint">
-          Vai para o juiz de todos os chats (salvo ajuste no chat). Sincroniza entre os seus
-          dispositivos (com o sync ligado).
-        </p>
       </div>
       <CaptureFields
         value={smart.capture}

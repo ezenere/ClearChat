@@ -191,7 +191,7 @@ function SaveForm({
       {cwd && (
         <ToggleRow
           label="Incluir diretório raiz"
-          description={compactPath(cwd, homeDir, 52)}
+          status={compactPath(cwd, homeDir, 52)}
           checked={includeCwd}
           onChange={setIncludeCwd}
         />

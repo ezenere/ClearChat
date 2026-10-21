@@ -29,6 +29,8 @@ import { tmpdir } from 'node:os'
 const FAKE_KEY = 'fake-key-auto-title'
 const AGENT = 'fake/agent-1'
 const TITLER = 'fake/titler-1'
+/** Raciocínio obrigatório (metadados no /models) → "Tokens de pensamento". */
+const THINKER = 'fake/thinker-title-1'
 const ROOT = resolve(process.env.CLEARCHAT_E2E_ROOT || join(import.meta.dirname, '..'))
 const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-autotitle-e2e'))
 const USER_DATA = join(BASE, 'userdata')
@@ -61,13 +63,24 @@ async function startFake(): Promise<void> {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(
           JSON.stringify({
-            data: [AGENT, TITLER].map((id) => ({
-              id,
-              name: id === AGENT ? 'Fake Agent' : 'Fake Titler',
-              context_length: 64_000,
-              pricing: { prompt: '0.0000001', completion: '0.0000002' },
-              supported_parameters: ['tools', 'temperature', 'max_tokens']
-            }))
+            data: [AGENT, TITLER]
+              .map((id) => ({
+                id,
+                name: id === AGENT ? 'Fake Agent' : 'Fake Titler',
+                context_length: 64_000,
+                pricing: { prompt: '0.0000001', completion: '0.0000002' },
+                supported_parameters: ['tools', 'temperature', 'max_tokens']
+              }))
+              .concat([
+                {
+                  id: THINKER,
+                  name: 'Fake Thinker',
+                  context_length: 64_000,
+                  pricing: { prompt: '0.0000001', completion: '0.0000002' },
+                  supported_parameters: ['max_tokens', 'reasoning'],
+                  reasoning: { mandatory: true, supported_efforts: ['low', 'high'] }
+                } as any
+              ])
           })
         )
         return
@@ -360,6 +373,50 @@ async function main(): Promise<void> {
       await page.keyboard.press('Escape')
     }
   )
+
+  await step('modelo com raciocínio obrigatório: aviso + "Tokens de pensamento"', async () => {
+    await openDefaults()
+    const g = group()
+    const picker = g.getByTestId('auto-title-model').getByRole('combobox')
+    assert((await g.getByTestId('auto-title-thinking').count()) === 0, 'titler: sem campo')
+    await pickModel(picker, THINKER)
+    const box = g.getByTestId('auto-title-thinking')
+    await box.waitFor({ timeout: 10_000 })
+    await box
+      .getByText('Este modelo sempre raciocina (thinking obrigatório) — esforço mínimo.')
+      .waitFor()
+    const input = box.getByRole('spinbutton', { name: 'Tokens de pensamento do título' })
+    assert((await input.getAttribute('placeholder')) === '1024', 'placeholder = padrão')
+    await input.fill('512')
+    await input.blur()
+    await waitUntil(
+      async () => (await read<any>('settings.get', 'autoTitle'))?.thinkingTokens === 512,
+      5000,
+      'tokens de pensamento salvos'
+    )
+    // (i): parâmetros exatos — max_tokens 48 + 512, effort mínimo
+    await g.getByRole('button', { name: 'O que é enviado para a API' }).first().hover()
+    const params = page.getByTestId('auto-title-request-params')
+    await params.waitFor({ timeout: 5000 })
+    const txt = (await params.textContent()) ?? ''
+    assert(txt.includes('"max_tokens": 560'), `max_tokens: ${txt}`)
+    assert(txt.includes('"reasoning_effort": "low"'), `effort: ${txt}`)
+    await shot('titulo-thinking-preview')
+    await page.mouse.move(0, 0)
+    await box.scrollIntoViewIfNeeded()
+    await shotOf(dialog(), 'titulo-thinking-campo')
+    // limpar = padrão; voltar ao titler → some o campo
+    await input.fill('')
+    await input.blur()
+    await waitUntil(
+      async () => (await read<any>('settings.get', 'autoTitle'))?.thinkingTokens === null,
+      5000,
+      'limpo'
+    )
+    await pickModel(picker, TITLER)
+    await box.waitFor({ state: 'detached', timeout: 5000 })
+    await page.keyboard.press('Escape')
+  })
 
   await step('chat novo: o agente responde na hora e o título gerado chega depois', async () => {
     await newChat()

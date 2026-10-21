@@ -16,8 +16,11 @@ import { useStore } from '../store'
 import { cn } from '../lib/format'
 import { AutoTextarea, Label } from './ui/controls'
 import { ModelPicker } from './ui/ModelPicker'
-import { ApiInfo, C, Tip } from './ui/Tooltip'
+import { ApiInfo, C, HelpTip, Tip } from './ui/Tooltip'
 import { ModelInfoLine } from './panel/editors'
+import { SideThinkingField } from './panel/SideThinkingField'
+import { useSideRequestPreview } from '../lib/sideReasoning'
+import { SIDE_THINKING } from '@shared/sideReasoning'
 import { NumberInput, RestoreButton, ToggleRow } from './panel/fields'
 
 const D = AUTO_TITLE_DEFAULTS
@@ -34,6 +37,21 @@ function AutoTitleInfo({ cfg }: { cfg: AutoTitleSettings }): React.JSX.Element {
       ? '<memory>\nMemórias do usuário (contexto). Formato: id · título — resumo.\n## Áreas …\n- m1a2b3c · Deploy do app — VPS com Ubuntu\n</memory>'
       : null
   })
+  // parâmetros exatos (max_tokens, raciocínio) pela mesma política do main
+  const preview = useSideRequestPreview({
+    providerId: cfg.providerId,
+    model: cfg.model,
+    messages: [
+      { role: 'system', content: cfg.prompt ?? DEFAULT_AUTO_TITLE_PROMPT },
+      { role: 'user', content: example }
+    ],
+    maxTokens: cfg.maxTokens,
+    thinkingTokens: cfg.thinkingTokens,
+    defaultThinkingTokens: SIDE_THINKING.title
+  })
+  const params = Object.fromEntries(
+    Object.entries(preview.body).filter(([k]) => k !== 'messages' && k !== 'system')
+  )
   return (
     <ApiInfo
       title="Chamada do título automático"
@@ -46,10 +64,24 @@ function AutoTitleInfo({ cfg }: { cfg: AutoTitleSettings }): React.JSX.Element {
       </p>
       <p>
         Body: <C>model</C>, <C>messages</C> = [<C>system</C> = o prompt de geração, <C>user</C> = a
-        mensagem abaixo], <C>max_tokens: {cfg.maxTokens}</C> (só se o modelo aceita), raciocínio no
-        mínimo (<C>none</C> ou o nível mais baixo, só quando o provedor informa os níveis do
-        modelo), <C>stream: true</C>. Headers: os do provedor + a assinatura do app do chat.
+        mensagem abaixo], <C>max_tokens: {cfg.maxTokens}</C> (só se o modelo aceita), raciocínio
+        desligado onde o modelo permite (obrigatório → esforço mínimo + os “Tokens de pensamento”
+        somados ao <C>max_tokens</C>; níveis desconhecidos → nada), <C>stream: true</C>. Headers: os
+        do provedor + a assinatura do app do chat.
       </p>
+      <pre
+        data-testid="auto-title-request-params"
+        className="rounded-lg border border-border bg-bg/80 p-2 font-mono text-[11px] whitespace-pre-wrap text-fg/90"
+      >
+        {JSON.stringify(params, null, 2)}
+      </pre>
+      {preview.notes.length > 0 && (
+        <ul className="list-disc space-y-0.5 pl-4 text-[11px]">
+          {preview.notes.map((n) => (
+            <li key={n}>{n}</li>
+          ))}
+        </ul>
+      )}
       <p>
         Vão só o começo da mensagem (até {D.messageChars.toLocaleString('pt-BR')} caracteres) e os{' '}
         <strong>nomes</strong> dos anexos — nunca o conteúdo deles
@@ -109,14 +141,14 @@ export function AutoTitleSettings(): React.JSX.Element {
     <section data-testid="auto-title-settings" className="space-y-3 border-t border-border pt-4">
       <div className="flex items-center gap-1.5">
         <h3 className="text-[13px] font-medium text-fg">Título automático</h3>
+        <HelpTip label="Título automático">
+          Quando um chat novo recebe a primeira mensagem, um modelo dá nome a ele em segundo plano
+          (o agente não espera). Sem modelo, o título é o começo da mensagem. Se você renomear o
+          chat antes da resposta, o seu título fica. Também dá para pedir “Gerar título” no
+          cabeçalho do chat.
+        </HelpTip>
         <AutoTitleInfo cfg={cfg} />
       </div>
-      <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
-        Quando um chat novo recebe a primeira mensagem, um modelo dá nome a ele em segundo plano (o
-        agente não espera). Sem modelo, o título é o começo da mensagem. Se você renomear o chat
-        antes da resposta, o seu título fica. Também dá para pedir “Gerar título” no cabeçalho do
-        chat.
-      </p>
 
       <div>
         <Label>Modelo para o título</Label>
@@ -145,8 +177,19 @@ export function AutoTitleSettings(): React.JSX.Element {
             O provedor deste modelo não existe mais — nenhum título será gerado.
           </p>
         ) : (
-          <div className="mt-1.5 empty:hidden">
+          <div className="mt-1.5 space-y-1.5 empty:hidden">
             {hasModel && <ModelInfoLine providerId={cfg.providerId!} model={cfg.model!} />}
+            {hasModel && (
+              <SideThinkingField
+                providerId={cfg.providerId}
+                model={cfg.model}
+                value={cfg.thinkingTokens}
+                onChange={(thinkingTokens) => save({ thinkingTokens })}
+                defaultTokens={SIDE_THINKING.title}
+                call="do título"
+                testId="auto-title-thinking"
+              />
+            )}
           </div>
         )}
       </div>
@@ -156,16 +199,18 @@ export function AutoTitleSettings(): React.JSX.Element {
           label="Usar as memórias do usuário"
           checked={cfg.useMemory}
           onChange={(v) => save({ useMemory: v })}
-          description={`Inclui um índice compacto (até ${D.memoryChars.toLocaleString('pt-BR')} caracteres) das memórias ativas no chat, para o título combinar com o que você está fazendo. Nada vai se a memória estiver desligada no chat.`}
+          help={`Inclui um índice compacto (até ${D.memoryChars.toLocaleString('pt-BR')} caracteres) das memórias ativas no chat, para o título combinar com o que você está fazendo. Nada vai se a memória estiver desligada no chat.`}
         />
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] text-fg/90">Limite de tokens de saída</div>
-            <p className="mt-0.5 text-[11.5px] leading-snug text-subtle">
-              <C>max_tokens</C> da chamada — só vai onde o modelo/provedor aceita. Em modelos de
-              raciocínio ele inclui o raciocínio (pedido no mínimo): se o título vier vazio,
-              aumente.
-            </p>
+            <div className="flex items-center gap-1.5 text-[13px] text-fg/90">
+              Limite de tokens de saída
+              <HelpTip label="Limite de tokens de saída">
+                <C>max_tokens</C> da chamada — só vai onde o modelo/provedor aceita. Em modelos de
+                raciocínio ele inclui o raciocínio (pedido no mínimo): se o título vier vazio,
+                aumente.
+              </HelpTip>
+            </div>
           </div>
           <div className="pt-0.5">
             <NumberInput

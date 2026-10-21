@@ -1,5 +1,5 @@
 import * as RT from '@radix-ui/react-tooltip'
-import { Info } from 'lucide-react'
+import { ChevronsLeftRightEllipsis, CircleQuestionMark } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { cn } from '../../lib/format'
 
@@ -39,7 +39,7 @@ export function Tip({
   )
 }
 
-/** Código inline para usar dentro dos textos de (i). */
+/** Código inline para usar dentro dos textos de (i) e (?). */
 export function C({ children }: { children: ReactNode }): React.JSX.Element {
   return (
     <code className="rounded bg-white/[0.06] px-1 py-px font-mono text-[11px] text-accent-strong">
@@ -49,8 +49,9 @@ export function C({ children }: { children: ReactNode }): React.JSX.Element {
 }
 
 /**
- * Ícone (i) que explica exatamente o que é enviado para a API e como.
- * Use em TODO lugar que vira parte do prompt/request.
+ * Ícone </> (ChevronsLeftRightEllipsis) que explica exatamente o que é enviado para a API e como.
+ * Use em TODO lugar que vira parte do prompt/request. A ajuda da opção (o que ela faz) vai no
+ * `HelpTip` (?), antes dele.
  */
 export function ApiInfo({
   title,
@@ -82,7 +83,7 @@ export function ApiInfo({
             className
           )}
         >
-          <Info className="size-3.5" strokeWidth={2} />
+          <ChevronsLeftRightEllipsis data-icon="api" className="size-3.5" strokeWidth={2} />
         </button>
       </RT.Trigger>
       <RT.Portal>
@@ -109,6 +110,71 @@ export function ApiInfo({
               </pre>
             </div>
           )}
+        </RT.Content>
+      </RT.Portal>
+    </RT.Root>
+  )
+}
+
+/** Texto com quebras de linha → um parágrafo por linha (ex.: "Desligado (padrão): …\nLigado: …"). */
+function paragraphs(children: ReactNode): ReactNode {
+  if (typeof children !== 'string' || !children.includes('\n')) return children
+  return children
+    .split('\n')
+    .filter((l) => l.trim())
+    .map((l, i) => <p key={i}>{l}</p>)
+}
+
+/**
+ * Ícone (?) com a ajuda de uma opção/campo/seção: o que ela faz (descrição estática). Fica logo
+ * depois do rótulo (antes do </> do `ApiInfo`, se houver). Estados, avisos e erros NÃO vão aqui —
+ * ficam visíveis. Texto com "\n" vira parágrafos.
+ */
+export function HelpTip({
+  title,
+  children,
+  label,
+  side = 'top',
+  className,
+  wide
+}: {
+  title?: ReactNode
+  children: ReactNode
+  /** Nome da opção (vai no nome acessível: "Ajuda: <label>"). */
+  label?: string
+  side?: Side
+  className?: string
+  wide?: boolean
+}): React.JSX.Element {
+  return (
+    <RT.Root delayDuration={120}>
+      <RT.Trigger asChild>
+        <button
+          type="button"
+          aria-label={label ? `Ajuda: ${label}` : 'Ajuda'}
+          data-testid="help-tip"
+          onClick={(e) => e.preventDefault()}
+          className={cn(
+            'no-drag inline-flex size-4 shrink-0 items-center justify-center rounded-full align-middle text-faint normal-case transition-colors hover:text-accent-strong focus-visible:text-accent-strong',
+            className
+          )}
+        >
+          <CircleQuestionMark data-icon="help" className="size-3.5" strokeWidth={2} />
+        </button>
+      </RT.Trigger>
+      <RT.Portal>
+        <RT.Content
+          side={side}
+          sideOffset={6}
+          collisionPadding={12}
+          data-testid="help-tip-content"
+          className={cn(
+            'z-[100] max-h-[min(70vh,520px)] animate-pop-in overflow-y-auto rounded-xl border border-border-strong/70 bg-elevated p-3 text-xs leading-relaxed font-normal tracking-normal text-muted normal-case shadow-popover',
+            wide ? 'w-[min(460px,90vw)]' : 'w-[300px]'
+          )}
+        >
+          {title && <div className="mb-1 text-[13px] font-medium text-fg">{title}</div>}
+          <div className="space-y-1.5">{paragraphs(children)}</div>
         </RT.Content>
       </RT.Portal>
     </RT.Root>

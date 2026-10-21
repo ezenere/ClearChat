@@ -33,6 +33,7 @@ import { CollapsibleSection, ToggleRow } from '../panel/fields'
 import { baseName, rootSummary } from '../../lib/configSummary'
 import { Button, IconButton, Label } from '../ui/controls'
 import { ModelLabel } from '../ui/ModelLabel'
+import { HelpTip } from '../ui/Tooltip'
 import { IconPicker, PresetIcon } from './PresetIcon'
 import { MemorySection } from '../memory/MemorySection'
 
@@ -128,10 +129,12 @@ export function PresetsList({
   const presets = useStore((s) => s.presets)
   return (
     <div className="space-y-2.5">
-      <p className="mb-3 text-xs leading-relaxed text-subtle">
-        Presets de chat: modelo, system prompt, parâmetros, tools e ajustes. Escolha uma no Novo
-        chat; a estrela define a que vem selecionada.
-      </p>
+      <div className="mb-3 flex items-center gap-1.5 text-xs leading-relaxed text-subtle">
+        Presets de chat: modelo, system prompt, parâmetros, tools e ajustes.
+        <HelpTip label="Personas">
+          Escolha uma no Novo chat; a estrela define a que vem selecionada.
+        </HelpTip>
+      </div>
       {presets.map((p) => (
         <PresetRow key={p.id} preset={p} onEdit={() => onEdit(p.id)} />
       ))}
@@ -194,7 +197,7 @@ function PresetChatEditor({
       >
         <ToggleRow
           label="Definir diretório raiz"
-          description="Desligado: o Novo chat usa a pasta escolhida na hora"
+          help="Desligado: o Novo chat usa a pasta escolhida na hora"
           checked={!!draft.cwd}
           onChange={(v) => (v ? void pick() : setCwd(undefined))}
         />

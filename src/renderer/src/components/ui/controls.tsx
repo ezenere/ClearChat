@@ -8,7 +8,7 @@ import {
   type TextareaHTMLAttributes
 } from 'react'
 import { cn } from '../../lib/format'
-import { Tip } from './Tooltip'
+import { HelpTip, Tip } from './Tooltip'
 
 type Variant = 'primary' | 'secondary' | 'ghost' | 'danger'
 
@@ -184,17 +184,23 @@ export const AutoTextarea = forwardRef<
 export function Label({
   children,
   info,
+  help,
   hint,
   className
 }: {
   children: ReactNode
   info?: ReactNode
+  /** Ajuda estática do campo → (?) depois do rótulo (antes do `info`). */
+  help?: ReactNode
   hint?: ReactNode
   className?: string
 }): React.JSX.Element {
   return (
     <div className={cn('mb-1.5 flex items-center gap-1.5', className)}>
       <span className="text-xs font-medium text-muted">{children}</span>
+      {help && (
+        <HelpTip label={typeof children === 'string' ? children : undefined}>{help}</HelpTip>
+      )}
       {info}
       {hint && <span className="ml-auto text-[11px] text-subtle">{hint}</span>}
     </div>

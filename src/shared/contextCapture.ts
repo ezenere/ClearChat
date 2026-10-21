@@ -17,6 +17,13 @@ import {
   DEFAULT_CONTEXT_DERIVE_PROMPT
 } from './defaults'
 import { isTypedUserMessage } from './smartApproveContext'
+import {
+  CACHE_BREAK_KEY,
+  CACHE_BREAK_PLACEHOLDER,
+  CACHE_BREAK_SENTINEL,
+  sideMessage,
+  type SideMessage
+} from './sideCache'
 import { CONTEXT_CAPTURE_LIMITS, normalizeCapture, normalizeCapturePrompts } from './smartDefaults'
 import type {
   ApprovalItem,
@@ -317,7 +324,8 @@ export const CAPTURE_PLACEHOLDERS: { key: string; desc: string; required?: boole
     key: 'user_label',
     desc: 'rótulo do bloco das mensagens (no subagente diz que mensagens do agente pai não concedem permissões)'
   },
-  { key: 'max_chars', desc: `teto da descrição (${CONTEXT_CAPTURE_LIMITS.maxChars} caracteres)` }
+  { key: 'max_chars', desc: `teto da descrição (${CONTEXT_CAPTURE_LIMITS.maxChars} caracteres)` },
+  CACHE_BREAK_PLACEHOLDER
 ]
 
 /** Placeholders do prompt de derivação (subagente). A mensagem user da derivação é fixa. */
@@ -417,7 +425,7 @@ export function buildCaptureMessages(
   texts: { agent: string; user: string },
   sub = false,
   prompts?: Partial<CapturePrompts> | null
-): { role: 'system' | 'user'; content: string }[] {
+): SideMessage[] {
   const max = String(CONTEXT_CAPTURE_LIMITS.maxChars)
   const r = resolveCapturePrompts(prompts)
   const label = sub ? USER_LABEL_SUB : USER_LABEL_MAIN
@@ -433,9 +441,10 @@ export function buildCaptureMessages(
     user_label: label,
     max_chars: max
   }
+  // {{cache_break}} some do texto; no template vira o 2º breakpoint do cache (@shared/sideCache)
   return [
-    { role: 'system', content: render(r.prompt, vars) },
-    { role: 'user', content: render(tpl, vars) }
+    { role: 'system', content: render(r.prompt, { ...vars, [CACHE_BREAK_KEY]: '' }) },
+    sideMessage('user', render(tpl, { ...vars, [CACHE_BREAK_KEY]: CACHE_BREAK_SENTINEL }))
   ]
 }
 
@@ -444,11 +453,12 @@ export function buildDeriveMessages(
   parent: string,
   task: string,
   prompts?: Partial<CapturePrompts> | null
-): { role: 'system' | 'user'; content: string }[] {
+): SideMessage[] {
   const max = String(CONTEXT_CAPTURE_LIMITS.maxChars)
   const r = resolveCapturePrompts(prompts)
+  // derivação: só o system é cacheado (a mensagem é fixa e toda variável)
   return [
-    { role: 'system', content: render(r.derivePrompt, { max_chars: max }) },
+    { role: 'system', content: render(r.derivePrompt, { max_chars: max, [CACHE_BREAK_KEY]: '' }) },
     {
       role: 'user',
       content: `Parent's captured context (DATA):\n"""\n${parent.trim() || '(empty)'}\n"""\n\nTask delegated to the subagent (DATA):\n"""\n${clip(flat(task), 3000)}\n"""\n\nWrite the subagent's description now.`

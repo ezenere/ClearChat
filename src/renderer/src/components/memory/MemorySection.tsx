@@ -111,7 +111,7 @@ export function MemorySection({
       >
         <ToggleRow
           label={isChat ? 'Memória neste chat' : 'Memória nesta persona'}
-          description="Índice, instruções e tools de memória nas requests"
+          help="Índice, instruções e tools de memória nas requests"
           checked={mem.enabled}
           onChange={(enabled) => set({ ...mem, enabled })}
         />
@@ -132,17 +132,19 @@ export function MemorySection({
         summary={collectionsSummary(mem, cols, !!persona && differsFromPersona(mem, persona))}
         warning={collectionsWarning(mem, cols)}
         aside={<MemoryCollectionsInfo />}
+        help={
+          <span data-testid="memory-collections-help">
+            Marque as coleções que o modelo lê; em cada categoria, escolha onde ele grava.
+            {persona && (
+              <>
+                {' '}
+                <Star className="mb-0.5 inline size-2.5 fill-current text-accent-strong" /> =
+                escrita da persona.
+              </>
+            )}
+          </span>
+        }
       >
-        <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
-          Marque as coleções que o modelo lê; em cada categoria, escolha onde ele grava.
-          {persona && (
-            <>
-              {' '}
-              <Star className="mb-0.5 inline size-2.5 fill-current text-accent-strong" /> = escrita
-              da persona.
-            </>
-          )}
-        </p>
         <div className={cn('space-y-3', !mem.enabled && 'opacity-55')}>
           {MEMORY_CATEGORIES.map((cat) => (
             <CategoryBlock
@@ -184,7 +186,7 @@ export function MemorySection({
       >
         <ToggleRow
           label="Memória nos subagentes (só busca/leitura)"
-          description="memory_search e memory_read — nunca escrita nem índice"
+          help="memory_search e memory_read — nunca escrita nem índice"
           checked={mem.subagents}
           onChange={(subagents) => set({ ...mem, subagents })}
         />
@@ -529,7 +531,7 @@ function HelpSection({
     <CollapsibleSection id="memory-help" title="Instruções" summary={memoryHelpSummary(mem)}>
       <ToggleRow
         label="Instruções de memória no system prompt"
-        description="Consultar antes de responder, gravar fatos novos, corrigir discrepâncias"
+        help="Consultar antes de responder, gravar fatos novos, corrigir discrepâncias"
         checked={mem.helpPrompt.enabled}
         onChange={(enabled) => onChange({ ...mem, helpPrompt: { ...mem.helpPrompt, enabled } })}
         info={<MemoryHelpInfo text={text} />}
@@ -649,7 +651,7 @@ function ExtractionSection({
     >
       <ToggleRow
         label="Extrair automaticamente após compactar"
-        description="Uma request separada lê a conversa e grava fatos duradouros"
+        help="Uma request separada lê a conversa e grava fatos duradouros"
         checked={ex.auto}
         onChange={(auto) => setEx({ auto })}
       />

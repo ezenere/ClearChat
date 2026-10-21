@@ -50,6 +50,11 @@ export interface ModelReasoningInfo {
   mandatory?: boolean
   /** Anthropic nativa: `capabilities.effort.supported` (false = não aceita effort). */
   effortSupported?: boolean
+  /**
+   * Raciocínio ligado por padrão (OpenRouter `default_enabled`; false = só pensa se pedido). Usado
+   * pelas chamadas laterais (@shared/sideReasoning) quando os níveis não são informados.
+   */
+  defaultEnabled?: boolean
 }
 
 /** Só campos definidos (≠ undefined/null) vão para a request. */
@@ -295,6 +300,17 @@ export interface SmartApproveConfig {
    */
   capturePrompts?: CapturePrompts | null
   /**
+   * "Tokens de pensamento" do juiz (0.8.8): só valem em modelo de raciocínio obrigatório
+   * (@shared/sideReasoning → modo `minimal`), somados ao `max_tokens` da chamada. Ausente/null = o
+   * padrão (SIDE_THINKING.judge).
+   */
+  thinkingTokens?: number | null
+  /**
+   * "Cache do prompt" do juiz (0.8.8): `cache_control` no fim do system e no {{cache_break}} do
+   * template (@shared/sideCache). Ausente = ligado; só `false` é gravado.
+   */
+  cache?: boolean
+  /**
    * @deprecated (≤ 0.4.0) liga/desliga. Só alias de leitura: migrateSmartApproveConfig converte
    * (ver approvalPolicy.ts) e remove. Hoje o juiz age nos itens em modo `smart` quando há modelo.
    */
@@ -330,6 +346,13 @@ export interface ContextCaptureConfig {
   maxTokens: number | null
   /** Quantas mensagens do agente (só o texto dele) antes da sua entram como contexto (1–10). */
   lookback: number
+  /**
+   * "Tokens de pensamento" do resumidor (0.8.8): só em modelo de raciocínio obrigatório, somados ao
+   * `max_tokens`. Ausente/null = o padrão (SIDE_THINKING.capture).
+   */
+  thinkingTokens?: number | null
+  /** "Cache do prompt" do resumidor (0.8.8; system + descrição atual). Ausente = ligado. */
+  cache?: boolean
 }
 
 /**

@@ -38,7 +38,7 @@ import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { Button, IconButton, Label, Switch } from '../ui/controls'
 import { Select } from '../ui/Select'
-import { ApiInfo, C, Tip } from '../ui/Tooltip'
+import { ApiInfo, C, HelpTip, Tip } from '../ui/Tooltip'
 
 const NEED_KEY_HINT = 'Informe a chave de API para habilitar'
 
@@ -84,19 +84,19 @@ export function WebSearchSettings(): React.JSX.Element {
   return (
     <div className="space-y-6" data-testid="web-search-settings">
       <section>
-        <div className="mb-1 flex items-baseline gap-2">
+        <div className="mb-3 flex items-baseline gap-2">
           <span className="text-[13px] font-medium text-fg/90">Buscadores</span>
+          <HelpTip label="Buscadores" className="self-center">
+            Cada pesquisa usa <strong className="text-fg/80">um buscador só</strong>: o primeiro
+            habilitado da lista. Se ele falhar (sem chave ou chave inválida, limite de uso/cota,
+            captcha/bloqueio, erro de rede ou resposta vazia), a mesma pesquisa passa para o próximo
+            habilitado — os resultados nunca são misturados, e a 1ª linha do resultado diz qual
+            buscador respondeu e qual falhou antes. Arraste pela alça ou use ↑/↓ para mudar a ordem.
+          </HelpTip>
           <span className="text-[11px] text-subtle">
             {engines ? `${enabledCount} habilitado${enabledCount === 1 ? '' : 's'}` : ''}
           </span>
         </div>
-        <p className="mb-3 text-xs leading-relaxed text-subtle">
-          Cada pesquisa usa <strong className="text-fg/80">um buscador só</strong>: o primeiro
-          habilitado da lista. Se ele falhar (sem chave ou chave inválida, limite de uso/cota,
-          captcha/bloqueio, erro de rede ou resposta vazia), a mesma pesquisa passa para o próximo
-          habilitado — os resultados nunca são misturados, e a 1ª linha do resultado diz qual
-          buscador respondeu e qual falhou antes. Arraste pela alça ou use ↑/↓ para mudar a ordem.
-        </p>
         {!engines ? (
           <div className="h-40 animate-pulse rounded-xl border border-border bg-elevated/30" />
         ) : (
@@ -601,7 +601,20 @@ function IntervalField(): React.JSX.Element {
 
   return (
     <section className="border-t border-border pt-4">
-      <Label>Intervalo mínimo entre pesquisas (s)</Label>
+      <Label
+        help={
+          <>
+            Vale para todas as chamadas de <span className="font-mono">web_search</span> de qualquer
+            chat, sessão ou subagente, qualquer que seja o buscador: uma pesquisa que chega antes do
+            intervalo espera o restante, e pesquisas simultâneas saem uma de cada vez. Cada pesquisa
+            conta uma vez só — se o primeiro buscador falhar, o próximo é tentado na hora, sem
+            esperar de novo. O botão Testar não entra no intervalo. Espaçar as buscas evita o
+            bloqueio anti-robô do DuckDuckGo e do Brave (site).
+          </>
+        }
+      >
+        Intervalo mínimo entre pesquisas (s)
+      </Label>
       <input
         type="number"
         min={0}
@@ -621,13 +634,7 @@ function IntervalField(): React.JSX.Element {
         className="field h-8 w-[110px] px-2 py-0 text-right font-mono text-[12.5px] tabular-nums"
       />
       <p className="mt-2 text-xs leading-relaxed text-subtle">
-        Vale para todas as chamadas de <span className="font-mono">web_search</span> de qualquer
-        chat, sessão ou subagente, qualquer que seja o buscador: uma pesquisa que chega antes do
-        intervalo espera o restante, e pesquisas simultâneas saem uma de cada vez. Cada pesquisa
-        conta uma vez só — se o primeiro buscador falhar, o próximo é tentado na hora, sem esperar
-        de novo. O botão Testar não entra no intervalo. Espaçar as buscas evita o bloqueio anti-robô
-        do DuckDuckGo e do Brave (site). 0 = desligado · máx. {SEARCH_INTERVAL_MAX_S} s · padrão{' '}
-        {SEARCH_INTERVAL_DEFAULT_S} s.
+        0 = desligado · máx. {SEARCH_INTERVAL_MAX_S} s · padrão {SEARCH_INTERVAL_DEFAULT_S} s.
       </p>
     </section>
   )

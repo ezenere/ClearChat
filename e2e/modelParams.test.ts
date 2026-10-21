@@ -369,7 +369,11 @@ test('juiz do Smart-Approve: temperature 0 omitido onde não é aceito', () => {
   assert.match(j.notes!.join(), /temperature omitido/)
   const j2 = buildJudgeRequest({ sa: sa('claude-haiku-4-5'), provider: anth, chatConfig: {}, ctx })!
   assert.equal((j2.body as any).temperature, 0)
-  assert.equal(j2.notes, undefined)
+  assert.deepEqual(
+    (j2.notes ?? []).filter((n) => !n.startsWith('Cache do prompt')),
+    [],
+    'sem notas de parâmetros'
+  )
   models['po|openai/o4-mini'] = { id: 'openai/o4-mini', supportedParams: ['max_tokens'] }
   const j3 = buildJudgeRequest({
     sa: sa('openai/o4-mini', 'po'),

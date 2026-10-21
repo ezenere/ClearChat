@@ -154,6 +154,47 @@ export function anthropicModelRules(model: string): AnthropicRules {
   return { sampling, effort, efforts }
 }
 
+export interface AnthropicThinkingRule {
+  /**
+   * Como deixar o modelo sem raciocínio: 'omit' = já não pensa sem o campo `thinking`; 'disabled' =
+   * `thinking: {type: "disabled"}` (pensa por padrão); 'between_tools' = `thinking: {type:
+   * "between_tools"}` (não aceita "disabled"; só pensa entre chamadas de tool); null = não dá
+   * (raciocínio obrigatório: só o effort controla).
+   */
+  off: 'omit' | 'disabled' | 'between_tools' | null
+  /** Versão fora da tabela: regra presumida (null = conservador: sem `thinking`, effort mínimo). */
+  inferred?: boolean
+}
+
+/**
+ * Raciocínio por modelo na API nativa (usado pelas chamadas laterais — juiz, resumidor, título —
+ * em @shared/sideReasoning). Doc platform.claude.com/docs/en/build-with-claude/thinking +
+ * guias de migração (tabela "Thinking & Effort"):
+ * - Claude 3.x e 4.x (Haiku 4.5, Sonnet 4.5/4.6, Opus 4.5–4.8): sem `thinking` não pensam
+ *   (4.6 precisa de `adaptive` explícito; 4.7/4.8 "runs without thinking") → 'omit'.
+ * - Opus 5, Sonnet 5 (omitir = adaptive) e Haiku 5.5 (ligado por padrão): aceitam
+ *   `{type: "disabled"}` (Opus 5/Haiku 5.5: só com effort ≤ high) → 'disabled'.
+ * - Sonnet 5.5: "disabled" → 400; desligar = `{type: "between_tools"}` (sem outro campo, effort ≤
+ *   high) → sem tools, não pensa.
+ * - Opus 5.5, Fable 5/5.1, Mythos: "disabled" e budget_tokens → 400 (sempre pensa) → null.
+ * - Versões além da tabela (ex.: 5.1–5.4, ≥ 5.6, 6.x): null + inferred (não manda `thinking`, que
+ *   poderia dar 400; effort no mínimo).
+ * Id não-Claude → null (desconhecido: nada é enviado).
+ */
+export function anthropicThinkingRule(model: string): AnthropicThinkingRule | null {
+  const c = parseClaudeId(model)
+  if (!c) return null
+  if (c.family === 'fable' || c.family === 'mythos') return { off: null }
+  if (c.major <= 4) return { off: 'omit' }
+  if (c.major === 5 && c.minor === 0) return { off: 'disabled' }
+  if (c.major === 5 && c.minor === 5) {
+    if (c.family === 'opus') return { off: null }
+    if (c.family === 'sonnet') return { off: 'between_tools' }
+    return { off: 'disabled' }
+  }
+  return { off: null, inferred: true }
+}
+
 // ---------------- reasoning_effort: níveis por modelo ----------------
 
 /** Todos os níveis conhecidos, em ordem crescente (o gateway do OpenRouter aceita todos). */
@@ -191,6 +232,7 @@ export function openRouterReasoning(r: unknown): ModelReasoningInfo | undefined 
   else if (Array.isArray(o.supported_efforts)) info.efforts = sortEfforts(o.supported_efforts)
   if (isEffort(o.default_effort)) info.defaultEffort = o.default_effort
   if (typeof o.mandatory === 'boolean') info.mandatory = o.mandatory
+  if (typeof o.default_enabled === 'boolean') info.defaultEnabled = o.default_enabled
   return info
 }
 

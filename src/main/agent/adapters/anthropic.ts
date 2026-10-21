@@ -103,7 +103,16 @@ export function dropAudioParts(messages: ApiMessage[]): ApiMessage[] {
 const DATA_URL = /^data:([^;,]+)(?:;[^,]*)?;base64,(.*)$/s
 
 function partToBlock(p: ContentPart): AnthropicBlock | null {
-  if (p.type === 'text') return p.text ? { type: 'text', text: p.text } : null
+  // cache_control de um text part vem só das chamadas laterais (@shared/sideCache); o histórico
+  // persistido nunca o tem (os breakpoints do chat são postos por applyAnthropicCache)
+  if (p.type === 'text')
+    return p.text
+      ? {
+          type: 'text',
+          text: p.text,
+          ...(p.cache_control ? { cache_control: p.cache_control } : {})
+        }
+      : null
   if (p.type === 'image_url') {
     const url = p.image_url.url
     const m = DATA_URL.exec(url)

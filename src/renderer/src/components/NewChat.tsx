@@ -260,7 +260,12 @@ export function NewChat(): React.JSX.Element {
 
           <div className="grid grid-cols-[minmax(0,3fr)_minmax(0,2fr)] items-start gap-3">
             <div>
-              <Label info={<RootInfo />}>Diretório raiz</Label>
+              <Label
+                info={<RootInfo />}
+                help="Workspace da sessão: o agente cria e edita arquivos e roda o shell aqui."
+              >
+                Diretório raiz
+              </Label>
               <div className="flex gap-2">
                 <button
                   type="button"
@@ -305,9 +310,6 @@ export function NewChat(): React.JSX.Element {
                   />
                 </div>
               )}
-              <p className="mt-1.5 text-[11px] leading-snug text-subtle">
-                Workspace da sessão: o agente cria e edita arquivos e roda o shell aqui.
-              </p>
             </div>
             <div>
               <Label

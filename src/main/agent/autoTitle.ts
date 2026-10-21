@@ -2,7 +2,6 @@
 // plano e só troca o título provisório se ninguém renomeou o chat enquanto isso. Banco/eventos
 // entram por `AutoTitleDeps` (src/main/autoTitle.ts liga ao app; os testes passam falsos).
 // Ver SPEC.md → "Título automático".
-import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
 import {
   AUTO_TITLE_DEFAULTS,
   autoTitleEnabled,
@@ -12,15 +11,15 @@ import {
   type AutoTitleSettings
 } from '@shared/autoTitle'
 import { EFFORT_ORDER, type ParamSupport } from '@shared/modelParams'
-import { providerKind } from '@shared/providerKinds'
-import type { Chat, ChatConfig, ChatParams, Provider, ReasoningEffort } from '@shared/types'
-import { adapterFor } from './adapters'
-import { buildAnthropicBody } from './adapters/anthropic'
+import { SIDE_THINKING } from '@shared/sideReasoning'
+import type { Chat, ChatConfig, Provider, ReasoningEffort } from '@shared/types'
 import { newAccumulator, streamChat } from './llm'
-import { filterParams, type BuiltRequest } from './request'
+import type { BuiltRequest } from './request'
+import { buildSideRequest } from './smartApprove'
 
 /**
- * Raciocínio mínimo para a chamada (barata): `none` se o modelo aceita, senão o nível mais baixo.
+ * (Legado: a request usa @shared/sideReasoning.) Raciocínio mínimo: `none` se o modelo aceita,
+ * senão o nível mais baixo.
  * Só com níveis confiáveis (API ou tabela conferida); desconhecido → não manda nada (um endpoint
  * que não conhece o campo poderia recusar a request).
  */
@@ -39,51 +38,22 @@ export function buildAutoTitleRequest(input: {
   memory?: string | null
 }): BuiltRequest {
   const { settings: s, provider } = input
-  const model = s.model ?? ''
-  const kind = providerKind(provider)
-  const adapter = adapterFor(kind)
-  const signature = resolveAppSignatureHeaders(
-    input.chatConfig?.appSignature ?? DEFAULT_APP_SIGNATURE,
-    input.chatConfig?.appSignatureCustom
-  )
   const messages = buildAutoTitleMessages(s.prompt, {
     text: input.text,
     attachments: input.attachments,
     memory: input.memory
   })
-  // max_tokens e raciocínio mínimo passam pelo mesmo filtro do chat: só vai o que o modelo aceita
-  const base: ChatParams = { max_tokens: s.maxTokens }
-  const effort = minimalEffort(filterParams(base, kind, provider.id, model, null).effort)
-  const support = filterParams(
-    effort ? { ...base, reasoning_effort: effort } : base,
-    kind,
-    provider.id,
-    model,
-    null
-  )
-  let body: Record<string, unknown>
-  if (kind === 'anthropic') {
-    // max_tokens é obrigatório na API nativa (o filtro nunca o tira na Anthropic)
-    body = buildAnthropicBody({ model, messages, params: support.send })
-  } else {
-    body = { model, messages }
-    if (support.send.max_tokens != null) body.max_tokens = support.send.max_tokens
-    const e = support.send.reasoning_effort
-    if (e) {
-      if (kind === 'openrouter') body.reasoning = { effort: e }
-      else body.reasoning_effort = e
-    }
-    body.stream = true
-    body.stream_options = { include_usage: true }
-    if (kind === 'openrouter') body.usage = { include: true }
-  }
-  return {
-    url: adapter.chatUrl(provider.baseUrl),
-    headers: adapter.headers(provider, signature),
-    body,
-    kind,
-    ...(support.notes.length ? { notes: support.notes } : {})
-  }
+  // max_tokens e raciocínio (desligado onde dá; obrigatório → mínimo + tokens de pensamento) pela
+  // política das chamadas laterais; passam pelo mesmo filtro do chat: só vai o que o modelo aceita
+  return buildSideRequest({
+    provider,
+    model: s.model ?? '',
+    messages,
+    maxTokens: s.maxTokens,
+    thinkingTokens: s.thinkingTokens,
+    defaultThinkingTokens: SIDE_THINKING.title,
+    chatConfig: input.chatConfig
+  })
 }
 
 export interface AutoTitleDeps {

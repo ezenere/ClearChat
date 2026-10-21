@@ -6,9 +6,8 @@
 import { AlertTriangle, FlaskConical, X } from 'lucide-react'
 import { useState } from 'react'
 import { DEFAULT_SMART_APPROVE_PROMPT, DEFAULT_SMART_APPROVE_TEMPLATE } from '@shared/defaults'
-import { providerKind } from '@shared/providerKinds'
+import { SIDE_THINKING } from '@shared/sideReasoning'
 import {
-  buildJudgeBody,
   buildJudgeMessages,
   normalizeSmartApprove,
   SMART_APPROVE_DEFAULTS,
@@ -33,10 +32,14 @@ import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { Select } from '../ui/Select'
 import { ApiInfo, C, Tip } from '../ui/Tooltip'
+import { PlaceholderList } from '../ui/PlaceholderList'
 import { smartAdvancedSummary, smartApproveSummary } from '../../lib/configSummary'
 import type { CfgProps } from './editors'
 import { CollapsibleSection, NumberInput, RestoreButton, ToggleRow } from './fields'
 import { SmartContextSection } from './SmartContextFields'
+import { SideThinkingField } from './SideThinkingField'
+import { PromptCacheToggle } from './PromptCacheToggle'
+import { useSideRequestPreview } from '../../lib/sideReasoning'
 
 /** Resumo da subseção "Ambiente e contexto" (fechada). */
 function environmentSummary(cfg: CfgProps['cfg']): { text: string; changed: boolean } {
@@ -79,16 +82,17 @@ function SmartRequestInfo({
     sandbox: !!cfg.sandboxBash && bwrap,
     history: SMART_APPROVE_SAMPLE.history
   })
-  const body = buildJudgeBody(
-    sa.model ?? '<modelo>',
+  // body exato (mesma política de raciocínio e filtro de params do main)
+  const { url, body, notes } = useSideRequestPreview({
+    providerId: provider?.id,
+    model: sa.model,
     messages,
-    provider ? providerKind(provider) === 'openrouter' : false
-  )
-  const endpoint =
-    provider && providerKind(provider) === 'anthropic' ? 'messages' : 'chat/completions'
-  const url = provider
-    ? `${provider.baseUrl.replace(/\/+$/, '')}/${endpoint}`
-    : '<provedor>/chat/completions'
+    cache: sa.cache !== false,
+    maxTokens: SMART_APPROVE_DEFAULTS.maxTokens,
+    temperature: SMART_APPROVE_DEFAULTS.temperature,
+    thinkingTokens: sa.thinkingTokens,
+    defaultThinkingTokens: SIDE_THINKING.judge
+  })
   return (
     <ApiInfo
       title="Chamada ao juiz (exemplo)"
@@ -106,9 +110,19 @@ function SmartRequestInfo({
         <strong className="text-fg">separada</strong> ao modelo escolhido (fora do histórico; o
         agente não a vê): <C>{'role: "system"'}</C> = o prompt, <C>{'role: "user"'}</C> = o template
         com os placeholders preenchidos, <C>temperature: 0</C> (omitido se o modelo não aceita),{' '}
-        <C>max_tokens: {SMART_APPROVE_DEFAULTS.maxTokens}</C>. Headers: os do provedor do juiz + a
-        assinatura do app deste chat.
+        <C>max_tokens: {SMART_APPROVE_DEFAULTS.maxTokens}</C>. Raciocínio desligado onde o modelo
+        permite; se for obrigatório, esforço mínimo e os “Tokens de pensamento” somados ao{' '}
+        <C>max_tokens</C>. Com “Cache do prompt”, <C>cache_control</C> no fim do system e no{' '}
+        <C>{'{{cache_break}}'}</C> do template (Anthropic e Anthropic/Gemini no OpenRouter).
+        Headers: os do provedor do juiz + a assinatura do app deste chat.
       </p>
+      {notes.length > 0 && (
+        <ul data-testid="smart-request-notes" className="list-disc space-y-0.5 pl-4 text-[11px]">
+          {notes.map((n) => (
+            <li key={n}>{n}</li>
+          ))}
+        </ul>
+      )}
       <p>
         O template recebe o contexto montado pelo app (limitado a ~6.000 caracteres): as últimas
         mensagens que você digitou na conversa principal, a tarefa do subagente, as últimas chamadas
@@ -210,14 +224,19 @@ export function SmartApproveSection({
       // rascunho de rótulos inválido (não salvo): mantém aberta e marca o cabeçalho
       error={labelError ? 'rótulos inválidos' : null}
       aside={<SmartRequestInfo cfg={cfg} patch={patch} sa={sa} tool={testTool} args={parsedArgs} />}
+      help={
+        <>
+          <p>
+            Um modelo avalia as chamadas dos itens em modo “Smart-Approve” (seção Aprovações acima)
+            e aprova ou pergunta a você, sabendo o que você pediu e o que o agente está fazendo.
+          </p>
+          <p>
+            Em Comandos/Processos/Páginas ele só complementa as listas: o que a whitelist libera
+            roda sem ele; a blacklist bloqueia. Erro, demora ou resposta ambígua → pergunta a você.
+          </p>
+        </>
+      }
     >
-      <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
-        Um modelo avalia as chamadas dos itens em modo “Smart-Approve” (seção Aprovações acima) e
-        aprova ou pergunta a você, sabendo o que você pediu e o que o agente está fazendo. Em
-        Comandos/Processos/Páginas ele só complementa as listas: o que a whitelist libera roda sem
-        ele; a blacklist bloqueia. Erro, demora ou resposta ambígua → pergunta a você.
-      </p>
-
       <div data-testid="smart-approve-model" className="flex items-center gap-1.5">
         <ModelPicker
           className="min-w-0 flex-1"
@@ -260,6 +279,26 @@ export function SmartApproveSection({
         </span>
       </div>
 
+      <SideThinkingField
+        providerId={sa.providerId}
+        model={sa.model}
+        value={sa.thinkingTokens}
+        onChange={(thinkingTokens) => set({ thinkingTokens })}
+        defaultTokens={SIDE_THINKING.judge}
+        call="do juiz"
+        testId="smart-thinking"
+      />
+
+      <div data-testid="smart-cache" className={cn(!hasModel && 'opacity-60')}>
+        <PromptCacheToggle
+          providerId={sa.providerId}
+          model={sa.model}
+          checked={sa.cache !== false}
+          onChange={(on) => set({ cache: on ? undefined : false })}
+          what="judge"
+        />
+      </div>
+
       <div className={cn('space-y-3 transition-opacity', !hasModel && 'opacity-60')}>
         <CollapsibleSection
           id="smart-environment"
@@ -290,13 +329,17 @@ export function SmartApproveSection({
           <div className="space-y-3">
             <ToggleRow
               label="O juiz pode negar"
-              description="Desligado (padrão): o juiz só aprova ou pergunta a você — uma resposta “negar” vira pergunta, com o motivo como dica no card. Ligado: a chamada negada não roda e o agente recebe o motivo."
+              help={
+                'Desligado (padrão): o juiz só aprova ou pergunta a você — uma resposta “negar” vira pergunta, com o motivo como dica no card.\nLigado: a chamada negada não roda e o agente recebe o motivo.'
+              }
               checked={sa.canDeny}
               onChange={(canDeny) => set({ canDeny })}
             />
             <ToggleRow
               label="Consultar o Smart-Approve também para o que a whitelist já libera"
-              description="Desligado (padrão): Comandos/Processos/Páginas cobertos inteiros pela whitelist rodam sem o juiz, e ele decide só o que as listas não decidem. Ligado: o juiz também avalia o que a whitelist libera."
+              help={
+                'Desligado (padrão): Comandos/Processos/Páginas cobertos inteiros pela whitelist rodam sem o juiz, e ele decide só o que as listas não decidem.\nLigado: o juiz também avalia o que a whitelist libera.'
+              }
               checked={sa.judgeWhitelisted}
               onChange={(judgeWhitelisted) => set({ judgeWhitelisted })}
             />
@@ -422,19 +465,11 @@ export function SmartApproveSection({
                     className="field font-mono text-[11px] leading-relaxed"
                   />
                 </div>
-                <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
-                  <div className="mb-1 text-[10.5px] font-medium text-subtle">
-                    Placeholders (system e template)
-                  </div>
-                  <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
-                    {SMART_APPROVE_PLACEHOLDERS.map((p) => (
-                      <div key={p.key} className="contents">
-                        <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
-                        <dd className="text-subtle">{p.desc}</dd>
-                      </div>
-                    ))}
-                  </dl>
-                </div>
+                <PlaceholderList
+                  groups={[
+                    { title: 'Placeholders (system e template)', items: SMART_APPROVE_PLACEHOLDERS }
+                  ]}
+                />
               </div>
             </CollapsibleSection>
           </div>

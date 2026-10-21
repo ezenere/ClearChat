@@ -3,6 +3,7 @@
 // src/main/agent/autoTitle.ts e a ligação com banco/eventos em src/main/autoTitle.ts.
 // Ver SPEC.md → "Título automático".
 import { DEFAULT_AUTO_TITLE_PROMPT } from './defaults'
+import { normalizeThinkingTokens } from './sideReasoning'
 import type { Usage } from './types'
 
 /** Chave em `settings` (sincroniza: registro `setting autoTitle`, protocolo 1.4.0, §4.3.2). */
@@ -18,6 +19,11 @@ export interface AutoTitleSettings {
   maxTokens: number
   /** System prompt da chamada; null = DEFAULT_AUTO_TITLE_PROMPT. */
   prompt: string | null
+  /**
+   * "Tokens de pensamento" (0.8.8): só em modelo de raciocínio obrigatório (@shared/sideReasoning),
+   * somados ao `max_tokens`. Ausente/null = o padrão (SIDE_THINKING.title).
+   */
+  thinkingTokens?: number | null
 }
 
 export const AUTO_TITLE_DEFAULTS = {
@@ -71,6 +77,7 @@ export function normalizeAutoTitleSettings(v: unknown): AutoTitleSettings {
   const providerId = str(o.providerId)
   const model = str(o.model)
   const n = typeof o.maxTokens === 'number' && Number.isFinite(o.maxTokens) ? o.maxTokens : NaN
+  const thinkingTokens = normalizeThinkingTokens(o.thinkingTokens)
   return {
     // par: um sem o outro não vale
     providerId: providerId && model ? providerId : null,
@@ -82,7 +89,8 @@ export function normalizeAutoTitleSettings(v: unknown): AutoTitleSettings {
           AUTO_TITLE_DEFAULTS.maxMaxTokens,
           Math.max(AUTO_TITLE_DEFAULTS.minMaxTokens, Math.round(n))
         ),
-    prompt: typeof o.prompt === 'string' && o.prompt.trim() ? o.prompt : null
+    prompt: typeof o.prompt === 'string' && o.prompt.trim() ? o.prompt : null,
+    ...(thinkingTokens != null ? { thinkingTokens } : {})
   }
 }
 

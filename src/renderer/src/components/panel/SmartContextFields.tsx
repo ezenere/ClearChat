@@ -32,8 +32,12 @@ import { cn, formatCost, relativeTime } from '../../lib/format'
 import { useStore } from '../../store'
 import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
-import { C, Tip } from '../ui/Tooltip'
+import { C, HelpTip, Tip } from '../ui/Tooltip'
+import { PlaceholderList } from '../ui/PlaceholderList'
 import { CollapsibleSection, NumberInput, RestoreButton, ToggleRow } from './fields'
+import { SideThinkingField } from './SideThinkingField'
+import { PromptCacheToggle } from './PromptCacheToggle'
+import { SIDE_THINKING } from '@shared/sideReasoning'
 
 export const ENVIRONMENT_PLACEHOLDER =
   'Ex.: 172.16.1.7 é meu servidor de testes; pode reiniciar containers lá. Produção é deploy@prod.exemplo.com — nunca mexer sem perguntar.'
@@ -55,7 +59,20 @@ export function CaptureFields({
     <div data-testid={testId} className="space-y-2.5">
       <ToggleRow
         label="Coleta automática de contexto"
-        description="Depois de cada mensagem sua, um modelo barato atualiza (em segundo plano) uma descrição curta do que você quer e permite — o juiz lê antes de decidir. Recebe só as suas mensagens e o texto das últimas falas do agente (nunca resultados de tool)."
+        help={
+          <>
+            <p>
+              Depois de cada mensagem sua, um modelo barato atualiza (em segundo plano) uma
+              descrição curta do que você quer e permite — o juiz lê antes de decidir. Recebe só as
+              suas mensagens e o texto das últimas falas do agente (nunca resultados de tool).
+            </p>
+            <p>
+              Só olha o que veio depois da última mensagem já resumida (nada é reenviado); mensagens
+              seguidas viram uma chamada só; Parar cancela o resumo em andamento. Sem itens em
+              Smart-Approve, nenhuma chamada é feita.
+            </p>
+          </>
+        }
         checked={c.enabled && hasModel}
         onChange={(enabled) => onChange({ ...c, enabled })}
       />
@@ -120,11 +137,28 @@ export function CaptureFields({
           }
         />
       </div>
-      <p className="text-[11px] leading-snug text-faint">
-        Só olha o que veio depois da última mensagem já resumida (nada é reenviado); mensagens
-        seguidas viram uma chamada só; Parar cancela o resumo em andamento. Sem itens em
-        Smart-Approve, nenhuma chamada é feita.
-      </p>
+      <SideThinkingField
+        providerId={c.providerId}
+        model={c.model}
+        value={c.thinkingTokens}
+        onChange={(thinkingTokens) => onChange({ ...c, thinkingTokens })}
+        defaultTokens={SIDE_THINKING.capture}
+        call="do resumo"
+        testId={testId ? `${testId}-thinking` : 'capture-thinking'}
+      />
+      <div data-testid={testId ? `${testId}-cache` : 'capture-cache'}>
+        <PromptCacheToggle
+          providerId={c.providerId}
+          model={c.model}
+          checked={c.cache !== false}
+          onChange={(on) => {
+            const next: ContextCaptureConfig = { ...c, cache: false }
+            if (on) delete next.cache
+            onChange(next)
+          }}
+          what="capture"
+        />
+      </div>
     </div>
   )
 }
@@ -271,39 +305,13 @@ export function CapturePromptsFields({
           </div>
         )
       })}
-      <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
-        <div className="mb-1 text-[10.5px] font-medium text-subtle">
-          Placeholders do resumo (prompt e template)
-        </div>
-        <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
-          {CAPTURE_PLACEHOLDERS.map((p) => (
-            <div key={p.key} className="contents">
-              <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
-              <dd className="text-subtle">
-                {p.desc}
-                {p.required && <span className="text-warning/90"> · obrigatório</span>}
-              </dd>
-            </div>
-          ))}
-        </dl>
-        <div className="mt-1.5 mb-1 text-[10.5px] font-medium text-subtle">
-          Placeholders da derivação
-        </div>
-        <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
-          {DERIVE_PLACEHOLDERS.map((p) => (
-            <div key={p.key} className="contents">
-              <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
-              <dd className="text-subtle">{p.desc}</dd>
-            </div>
-          ))}
-        </dl>
-        <p className="mt-1.5 text-[11px] leading-snug text-faint">
-          Qualquer que seja o prompt, o app descarta linhas novas que copiam o texto do agente sem
-          que você tenha dito ou confirmado (trava “só o que o usuário disse”), e o resumidor nunca
-          recebe resultados de tool. A derivação recebe a descrição do pai e a tarefa numa mensagem
-          fixa.
-        </p>
-      </div>
+      <PlaceholderList
+        groups={[
+          { title: 'Placeholders do resumo (prompt e template)', items: CAPTURE_PLACEHOLDERS },
+          { title: 'Placeholders da derivação', items: DERIVE_PLACEHOLDERS }
+        ]}
+        note="Qualquer que seja o prompt, o app descarta linhas novas que copiam o texto do agente sem que você tenha dito ou confirmado (trava “só o que o usuário disse”), e o resumidor nunca recebe resultados de tool. A derivação recebe a descrição do pai e a tarefa numa mensagem fixa."
+      />
     </div>
   )
 }
@@ -338,7 +346,18 @@ export function SmartContextSection({
       <div>
         <div className="mb-1 flex items-center gap-2">
           <span className="text-[12.5px] font-medium text-fg/90">Descrição do ambiente</span>
-          <label className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-subtle">
+          <HelpTip label="Descrição do ambiente">
+            Vai para o juiz no começo da mensagem (<C>{'{{environment}}'}</C>): quais máquinas são
+            quais, o que pode ser feito onde.
+          </HelpTip>
+          <button
+            type="button"
+            onClick={() => setSettingsOpen(true, 'approvals')}
+            className="ml-auto text-[11px] text-accent-strong hover:underline"
+          >
+            Global
+          </button>
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-subtle">
             <input
               type="checkbox"
               data-testid="env-use-global"
@@ -370,18 +389,6 @@ export function SmartContextSection({
             )}
           </p>
         )}
-        <p className="mt-1 text-[11px] leading-snug text-faint">
-          Vai para o juiz no começo da mensagem (
-          <span className="font-mono">{'{{environment}}'}</span>
-          ): quais máquinas são quais, o que pode ser feito onde.{' '}
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true, 'approvals')}
-            className="text-accent-strong hover:underline"
-          >
-            Global
-          </button>
-        </p>
       </div>
 
       <div className="border-t border-border/60 pt-2.5">

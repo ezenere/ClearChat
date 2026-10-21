@@ -9,6 +9,14 @@
 // pergunta ao usuário (nunca libera nem nega). Contexto extra: smartApproveContext.ts.
 import { contentText } from './attachments'
 import { normalizeCapture, normalizeCapturePrompts } from './smartDefaults'
+import { normalizeThinkingTokens } from './sideReasoning'
+import {
+  CACHE_BREAK_KEY,
+  CACHE_BREAK_PLACEHOLDER,
+  CACHE_BREAK_SENTINEL,
+  sideMessage,
+  type SideMessage
+} from './sideCache'
 import { describeShell } from './shellParse'
 import { activeHistory, isDisplayOnly } from './context'
 import {
@@ -108,7 +116,8 @@ export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
   {
     key: 'reject_rule',
     desc: 'a regra de rejeitar (uma linha começando com quebra de linha) com “O juiz pode negar”; vazio sem ela'
-  }
+  },
+  CACHE_BREAK_PLACEHOLDER
 ]
 
 const clampInt = (v: unknown, min: number, max: number, def: number): number => {
@@ -146,6 +155,7 @@ export function normalizeSmartApprove(
         }
       : { ...DEFAULT_SMART_APPROVE_LABELS }
   const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v : null)
+  const thinkingTokens = normalizeThinkingTokens(s.thinkingTokens)
   return {
     providerId: str(s.providerId),
     model: str(s.model)?.trim() ?? null,
@@ -173,7 +183,11 @@ export function normalizeSmartApprove(
     ...(s.capture && typeof s.capture === 'object' ? { capture: normalizeCapture(s.capture) } : {}),
     ...(s.capturePrompts && typeof s.capturePrompts === 'object'
       ? { capturePrompts: normalizeCapturePrompts(s.capturePrompts) }
-      : {})
+      : {}),
+    // 0.8.8: tokens de pensamento (modelo de raciocínio obrigatório); ausente = SIDE_THINKING.judge
+    ...(thinkingTokens != null ? { thinkingTokens } : {}),
+    // 0.8.8: cache do prompt; ausente = ligado (só o desligado é gravado)
+    ...(s.cache === false ? { cache: false } : {})
   }
 }
 
@@ -501,21 +515,28 @@ export function judgeVars(sa: SmartApproveConfig, ctx: JudgeContext): Record<str
   }
 }
 
-/** Mensagens exatas da chamada ao juiz: system (prompt) + user (template), ambos renderizados. */
-export function buildJudgeMessages(
-  sa: SmartApproveConfig,
-  ctx: JudgeContext
-): { role: 'system' | 'user'; content: string }[] {
+/**
+ * Mensagens exatas da chamada ao juiz: system (prompt) + user (template), ambos renderizados.
+ * {{cache_break}} some do texto; no template ele vira `cacheAt` (2º breakpoint do cache, ver
+ * @shared/sideCache) — o texto enviado sem cache é o mesmo.
+ */
+export function buildJudgeMessages(sa: SmartApproveConfig, ctx: JudgeContext): SideMessage[] {
   const vars = judgeVars(sa, ctx)
   return [
     {
       role: 'system',
-      content: renderSmartTemplate(sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT, vars)
+      content: renderSmartTemplate(sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT, {
+        ...vars,
+        [CACHE_BREAK_KEY]: ''
+      })
     },
-    {
-      role: 'user',
-      content: renderSmartTemplate(sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE, vars)
-    }
+    sideMessage(
+      'user',
+      renderSmartTemplate(sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE, {
+        ...vars,
+        [CACHE_BREAK_KEY]: CACHE_BREAK_SENTINEL
+      })
+    )
   ]
 }
 

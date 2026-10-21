@@ -48,7 +48,7 @@ export function SkillsSection({
       <div data-testid={chatScope ? 'skills-panel' : 'preset-skills'} className="space-y-3">
         <ToggleRow
           label={chatScope ? 'Skills neste chat' : 'Skills nesta persona'}
-          description="Prompt de apoio e as tools list_skills, skill_load e skill_read"
+          help="Prompt de apoio e as tools list_skills, skill_load e skill_read"
           checked={sc.enabled}
           onChange={(enabled) => set({ ...sc, enabled })}
         />
@@ -154,7 +154,7 @@ export function SkillsSection({
           <div className={cn('space-y-2', !sc.enabled && 'opacity-55')}>
             <ToggleRow
               label="Prompt de apoio"
-              description="Anexado ao system prompt: diz que há skills e para usar list_skills"
+              help="Anexado ao system prompt: diz que há skills e para usar list_skills"
               checked={sc.supportPrompt.enabled}
               onChange={(enabled) =>
                 set({ ...sc, supportPrompt: { ...sc.supportPrompt, enabled } })
@@ -199,7 +199,7 @@ export function SkillsSection({
           <div data-section="skills-subagentes" className={cn(!sc.enabled && 'opacity-55')}>
             <ToggleRow
               label="Skills nos subagentes"
-              description="Mesmas tools e prompt de apoio, limitados às skills ativas"
+              help="Mesmas tools e prompt de apoio, limitados às skills ativas"
               checked={sc.subagents}
               onChange={(subagents) => set({ ...sc, subagents })}
               info={<SkillsSubagentsInfo />}

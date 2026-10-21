@@ -47,7 +47,7 @@ import { useStore, type MemoryFocus } from '../../store'
 import { IconPicker } from '../presets/PresetIcon'
 import { AutoTextarea, Button, Switch } from '../ui/controls'
 import { Select } from '../ui/Select'
-import { Tip } from '../ui/Tooltip'
+import { HelpTip, Tip } from '../ui/Tooltip'
 import { useMemoryCollections } from './hooks'
 import { CATEGORY_ICON, CollectionIcon } from './MemoryIcon'
 
@@ -240,11 +240,14 @@ function Home({
 
   return (
     <div data-testid="memory-settings" className="animate-fade-in space-y-5">
-      <p className="text-xs leading-relaxed text-subtle">
-        Coleções globais, cada uma de uma categoria. Os chats e as personas escolhem quais o modelo
-        lê e em qual ele grava (aba <strong className="text-fg/85">Memória</strong> do painel). Tudo
-        o que você edita aqui vale para todos.
-      </p>
+      <div className="flex items-center gap-1.5 text-xs leading-relaxed text-subtle">
+        Coleções globais, cada uma de uma categoria.
+        <HelpTip label="Memórias">
+          Os chats e as personas escolhem quais o modelo lê e em qual ele grava (aba{' '}
+          <strong className="text-fg/85">Memória</strong> do painel). Tudo o que você edita aqui
+          vale para todos.
+        </HelpTip>
+      </div>
       <SearchBox value={query} onChange={setQuery} placeholder="Buscar em todas as memórias" />
 
       {results ? (
@@ -1210,10 +1213,12 @@ function MemoryDetail({
       <div className="mt-5 space-y-3 border-t border-border/70 pt-4">
         <div className="flex items-start gap-3">
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] text-fg/90">Sempre carregar</div>
-            <p className="mt-0.5 text-[11.5px] leading-snug text-subtle">
-              Vai no índice com os detalhes completos (não só título e resumo)
-            </p>
+            <div className="flex items-center gap-1.5 text-[13px] text-fg/90">
+              Sempre carregar
+              <HelpTip label="Sempre carregar">
+                Vai no índice com os detalhes completos (não só título e resumo)
+              </HelpTip>
+            </div>
           </div>
           <Switch
             checked={m.pinned}
@@ -1223,10 +1228,11 @@ function MemoryDetail({
         </div>
         <div className="flex items-center gap-3">
           <div className="min-w-0 flex-1">
-            <div className="text-[13px] text-fg/90">Coleção</div>
-            <p className="mt-0.5 text-[11.5px] text-subtle">
-              {MEMORY_CATEGORY_LABELS[m.category]} · mover só entre coleções da mesma categoria
-            </p>
+            <div className="flex items-center gap-1.5 text-[13px] text-fg/90">
+              Coleção
+              <HelpTip label="Coleção">Mover só entre coleções da mesma categoria.</HelpTip>
+            </div>
+            <p className="mt-0.5 text-[11.5px] text-subtle">{MEMORY_CATEGORY_LABELS[m.category]}</p>
           </div>
           <Select<string>
             label="Mover para a coleção"

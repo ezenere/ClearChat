@@ -1,6 +1,7 @@
 // Padrões globais do Smart-Approve/aprovações (setting `smartApproveDefaults` — sincroniza desde o
 // protocolo 1.4.0; ver SPEC → Sync) e limites da coleta automática de contexto. Sem dependências
 // (approvalPolicy e contextCapture importam daqui).
+import { normalizeThinkingTokens } from './sideReasoning'
 import type { CapturePrompts, ContextCaptureConfig, SmartApproveDefaults } from './types'
 
 export const SMART_DEFAULTS_SETTING = 'smartApproveDefaults'
@@ -53,6 +54,7 @@ const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? 
 export function normalizeCapture(v: unknown): ContextCaptureConfig {
   const c = (v && typeof v === 'object' ? v : {}) as Partial<ContextCaptureConfig>
   const L = CONTEXT_CAPTURE_LIMITS
+  const thinkingTokens = normalizeThinkingTokens(c.thinkingTokens)
   return {
     enabled: c.enabled === true,
     providerId: str(c.providerId),
@@ -61,7 +63,11 @@ export function normalizeCapture(v: unknown): ContextCaptureConfig {
       typeof c.maxTokens === 'number' && Number.isFinite(c.maxTokens)
         ? clampInt(c.maxTokens, L.minMaxTokens, L.maxMaxTokens, L.defaultMaxTokens)
         : null,
-    lookback: clampInt(c.lookback, 1, L.maxLookback, L.defaultLookback)
+    lookback: clampInt(c.lookback, 1, L.maxLookback, L.defaultLookback),
+    // 0.8.8: só com valor (ausente/null = o padrão SIDE_THINKING.capture)
+    ...(thinkingTokens != null ? { thinkingTokens } : {}),
+    // 0.8.8: cache do prompt do resumidor; ausente = ligado (só o desligado é gravado)
+    ...(c.cache === false ? { cache: false } : {})
   }
 }
 

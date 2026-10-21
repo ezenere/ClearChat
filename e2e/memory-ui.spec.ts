@@ -488,6 +488,44 @@ app.on('window-all-closed', () => app.quit())
     await panel().locator('[data-collapse-id="memory-subagents"][data-open]').waitFor()
   })
 
+  await step('ajuda (?) das opções: descrição no tooltip, não no painel', async () => {
+    await panel().getByRole('tab', { name: 'Tools' }).click()
+    await expand(panel(), 'smart-approve')
+    await expand(panel(), 'smart-advanced')
+    const sec = panel().locator('[data-collapse-id="smart-advanced"]')
+    // a descrição do toggle não fica mais à vista
+    assert.equal(await sec.getByText(/Desligado \(padrão\): o juiz só aprova/).count(), 0)
+    const help = sec.getByRole('button', { name: 'Ajuda: O juiz pode negar', exact: true })
+    const text = await infoText(help)
+    assert.match(text, /Desligado \(padrão\): o juiz só aprova ou pergunta a você/)
+    assert.match(text, /Ligado: a chamada negada não roda/)
+    assert.doesNotMatch(text, /Enviado à API/)
+    // "Desligado…" e "Ligado…" em parágrafos separados
+    const tip = page.getByTestId('help-tip-content').last()
+    assert.equal(await tip.locator('p').count(), 2)
+    await page.mouse.move(2, 2, { steps: 8 })
+    await page.keyboard.press('Escape')
+    await tip.waitFor({ state: 'detached' })
+    // teclado: focar o (?) abre o tooltip
+    await help.focus()
+    await page.getByTestId('help-tip-content').last().waitFor()
+    await page.keyboard.press('Escape')
+    // (?) da seção no cabeçalho (visível mesmo fechada) e o </> do ApiInfo com ícone de código
+    const head = panel().locator('[data-collapse-id="smart-approve"]')
+    assert.ok(
+      await head.getByRole('button', { name: 'Ajuda: Smart-Approve', exact: true }).isVisible()
+    )
+    assert.equal(
+      await head
+        .getByRole('button', { name: 'O que é enviado para a API', exact: true })
+        .first()
+        .locator('svg[data-icon="api"]')
+        .count(),
+      1
+    )
+    await shot('09b-ajuda-tooltip')
+  })
+
   await step('Configurações → Memórias: visão geral', async () => {
     await openSettingsMemory()
     const s = settings()

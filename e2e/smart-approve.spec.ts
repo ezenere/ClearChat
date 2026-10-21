@@ -36,6 +36,10 @@ const FAKE_KEY = 'fake-key-smart-approve'
 const AGENT = 'fake/agent-1'
 const JUDGE = 'fake/judge-1'
 const SUMMARY = 'fake/summary-1'
+/** Modelo de raciocínio obrigatório (metadados no /models): juiz com "Tokens de pensamento". */
+const THINKER = 'fake/thinker-1'
+/** Id "Anthropic" (prefixo anthropic/): num provedor OpenRouter recebe cache_control. */
+const CACHE_JUDGE = 'anthropic/fake-judge'
 const ROOT = resolve(import.meta.dirname, '..')
 const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-smart-e2e'))
 const USER_DATA = join(BASE, 'userdata')
@@ -86,13 +90,35 @@ async function startFake(): Promise<void> {
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(
           JSON.stringify({
-            data: [AGENT, JUDGE].map((id) => ({
-              id,
-              name: id === AGENT ? 'Fake Agent' : 'Fake Judge',
-              context_length: 64_000,
-              pricing: { prompt: '0.0000001', completion: '0.0000002' },
-              supported_parameters: ['tools', 'temperature', 'max_tokens']
-            }))
+            data: [AGENT, JUDGE]
+              .map((id) => ({
+                id,
+                name: id === AGENT ? 'Fake Agent' : 'Fake Judge',
+                context_length: 64_000,
+                pricing: { prompt: '0.0000001', completion: '0.0000002' },
+                supported_parameters: ['tools', 'temperature', 'max_tokens']
+              }))
+              .concat([
+                {
+                  id: THINKER,
+                  name: 'Fake Thinker',
+                  context_length: 64_000,
+                  pricing: { prompt: '0.0000001', completion: '0.0000002' },
+                  supported_parameters: ['max_tokens', 'reasoning'],
+                  reasoning: {
+                    mandatory: true,
+                    supported_efforts: ['high', 'medium', 'low'],
+                    default_effort: 'medium'
+                  }
+                } as any,
+                {
+                  id: CACHE_JUDGE,
+                  name: 'Fake Cache Judge',
+                  context_length: 64_000,
+                  pricing: { prompt: '0.0000001', completion: '0.0000002' },
+                  supported_parameters: ['temperature', 'max_tokens']
+                }
+              ])
           })
         )
         return
@@ -126,7 +152,7 @@ async function startFake(): Promise<void> {
         })
         return
       }
-      if (body.model === JUDGE) {
+      if (body.model === JUDGE || body.model === THINKER || body.model === CACHE_JUDGE) {
         const r = judgeQueue.shift() ?? { text: 'ASK-USER\n(sem roteiro)' }
         const send = (): void => {
           if (res.destroyed) return
@@ -421,8 +447,10 @@ async function main(): Promise<void> {
         .getByTestId('smart-approve-hint')
         .getByText(/Escolha um modelo para poder usar o modo Smart-Approve/)
         .waitFor()
+      // o único switch visível é o "Cache do prompt" (não há liga/desliga do juiz)
       assert(
-        (await sec.getByRole('switch').count()) === 0,
+        (await sec.getByRole('switch').count()) ===
+          (await sec.getByTestId('smart-cache').getByRole('switch').count()),
         'sem liga/desliga na seção Smart-Approve'
       )
       assert(
@@ -842,6 +870,162 @@ async function main(): Promise<void> {
     await res.scrollIntoViewIfNeeded()
     await shotOf(page.getByTestId('right-panel'), 'smart-section-testar')
   })
+
+  await step(
+    'juiz com raciocínio obrigatório: aviso + "Tokens de pensamento" no body',
+    async () => {
+      const sec = section()
+      await sec.scrollIntoViewIfNeeded()
+      const picker = sec.getByTestId('smart-approve-model').getByRole('combobox')
+      // juiz sem raciocínio: nada de aviso nem campo
+      assert((await sec.getByTestId('smart-thinking').count()) === 0, 'sem campo no fake/judge-1')
+      await pickModel(picker, THINKER)
+      const box = sec.getByTestId('smart-thinking')
+      await box.waitFor({ timeout: 10_000 })
+      await box
+        .getByTestId('smart-thinking-note')
+        .getByText('Este modelo sempre raciocina (thinking obrigatório) — esforço mínimo.')
+        .waitFor()
+      const input = box.getByRole('spinbutton', { name: 'Tokens de pensamento do juiz' })
+      assert((await input.getAttribute('placeholder')) === '2048', 'placeholder = padrão')
+      await input.fill('3000')
+      await input.blur()
+      await sleep(700)
+      let cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove?.thinkingTokens === 3000, `salvo ${cfg.smartApprove?.thinkingTokens}`)
+      // (i) "Enviado à API": body exato com max_tokens somado e effort mínimo
+      const info = sec.getByRole('button', { name: 'O que é enviado para a API' }).first()
+      await info.hover()
+      const tip = page.getByRole('tooltip').filter({ hasText: 'Chamada ao juiz (exemplo)' }).first()
+      await tip.waitFor({ timeout: 5000 })
+      const code = (await tip.locator('pre').first().textContent()) ?? ''
+      assert(code.includes('"max_tokens": 3300'), `preview max_tokens: ${code.slice(0, 400)}`)
+      assert(code.includes('"reasoning_effort": "low"'), 'preview effort')
+      assert(!code.includes('"temperature"'), 'preview sem temperature')
+      await tip
+        .getByTestId('smart-request-notes')
+        .getByText(/3000 tokens de pensamento/)
+        .waitFor()
+      await shot('smart-thinking-preview')
+      await page.mouse.move(0, 0)
+      await page.keyboard.press('Escape')
+      // Testar: a request real ao juiz leva o mesmo body
+      await expand(sec, 'smart-test')
+      judgeQueue.push({ text: 'APPROVED\nok' })
+      await sec.getByRole('button', { name: 'Testar', exact: true }).click()
+      await sec
+        .getByTestId('smart-test-result')
+        .getByText('Liberado pelo Smart-Approve')
+        .waitFor({ timeout: 10_000 })
+      const tb = hits.filter((h) => h.model === THINKER).at(-1)!.body
+      assert(tb.max_tokens === 3300, `max_tokens ${tb.max_tokens}`)
+      assert(tb.reasoning_effort === 'low', `effort ${tb.reasoning_effort}`)
+      assert(!('temperature' in tb), 'sem temperature')
+      await box.scrollIntoViewIfNeeded()
+      await shotOf(sec, 'smart-thinking-field')
+      // limpar = padrão (null)
+      await input.fill('')
+      await input.blur()
+      await sleep(700)
+      cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove?.thinkingTokens == null, 'limpo = padrão')
+      // volta ao juiz normal: some o campo
+      await pickModel(picker, JUDGE)
+      await box.waitFor({ state: 'detached', timeout: 5000 })
+      await sleep(700) // debounce da config
+      cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove?.model === JUDGE, 'juiz restaurado')
+    }
+  )
+
+  await step(
+    'cache do prompt: ligado divide em parts com cache_control; desligado = strings',
+    async () => {
+      // provedor OpenRouter apontando para o mesmo servidor falso (modelo anthropic/… recebe cache_control)
+      await read('providers.create', {
+        name: 'Local OR',
+        kind: 'openrouter',
+        baseUrl: fakeBase,
+        apiKey: FAKE_KEY,
+        headers: {}
+      })
+      await page.reload()
+      await page.getByTestId('chat-item').first().click()
+      await composer().waitFor({ timeout: 15_000 })
+      await openToolsTab()
+      const panel = page.getByTestId('right-panel')
+      await expand(panel, 'smart-approve')
+      const sec = section()
+      await sec.scrollIntoViewIfNeeded()
+      await sec.getByTestId('smart-approve-model').getByRole('combobox').click()
+      await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(CACHE_JUDGE)
+      await page
+        .getByRole('listbox', { name: 'Modelos' })
+        .locator(`[role=option][data-provider="Local OR"][data-model="${CACHE_JUDGE}"]`)
+        .first()
+        .click()
+      await sleep(700)
+      let cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove?.model === CACHE_JUDGE, `juiz ${cfg.smartApprove?.model}`)
+      const toggle = sec.getByTestId('smart-cache').getByRole('switch')
+      assert((await toggle.getAttribute('aria-checked')) === 'true', 'ligado por padrão')
+      const test = async (): Promise<any> => {
+        const n = hits.length
+        judgeQueue.push({ text: 'APPROVED\nok' })
+        await expand(sec, 'smart-test')
+        await sec.getByRole('button', { name: 'Testar', exact: true }).click()
+        await sec
+          .getByTestId('smart-test-result')
+          .getByText('Liberado pelo Smart-Approve')
+          .waitFor({ timeout: 10_000 })
+        return hits.slice(n).find((h) => h.model === CACHE_JUDGE)!.body
+      }
+      const on = await test()
+      assert(Array.isArray(on.messages[0].content), 'system em parts')
+      assert(on.messages[0].content[0].cache_control?.type === 'ephemeral', 'breakpoint no system')
+      const parts = on.messages[1].content
+      assert(Array.isArray(parts) && parts.length === 2, 'user dividido em 2 parts')
+      assert(
+        parts[0].cache_control?.type === 'ephemeral' && !parts[1].cache_control,
+        '2º breakpoint'
+      )
+      assert(parts[1].text.includes('Pending tool call'), 'chamada pendente fora do cache')
+      // (i): o body exato mostra o cache_control
+      await sec.getByRole('button', { name: 'O que é enviado para a API' }).first().hover()
+      const tip = page.getByRole('tooltip').filter({ hasText: 'Chamada ao juiz (exemplo)' }).first()
+      await tip.waitFor({ timeout: 5000 })
+      const code = (await tip.locator('pre').first().textContent()) ?? ''
+      assert((code.match(/"cache_control"/g) ?? []).length === 2, 'preview com 2 cache_control')
+      await shot('smart-cache-preview')
+      await page.mouse.move(0, 0)
+      await page.keyboard.press('Escape')
+      // desligar: request de sempre (strings, sem cache_control)
+      await toggle.click()
+      await sleep(700)
+      cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove?.cache === false, 'desligado salvo')
+      const off = await test()
+      assert(!JSON.stringify(off).includes('cache_control'), 'sem cache_control')
+      assert(typeof off.messages[1].content === 'string', 'user string')
+      assert(off.messages[1].content === parts[0].text + parts[1].text, 'mesmo texto')
+      await sec.getByTestId('smart-cache').scrollIntoViewIfNeeded()
+      await shotOf(sec, 'smart-cache-toggle')
+      // religar (ausente = ligado) e voltar ao juiz do provedor Local
+      await toggle.click()
+      await sleep(700)
+      cfg = (await chatState()).chat.config
+      assert(!('cache' in cfg.smartApprove), 'ligado = chave ausente')
+      await sec.getByTestId('smart-approve-model').getByRole('combobox').click()
+      await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(JUDGE)
+      await page
+        .getByRole('listbox', { name: 'Modelos' })
+        .locator(`[role=option][data-provider="Local"][data-model="${JUDGE}"]`)
+        .first()
+        .click()
+      await sleep(700)
+      assert((await chatState()).chat.config.smartApprove?.model === JUDGE, 'juiz restaurado')
+    }
+  )
 
   await step(
     'listas antes do juiz: whitelist inteira → sem juiz; parcial → juiz só no resto; blacklist → bloqueia',
