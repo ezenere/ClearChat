@@ -66,9 +66,10 @@ export function ApprovalsSettings(): React.JSX.Element {
       <p className="text-[11px] leading-snug text-subtle">
         <strong className="text-fg/80">Sempre permitir</strong>: roda sem perguntar (a blacklist não
         vale). <strong className="text-fg/80">Smart-Approve</strong>: o modelo juiz escolhido no
-        chat (aba Tools → Smart-Approve) decide; sem modelo → pergunta.{' '}
-        <strong className="text-fg/80">Listas</strong> (Comandos, Processos, Páginas): blacklist
-        bloqueia (tem precedência), whitelist libera, o resto pergunta.{' '}
+        chat (aba Tools → Smart-Approve) aprova ou pergunta; em Comandos/Processos/Páginas ele só
+        complementa as listas (blacklist bloqueia, o que a whitelist libera roda sem ele); sem
+        modelo → pergunta. <strong className="text-fg/80">Listas</strong> (Comandos, Processos,
+        Páginas): blacklist bloqueia (tem precedência), whitelist libera, o resto pergunta.{' '}
         <strong className="text-fg/80">Perguntar</strong> (demais itens): cada chamada pede sua
         confirmação.
       </p>

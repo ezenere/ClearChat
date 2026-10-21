@@ -334,11 +334,23 @@ async function main(): Promise<void> {
           tool.meta.approval?.userAllowed?.length === 1,
         `meta ${JSON.stringify(tool.meta.approval)}`
       )
-      await bashCards()
-        .last()
-        .getByTestId('approval-allowed')
-        .getByText(/Liberado pela whitelist/)
-        .waitFor()
+      // aprovada: nada abaixo do card — os detalhes ficam no selo "ok" (tooltip; clique fixa)
+      const done = bashCards().last()
+      assert((await done.getByTestId('approval-denied-strip').count()) === 0, 'sem faixa')
+      const badge = done.getByTestId('approval-badge')
+      assert(
+        (await badge.getAttribute('data-approved-by')) === 'user lists',
+        `quem aprovou: ${await badge.getAttribute('data-approved-by')}`
+      )
+      await badge.click()
+      const details = page.getByTestId('approval-details')
+      await details.getByText('Aprovado por você e pela lista').waitFor()
+      await details.locator('[data-by="lists"]').getByText('echo AP-1').waitFor()
+      await details.locator('[data-by="user"]').getByText('git log --oneline -n 1').waitFor()
+      await sleep(300)
+      await shot('selo-ok-detalhes-aprovacao')
+      await page.keyboard.press('Escape')
+      await details.waitFor({ state: 'detached', timeout: 5000 })
     }
   )
 
@@ -387,6 +399,9 @@ async function main(): Promise<void> {
         `conteúdo ${tool.message.content}`
       )
       assert(tool.meta.toolStatus === 'denied', 'denied')
+      const deniedStrip = bashCards().last().getByTestId('approval-denied-strip')
+      assert((await deniedStrip.getAttribute('data-kind')) === 'user', 'faixa: negado por você')
+      await deniedStrip.getByText('Negado por você').waitFor()
       await sendMessage('rode: echo ok; rm -rf /tmp/x')
       await waitIdle()
       ;({ msgs } = await chatState())
@@ -397,7 +412,11 @@ async function main(): Promise<void> {
         `conteúdo ${tool.message.content}`
       )
       const card2 = bashCards().last()
-      await card2.getByTestId('approval-blocked').waitFor()
+      const strip = card2.getByTestId('approval-denied-strip')
+      assert((await strip.getAttribute('data-kind')) === 'blacklist', 'faixa da blacklist')
+      await strip.getByText('Bloqueado pela blacklist').waitFor()
+      const box = await strip.boundingBox()
+      assert(box && box.height <= 36, `faixa compacta (${box?.height}px)`)
       await card2.scrollIntoViewIfNeeded()
       await shotOf(card2, 'card-bloqueado')
     }
@@ -450,6 +469,47 @@ async function main(): Promise<void> {
           `Bloqueado pela blacklist (comandos): "rm -rf *" casou com "rm -rf /srv/old" (no servidor ${host} (via ssh))`,
         `conteúdo ${tool.message.content}`
       )
+    }
+  )
+
+  await step(
+    'script executado: o card mostra o começo do arquivo (e avisa se não existe)',
+    async () => {
+      mkdirSync(join(CWD, 'tools'), { recursive: true })
+      writeFileSync(
+        join(CWD, 'tools', 'limpa.py'),
+        [
+          '#!/usr/bin/env python3',
+          '# Apaga os arquivos temporários do projeto.',
+          'import pathlib, sys',
+          '',
+          'DRY = "--dry" in sys.argv',
+          ...Array.from({ length: 20 }, (_, i) => `# passo ${i + 1}`),
+          'for p in pathlib.Path(".").glob("*.tmp"):',
+          '    print("apagando", p)',
+          '    if not DRY: p.unlink()'
+        ].join('\n') + '\n'
+      )
+      await sendMessage('rode: echo inicio && python3 -u tools/limpa.py --dry && python3 sumiu.py')
+      const card = approvalCard()
+      await card.waitFor({ timeout: 15_000 })
+      const previews = card.getByTestId('script-preview')
+      assert((await previews.count()) === 2, `2 prévias (${await previews.count()})`)
+      const ok = previews.nth(0)
+      assert((await ok.getAttribute('data-status')) === 'ok', 'arquivo lido')
+      await ok.getByText('arquivo: tools/limpa.py · 28 linhas').waitFor()
+      const head = await ok.getByTestId('script-head').innerText()
+      assert(head.startsWith('#!/usr/bin/env python3'), `começo: ${head.slice(0, 40)}`)
+      assert(head.split('\n').length === 16 && head.endsWith('…'), 'até 15 linhas + …')
+      assert((await previews.nth(1).getAttribute('data-status')) === 'missing', 'inexistente')
+      await previews.nth(1).getByText('arquivo não encontrado:').waitFor()
+      await card.scrollIntoViewIfNeeded()
+      await shotOf(card, 'card-script-preview')
+      // recolhível
+      await ok.getByRole('button', { name: /arquivo:/ }).click()
+      assert((await ok.getByTestId('script-head').count()) === 0, 'recolheu')
+      await card.getByRole('button', { name: 'Não', exact: true }).first().click()
+      await waitIdle()
     }
   )
 

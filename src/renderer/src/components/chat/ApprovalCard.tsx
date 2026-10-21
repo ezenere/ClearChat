@@ -5,7 +5,16 @@
 // qualquer "Não" responde na hora (nada roda). "Sim para todos" atalho. Decomposição em árvore:
 // os comandos internos de ssh/sudo/docker exec… ficam indentados sob o cabeçalho do grupo
 // ("no servidor deploy@host (via ssh)"), cada um com o próprio veredito.
-import { AlertTriangle, Ban, Check, CornerDownRight, Hand, ShieldCheck } from 'lucide-react'
+import {
+  AlertTriangle,
+  Ban,
+  Check,
+  ChevronRight,
+  CornerDownRight,
+  FileCode,
+  Hand,
+  ShieldCheck
+} from 'lucide-react'
 import { Fragment, useState } from 'react'
 import { groupHeadings } from '@shared/shellParse'
 import {
@@ -14,7 +23,12 @@ import {
   ITEM_TOOL,
   type ApprovalItemDecision
 } from '@shared/approvalPolicy'
-import type { ApprovalCheckItem, ApprovalListItem, ApprovalRequest } from '@shared/types'
+import type {
+  ApprovalCheckItem,
+  ApprovalListItem,
+  ApprovalRequest,
+  ApprovalScript
+} from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { ListEntryEditor, SmartMissingNote } from '../approvals/ApprovalControls'
@@ -141,9 +155,15 @@ function ListsPrompt({
               : `Permitir que ${who} execute este comando?`}
         </span>
         <span className="ml-auto shrink-0 text-[11px] text-faint">
-          {ITEM_LABEL[item]} · listas · <span className="font-mono">{ITEM_TOOL[item]}</span>
+          {ITEM_LABEL[item]} · {request.smartApprove ? 'listas + Smart-Approve' : 'listas'} ·{' '}
+          <span className="font-mono">{ITEM_TOOL[item]}</span>
         </span>
       </div>
+      {request.smartApprove && (
+        <div className="-mx-3.5 mt-2 border-y border-warning/15 bg-bg/30">
+          <SmartApproveLine rec={request.smartApprove} pending />
+        </div>
+      )}
       <div className="mt-2 space-y-1.5">
         {items.map((it, index) => {
           const c = choices[index]
@@ -183,7 +203,7 @@ function ListsPrompt({
                       data-testid="sub-whitelisted"
                       className="inline-flex shrink-0 items-center gap-1 text-[11px] text-success/90"
                     >
-                      <Check className="size-3" /> whitelist “{it.entry}”
+                      <Check className="size-3" /> liberado pela lista “{it.entry}”
                     </span>
                   ) : c ? (
                     <span
@@ -270,6 +290,7 @@ function ListsPrompt({
                     </span>
                   </p>
                 )}
+                {it.script && <ScriptPreview script={it.script} />}
                 {editing?.index === index && (
                   <ListEntryEditor
                     item={item}
@@ -310,6 +331,72 @@ function ListsPrompt({
             : '“+ whitelist/blacklist” salva um padrão nas listas globais (Configurações → Aprovações).'}
         </span>
       </div>
+    </div>
+  )
+}
+
+const SCRIPT_NOTE: Partial<Record<ApprovalScript['status'], string>> = {
+  missing: 'arquivo não encontrado',
+  binary: 'binário',
+  notfile: 'não é um arquivo',
+  remote: 'arquivo remoto (não lido)',
+  error: 'não foi possível ler',
+  pending: 'não lido'
+}
+
+/**
+ * Começo do script que o sub-comando executa (lido no main, ≤ 64 KiB) ou o código inline: até
+ * 15 linhas, recolhível. Arquivo inexistente/binário/remoto → só um aviso.
+ */
+function ScriptPreview({ script }: { script: ApprovalScript }): React.JSX.Element {
+  const [open, setOpen] = useState(true)
+  // como escrito no comando (curto); o caminho resolvido fica no title
+  const path = script.path ?? ''
+  const full = script.resolved ?? path
+  const note = SCRIPT_NOTE[script.status]
+  if (note)
+    return (
+      <p
+        data-testid="script-preview"
+        data-status={script.status}
+        className="mt-1 flex min-w-0 items-center gap-1 text-[10.5px] text-subtle"
+      >
+        <FileCode className="size-3 shrink-0 text-faint" />
+        <span className="shrink-0">{note}:</span>
+        <span className="min-w-0 truncate font-mono" title={full}>
+          {path}
+        </span>
+      </p>
+    )
+  const label =
+    script.status === 'inline'
+      ? `código inline (${script.interpreter}${script.lines ? ` · ${script.lines} ${script.lines === 1 ? 'linha' : 'linhas'}` : ''})`
+      : `arquivo: ${path} · ${script.lines ?? 0}${script.partial ? '+' : ''} ${script.lines === 1 ? 'linha' : 'linhas'}`
+  return (
+    <div data-testid="script-preview" data-status={script.status} className="mt-1 min-w-0">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className="flex max-w-full min-w-0 items-center gap-1 text-[10.5px] text-subtle hover:text-fg"
+      >
+        <ChevronRight
+          className={cn('size-3 shrink-0 text-faint transition-transform', open && 'rotate-90')}
+        />
+        <FileCode className="size-3 shrink-0 text-faint" />
+        <span className="min-w-0 truncate font-mono" title={full || label}>
+          ({label})
+        </span>
+      </button>
+      {open && (
+        <pre
+          data-testid="script-head"
+          className="mt-0.5 max-h-56 overflow-auto rounded-md border border-border/60 bg-bg/50 px-2 py-1 font-mono text-[10.5px] leading-snug whitespace-pre text-muted"
+        >
+          {script.content}
+          {script.truncated ? '\n…' : ''}
+        </pre>
+      )}
     </div>
   )
 }

@@ -3,8 +3,10 @@
 // "Smart-Approve".
 //
 // Quando o juiz é chamado: ver approvalRoute em approvalPolicy.ts (itens em modo `smart`, com um
-// modelo escolhido). Aprovar → roda · rejeitar → não roda · perguntar → usuário.
-// Qualquer erro, tempo esgotado ou resposta ambígua do juiz → pergunta ao usuário (nunca libera).
+// modelo escolhido); nos itens com listas, só para o que as listas não decidem (smartListPlan).
+// Aprovar → roda · perguntar → usuário · rejeitar → só com "O juiz pode negar" (canDeny); sem ele,
+// vira perguntar (mapJudgeDecision). Qualquer erro, tempo esgotado ou resposta ambígua do juiz →
+// pergunta ao usuário (nunca libera nem nega). Contexto extra: smartApproveContext.ts.
 import { contentText } from './attachments'
 import { describeShell } from './shellParse'
 import { activeHistory, isDisplayOnly } from './context'
@@ -14,7 +16,18 @@ import {
   DEFAULT_SMART_APPROVE_TEMPLATE
 } from './defaults'
 import {
+  approvedBlock,
+  buildJudgeExtras,
+  checkBlock,
+  recentActivityBlock,
+  subagentBlock,
+  touchedFilesBlock,
+  userGoalText,
+  type JudgeExtras
+} from './smartApproveContext'
+import {
   type ApiMessage,
+  type ApprovalCheck,
   type SmartApproveConfig,
   type SmartApproveDecision,
   type SmartApproveLabels,
@@ -42,15 +55,42 @@ export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
     key: 'commands',
     desc: 'shell/process_start: a decomposição do comando (ssh, sudo, bash -c… desmontados, com o contexto); vazio nas outras tools'
   },
+  {
+    key: 'user_goal',
+    desc: 'objetivo do usuário: as últimas 3 mensagens digitadas na sessão principal (a mais recente primeiro, ≤ 1.500 chars)'
+  },
+  {
+    key: 'subagent',
+    desc: 'subagente: profundidade, título e a tarefa recebida do pai (+ a dos subagentes acima); vazio no agente principal'
+  },
+  {
+    key: 'touched_files',
+    desc: 'arquivos criados/editados/apresentados nesta tarefa (sessão + pais; até 30); vazio se nenhum'
+  },
+  {
+    key: 'approved_before',
+    desc: 'já aprovados: entradas parecidas da whitelist + o que você aprovou nesta sessão; vazio se nada'
+  },
+  {
+    key: 'recent_activity',
+    desc: 'últimas 12 chamadas de tool da sessão (status, nome, args curtos) + a última fala do agente'
+  },
   { key: 'cwd', desc: 'diretório raiz do chat' },
   { key: 'confine', desc: 'tools de arquivo confinadas à raiz (yes/no)' },
   { key: 'sandbox', desc: 'shell em sandbox (yes/no)' },
   { key: 'last_user_message', desc: 'última mensagem do usuário na sessão' },
   { key: 'recent_context', desc: 'últimas N mensagens da sessão, compactas' },
-  { key: 'labels', desc: 'os três rótulos separados por " | "' },
+  {
+    key: 'labels',
+    desc: 'os rótulos aceitos separados por " | " (o de rejeitar só com “O juiz pode negar”)'
+  },
   { key: 'approve', desc: 'rótulo de aprovar' },
   { key: 'reject', desc: 'rótulo de rejeitar' },
-  { key: 'ask', desc: 'rótulo de perguntar ao usuário' }
+  { key: 'ask', desc: 'rótulo de perguntar ao usuário' },
+  {
+    key: 'reject_rule',
+    desc: 'a regra de rejeitar (uma linha começando com quebra de linha) com “O juiz pode negar”; vazio sem ela'
+  }
 ]
 
 const clampInt = (v: unknown, min: number, max: number, def: number): number => {
@@ -105,8 +145,23 @@ export function normalizeSmartApprove(
       SMART_APPROVE_DEFAULTS.minTimeoutS,
       SMART_APPROVE_DEFAULTS.maxTimeoutS,
       SMART_APPROVE_DEFAULTS.timeoutS
-    )
+    ),
+    // 0.8.4: ausentes (configs anteriores) = desligados — quem já usava o juiz passa a ter
+    // rejeição → perguntar e a whitelist decidindo sozinha o que ela cobre
+    canDeny: s.canDeny === true,
+    judgeWhitelisted: s.judgeWhitelisted === true
   }
+}
+
+/**
+ * Decisão efetiva do juiz: sem "O juiz pode negar" (`canDeny`), rejeitar vira perguntar
+ * (`wouldReject` — o card mostra o motivo como dica). Aprovar/perguntar não mudam.
+ */
+export function mapJudgeDecision(
+  decision: SmartApproveDecision,
+  canDeny: boolean
+): { decision: SmartApproveDecision; wouldReject?: true } {
+  return decision === 'reject' && !canDeny ? { decision: 'ask', wouldReject: true } : { decision }
 }
 
 /**
@@ -264,16 +319,29 @@ export interface JudgeContext {
   cwd: string
   confine: boolean
   sandbox: boolean
+  /** Histórico da sessão chamadora ({{last_user_message}}, {{recent_context}}). */
   history: StoredMessage[]
+  /** Itens com listas: a avaliação das listas e os índices que o juiz decide (smartListPlan). */
+  check?: ApprovalCheck
+  judgeIdx?: number[]
+  /** Contexto extra montado no main; ausente = derivado de `history` como sessão principal. */
+  extra?: JudgeExtras
 }
 
 /**
  * `{{commands}}`: decomposição do comando de shell/process_start (o que o modo Listas avalia — ver
- * describeShell), para o juiz ver os comandos remotos/sob sudo/no container e não só `ssh`.
- * Outras tools (ou comando vazio): "" — o template padrão fica igual ao de antes.
+ * describeShell), para o juiz ver os comandos remotos/sob sudo/no container e não só `ssh`. Com a
+ * avaliação das listas (`check`), cada item vem marcado "already allowed" (whitelist, só contexto)
+ * ou "TO DECIDE" (checkBlock). Outras tools (ou comando vazio): "".
  */
-export function commandsBlock(tool: string, args: unknown): string {
+export function commandsBlock(
+  tool: string,
+  args: unknown,
+  check?: ApprovalCheck,
+  judgeIdx?: number[]
+): string {
   if (tool !== 'shell' && tool !== 'process_start') return ''
+  if (check && judgeIdx) return checkBlock(check, judgeIdx)
   const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const cmd = typeof a.command === 'string' ? a.command : ''
   const text = cmd.trim() ? describeShell(cmd) : ''
@@ -281,22 +349,39 @@ export function commandsBlock(tool: string, args: unknown): string {
   return `\nDecomposed commands (parsed by the app; indented lines run inside the line above):\n${text}\n`
 }
 
+/**
+ * `{{reject_rule}}`: a opção de rejeitar no prompt padrão — só com "O juiz pode negar"; sem ela, ""
+ * (o juiz escolhe entre aprovar e perguntar). Começa com quebra de linha (continua a lista).
+ */
+export function rejectRule(sa: SmartApproveConfig): string {
+  if (!sa.canDeny) return ''
+  const l = sa.labels
+  return `\n- ${l.reject} — only for calls that are clearly malicious or that the user explicitly forbade: exfiltrating secrets or private data, deliberately destroying data unrelated to the work, obfuscated code or scripts piped from the internet (curl … | sh), disabling security tools. When in doubt between ${l.reject} and ${l.ask}, choose ${l.ask}.`
+}
+
 /** Valores dos placeholders para uma chamada. */
 export function judgeVars(sa: SmartApproveConfig, ctx: JudgeContext): Record<string, string> {
   const l = sa.labels
+  const x = ctx.extra ?? buildJudgeExtras({ history: ctx.history, cwd: ctx.cwd })
   return {
     tool: String(ctx.tool),
     args: prettyArgs(ctx.args),
-    commands: commandsBlock(ctx.tool, ctx.args),
+    commands: commandsBlock(ctx.tool, ctx.args, ctx.check, ctx.judgeIdx),
     cwd: ctx.cwd,
     confine: ctx.confine ? 'yes' : 'no',
     sandbox: ctx.sandbox ? 'yes' : 'no',
     last_user_message: lastUserMessage(ctx.history),
     recent_context: recentContext(ctx.history, sa.contextMessages),
-    labels: `${l.approve} | ${l.reject} | ${l.ask}`,
+    user_goal: userGoalText(x),
+    subagent: subagentBlock(x),
+    touched_files: touchedFilesBlock(x),
+    approved_before: approvedBlock(x),
+    recent_activity: recentActivityBlock(x),
+    labels: sa.canDeny ? `${l.approve} | ${l.reject} | ${l.ask}` : `${l.approve} | ${l.ask}`,
     approve: l.approve,
     reject: l.reject,
-    ask: l.ask
+    ask: l.ask,
+    reject_rule: rejectRule(sa)
   }
 }
 

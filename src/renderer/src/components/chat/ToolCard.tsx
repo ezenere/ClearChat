@@ -26,8 +26,6 @@ import {
   MessageSquareText,
   MessagesSquare,
   Send,
-  ShieldCheck,
-  ShieldX,
   Play,
   Presentation,
   ScrollText,
@@ -39,13 +37,7 @@ import {
 import { useState, type ReactNode } from 'react'
 import { TOOL_LABELS } from '@shared/tools'
 import { approxTokens } from '@shared/limits'
-import type {
-  ApprovalRecord,
-  ApprovalRequest,
-  Session,
-  StoredMessage,
-  ToolName
-} from '@shared/types'
+import type { ApprovalRequest, MessageMeta, Session, StoredMessage, ToolName } from '@shared/types'
 import { cn, formatTokens, prettyJson } from '../../lib/format'
 import { useStore, type ToolRun } from '../../store'
 import { MessageInfo, TaskInfo } from '../apiDocs'
@@ -54,7 +46,8 @@ import { Button, Spinner } from '../ui/controls'
 import { CopyButton } from './Markdown'
 import { StatusDot } from './SessionSwitcher'
 import { ModelLabel } from '../ui/ModelLabel'
-import { SmartApproveLine } from './SmartApprove'
+import { ApprovalBadge, DeniedStrip } from './ApprovalOutcome'
+import { approvalOutcome, type ApprovalOutcome } from '../../lib/approvalOutcome'
 import { ApprovalPrompt } from './ApprovalCard'
 import { AskUserAnswers, AskUserQuestionsList } from './AskUser'
 import { ToolResultMedia } from './Attachments'
@@ -258,7 +251,16 @@ type Status =
   | 'cancelled'
   | 'pending'
 
-function StatusChip({ status }: { status: Status }): React.JSX.Element | null {
+function StatusChip({
+  status,
+  outcome,
+  meta
+}: {
+  status: Status
+  /** Chamada aprovada: o selo abre os detalhes da aprovação (ApprovalBadge). */
+  outcome?: ApprovalOutcome | null
+  meta?: MessageMeta
+}): React.JSX.Element | null {
   const map: Record<Status, { label: string; cls: string; icon: ReactNode }> = {
     streaming: { label: 'gerando', cls: 'text-subtle', icon: <Spinner className="size-3" /> },
     judging: {
@@ -288,80 +290,19 @@ function StatusChip({ status }: { status: Status }): React.JSX.Element | null {
     pending: { label: 'pendente', cls: 'text-faint', icon: null }
   }
   const s = map[status]
-  return (
+  const chip = (
     <span className={cn('inline-flex shrink-0 items-center gap-1 text-[11px]', s.cls)}>
       {s.icon}
       {s.label}
     </span>
   )
-}
-
-/** Gate de aprovação (meta.approval): liberado pela whitelist / bloqueado pela blacklist / sempre. */
-function ApprovalLine({ rec }: { rec: ApprovalRecord }): React.JSX.Element | null {
-  const line = (
-    cls: string,
-    icon: ReactNode,
-    text: ReactNode,
-    testId: string
-  ): React.JSX.Element => (
-    <div
-      data-testid={testId}
-      className={cn(
-        'flex items-start gap-1.5 border-t border-border/70 px-3.5 py-2 text-[12px]',
-        cls
-      )}
-    >
-      {icon}
-      <span className="min-w-0">{text}</span>
-    </div>
-  )
-  if (rec.blocked)
-    return line(
-      'text-danger/90',
-      <ShieldX className="mt-px size-3.5 shrink-0" />,
-      <>
-        Bloqueado pela blacklist: <C>{rec.blocked.entry}</C> casou com <C>{rec.blocked.text}</C>
-      </>,
-      'approval-blocked'
+  if (outcome?.kind === 'approved' && meta)
+    return (
+      <ApprovalBadge outcome={outcome} meta={meta}>
+        {chip}
+      </ApprovalBadge>
     )
-  const parts: ReactNode[] = []
-  if (rec.allowed?.length)
-    parts.push(
-      <span key="w">
-        Liberado pela whitelist:{' '}
-        {rec.allowed.map((a, i) => (
-          <span key={i}>
-            {i > 0 && ', '}
-            <C>{a.entry}</C>
-          </span>
-        ))}
-      </span>
-    )
-  if (rec.userAllowed?.length)
-    parts.push(
-      <span key="u">
-        {parts.length ? ' · ' : ''}você permitiu {rec.userAllowed.length}{' '}
-        {rec.userAllowed.length === 1 ? 'item' : 'itens'}
-      </span>
-    )
-  if (rec.denied)
-    return line(
-      'text-danger/90',
-      <Ban className="mt-px size-3.5 shrink-0" />,
-      <>
-        Você negou <C>{rec.denied}</C>
-        {parts.length ? <> · {parts}</> : null}
-      </>,
-      'approval-denied'
-    )
-  // modo "Sempre permitir": sem linha (seria ruído em todo card; o selo do header mostra o modo)
-  if (!parts.length) return null
-  return line(
-    'text-subtle',
-    <ShieldCheck className="mt-px size-3.5 shrink-0 text-success/80" />,
-    parts,
-    'approval-allowed'
-  )
+  return chip
 }
 
 function Section({
@@ -504,6 +445,8 @@ export function ToolCard({
           : shellCwd
       : null
 
+  // aprovada → detalhes no selo de status; negada/bloqueada → faixa compacta abaixo do cabeçalho
+  const outcome = result ? approvalOutcome(result.meta) : null
   const subFailed = isDelegate && liveSub?.status === 'error'
   const subError = useStore((s) => (subFailed && subId ? s.errors[subId] : undefined))
   return (
@@ -567,21 +510,11 @@ export function ToolCard({
             </span>
           </Tip>
         )}
-        <StatusChip status={status} />
+        <StatusChip status={status} outcome={outcome} meta={result?.meta} />
       </div>
 
-      {result?.meta.approval && <ApprovalLine rec={result.meta.approval} />}
-      {result?.meta.smartApprove && (
-        <SmartApproveLine rec={result.meta.smartApprove} messageId={result.id} />
-      )}
-      {result?.meta.smartOverride && (
-        <div
-          data-testid="smart-override-run"
-          className="flex items-center gap-1.5 border-t border-border/70 px-3.5 py-2 text-[12px] text-subtle"
-        >
-          <ShieldCheck className="size-3.5 shrink-0 text-success/80" />
-          Executada com a sua liberação (Executar mesmo assim), sem passar pelo Smart-Approve.
-        </div>
+      {result && outcome?.kind === 'denied' && (
+        <DeniedStrip outcome={outcome} meta={result.meta} messageId={result.id} />
       )}
 
       {isDelegate && !streaming && (

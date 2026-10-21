@@ -1,6 +1,7 @@
 // Chip "N processos" no header do chat (processos em segundo plano de process_start) + popover
-// com nome, comando, tempo, Parar e "Ver logs" (últimas linhas).
-import { Activity, ChevronRight, CircleStop, ScrollText } from 'lucide-react'
+// com nome, comando, tempo, Parar e "Ver logs" (últimas linhas). A lista vem do main: rodando +
+// encerrados sozinhos (com o código); Parar/Remover tira da lista (= process_stop).
+import { Activity, ChevronRight, CircleStop, ScrollText, X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { ProcessInfo } from '@shared/types'
 import type { ProcessLogsResult } from '@shared/ipc'
@@ -10,7 +11,7 @@ import { selectProcesses, useStore } from '../../store'
 import { Popover } from '../ui/layers'
 import { Tip } from '../ui/Tooltip'
 import { CopyButton } from './Markdown'
-import { processState } from './processFormat'
+import { processesChip, processState } from './processFormat'
 
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now())
@@ -93,7 +94,7 @@ function ProcessRow({
           Ver logs
           <span className="text-faint">· {p.lines.toLocaleString('pt-BR')} linhas</span>
         </button>
-        {running && (
+        {running ? (
           <button
             type="button"
             disabled={stopping}
@@ -106,6 +107,22 @@ function ProcessRow({
             <CircleStop className="size-3" />
             {stopping ? 'Parando…' : 'Parar'}
           </button>
+        ) : (
+          <Tip label="Tirar da lista (o arquivo de log continua no disco)">
+            <button
+              type="button"
+              data-testid="process-dismiss"
+              disabled={stopping}
+              onClick={() => {
+                setStopping(true)
+                void stopProcess(chatId, p.id).finally(() => setStopping(false))
+              }}
+              className="ml-auto flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11.5px] text-muted hover:bg-hover hover:text-fg disabled:opacity-50"
+            >
+              <X className="size-3" />
+              Remover
+            </button>
+          </Tip>
         )}
       </div>
       {open && (
@@ -138,24 +155,48 @@ export function ProcessesBadge({ chatId }: { chatId: string }): React.JSX.Elemen
   const list = useStore(selectProcesses(chatId))
   const [open, setOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
-  const running = list.filter((p) => p.status === 'running')
+  const chip = processesChip(list)
   const now = useNow(open)
-  if (!running.length && !open) return null
-  const n = running.length
+  // lista esvaziou (último removido/parado): fecha o popover junto com o chip (ajuste durante o
+  // render — não reabre sozinho quando surgir outro processo)
+  if (!chip && open) setOpen(false)
+  if (!chip) return null
+  const n = chip.count
+  const finished = chip.kind === 'finished'
+  const failed = finished ? chip.failed : 0
+  const s = n === 1 ? '' : 's'
+  const tip = finished
+    ? `${n} processo${s} encerrado${s}${failed ? ` (${failed} com falha)` : ''} — ver/remover`
+    : 'Processos em segundo plano deste chat (process_start)'
   return (
     <>
-      <Tip side="bottom" label="Processos em segundo plano deste chat (process_start)">
+      <Tip side="bottom" label={tip}>
         <button
           ref={anchor}
           type="button"
           data-testid="processes-badge"
+          data-state={finished ? (failed ? 'failed' : 'finished') : 'running'}
           onClick={() => setOpen((o) => !o)}
           aria-expanded={open}
-          className="no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-success/25 bg-success/[0.06] px-2 text-xs text-success/90 transition-colors hover:bg-success/[0.12]"
+          aria-label={finished ? tip : undefined}
+          className={cn(
+            'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
+            finished
+              ? 'border-border text-muted hover:border-border-strong hover:text-fg'
+              : 'border-success/25 bg-success/[0.06] text-success/90 hover:bg-success/[0.12]'
+          )}
         >
-          <Activity className="size-3.5" />
+          <span className="relative flex">
+            <Activity className="size-3.5" />
+            {failed > 0 && (
+              <span
+                data-testid="processes-badge-warning"
+                className="absolute -top-0.5 -right-0.5 size-1.5 rounded-full bg-warning ring-2 ring-bg"
+              />
+            )}
+          </span>
           <span className="max-[1179px]:hidden">
-            {n} processo{n === 1 ? '' : 's'}
+            {n} {finished ? `encerrado${s}` : `processo${s}`}
           </span>
           <span className="min-[1180px]:hidden">{n}</span>
         </button>
@@ -166,21 +207,34 @@ export function ProcessesBadge({ chatId }: { chatId: string }): React.JSX.Elemen
         anchor={anchor}
         width={420}
         align="end"
-        maxHeight={520}
+        maxHeight={760}
       >
-        <div data-testid="processes-popover" className="flex flex-col py-1">
-          <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
+        {/* o Popover limita a altura ao espaço até a borda da janela; só a lista rola
+            (título e nota fixos) e ela mesma não passa de ~60% da altura da janela */}
+        <div data-testid="processes-popover" className="flex min-h-0 flex-1 flex-col py-1">
+          <div className="shrink-0 px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-[0.06em] text-subtle uppercase">
             Processos em segundo plano
+            {list.length > 0 && (
+              <span className="ml-1.5 font-normal tracking-normal normal-case text-faint">
+                · {list.length}
+              </span>
+            )}
           </div>
-          {list.length === 0 ? (
-            <p className="px-3 pb-2 text-[12px] text-subtle">Nenhum processo.</p>
-          ) : (
-            [...list]
-              .reverse()
-              .map((p) => <ProcessRow key={p.id} chatId={chatId} p={p} now={now} />)
-          )}
-          <p className="px-3 pt-1.5 text-[11px] leading-snug text-faint">
+          <div
+            data-testid="processes-list"
+            className="max-h-[60vh] min-h-0 flex-1 overflow-y-auto overscroll-contain border-y border-border/40"
+          >
+            {list.length === 0 ? (
+              <p className="px-3 py-2 text-[12px] text-subtle">Nenhum processo.</p>
+            ) : (
+              [...list]
+                .reverse()
+                .map((p) => <ProcessRow key={p.id} chatId={chatId} p={p} now={now} />)
+            )}
+          </div>
+          <p className="shrink-0 px-3 pt-1.5 text-[11px] leading-snug text-faint">
             Continuam rodando entre turnos; são encerrados ao fechar o ClearChat ou apagar o chat.
+            Os que terminam sozinhos ficam na lista até Remover.
           </p>
         </div>
       </Popover>

@@ -9,11 +9,13 @@
 // `approvalModes`) ?? DEFAULT_APPROVAL_MODES.
 //   always → roda sem perguntar (blacklist NÃO vale).
 //   smart  → o juiz do Smart-Approve decide (config do chat). Sem modelo escolhido → pergunta
-//            (fail-closed).
+//            (fail-closed). commands/processes/pages: as listas valem antes (blacklist bloqueia;
+//            100% whitelist roda sem juiz) e o juiz decide só o que sobrou (smartListPlan).
 //   lists  → commands/processes/pages: cada sub-comando (ou a URL) contra blacklist (bloqueia tudo,
 //            precede) e whitelist; o que sobrar → card com uma decisão por item.
 //            demais itens (search, arquivos, chats, subagentes): sem listas — pergunta sim/não.
 import { analyzeShell, shellQuote, type ShellCommand } from './shellParse'
+import { detectScript, SCRIPT_PREVIEW, scriptHead } from './scriptPreview'
 import {
   CONFIRM_TOOLS,
   type ApprovalCheck,
@@ -22,6 +24,7 @@ import {
   type ApprovalList,
   type ApprovalListItem,
   type ApprovalMode,
+  type ApprovalScript,
   type ApprovalSettings,
   type ChatConfig,
   type SmartApproveConfig,
@@ -125,7 +128,10 @@ export function modeLabel(item: ApprovalItem, mode: ApprovalMode): string {
 export function modeHint(item: ApprovalItem, mode: ApprovalMode): string {
   if (mode === 'always')
     return isListItem(item) ? 'Roda sem perguntar (nem a blacklist vale)' : 'Roda sem perguntar'
-  if (mode === 'smart') return 'O modelo juiz do Smart-Approve decide (sem modelo → pergunta)'
+  if (mode === 'smart')
+    return isListItem(item)
+      ? 'Blacklist bloqueia e whitelist libera; o juiz do Smart-Approve decide o resto (sem modelo → pergunta)'
+      : 'O modelo juiz do Smart-Approve aprova ou pergunta a você (sem modelo → pergunta)'
   return isListItem(item)
     ? 'Whitelist libera, blacklist bloqueia; o resto pergunta'
     : 'Pergunta a você a cada chamada'
@@ -613,7 +619,39 @@ export function checkItemLabel(it: { text: string; group?: string }): string {
   return it.group ? `${it.text} — ${it.group}` : it.text
 }
 
-function subItem(c: ShellCommand, list: ApprovalList): ApprovalCheckItem {
+/**
+ * Prévia de script do sub-comando (detecção pura; o main lê o arquivo depois). `remote`: o comando
+ * roda do outro lado de um ssh/docker exec/kubectl exec — o arquivo não é daqui.
+ */
+function scriptOf(c: ShellCommand, remote: boolean): ApprovalScript | undefined {
+  const ref = detectScript(c.tokens)
+  if (!ref) return undefined
+  if (ref.kind === 'inline') {
+    const h = scriptHead(ref.code, SCRIPT_PREVIEW.cardLines, SCRIPT_PREVIEW.cardChars)
+    return {
+      interpreter: ref.interpreter,
+      status: 'inline',
+      content: h.head,
+      lines: h.lines,
+      ...(h.truncated ? { truncated: true } : {})
+    }
+  }
+  return { interpreter: ref.interpreter, path: ref.path, status: remote ? 'remote' : 'pending' }
+}
+
+/** Para cada sub-comando: roda do outro lado de um ssh/container (algum wrapper acima dele)? */
+function remoteFlags(cmds: ShellCommand[]): boolean[] {
+  const roles: (ShellCommand['role'] | undefined)[] = []
+  return cmds.map((c) => {
+    const d = c.depth ?? 0
+    roles.length = d
+    const remote = roles.some((r) => r === 'ssh' || r === 'container')
+    roles[d] = c.role
+    return remote
+  })
+}
+
+function subItem(c: ShellCommand, list: ApprovalList, remote = false): ApprovalCheckItem {
   const text = c.tokens.length ? c.tokens.map(shellQuote).join(' ') : c.text
   const tokens = c.match ?? c.tokens
   const suggestion =
@@ -622,12 +660,14 @@ function subItem(c: ShellCommand, list: ApprovalList): ApprovalCheckItem {
       : c.role === 'elevate' && baseName(c.tokens[0] ?? '') === 'su'
         ? text
         : suggestCommandPattern(c.tokens)
+  const script = scriptOf(c, remote)
   const base = {
     text,
     suggestion,
     ...(c.note ? { note: c.note } : {}),
     ...(c.depth ? { depth: c.depth } : {}),
-    ...(c.group ? { group: c.group } : {})
+    ...(c.group ? { group: c.group } : {}),
+    ...(script ? { script } : {})
   }
   if (c.unsafe) return { ...base, verdict: 'ask', reason: c.unsafe }
   const entry = list.allow.find(
@@ -654,7 +694,8 @@ export function evaluateCommand(
         (!!c.match && matchCommandPattern(p, c.match, { basenameProgram: true }))
     )
     if (entry) {
-      const items = cmds.map((x) => subItem(x, list))
+      const remote = remoteFlags(cmds)
+      const items = cmds.map((x, i) => subItem(x, list, remote[i]))
       return {
         blocked: {
           text: c.tokens.map(shellQuote).join(' ') || c.text,
@@ -666,7 +707,8 @@ export function evaluateCommand(
       }
     }
   }
-  const items = cmds.map((c) => subItem(c, list))
+  const remote = remoteFlags(cmds)
+  const items = cmds.map((c, i) => subItem(c, list, remote[i]))
   return { check: { item, items }, allAllowed: items.every((i) => i.verdict === 'allow') }
 }
 
@@ -752,8 +794,9 @@ export const judgeConfigured = (sa: Partial<SmartApproveConfig> | null | undefin
 
 /**
  * Rota de uma chamada pelo modo efetivo do item: always → roda; smart → juiz (sem modelo →
- * usuário, fail-closed); lists → listas (commands/processes/pages) ou pergunta simples. Tools que
- * não são itens (leitura, process_stop, ask_user…) → roda.
+ * usuário, fail-closed; nos itens com listas o runner aplica smartListPlan antes do juiz); lists →
+ * listas (commands/processes/pages) ou pergunta simples. Tools que não são itens (leitura,
+ * process_stop, ask_user…) → roda.
  */
 export function approvalRoute(
   cfg: Pick<ChatConfig, 'approvalModes'> & { smartApprove?: Partial<SmartApproveConfig> },
@@ -769,6 +812,35 @@ export function approvalRoute(
       ? { kind: 'judge' }
       : { kind: 'user', smartMissing: true }
   return isListItem(item) ? { kind: 'lists' } : { kind: 'user' }
+}
+
+/**
+ * Modo smart num item com listas (commands/processes/pages): as listas decidem primeiro.
+ * - blacklist casou → `blocked` (nada roda, sem juiz — como no modo Listas);
+ * - tudo liberado pela whitelist → `run` (sem juiz), a menos que `judgeWhitelisted` ("Consultar o
+ *   Smart-Approve também para o que a whitelist já libera");
+ * - senão → `judge` com `judgeIdx` = os itens que o juiz decide (os não liberados; com
+ *   `judgeWhitelisted`, todos). Os liberados vão ao juiz só como contexto.
+ */
+export type SmartListPlan =
+  | { kind: 'blocked'; ev: ListEvaluation }
+  | { kind: 'run'; ev: ListEvaluation }
+  | { kind: 'judge'; ev: ListEvaluation; judgeIdx: number[] }
+
+export function smartListPlan(
+  item: ApprovalListItem,
+  args: unknown,
+  lists: Record<ApprovalListItem, ApprovalList>,
+  opts: { judgeWhitelisted?: boolean } = {}
+): SmartListPlan {
+  const ev = evaluateLists(item, args, lists)
+  if (ev.blocked) return { kind: 'blocked', ev }
+  if (ev.allAllowed && !opts.judgeWhitelisted) return { kind: 'run', ev }
+  const judgeIdx = ev.check.items
+    .map((it, i) => ({ it, i }))
+    .filter(({ it }) => opts.judgeWhitelisted || it.verdict !== 'allow')
+    .map(({ i }) => i)
+  return { kind: 'judge', ev, judgeIdx }
 }
 
 /** Itens em modo smart que, por falta de modelo, estão perguntando (aviso na UI). */

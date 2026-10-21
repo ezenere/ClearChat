@@ -366,6 +366,109 @@ app.on('window-all-closed', () => app.quit())
   await page.waitForLoadState('domcontentloaded')
   await setSize(1280, 820)
 
+  await step(
+    'processos: chip verde → neutro (aviso de falha) → Remover o último some',
+    async () => {
+      await open('processes', 'Refatorar o parser')
+      const badge = page.getByTestId('processes-badge')
+      const pop = page.getByTestId('processes-popover')
+      await badge.waitFor()
+      assert.equal(await badge.getAttribute('data-state'), 'running')
+      assert.match((await badge.getAttribute('class')) ?? '', /text-success/)
+      assert.match(await badge.innerText(), /1 processo\b/)
+      assert.equal(await page.getByTestId('processes-badge-warning').count(), 0)
+      await badge.click()
+      await pop.waitFor()
+      assert.equal(await pop.getByTestId('process-item').count(), 3)
+      // Parar o único rodando → sai da lista; sobram encerrados (um com falha): chip neutro + aviso
+      await pop
+        .getByTestId('process-item')
+        .filter({ hasText: 'vite' })
+        .getByRole('button', { name: 'Parar' })
+        .click()
+      await page.locator('[data-testid=processes-badge][data-state=failed]').waitFor()
+      assert.doesNotMatch((await badge.getAttribute('class')) ?? '', /text-success/)
+      assert.match(await badge.innerText(), /2 encerrados/)
+      assert.match(
+        (await badge.getAttribute('aria-label')) ?? '',
+        /^2 processos encerrados \(1 com falha\) — ver\/remover$/
+      )
+      await page.getByTestId('processes-badge-warning').waitFor()
+      await shot('proc-01-neutral-failed')
+      // Remover a falha → neutro sem aviso
+      await pop
+        .getByTestId('process-item')
+        .filter({ hasText: 'testes' })
+        .getByTestId('process-dismiss')
+        .click()
+      await page.locator('[data-testid=processes-badge][data-state=finished]').waitFor()
+      assert.equal(await page.getByTestId('processes-badge-warning').count(), 0)
+      assert.match(await badge.innerText(), /1 encerrado\b/)
+      // Remover o último → chip e popover somem
+      await pop.getByTestId('process-dismiss').click()
+      await badge.waitFor({ state: 'detached' })
+      await pop.waitFor({ state: 'detached' })
+      return 'verde → neutro+aviso → neutro → sem chip'
+    }
+  )
+
+  await step('processos: lista longa rola dentro do popover e cabe na janela', async () => {
+    await open('processes-many', 'Refatorar o parser')
+    const out: string[] = []
+    for (const [w, h] of [
+      [1280, 820],
+      [900, 600]
+    ] as const) {
+      await setSize(w, h)
+      await page.getByTestId('processes-badge').click()
+      await page.getByTestId('processes-popover').waitFor()
+      await page.waitForTimeout(250)
+      const g = await page.evaluate(() => {
+        const list = document.querySelector<HTMLElement>('[data-testid=processes-list]')!
+        const box = document.querySelector<HTMLElement>(
+          '[data-testid=processes-popover]'
+        )!.parentElement!
+        const items = list.querySelectorAll<HTMLElement>('[data-testid=process-item]')
+        const before = { sh: list.scrollHeight, ch: list.clientHeight }
+        list.scrollTop = list.scrollHeight
+        const r = box.getBoundingClientRect()
+        const lr = list.getBoundingClientRect()
+        const last = items[items.length - 1].getBoundingClientRect()
+        const title = box.firstElementChild!.firstElementChild!.getBoundingClientRect()
+        const note = box.firstElementChild!.lastElementChild!.getBoundingClientRect()
+        return {
+          n: items.length,
+          ...before,
+          top: r.top,
+          bottom: r.bottom,
+          left: r.left,
+          right: r.right,
+          lastIn: last.bottom <= lr.bottom + 1 && last.top >= lr.top - 1,
+          titleIn: title.top >= r.top && title.bottom <= lr.top + 1,
+          noteIn: note.top >= lr.bottom - 1 && note.bottom <= r.bottom + 1,
+          listMax: lr.height <= window.innerHeight * 0.6 + 1,
+          vw: window.innerWidth,
+          vh: window.innerHeight
+        }
+      })
+      assert.equal(g.n, 30, 'todos os processos na lista')
+      assert(g.sh > g.ch, `lista rola (${g.sh} > ${g.ch})`)
+      assert(g.lastIn, 'último item alcançável rolando')
+      assert(g.titleIn && g.noteIn, 'título e nota fixos fora da área que rola')
+      assert(g.listMax, 'lista ≤ 60% da altura da janela')
+      assert(
+        g.top >= 0 && g.left >= 0 && g.bottom <= g.vh && g.right <= g.vw,
+        `popover dentro da janela (${JSON.stringify(g)})`
+      )
+      await shot(`proc-02-many-${w}x${h}`)
+      await page.keyboard.press('Escape')
+      await page.getByTestId('processes-popover').waitFor({ state: 'detached' })
+      out.push(`${w}x${h}: ${g.ch}/${g.sh}px`)
+    }
+    await setSize(1280, 820)
+    return out.join(' · ')
+  })
+
   await step('estrutura: scroller até o fim, composer por cima (z), 90% da coluna', async () => {
     await open('chat', 'Ideias de nomes')
     await panel(false)

@@ -19,7 +19,9 @@ import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import {
   _resetProcesses,
+  exitedWithFailure,
   gcProcessLogs,
+  isListed,
   killAllProcesses,
   listProcesses,
   processList,
@@ -28,7 +30,8 @@ import {
   processStop,
   setProcessListener,
   setProcessLogDir,
-  stopChatProcesses
+  stopChatProcesses,
+  stopProcess
 } from '../src/main/tools/processes.ts'
 import {
   _setShell,
@@ -48,6 +51,7 @@ import { migrateToolShellRename, TOOL_SHELL_RENAME_FLAG } from '../src/main/migr
 import { migrateConfigTools } from '../src/shared/toolRename.ts'
 import { sanitizePresetConfig } from '../src/shared/presets.ts'
 import { LIMITS } from '../src/shared/limits.ts'
+import { processesChip, processFailed } from '../src/renderer/src/components/chat/processFormat.ts'
 
 const TMP = mkdtempSync(join(process.env.CLEARCHAT_TEST_TMP || tmpdir(), 'clearchat-proc-'))
 const ROOT = join(TMP, 'root')
@@ -106,11 +110,11 @@ test('process_start: wait_for casa, processo segue rodando; process_list/logs/st
   assert.match(l.content, /p1 "srv" · rodando há/)
   const logs = await processLogs({ id: 'p1', tail: 3 }, c)
   assert.match(logs.content, /\n\d+\ttick\n\d+\ttick\n\d+\ttick\n/)
-  const s = await processStop({ id: 'p1' }, c)
-  assert.match(s.content, /Processo p1 "srv" parado: encerrado/)
-  assert.equal(listProcesses(c.chatId)[0].status, 'exited')
-  // arquivo de log completo
   const file = listProcesses(c.chatId)[0].logFile
+  const s = await processStop({ id: 'p1' }, c)
+  assert.match(s.content, /Processo p1 "srv" parado: encerrado .*— removido da lista\./)
+  assert.equal(listProcesses(c.chatId).length, 0, 'parado sai da lista')
+  // arquivo de log completo
   assert.ok(existsSync(file))
   assert.match(readFileSync(file, 'utf8'), /^iniciando\nListening on 1234\ntick\n/)
 })
@@ -242,7 +246,9 @@ test('killAllProcesses: mata todos os grupos de todos os chats (síncrono)', asy
     assert.throws(() => process.kill(-pid, 0), 'grupo morto')
   }
   await sleep(300)
-  assert.equal(listProcesses(a.chatId)[0].status, 'exited')
+  // fechar o app = parada pedida: não ficam como falha na lista
+  assert.equal(listProcesses(a.chatId).length, 0)
+  assert.equal(listProcesses(b.chatId).length, 0)
 })
 
 test('limite por chat e escopo por chat', async () => {
@@ -301,6 +307,175 @@ test('evento processes-updated e gc de logs antigos', async () => {
   const del = gcProcessLogs(7)
   assert.deepEqual(del, [old])
   _resetProcesses()
+})
+
+// ======================= lista: parados saem, encerrados sozinhos ficam =======================
+
+test('isListed/exitedWithFailure (puros): rodando e encerrados ficam; parado/dispensado sai', () => {
+  const run = { status: 'running' as const, exitCode: null }
+  const ok0 = { status: 'exited' as const, exitCode: 0 }
+  const bad = { status: 'exited' as const, exitCode: 1 }
+  const sig = { status: 'exited' as const, exitCode: null }
+  const none = { stopRequested: false, dismissed: false }
+  for (const i of [run, ok0, bad, sig]) assert.equal(isListed(i, none), true)
+  // parada pedida que ainda não morreu continua (rodando)
+  assert.equal(isListed(run, { stopRequested: true, dismissed: false }), true)
+  for (const i of [ok0, bad, sig]) {
+    assert.equal(isListed(i, { stopRequested: true, dismissed: false }), false)
+    assert.equal(isListed(i, { stopRequested: false, dismissed: true }), false)
+  }
+  assert.equal(exitedWithFailure(run), false)
+  assert.equal(exitedWithFailure(ok0), false)
+  assert.equal(exitedWithFailure(bad), true)
+  assert.equal(exitedWithFailure(sig), true)
+})
+
+test('chip do header (processesChip, puro): verde rodando; neutro com encerrados; aviso de falha', () => {
+  const base = { status: 'exited', exitCode: 0, signal: null } as any
+  const run = { ...base, status: 'running', exitCode: null }
+  const bad = { ...base, exitCode: 1 }
+  const sig = { ...base, exitCode: null, signal: 'SIGKILL' }
+  assert.equal(processesChip([]), null)
+  assert.deepEqual(processesChip([run, base, bad]), { kind: 'running', count: 1 })
+  assert.deepEqual(processesChip([base]), { kind: 'finished', count: 1, failed: 0 })
+  assert.deepEqual(processesChip([base, bad, sig]), { kind: 'finished', count: 3, failed: 2 })
+  assert.equal(processFailed(base), false)
+  assert.equal(processFailed(run), false)
+  assert.equal(processFailed(sig), true)
+})
+
+test('lista: process_stop tira da lista na hora (tool, evento); process_logs ainda lê', async () => {
+  const c = ctl()
+  const events: string[][] = []
+  setProcessListener((chatId, list) => {
+    if (chatId === c.chatId) events.push(list.map((p) => `${p.id}:${p.status}`))
+  })
+  try {
+    await processStart({ command: 'echo oi; sleep 30', wait_for: 'oi' }, c)
+    assert.deepEqual(
+      listProcesses(c.chatId).map((p) => p.status),
+      ['running']
+    )
+    const r = await processStop({ id: 'p1' }, c)
+    assert.equal(r.status, 'ok')
+    assert.match(r.content, /removido da lista/)
+    assert.match(r.content, /log completo: .*p1-\d+\.log \(fica no disco/)
+    assert.equal(listProcesses(c.chatId).length, 0)
+    assert.match((await processList({}, c)).content, /^Nenhum processo/)
+    await sleep(250) // eventos atrasados (exit/close) também sem o parado
+    assert.deepEqual(events[events.length - 1], [])
+    assert.ok(
+      events.every((l) => l.every((x) => x === 'p1:running')),
+      `nunca aparece como encerrado: ${JSON.stringify(events)}`
+    )
+    const logs = await processLogs({ id: 'p1' }, c)
+    assert.match(logs.content, /fora da lista \(parado\/dispensado\)/)
+    assert.match(logs.content, /\n1\toi\n/)
+  } finally {
+    setProcessListener(null)
+    await stopChatProcesses(c.chatId)
+  }
+})
+
+test('lista: Parar pela UI (stopProcess, como no IPC) também tira da lista', async () => {
+  const c = ctl()
+  await processStart({ command: 'echo oi; sleep 30', wait_for: 'oi' }, c)
+  const r = await stopProcess(c.chatId, 'p1', 'SIGTERM')
+  assert.equal(r.removed, true)
+  assert.equal(r.already, false)
+  assert.equal(listProcesses(c.chatId).length, 0)
+  await stopChatProcesses(c.chatId)
+})
+
+test('lista: encerrados sozinhos ficam (código 0, código 1, sinal não pedido) com estado', async () => {
+  const c = ctl()
+  await processStart({ command: 'echo pronto' }, c) // p1: código 0
+  await processStart({ command: 'echo "deu ruim" >&2; exit 1' }, c) // p2: código 1
+  await processStart({ command: 'echo vivo; sleep 30', wait_for: 'vivo' }, c) // p3
+  const pid = listProcesses(c.chatId)[2].pid!
+  process.kill(-pid, 'SIGKILL') // morto por fora (OOM killer, usuário no terminal…)
+  await sleep(400)
+  const list = listProcesses(c.chatId)
+  assert.deepEqual(
+    list.map((p) => [p.id, p.status, p.exitCode, p.signal]),
+    [
+      ['p1', 'exited', 0, null],
+      ['p2', 'exited', 1, null],
+      ['p3', 'exited', null, 'SIGKILL']
+    ]
+  )
+  const l = await processList({}, c)
+  assert.match(
+    l.content,
+    /^\[3 processo\(s\); 0 rodando; 1 encerrado\(s\) com código 0; 2 com falha\]\n\[encerrados ficam na lista até process_stop/
+  )
+  assert.match(l.content, /p1 · encerrado com código 0 há/)
+  assert.match(l.content, /p2 · encerrado com código 1 há [^\n]*\n[^\n]*último: "deu ruim"/)
+  assert.match(l.content, /p3 · encerrado pelo sinal SIGKILL há/)
+  await stopChatProcesses(c.chatId)
+})
+
+test('lista: process_stop num encerrado dispensa (sem erro) e dá o caminho do log', async () => {
+  const c = ctl()
+  await processStart({ command: 'echo falhou; exit 2' }, c) // p1
+  await processStart({ command: 'echo pronto' }, c) // p2 (código 0)
+  const file = listProcesses(c.chatId)[0].logFile
+  const r = await processStop({ id: 'p1' }, c)
+  assert.equal(r.status, 'ok')
+  assert.match(
+    r.content,
+    /^O processo p1 já tinha encerrado \(encerrado com código 2 .*\) — removido da lista\./
+  )
+  assert.ok(r.content.includes(`log completo: ${file} (fica no disco`))
+  assert.match(r.content, /--- fim do log ---\n1\tfalhou/)
+  assert.ok(existsSync(file), 'log continua no disco')
+  assert.deepEqual(
+    listProcesses(c.chatId).map((p) => p.id),
+    ['p2']
+  )
+  const r2 = await processStop({ id: 'p2' }, c)
+  assert.match(r2.content, /já tinha encerrado \(encerrado com código 0 .*— removido da lista/)
+  assert.equal(listProcesses(c.chatId).length, 0)
+  // de novo: já fora da lista, sem erro
+  const again = await processStop({ id: 'p1' }, c)
+  assert.equal(again.status, 'ok')
+  assert.match(again.content, /já estava fora da lista/)
+  // process_logs pelo id continua
+  assert.match((await processLogs({ id: 'p1' }, c)).content, /\n1\tfalhou\n/)
+  await stopChatProcesses(c.chatId)
+})
+
+test('lista: poda do registro lembra o id (erro com o caminho do log; stop sem erro)', async () => {
+  const c = ctl()
+  for (let i = 0; i < 21; i++) await processStart({ command: `echo n${i}` }, c)
+  await sleep(200)
+  const list = listProcesses(c.chatId)
+  assert.equal(list.length, 20, 'até 20 encerrados guardados')
+  assert.equal(list[0].id, 'p2')
+  const err = await processLogs({ id: 'p1' }, c).catch((e) => e)
+  assert.match(
+    String(err.message),
+    /o processo "p1" já encerrou e saiu da memória deste chat\. O log completo continua em .*p1-\d+\.log — leia com read_file/
+  )
+  const st = await processStop({ id: 'p1' }, c)
+  assert.equal(st.status, 'ok')
+  assert.match(st.content, /não está mais na lista\. O log completo continua em/)
+  // parado/dispensado sai primeiro na poda (antes dos listados)
+  await processStop({ id: 'p21' }, c)
+  await processStart({ command: 'echo n21' }, c) // p22
+  await sleep(200)
+  assert.deepEqual(
+    listProcesses(c.chatId).map((p) => p.id)[0],
+    'p2',
+    'listado mais antigo continua; podado foi o dispensado'
+  )
+  const unknown = await processLogs({ id: 'p99' }, c).catch((e) => e)
+  assert.match(String(unknown.message), /não encontrado neste chat\. Ids na lista: p2,/)
+  // apagar o chat apaga também os logs dos podados
+  const file = /continua em (\S+\.log)/.exec(st.content)![1]
+  assert.ok(existsSync(file))
+  await stopChatProcesses(c.chatId)
+  assert.equal(existsSync(file), false)
 })
 
 // ======================= shell do usuário =======================

@@ -450,12 +450,12 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
   ),
   process_list: def(
     'process_list',
-    'Lista os processos em segundo plano deste chat (iniciados por esta sessão, pela principal ou por subagentes): id, nome, comando, pid, diretório, estado, há quanto tempo roda, nº de linhas de log e a última linha.',
+    'Lista os processos em segundo plano deste chat (iniciados por esta sessão, pela principal ou por subagentes): id, nome, comando, pid, diretório, estado, há quanto tempo roda, nº de linhas de log e a última linha. Inclui os que já encerraram sozinhos (com o código de saída ou o sinal — confira também os de código 0, e veja o motivo com process_logs); só sai da lista o que foi parado/dispensado com process_stop (ou pelo usuário).',
     {}
   ),
   process_stop: def(
     'process_stop',
-    'Para um processo de process_start: envia o sinal ao grupo de processos inteiro (filhos inclusos) e, se não sair em ~3 s, SIGKILL. Retorna o código final e o fim do log.',
+    'Para um processo de process_start: envia o sinal ao grupo de processos inteiro (filhos inclusos) e, se não sair em ~3 s, SIGKILL; o processo sai da lista. Num processo que já encerrou, só o remove da lista (dispensa). Retorna o código final, o caminho do log (continua no disco; process_logs pelo id ainda lê) e o fim do log.',
     {
       id: { type: 'string', description: 'Id do processo (ex.: "p1").' },
       signal: {

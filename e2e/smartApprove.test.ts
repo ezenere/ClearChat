@@ -6,12 +6,20 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { approvalRoute } from '../src/shared/approvalPolicy.ts'
+import { approvalRoute, evaluateLists, smartListPlan } from '../src/shared/approvalPolicy.ts'
+import {
+  JUDGE_CONTEXT_LIMITS,
+  buildJudgeExtras,
+  relevantWhitelist
+} from '../src/shared/smartApproveContext.ts'
+import { approvalOutcome } from '../src/renderer/src/lib/approvalOutcome.ts'
 import {
   argsKey,
   buildJudgeBody,
   buildJudgeMessages,
+  judgeVars,
   lastUserMessage,
+  mapJudgeDecision,
   normalizeSmartApprove,
   overrideMessageText,
   parseJudgeOutput,
@@ -119,7 +127,9 @@ test('validateLabels / normalizeSmartApprove', () => {
     template: null,
     labels: { approve: 'APPROVED', reject: 'REJECTED', ask: 'ASK-USER' },
     contextMessages: 6,
-    timeoutS: 30
+    timeoutS: 30,
+    canDeny: false,
+    judgeWhitelisted: false
   })
   const n = normalizeSmartApprove({
     enabled: true,
@@ -205,7 +215,9 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
   })
   assert.equal(msgs.length, 2)
   assert.equal(msgs[0].role, 'system')
-  assert.ok(msgs[0].content.includes('APPROVED | REJECTED | ASK-USER'))
+  // sem "O juiz pode negar": o rótulo de rejeitar não é oferecido
+  assert.ok(msgs[0].content.includes('(APPROVED | ASK-USER)'))
+  assert.ok(!msgs[0].content.includes('REJECTED'))
   assert.ok(!msgs[0].content.includes('{{'), 'system sem placeholders')
   const u = msgs[1].content
   assert.ok(!u.includes('{{'), 'user sem placeholders')
@@ -214,13 +226,29 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
   assert.ok(u.includes('Project root (cwd): /work'))
   assert.ok(u.includes('File tools confined to the root: yes'))
   assert.ok(u.includes('Shell sandboxed (only the root is writable): no'))
-  assert.ok(u.includes('"""\nListe os arquivos, por favor.\n"""'))
-  // últimas 3 (sem a de erro): assistant(read_file), tool (cortado), assistant(shell)
-  assert.ok(!u.includes('mensagem antiga'))
-  assert.ok(u.includes('→ read_file({"path":"a"})'))
-  assert.ok(u.includes('[tool read_file] ' + 'x'.repeat(300) + '… [+1700 chars]'))
-  assert.ok(u.includes('[assistant] Vou listar.\n  → shell({"command":"ls -la"})'))
+  // objetivo: mensagens digitadas, a mais recente primeiro
+  assert.ok(u.includes('[1] Liste os arquivos, por favor.\n[2] mensagem antiga'))
+  // atividade: só chamadas com resultado (a pendente c2 fica de fora) + a última fala
+  assert.ok(u.includes("Agent's recent tool calls (oldest first):\n- [ok] read_file: a\n"))
+  assert.ok(!u.includes('- [ok] shell'))
+  assert.ok(u.includes(`Agent's latest message: "Vou listar."`))
+  assert.ok(!u.includes('Caller: a SUBAGENT'), 'principal: sem seção de subagente')
   assert.ok(!u.includes('erro'))
+  // {{recent_context}} continua disponível para templates personalizados
+  const custom = buildJudgeMessages(
+    { ...sa, template: '{{last_user_message}}\n{{recent_context}}' },
+    { tool: 'shell', args: {}, cwd: '/w', confine: true, sandbox: false, history }
+  )[1].content
+  assert.ok(custom.startsWith('Liste os arquivos, por favor.\n'))
+  assert.ok(custom.includes('[tool read_file] ' + 'x'.repeat(300) + '… [+1700 chars]'))
+  assert.ok(custom.includes('[assistant] Vou listar.\n  → shell({"command":"ls -la"})'))
+  // com "O juiz pode negar": rótulo e regra de rejeitar no prompt
+  const deny = buildJudgeMessages(
+    { ...sa, canDeny: true },
+    { tool: 'shell', args: {}, cwd: '/w', confine: true, sandbox: false, history }
+  )[0].content
+  assert.ok(deny.includes('(APPROVED | REJECTED | ASK-USER)'))
+  assert.ok(deny.includes('\n- REJECTED — only for calls that are clearly malicious'))
 })
 
 test('contexto: N=0, fronteira de compactação, última mensagem do usuário', () => {
@@ -451,10 +479,11 @@ test('juiz: aprovar / rejeitar / perguntar; request exata e usage', async () => 
     assert.equal(
       hit.body.messages[0].content,
       renderSmartTemplate(DEFAULT_SMART_APPROVE_PROMPT, {
-        labels: 'APPROVED | REJECTED | ASK-USER',
+        labels: 'APPROVED | ASK-USER',
         approve: 'APPROVED',
         reject: 'REJECTED',
-        ask: 'ASK-USER'
+        ask: 'ASK-USER',
+        reject_rule: ''
       })
     )
     assert.ok(
@@ -465,9 +494,17 @@ test('juiz: aprovar / rejeitar / perguntar; request exata e usage', async () => 
     assert.ok(!JSON.stringify(r.request).includes('0123456789abcdef'))
     assert.deepEqual((r.request!.body as any).messages, hit.body.messages)
 
+    // sem "O juiz pode negar" (padrão, também em configs antigas): rejeitar → perguntar + dica
     script = { body: '**REJECTED** — apaga a home' }
     r = await judge()
+    assert.equal(r.decision, 'ask')
+    assert.equal(r.wouldReject, true)
+    assert.equal(r.reason, 'apaga a home')
+    assert.equal(r.fallback, undefined)
+    // com "O juiz pode negar": a rejeição é honrada
+    r = await judge({ canDeny: true })
     assert.equal(r.decision, 'reject')
+    assert.equal(r.wouldReject, undefined)
     assert.equal(r.reason, 'apaga a home')
 
     script = { body: 'ASK-USER\nAmbíguo.', json: true }
@@ -530,4 +567,423 @@ test('juiz: falhas nunca liberam (ambíguo, vazio, HTTP, rede, timeout, abort, s
   assert.equal(r.decision, 'ask')
   assert.equal(r.fallback, 'error')
   assert.match(r.error!, /Falha de rede/)
+})
+
+// ======================= 0.8.4: listas antes do juiz, juiz sem negar, contexto =======================
+
+const LISTS = {
+  commands: {
+    allow: ['git status', 'git diff *', 'ssh deploy@prod.example.com', 'ls *'],
+    deny: ['rm -rf /*']
+  },
+  processes: { allow: [], deny: [] },
+  pages: { allow: ['docs.example.com', 'github.com'], deny: ['evil.example.org'] }
+}
+
+test('rota smart com listas: whitelist inteira → sem juiz; parcial → só os não liberados; opção → juiz', () => {
+  // 100% whitelist → roda sem juiz
+  let p = smartListPlan('commands', { command: 'git status && ls -la' }, LISTS)
+  assert.equal(p.kind, 'run')
+  // blacklist → bloqueia sem juiz
+  p = smartListPlan('commands', { command: 'git status; rm -rf /tmp/x' }, LISTS)
+  assert.equal(p.kind, 'blocked')
+  // parcial → juiz decide só o que sobrou (índice 1)
+  p = smartListPlan('commands', { command: 'git status && rm tmp.txt' }, LISTS)
+  assert.equal(p.kind, 'judge')
+  assert.deepEqual(p.kind === 'judge' && p.judgeIdx, [1])
+  // "Consultar também o que a whitelist libera" → juiz em tudo, inclusive o 100% liberado
+  p = smartListPlan('commands', { command: 'git status && ls -la' }, LISTS, {
+    judgeWhitelisted: true
+  })
+  assert.equal(p.kind, 'judge')
+  assert.deepEqual(p.kind === 'judge' && p.judgeIdx, [0, 1])
+  // a blacklist continua precedendo com a opção ligada
+  assert.equal(
+    smartListPlan('commands', { command: 'rm -rf /tmp' }, LISTS, { judgeWhitelisted: true }).kind,
+    'blocked'
+  )
+  // páginas
+  assert.equal(smartListPlan('pages', { url: 'https://github.com/x' }, LISTS).kind, 'run')
+  assert.equal(smartListPlan('pages', { url: 'https://evil.example.org/' }, LISTS).kind, 'blocked')
+  assert.equal(smartListPlan('pages', { url: 'https://npmjs.com/' }, LISTS).kind, 'judge')
+  // a rota continua 'judge' para o item em smart (o runner aplica o plano)
+  assert.equal(
+    approvalRoute(
+      { approvalModes: { commands: 'smart' }, smartApprove: { providerId: 'p', model: 'j' } },
+      null,
+      'shell'
+    ).kind,
+    'judge'
+  )
+})
+
+test('veredito: rejeitar → perguntar sem "pode negar"; honrado com ela; aprovar/perguntar iguais', () => {
+  assert.deepEqual(mapJudgeDecision('reject', false), { decision: 'ask', wouldReject: true })
+  assert.deepEqual(mapJudgeDecision('reject', true), { decision: 'reject' })
+  assert.deepEqual(mapJudgeDecision('approve', false), { decision: 'approve' })
+  assert.deepEqual(mapJudgeDecision('ask', true), { decision: 'ask' })
+})
+
+test('migração: configs antigas (sem os campos novos) → pode negar e julgar a whitelist desligados', () => {
+  const old = normalizeSmartApprove({
+    providerId: 'p',
+    model: 'j',
+    prompt: 'custom {{reject}}',
+    labels: { approve: 'SIM', reject: 'NAO', ask: 'TALVEZ' },
+    enabled: true
+  } as any)
+  assert.equal(old.canDeny, false)
+  assert.equal(old.judgeWhitelisted, false)
+  assert.equal(old.prompt, 'custom {{reject}}', 'prompt personalizado preservado')
+  assert.equal(normalizeSmartApprove({ canDeny: 'yes' as any }).canDeny, false, 'só true liga')
+  assert.equal(
+    normalizeSmartApprove({ canDeny: true, judgeWhitelisted: true }).judgeWhitelisted,
+    true
+  )
+  // template personalizado antigo continua funcionando: {{labels}} só sem o de rejeitar
+  const vars = judgeVars(old, {
+    tool: 'shell',
+    args: {},
+    cwd: '/w',
+    confine: true,
+    sandbox: false,
+    history: []
+  })
+  assert.equal(vars.labels, 'SIM | TALVEZ')
+  assert.equal(vars.reject, 'NAO')
+  assert.equal(vars.reject_rule, '')
+})
+
+const H = (sessionId: string, items: [any, any?][]): StoredMessage[] =>
+  items.map(([message, meta], i) => ({
+    id: `${sessionId}-${i}`,
+    sessionId,
+    seq: i + 1,
+    message,
+    meta: meta ?? {},
+    createdAt: 0
+  }))
+const call = (id: string, name: string, args: any): any => ({
+  id,
+  type: 'function',
+  function: { name, arguments: JSON.stringify(args) }
+})
+
+test('contexto: objetivo da principal, tarefa do subagente, atividade, arquivos tocados, aprovados', () => {
+  const main = H('m', [
+    [{ role: 'user', content: 'Primeiro pedido antigo' }],
+    [{ role: 'user', content: 'Gere o relatório em docs/' }],
+    [{ role: 'user', content: '<tool_result>x</tool_result>' }, { synthetic: true }],
+    [{ role: 'user', content: 'mensagem de outro chat' }, { kind: 'inter-chat' }],
+    [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [call('p1', 'write_file', { path: 'docs/base.md', content: 'x' })]
+      }
+    ],
+    [{ role: 'tool', tool_call_id: 'p1', content: 'ok' }, { toolStatus: 'ok' }],
+    [{ role: 'user', content: 'E apague os rascunhos depois' }, { kind: 'queued' }]
+  ])
+  const sub = H('s', [
+    [{ role: 'user', content: 'TAREFA: crie draft.txt e depois apague' }, { synthetic: true }],
+    [
+      {
+        role: 'assistant',
+        content: 'Vou criar.',
+        tool_calls: [
+          call('c1', 'write_file', { path: 'draft.txt', content: 'x' }),
+          call('c2', 'edit_file', { path: '/abs/a.ts', old_string: 'a', new_string: 'b' })
+        ]
+      }
+    ],
+    [{ role: 'tool', tool_call_id: 'c1', content: 'ok' }, { toolStatus: 'ok' }],
+    [{ role: 'tool', tool_call_id: 'c2', content: 'Erro' }, { toolStatus: 'error' }],
+    [
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [call('c3', 'shell', { command: 'rm -rf dist' })]
+      }
+    ],
+    [
+      { role: 'tool', tool_call_id: 'c3', content: '' },
+      {
+        toolStatus: 'ok',
+        approval: { item: 'commands', mode: 'smart', userAllowed: ['rm -rf dist'] }
+      }
+    ],
+    [
+      {
+        role: 'assistant',
+        content: 'Agora apago o rascunho.',
+        tool_calls: [call('c4', 'shell', { command: 'rm draft.txt' })]
+      }
+    ]
+  ])
+  const check = evaluateLists('commands', { command: 'git status && rm draft.txt' }, LISTS).check
+  const x = buildJudgeExtras({
+    history: sub,
+    mainHistory: main,
+    subagent: { depth: 1, title: 'Rascunhos', task: 'TAREFA: crie draft.txt e depois apague' },
+    cwd: '/proj',
+    item: 'commands',
+    check,
+    judgeIdx: [1],
+    lists: LISTS
+  })
+  assert.deepEqual(x.userGoal, [
+    'E apague os rascunhos depois',
+    'Gere o relatório em docs/',
+    'Primeiro pedido antigo'
+  ])
+  assert.equal(x.subagent?.depth, 1)
+  assert.equal(x.subagent?.task, 'TAREFA: crie draft.txt e depois apague')
+  // a pendente (c4) não entra; status de cada uma
+  assert.deepEqual(
+    x.recentTools.map((t) => `${t.status} ${t.name} ${t.summary}`),
+    ['ok write_file draft.txt', 'error edit_file /abs/a.ts', 'ok shell rm -rf dist']
+  )
+  assert.equal(x.lastAgentText, 'Agora apago o rascunho.')
+  // só os ok; relativos resolvidos pela raiz; do pai marcados
+  assert.deepEqual(x.touchedFiles, [
+    { path: '/proj/draft.txt', action: 'written' },
+    { path: '/proj/docs/base.md', action: 'written', byParent: true }
+  ])
+  assert.deepEqual(x.approvedByUser, ['rm -rf dist'])
+  // whitelist parecida: nenhuma entrada de "rm"; git status já liberou um item (fica de fora)
+  assert.deepEqual(x.approvedWhitelist, [])
+
+  const sa = normalizeSmartApprove({ providerId: 'p', model: 'j' })
+  const u = buildJudgeMessages(sa, {
+    tool: 'shell',
+    args: { command: 'git status && rm draft.txt' },
+    cwd: '/proj',
+    confine: true,
+    sandbox: false,
+    history: sub,
+    check,
+    judgeIdx: [1],
+    extra: x
+  })[1].content
+  assert.ok(u.includes('[1] E apague os rascunhos depois\n[2] Gere o relatório em docs/'))
+  assert.ok(u.includes('Caller: a SUBAGENT (depth 1, "Rascunhos")'))
+  assert.ok(u.includes('"""\nTAREFA: crie draft.txt e depois apague\n"""'))
+  assert.ok(u.includes('- /proj/draft.txt (created/overwritten)'))
+  assert.ok(u.includes('- /proj/docs/base.md (created/overwritten, by a parent agent)'))
+  assert.ok(u.includes('approved by the user earlier in this session: rm -rf dist'))
+  assert.ok(u.includes('- git status   [already allowed by whitelist "git status"]'))
+  assert.ok(u.includes('- rm draft.txt   [TO DECIDE]'))
+  // determinístico: mesma entrada → mesmo texto
+  const again = buildJudgeMessages(sa, {
+    tool: 'shell',
+    args: { command: 'git status && rm draft.txt' },
+    cwd: '/proj',
+    confine: true,
+    sandbox: false,
+    history: sub,
+    check,
+    judgeIdx: [1],
+    extra: buildJudgeExtras({
+      history: sub,
+      mainHistory: main,
+      subagent: { depth: 1, title: 'Rascunhos', task: 'TAREFA: crie draft.txt e depois apague' },
+      cwd: '/proj',
+      item: 'commands',
+      check,
+      judgeIdx: [1],
+      lists: LISTS
+    })
+  })[1].content
+  assert.equal(again, u)
+})
+
+test('contexto: whitelist parecida (programa, wrapper ssh, host; site em Páginas)', () => {
+  const c = evaluateLists(
+    'commands',
+    { command: 'git push origin x; ssh deploy@prod.example.com "systemctl restart app"' },
+    LISTS
+  ).check
+  const idx = c.items.map((it, i) => (it.verdict === 'allow' ? -1 : i)).filter((i) => i >= 0)
+  const wl = relevantWhitelist(c, idx, LISTS)
+  assert.ok(wl.includes('git diff *'), 'mesmo programa (git)')
+  assert.ok(!wl.includes('ls *'))
+  assert.ok(!wl.includes('ssh deploy@prod.example.com'), 'a que já liberou um item fica de fora')
+  const pg = evaluateLists('pages', { url: 'https://api.github.com/x' }, LISTS).check
+  assert.deepEqual(relevantWhitelist(pg, [0], LISTS), ['github.com'])
+})
+
+test('contexto: tetos (objetivo, atividade, arquivos, subagente) — prompt limitado', () => {
+  const L = JUDGE_CONTEXT_LIMITS
+  const big = 'y'.repeat(5000)
+  const hist = H('m', [
+    ...Array.from({ length: 6 }, () => [{ role: 'user', content: big }] as [any]),
+    ...Array.from(
+      { length: 40 },
+      (_, i) =>
+        [
+          {
+            role: 'assistant',
+            content: null,
+            tool_calls: [
+              call(`w${i}`, 'write_file', { path: `f${i}/${'z'.repeat(60)}.txt`, content: 'x' })
+            ]
+          }
+        ] as [any]
+    ),
+    ...Array.from(
+      { length: 40 },
+      (_, i) =>
+        [{ role: 'tool', tool_call_id: `w${i}`, content: 'ok' }, { toolStatus: 'ok' }] as [any, any]
+    )
+  ])
+  const x = buildJudgeExtras({
+    history: hist,
+    subagent: { depth: 2, title: 'Neto', task: big },
+    parents: [{ title: 'Filho', task: big, history: [] }],
+    cwd: '/p'
+  })
+  assert.ok(x.userGoal.length <= L.goalMessages)
+  assert.ok(x.userGoal.join('').length <= L.goalChars + 60)
+  assert.ok(x.recentTools.length <= L.toolCalls)
+  assert.ok(x.touchedFiles.length <= L.files)
+  assert.ok(
+    (x.subagent!.task + x.subagent!.parents.map((p) => p.task).join('')).length <= L.taskChars + 80
+  )
+  const sa = normalizeSmartApprove({ providerId: 'p', model: 'j' })
+  const vars = judgeVars(sa, {
+    tool: 'shell',
+    args: { command: 'ls' },
+    cwd: '/p',
+    confine: true,
+    sandbox: false,
+    history: hist,
+    extra: x
+  })
+  const ctxLen = ['user_goal', 'subagent', 'touched_files', 'approved_before', 'recent_activity']
+    .map((k) => vars[k].length)
+    .reduce((a, b) => a + b, 0)
+  assert.ok(ctxLen <= 6500, `contexto ${ctxLen} chars`)
+})
+
+test('juiz: com a avaliação das listas, registra os itens julgados; timeout nunca nega (nem com pode negar)', async () => {
+  await startServer()
+  try {
+    const check = evaluateLists('commands', { command: 'git status && rm x.txt' }, LISTS).check
+    script = { body: 'APPROVED\nArquivo da tarefa.' }
+    const r = await runJudge({
+      sa: normalizeSmartApprove({ providerId: 'pj', model: 'judge/1' }),
+      provider: provider(),
+      chatConfig: { appSignature: 'none' },
+      ctx: {
+        tool: 'shell',
+        args: { command: 'git status && rm x.txt' },
+        cwd: '/w',
+        confine: true,
+        sandbox: false,
+        history: [],
+        check,
+        judgeIdx: [1]
+      },
+      signal: new AbortController().signal
+    })
+    assert.equal(r.decision, 'approve')
+    assert.deepEqual(r.judged, ['rm x.txt'])
+    const u = hits.at(-1).body.messages[1].content
+    assert.ok(
+      u.includes('- rm x.txt   [TO DECIDE]') &&
+        u.includes('[already allowed by whitelist "git status"]')
+    )
+    script = { body: 'REJECTED\nnão', delayMs: 1500 }
+    const t = await judge({ canDeny: true, timeoutS: 0.3 })
+    assert.equal(t.decision, 'ask')
+    assert.equal(t.fallback, 'timeout')
+    script = { body: 'Talvez REJECTED, talvez APPROVED' }
+    const amb = await judge({ canDeny: true })
+    assert.equal(amb.decision, 'ask')
+    assert.equal(amb.fallback, 'ambiguous')
+  } finally {
+    server.closeAllConnections()
+    server.close()
+  }
+})
+
+test('card: aprovada → detalhes no selo (quem aprovou); negada/bloqueada → faixa', () => {
+  assert.equal(
+    approvalOutcome({ toolStatus: 'ok', approval: { item: 'memory_write', mode: 'always' } }),
+    null
+  )
+  let o = approvalOutcome({
+    toolStatus: 'ok',
+    approval: { item: 'commands', mode: 'lists', allowed: [{ text: 'ls', entry: 'ls *' }] }
+  })!
+  assert.equal(o.kind, 'approved')
+  assert.equal(o.title, 'Aprovado pela lista')
+  o = approvalOutcome({
+    toolStatus: 'ok',
+    approval: {
+      item: 'commands',
+      mode: 'smart',
+      allowed: [{ text: 'git status', entry: 'git status' }],
+      judgeAllowed: ['rm x']
+    },
+    smartApprove: { decision: 'approve', reason: 'ok', providerId: 'p', model: 'j', durationMs: 1 }
+  })!
+  assert.equal(o.title, 'Aprovado pela lista e pelo Smart-Approve')
+  assert.deepEqual(
+    o.items.map((i) => i.by),
+    ['lists', 'smart']
+  )
+  o = approvalOutcome({
+    toolStatus: 'ok',
+    approval: { item: 'commands', mode: 'smart', userAllowed: ['rm x'] },
+    smartApprove: {
+      decision: 'ask',
+      wouldReject: true,
+      reason: 'apaga',
+      providerId: 'p',
+      model: 'j',
+      durationMs: 1
+    }
+  })!
+  assert.equal(o.title, 'Aprovado por você')
+  // registro antigo: o juiz pediu e rodou → você
+  assert.equal(
+    approvalOutcome({
+      toolStatus: 'ok',
+      smartApprove: { decision: 'ask', reason: '', providerId: 'p', model: 'j', durationMs: 1 }
+    })!.title,
+    'Aprovado por você'
+  )
+  assert.equal(
+    approvalOutcome({ toolStatus: 'ok', smartOverride: true })!.title,
+    'Aprovado por você'
+  )
+  o = approvalOutcome({
+    toolStatus: 'denied',
+    approval: { item: 'commands', mode: 'smart', blocked: { text: 'rm -rf /', entry: 'rm -rf /*' } }
+  })!
+  assert.equal(o.kind, 'denied')
+  assert.equal(o.deniedBy, 'blacklist')
+  o = approvalOutcome({
+    toolStatus: 'denied',
+    smartApprove: {
+      decision: 'reject',
+      reason: 'perigoso',
+      providerId: 'p',
+      model: 'j',
+      durationMs: 1
+    }
+  })!
+  assert.equal(o.deniedBy, 'smart')
+  assert.equal(o.reason, 'perigoso')
+  o = approvalOutcome({
+    toolStatus: 'denied',
+    approval: { item: 'search', mode: 'lists', denied: 'rsync' }
+  })!
+  assert.equal(o.title, 'Negado por você')
+  assert.equal(
+    approvalOutcome({ toolStatus: 'cancelled', approval: { item: 'commands', mode: 'lists' } }),
+    null
+  )
 })

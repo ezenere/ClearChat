@@ -1,8 +1,11 @@
 // Loop do agente por sessão: build → stream → persistir assistant → tools → [fila] → repetir.
 // Ver SPEC.md → "Runner / fila / interrupção".
 import { randomUUID } from 'crypto'
+import { homedir } from 'os'
 import type {
   ApiMessage,
+  ApprovalCheck,
+  ApprovalItem,
   ApprovalRecord,
   Chat,
   ContentPart,
@@ -16,7 +19,13 @@ import type {
   ToolName
 } from '@shared/types'
 import { TOOL_ALIASES } from '@shared/types'
-import { normalizeSmartApprove, overrideMessageText, smartRejectText } from '@shared/smartApprove'
+import {
+  argsSummary,
+  normalizeSmartApprove,
+  overrideMessageText,
+  smartRejectText
+} from '@shared/smartApprove'
+import { buildJudgeExtras, type JudgeExtras } from '@shared/smartApproveContext'
 import {
   approvalRoute,
   blockedText,
@@ -24,6 +33,7 @@ import {
   effectiveMode,
   evaluateLists,
   isListItem,
+  smartListPlan,
   TOOL_ITEM,
   userDeniedText,
   validateListEntry,
@@ -128,6 +138,7 @@ import {
 } from './compaction'
 import { getApproval, listApprovals, requestApproval, resolveApproval } from './approvals'
 import { addOverride, runJudge, takeOverride } from './smartApprove'
+import { fillScriptPreviews, resolveScriptPath } from '../scriptPreview'
 import { bwrapAvailable } from '../tools/bash'
 import {
   drainQueue,
@@ -1049,7 +1060,11 @@ async function listsGate(
   name: ToolName,
   item: ApprovalListItem,
   args: Record<string, unknown>,
-  signal: AbortSignal
+  signal: AbortSignal,
+  /** Modo smart: o juiz pediu sua decisão (ou não decidiu) — o card mostra o motivo. */
+  smart?: SmartApproveRecord,
+  /** Diretório em que o comando vai rodar (prévia dos scripts executados). */
+  runDir?: string
 ): Promise<{ outcome?: Omit<ToolOutcome, 'durationMs'>; record: ApprovalRecord }> {
   for (let round = 0; ; round++) {
     const ev = evaluateLists(item, args, getApprovalSettings().lists)
@@ -1058,7 +1073,7 @@ async function listsGate(
       .map((i) => ({ text: i.text, entry: i.entry! }))
     const record: ApprovalRecord = {
       item,
-      mode: 'lists',
+      mode: smart ? 'smart' : 'lists',
       ...(allowed.length ? { allowed } : {})
     }
     if (ev.blocked) {
@@ -1071,7 +1086,15 @@ async function listsGate(
     if (ev.allAllowed) return { record }
     setStatus(sessionId, 'awaiting_approval')
     const outcome = await requestApproval(
-      { chatId, sessionId, toolCallId, toolName: name, args, check: ev.check },
+      {
+        chatId,
+        sessionId,
+        toolCallId,
+        toolName: name,
+        args,
+        check: runDir ? await fillScriptPreviews(ev.check, runDir) : ev.check,
+        ...(smart ? { smartApprove: smart } : {})
+      },
       signal
     )
     if (!signal.aborted) setStatus(sessionId, 'running')
@@ -1128,6 +1151,60 @@ onApprovalListsChanged(() => {
   }
 })
 
+/** Diretório em que shell/process_start vai rodar: o cwd do shell da sessão (ou o `cwd` do processo). */
+function runDirFor(
+  chat: Chat,
+  session: Session,
+  name: ToolName,
+  args: Record<string, unknown>
+): string {
+  const root = chat.config.cwd
+  if (name === 'process_start' && typeof args.cwd === 'string' && args.cwd.trim())
+    return resolveScriptPath(args.cwd, root)
+  return shellStateFor(session.id, root, () => lastShellCwd(session.id)).dir
+}
+
+/**
+ * Contexto extra do juiz (ver @shared/smartApproveContext): objetivo do usuário na sessão principal,
+ * tarefa do subagente (e dos subagentes acima), atividade recente e arquivos tocados (sessão + pais).
+ * Lê os históricos persistidos — só quando o juiz vai ser chamado.
+ */
+function judgeExtrasFor(
+  session: Session,
+  cwd: string,
+  history: StoredMessage[],
+  opts: {
+    item?: ApprovalItem
+    check?: ApprovalCheck
+    judgeIdx?: number[]
+    lists?: ReturnType<typeof getApprovalSettings>['lists']
+  }
+): JudgeExtras {
+  const parents: { title: string; task: string | null; history: StoredMessage[] }[] = []
+  let mainHistory = history
+  let cur: Session | null = session
+  for (let i = 0; cur?.parentSessionId && i < 4; i++) {
+    const p = sessionsRepo.get(cur.parentSessionId)
+    if (!p) break
+    const h = messagesRepo.path(p.id)
+    if (p.depth === 0 || !p.parentSessionId) {
+      mainHistory = h
+      break
+    }
+    parents.push({ title: p.title, task: p.task, history: h })
+    cur = p
+  }
+  return buildJudgeExtras({
+    history,
+    mainHistory,
+    subagent:
+      session.depth > 0 ? { depth: session.depth, title: session.title, task: session.task } : null,
+    parents,
+    cwd,
+    ...opts
+  })
+}
+
 async function executeTool(
   st: RunState,
   session: Session,
@@ -1177,38 +1254,99 @@ async function executeTool(
     smartOverride = true
     route = { kind: 'run' }
   }
+  // Modo smart: nos itens com listas, as listas decidem primeiro (smartListPlan) — blacklist
+  // bloqueia sem juiz; 100% whitelist roda sem juiz (a menos que `judgeWhitelisted`); o juiz decide
+  // só os itens que sobraram (os liberados vão como contexto). Juiz pede/falha → card das listas
+  // com o motivo (itens com listas) ou pergunta simples.
+  let smartCheck: ApprovalCheck | undefined
   if (route.kind === 'judge') {
     const sa = normalizeSmartApprove(chat.config.smartApprove)
-    emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: true, judging: true })
-    try {
-      smart = await runJudge({
-        sa,
-        provider: sa.providerId ? providersRepo.get(sa.providerId) : null,
-        chatConfig: chat.config,
-        ctx: {
-          tool: name,
-          args,
-          cwd: chat.config.cwd,
-          confine: chat.config.confineToRoot !== false,
-          sandbox: !!chat.config.sandboxBash && bwrapAvailable(),
-          history: messagesRepo.path(session.id)
-        },
-        signal
+    let judgeIdx: number[] | undefined
+    if (isListItem(item)) {
+      const plan = smartListPlan(item, args, settings.lists, {
+        judgeWhitelisted: sa.judgeWhitelisted
       })
-    } finally {
-      emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: false })
+      const allowed = plan.ev.check.items
+        .filter((i) => i.verdict === 'allow' && i.entry)
+        .map((i) => ({ text: i.text, entry: i.entry! }))
+      approval = { item, mode: 'smart', ...(allowed.length ? { allowed } : {}) }
+      if (plan.kind === 'blocked') {
+        const { text, entry, where } = plan.ev.blocked!
+        approval.blocked = { text: where ? `${text} — ${where}` : text, entry }
+        return done({ content: blockedText(item, plan.ev.blocked!), status: 'denied' })
+      }
+      if (plan.kind === 'run') route = { kind: 'run' }
+      else {
+        // o juiz vê o começo dos scripts que o comando executa
+        smartCheck = await fillScriptPreviews(plan.ev.check, runDirFor(chat, session, name, args))
+        judgeIdx = plan.judgeIdx
+      }
     }
-    dbg('smart-approve', name, smart.decision, smart.fallback ?? '', smart.durationMs, 'ms')
-    if (signal.aborted) return done({ content: CANCELLED_TEXT, status: 'cancelled' })
-    if (smart.decision === 'reject') {
-      return done({ content: smartRejectText(smart.model, smart.reason), status: 'denied' })
+    if (route.kind === 'judge') {
+      emit({
+        type: 'tool-running',
+        sessionId: session.id,
+        toolCallId,
+        running: true,
+        judging: true
+      })
+      try {
+        const history = messagesRepo.path(session.id)
+        smart = await runJudge({
+          sa,
+          provider: sa.providerId ? providersRepo.get(sa.providerId) : null,
+          chatConfig: chat.config,
+          ctx: {
+            tool: name,
+            args,
+            cwd: chat.config.cwd,
+            confine: chat.config.confineToRoot !== false,
+            sandbox: !!chat.config.sandboxBash && bwrapAvailable(),
+            history,
+            ...(smartCheck && judgeIdx ? { check: smartCheck, judgeIdx } : {}),
+            extra: judgeExtrasFor(session, chat.config.cwd, history, {
+              item,
+              check: smartCheck,
+              judgeIdx,
+              lists: settings.lists
+            })
+          },
+          signal
+        })
+      } finally {
+        emit({ type: 'tool-running', sessionId: session.id, toolCallId, running: false })
+      }
+      dbg('smart-approve', name, smart.decision, smart.fallback ?? '', smart.durationMs, 'ms')
+      if (signal.aborted) return done({ content: CANCELLED_TEXT, status: 'cancelled' })
+      // 'reject' só chega aqui com "O juiz pode negar" (sem ela, runJudge já mapeou para 'ask')
+      if (smart.decision === 'reject') {
+        return done({ content: smartRejectText(smart.model, smart.reason), status: 'denied' })
+      }
+      if (smart.decision === 'approve') {
+        route = { kind: 'run' }
+        if (approval && smart.judged?.length) approval.judgeAllowed = smart.judged
+      } else if (smartCheck && smartCheck.items.some((i) => i.verdict !== 'allow')) {
+        route = { kind: 'lists' }
+      } else {
+        // sem item pendente nas listas (tudo na whitelist + "consultar também"): pergunta simples
+        route = { kind: 'user' }
+      }
     }
-    route = smart.decision === 'approve' ? { kind: 'run' } : { kind: 'user' }
   }
   // fail-closed: 'lists' sem item de lista (não deveria acontecer) vira pergunta simples
   if (route.kind === 'lists' && !isListItem(item)) route = { kind: 'user' }
   if (route.kind === 'lists' && isListItem(item)) {
-    const r = await listsGate(chat.id, session.id, toolCallId, name, item, args, signal)
+    const r = await listsGate(
+      chat.id,
+      session.id,
+      toolCallId,
+      name,
+      item,
+      args,
+      signal,
+      mode === 'smart' ? smart : undefined,
+      runDirFor(chat, session, name, args)
+    )
     approval = r.record
     if (r.outcome) return done(r.outcome)
   } else if (route.kind === 'user') {
@@ -1226,9 +1364,19 @@ async function executeTool(
       signal
     )
     if (!signal.aborted) setStatus(session.id, 'running')
-    if (outcome.kind === 'deny') return done({ content: DENIED_TEXT, status: 'denied' })
+    if (outcome.kind === 'deny') {
+      if (item && mode)
+        approval = { ...(approval ?? { item, mode }), denied: argsSummary(name, args) }
+      return done({ content: DENIED_TEXT, status: 'denied' })
+    }
     if (outcome.kind !== 'allow' || signal.aborted)
       return done({ content: CANCELLED_TEXT, status: 'cancelled' })
+    // registro da sua aprovação (card compacto "Aprovado por você"; contexto do juiz depois)
+    if (item && mode)
+      approval = {
+        ...(approval ?? { item, mode }),
+        userAllowed: [argsSummary(name, args)]
+      }
   } else if (route.kind === 'run' && item && mode === 'always' && !smartOverride) {
     approval = { item, mode: 'always' }
   }
@@ -2789,13 +2937,25 @@ export function smartOverride(messageId: string): void {
 /** "Testar" do editor: roda o juiz numa chamada de exemplo (sem sessão; nada é salvo). */
 export async function smartApproveTest(input: SmartApproveTestInput): Promise<SmartApproveRecord> {
   const sa = normalizeSmartApprove(input.config.smartApprove)
+  // como na execução: nos itens com listas, o juiz vê o que a whitelist já libera (contexto)
+  const item = TOOL_ITEM[input.tool]
+  const lists = getApprovalSettings().lists
+  const plan = isListItem(item)
+    ? smartListPlan(item, input.args, lists, { judgeWhitelisted: sa.judgeWhitelisted })
+    : null
   const ctx = {
     tool: input.tool,
     args: input.args,
     cwd: input.config.cwd || '~',
     confine: input.config.confineToRoot !== false,
     sandbox: !!input.config.sandboxBash && bwrapAvailable(),
-    history: input.history ?? []
+    history: input.history ?? [],
+    ...(plan?.kind === 'judge'
+      ? {
+          check: await fillScriptPreviews(plan.ev.check, input.config.cwd || homedir()),
+          judgeIdx: plan.judgeIdx
+        }
+      : {})
   }
   const provider = sa.providerId ? providersRepo.get(sa.providerId) : null
   return runJudge({

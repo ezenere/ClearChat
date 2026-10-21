@@ -248,6 +248,18 @@ export interface SmartApproveConfig {
   /** Tempo máximo da chamada ao juiz, em segundos (padrão 30). Estourou → pergunta ao usuário. */
   timeoutS: number
   /**
+   * "O juiz pode negar" (0.8.4; padrão false — também para quem já usava o juiz): desligado, o juiz
+   * só escolhe entre aprovar e perguntar; um rótulo de rejeitar vira "perguntar" (o motivo aparece
+   * no card como dica). Ligado, a rejeição é honrada (não roda; o agente recebe o motivo).
+   */
+  canDeny: boolean
+  /**
+   * "Consultar o Smart-Approve também para o que a whitelist já libera" (0.8.4; padrão false): nos
+   * itens com listas (Comandos/Processos/Páginas), o juiz normalmente só decide o que as listas não
+   * decidem — chamada 100% liberada pela whitelist roda sem juiz. Ligado, ela também vai ao juiz.
+   */
+  judgeWhitelisted: boolean
+  /**
    * @deprecated (≤ 0.4.0) liga/desliga. Só alias de leitura: migrateSmartApproveConfig converte
    * (ver approvalPolicy.ts) e remove. Hoje o juiz age nos itens em modo `smart` quando há modelo.
    */
@@ -278,6 +290,13 @@ export interface SmartApproveRecord {
   response?: string
   /** O usuário clicou "Executar mesmo assim" depois de uma rejeição. */
   overridden?: boolean
+  /**
+   * O juiz respondeu o rótulo de rejeitar, mas "O juiz pode negar" está desligado: a decisão virou
+   * 'ask' (o card mostra "o Smart-Approve sugeriu perguntar" com o motivo).
+   */
+  wouldReject?: boolean
+  /** Itens (sub-comandos/URL) que o juiz avaliou — os demais já estavam liberados pela whitelist. */
+  judged?: string[]
 }
 
 /**
@@ -583,6 +602,34 @@ export interface ApprovalCheckItem {
   depth?: number
   /** Onde/como o sub-comando roda: "no servidor deploy@host (via ssh)", "via sudo"… */
   group?: string
+  /**
+   * O sub-comando executa um script (`python3 x.py`, `./run.sh`, `node -e '…'`): o começo do
+   * arquivo (lido no main, ≤ 64 KiB) ou o código inline — card e juiz mostram. Ver scriptPreview.ts.
+   */
+  script?: ApprovalScript
+}
+
+/** Prévia de script de um item do card (ver src/shared/scriptPreview.ts). */
+export interface ApprovalScript {
+  interpreter: string
+  /** Caminho como escrito no comando (arquivo). */
+  path?: string
+  /** Caminho resolvido pelo main (cwd do shell da chamada). */
+  resolved?: string
+  /**
+   * pending = arquivo ainda não lido (o main preenche); ok = lido; inline = código no comando;
+   * missing = não existe; binary; notfile = diretório/especial; remote = dentro de ssh/container
+   * (não dá para ler daqui); error = falha de leitura.
+   */
+  status: 'pending' | 'ok' | 'inline' | 'missing' | 'binary' | 'notfile' | 'remote' | 'error'
+  /** Começo do conteúdo (até 15 linhas / 1.200 chars). */
+  content?: string
+  /** Linhas do arquivo (com `partial`, das primeiras 64 KiB lidas). */
+  lines?: number
+  /** Arquivo maior que o limite de leitura (64 KiB). */
+  partial?: boolean
+  /** `content` é só o começo (há mais linhas/chars). */
+  truncated?: boolean
 }
 
 export interface ApprovalCheck {
@@ -590,7 +637,7 @@ export interface ApprovalCheck {
   items: ApprovalCheckItem[]
 }
 
-/** meta.approval da mensagem tool. */
+/** meta.approval da mensagem tool (modo lists/smart; `always` só com o modo). */
 export interface ApprovalRecord {
   item: ApprovalItem
   mode: ApprovalMode
@@ -598,7 +645,9 @@ export interface ApprovalRecord {
   allowed?: { text: string; entry: string }[]
   /** Bloqueado pela blacklist (nada rodou). */
   blocked?: { text: string; entry: string }
-  /** Sub-comandos que você aprovou no card. */
+  /** Sub-comandos que o Smart-Approve liberou (modo smart: só os que a whitelist não liberou). */
+  judgeAllowed?: string[]
+  /** Sub-comandos que você aprovou no card (ou o resumo da chamada, na pergunta simples). */
   userAllowed?: string[]
   /** Sub-comando que você negou. */
   denied?: string

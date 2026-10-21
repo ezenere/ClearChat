@@ -36,6 +36,12 @@ import {
   SMART_APPROVE_ITEMS_MIGRATION_FLAG
 } from '../src/main/migrateApprovals.ts'
 import { CONFIRM_TOOLS } from '../src/shared/types.ts'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { detectScript, looksBinary, scriptHead } from '../src/shared/scriptPreview.ts'
+import { checkBlock } from '../src/shared/smartApproveContext.ts'
+import { fillScriptPreviews } from '../src/main/scriptPreview.ts'
 import { PRESET_FIELDS, sanitizePresetConfig } from '../src/shared/presets.ts'
 
 const cmds = (s: string): string[][] => analyzeShell(s).commands.map((c) => c.tokens)
@@ -1207,4 +1213,127 @@ test('Smart-Approve: o juiz vê a decomposição ({{commands}})', async () => {
     ]),
     [null, 'g', 's', null]
   )
+})
+
+// ======================= prévia de script no card (0.8.4) =======================
+
+test('script: detecção (interpretadores, opções, -m sem arquivo, -c inline, caminho executável)', () => {
+  const f = (cmd: string): any => detectScript(cmd.split(' '))
+  assert.deepEqual(f('python3 file.py'), { kind: 'file', path: 'file.py', interpreter: 'python3' })
+  assert.deepEqual(f('python file.py a b'), {
+    kind: 'file',
+    path: 'file.py',
+    interpreter: 'python'
+  })
+  assert.equal(f('python3 -u file.py').path, 'file.py')
+  assert.equal(f('python3.12 -W ignore x.py').path, 'x.py')
+  assert.equal(f('python -m http.server'), null)
+  assert.deepEqual(detectScript(['python', '-c', 'print(1)']), {
+    kind: 'inline',
+    code: 'print(1)',
+    interpreter: 'python'
+  })
+  assert.equal(f('node --inspect x.js').path, 'x.js')
+  assert.equal(f('node --inspect=9229 -r dotenv/config x.js').path, 'x.js')
+  assert.equal(detectScript(['node', '-e', 'console.log(1)'])?.kind, 'inline')
+  assert.equal(f('bash script.sh').path, 'script.sh')
+  assert.equal(f('sh -x x.sh').path, 'x.sh')
+  assert.equal(f('./script').path, './script')
+  assert.equal(f('bin/run --flag').path, 'bin/run')
+  assert.equal(f('ruby x.rb').path, 'x.rb')
+  assert.equal(f('perl -I lib x.pl').path, 'x.pl')
+  assert.equal(f('php x.php').path, 'x.php')
+  assert.equal(f('deno run --allow-read x.ts').path, 'x.ts')
+  assert.equal(f('deno fmt'), null)
+  assert.equal(f('bun x.ts').path, 'x.ts')
+  assert.equal(f('bun run x.ts').path, 'x.ts')
+  assert.equal(f('tsx x.ts').path, 'x.ts')
+  assert.equal(f('npx tsx x.ts').path, 'x.ts')
+  assert.equal(f('npx -y ts-node x.ts').path, 'x.ts')
+  assert.equal(f('npx prettier x.ts'), null)
+  assert.equal(f('ts-node -P tsconfig.json x.ts').path, 'x.ts')
+  assert.equal(f('Rscript x.R').path, 'x.R')
+  assert.equal(f('pwsh -File x.ps1').path, 'x.ps1')
+  assert.equal(f('pwsh -NoProfile'), null)
+  assert.equal(f('python3'), null)
+  assert.equal(f('ls -la'), null)
+  assert.equal(f('/bin/rm -rf x'), null, 'programa do sistema por caminho')
+  assert.equal(f('/usr/bin/env node'), null)
+  assert.equal(f('git status'), null)
+})
+
+test('script: recorte (linhas, chars, "…"), binário; itens do card (remoto, inline, sudo local)', () => {
+  const text = Array.from({ length: 30 }, (_, i) => `linha ${i + 1}`).join('\n') + '\n'
+  let h = scriptHead(text, 15, 1200)
+  assert.equal(h.lines, 30)
+  assert.equal(h.head.split('\n').length, 15)
+  assert.equal(h.truncated, true)
+  h = scriptHead('a\nb\n', 15, 1200)
+  assert.deepEqual(h, { head: 'a\nb', lines: 2, truncated: false })
+  h = scriptHead('x'.repeat(2000), 15, 1200)
+  assert.equal(h.head.length, 1200)
+  assert.equal(h.truncated, true)
+  assert.equal(looksBinary('abc\u0000def'), true)
+  assert.equal(looksBinary('print("olá")\n'), false)
+  const lists = {
+    commands: { allow: [], deny: [] },
+    processes: { allow: [], deny: [] },
+    pages: { allow: [], deny: [] }
+  }
+  const items = evaluateLists(
+    'commands',
+    {
+      command:
+        "python3 a.py && ssh h 'python3 b.py' && sudo python3 c.py && node -e 'console.log(1)'"
+    },
+    lists
+  ).check.items
+  const byText = (t: string): any => items.find((i) => i.text === t)?.script
+  assert.equal(byText('python3 a.py').status, 'pending')
+  assert.equal(byText('python3 b.py').status, 'remote')
+  assert.equal(byText('python3 c.py').status, 'pending', 'sudo é local')
+  assert.equal(byText("node -e 'console.log(1)'").status, 'inline')
+  assert.equal(byText("node -e 'console.log(1)'").content, 'console.log(1)')
+})
+
+test('script: leitura no main (cwd, cd, inexistente, binário, limite de 64 KiB) e texto do juiz', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cc-script-'))
+  try {
+    mkdirSync(join(dir, 'app'))
+    writeFileSync(join(dir, 'a.py'), Array.from({ length: 20 }, (_, i) => `print(${i})`).join('\n'))
+    writeFileSync(join(dir, 'app', 'b.py'), 'import os\nos.remove("x")\n')
+    writeFileSync(join(dir, 'bin.py'), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0, 0, 1, 2]))
+    writeFileSync(join(dir, 'big.py'), '# x\n'.repeat(40_000))
+    const lists = {
+      commands: { allow: [], deny: [] },
+      processes: { allow: [], deny: [] },
+      pages: { allow: [], deny: [] }
+    }
+    const check = evaluateLists(
+      'commands',
+      {
+        command:
+          'python3 a.py; python3 nope.py; python3 bin.py; python3 big.py; cd app && python3 b.py'
+      },
+      lists
+    ).check
+    const filled = await fillScriptPreviews(check, dir)
+    const s = (t: string): any => filled.items.find((i) => i.text === t)?.script
+    assert.equal(s('python3 a.py').status, 'ok')
+    assert.equal(s('python3 a.py').lines, 20)
+    assert.equal(s('python3 a.py').truncated, true)
+    assert.equal(s('python3 a.py').resolved, join(dir, 'a.py'))
+    assert.equal(s('python3 nope.py').status, 'missing')
+    assert.equal(s('python3 bin.py').status, 'binary')
+    assert.equal(s('python3 big.py').partial, true)
+    assert.equal(s('python3 b.py').status, 'ok', 'segue o cd')
+    assert.equal(s('python3 b.py').content, 'import os\nos.remove("x")')
+    // juiz: 10 linhas, indentadas debaixo do item a decidir
+    const jt = checkBlock(filled, [0])
+    assert.ok(jt.includes(`script file a.py (20 lines), first lines:`))
+    assert.ok(jt.includes('| print(9)') && !jt.includes('| print(10)'))
+    assert.ok(jt.includes('| …'))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

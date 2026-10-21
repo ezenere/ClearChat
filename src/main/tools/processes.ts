@@ -7,8 +7,23 @@
 // - Ciclo de vida: process_stop (grupo inteiro; SIGKILL após ~3 s), apagar o chat
 //   (stopChatProcesses), fechar o app (killAllProcesses — síncrono: SIGTERM, ~300 ms, SIGKILL).
 // - Abortar a tool (Parar) durante o wait_for só interrompe a ESPERA: o processo continua.
+// - Lista (process_list, `processes-updated`, snapshot do sync): os que RODAM + os que morreram
+//   sozinhos (código 0 inclusive — às vezes "sucesso" era para ter sido falha —, código ≠ 0, sinal
+//   que ninguém pediu, erro ao iniciar), com estado/código, para o agente conferir. Só sai da lista
+//   o que foi parado DE PROPÓSITO (process_stop, Parar na UI, fechar o app) — na hora — ou
+//   dispensado (process_stop num já encerrado). Quem saiu da lista continua no registro
+//   (process_logs pelo id) até a poda; o arquivo de log fica até o GC/apagar o chat.
 import { spawn, type ChildProcess } from 'child_process'
-import { closeSync, mkdirSync, openSync, readdirSync, rmSync, statSync, writeSync } from 'fs'
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeSync
+} from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { StringDecoder } from 'string_decoder'
@@ -38,6 +53,8 @@ const STOP_GRACE_MS = 3000
 const START_SETTLE_MS = 1000
 /** Processos encerrados guardados por chat (para process_logs depois que saem). */
 const KEEP_EXITED = 20
+/** Ids podados lembrados por chat (só id → arquivo de log, para um erro útil). */
+const KEEP_FORGOTTEN = 200
 
 // ---------------- diretório de logs ----------------
 
@@ -104,10 +121,37 @@ interface Proc {
   closed: boolean
   waiters: Set<Waiter>
   exitWaiters: Set<() => void>
+  /** Parada pedida (process_stop, Parar na UI, fechar o app): ao morrer, sai da lista. */
+  stopRequested: boolean
+  /** Morto com falha dispensado por process_stop: fora da lista. */
+  dismissed: boolean
+  /** Erro do spawn (evento 'error'), se houve. */
+  spawnError: string | null
 }
 
 const registry = new Map<string, Map<string, Proc>>()
 const counters = new Map<string, number>()
+/** Podados do registro: chat → id → arquivo de log ('' sem arquivo). */
+const forgotten = new Map<string, Map<string, string>>()
+
+/** Encerrado com FALHA: código ≠ 0, morto por sinal ou erro ao iniciar (sem código). Puro. */
+export function exitedWithFailure(info: Pick<ProcessInfo, 'status' | 'exitCode'>): boolean {
+  return info.status === 'exited' && info.exitCode !== 0
+}
+
+/**
+ * Fica na lista? Rodando, ou encerrado (com qualquer código/sinal) sem parada pedida e sem ter sido
+ * dispensado. Puro (testes).
+ */
+export function isListed(
+  info: Pick<ProcessInfo, 'status'>,
+  flags: { stopRequested: boolean; dismissed: boolean }
+): boolean {
+  if (info.status === 'running') return true
+  return !flags.stopRequested && !flags.dismissed
+}
+
+const listed = (p: Proc): boolean => isListed(p.info, p)
 
 type Listener = (chatId: string, list: ProcessInfo[]) => void
 let listener: Listener | null = null
@@ -140,17 +184,32 @@ function lastLineOf(p: Proc): string {
   return ''
 }
 
-/** Processos do chat (mais antigos primeiro). */
+/** Processos da lista do chat — rodando + encerrados sem parada pedida (mais antigos primeiro). */
 export function listProcesses(chatId: string): ProcessInfo[] {
-  return [...(registry.get(chatId)?.values() ?? [])].map(snapshot)
+  return [...(registry.get(chatId)?.values() ?? [])].filter(listed).map(snapshot)
 }
+
+/** Arquivo de log de um processo já podado do registro (undefined = id desconhecido). */
+function forgottenLog(chatId: string, id: string): string | undefined {
+  return forgotten.get(chatId)?.get(id.trim())
+}
+
+const logHint = (file: string): string =>
+  file && existsSync(file)
+    ? ` O log completo continua em ${file} — leia com read_file/search_files.`
+    : ' O arquivo de log não existe mais.'
 
 function getProc(chatId: string, id: string): Proc {
   const p = registry.get(chatId)?.get(id.trim())
   if (!p) {
-    const ids = [...(registry.get(chatId)?.keys() ?? [])]
+    const gone = forgottenLog(chatId, id)
+    if (gone !== undefined)
+      throw new ToolError(
+        `Erro: o processo "${id.trim()}" já encerrou e saiu da memória deste chat.${logHint(gone)}`
+      )
+    const ids = listProcesses(chatId).map((x) => x.id)
     throw new ToolError(
-      `Erro: processo "${id}" não encontrado neste chat.${ids.length ? ` Ids: ${ids.join(', ')}.` : ' Nenhum processo iniciado (use process_start).'}`
+      `Erro: processo "${id}" não encontrado neste chat.${ids.length ? ` Ids na lista: ${ids.join(', ')}.` : ' Nenhum processo na lista (use process_start).'}`
     )
   }
   return p
@@ -159,12 +218,25 @@ function getProc(chatId: string, id: string): Proc {
 const runningCount = (chatId: string): number =>
   [...(registry.get(chatId)?.values() ?? [])].filter((p) => p.info.status === 'running').length
 
-/** Mantém no máximo KEEP_EXITED encerrados por chat (os mais antigos saem). */
+/**
+ * Mantém no máximo KEEP_EXITED encerrados por chat no registro. Saem primeiro os que já estão
+ * fora da lista (parados/dispensados), depois os listados — os mais antigos de cada grupo.
+ * O id podado é lembrado (só o caminho do log) para process_logs/process_stop responderem.
+ */
 function pruneExited(chatId: string): void {
   const m = registry.get(chatId)
   if (!m) return
   const exited = [...m.values()].filter((p) => p.info.status === 'exited')
-  for (const p of exited.slice(0, Math.max(0, exited.length - KEEP_EXITED))) m.delete(p.info.id)
+  const drop = exited.length - KEEP_EXITED
+  if (drop <= 0) return
+  const order = [...exited.filter((p) => !listed(p)), ...exited.filter(listed)]
+  let f = forgotten.get(chatId)
+  if (!f) forgotten.set(chatId, (f = new Map()))
+  for (const p of order.slice(0, drop)) {
+    m.delete(p.info.id)
+    f.set(p.info.id, p.info.logFile)
+  }
+  while (f.size > KEEP_FORGOTTEN) f.delete(f.keys().next().value!)
 }
 
 // ---------------- linhas ----------------
@@ -261,7 +333,7 @@ function stateText(info: ProcessInfo, now = Date.now()): string {
       ? `com código ${info.exitCode}`
       : info.signal
         ? `pelo sinal ${info.signal}`
-        : ''
+        : '(falhou ao iniciar)'
   const ago = info.endedAt ? ` há ${fmtDuration(now - info.endedAt)}` : ''
   return `encerrado ${how}${ago}`.replace(/\s+/g, ' ').trim()
 }
@@ -436,14 +508,16 @@ export async function processStart(
     fd,
     closed: false,
     waiters: new Set(),
-    exitWaiters: new Set()
+    exitWaiters: new Set(),
+    stopRequested: false,
+    dismissed: false,
+    spawnError: null
   }
   if (!registry.has(chatId)) registry.set(chatId, new Map())
   registry.get(chatId)!.set(id, p)
 
   child.stdout?.on('data', (d: Buffer) => onChunk(p, 'out', p.decoders.out.write(d)))
   child.stderr?.on('data', (d: Buffer) => onChunk(p, 'err', p.decoders.err.write(d)))
-  let spawnError: string | null = null
   const markExit = (code: number | null, sig: NodeJS.Signals | null): void => {
     if (p.info.status === 'exited') return
     p.info.status = 'exited'
@@ -455,7 +529,7 @@ export async function processStart(
     notify(chatId)
   }
   child.on('error', (e) => {
-    spawnError = e.message
+    p.spawnError = e.message
     markExit(null, null)
   })
   child.on('exit', (code, sig) => {
@@ -522,10 +596,10 @@ export async function processStart(
 
   if (outcome.kind === 'exit') {
     const code = info.exitCode
-    const failed = spawnError !== null || code !== 0
+    const failed = p.spawnError !== null || code !== 0
     const body = tailText(p, 60, budget)
-    const what = spawnError
-      ? `Erro: não foi possível iniciar o processo: ${spawnError}`
+    const what = p.spawnError
+      ? `Erro: não foi possível iniciar o processo: ${p.spawnError}`
       : `${failed ? 'Erro: o processo' : 'O processo'} ${label(info)} saiu ${waitRe ? 'antes de casar o wait_for' : 'logo após iniciar'} (${info.exitCode !== null ? `exit code ${info.exitCode}` : `sinal ${info.signal ?? '?'}`}).`
     const content = `${what}\n${header}\n--- fim do log ---\n${body}`
     return failed || waitRe ? fail(content) : ok(content)
@@ -577,7 +651,7 @@ export async function processLogs(
   const total = info.lines
 
   const head = [
-    `[processo ${label(info)} · ${stateText(info)} · ${fmtNum(total)} linhas]`,
+    `[processo ${label(info)} · ${stateText(info)} · ${fmtNum(total)} linhas${listed(p) ? '' : ' · fora da lista (parado/dispensado)'}]`,
     info.logFile ? `log completo: ${info.logFile}` : ''
   ]
     .filter(Boolean)
@@ -664,32 +738,55 @@ export async function processList(
   const chatId = ctx.chatId
   if (!chatId) return fail('Erro: process_list indisponível (sem chat).')
   const list = listProcesses(chatId)
-  if (!list.length) return ok('Nenhum processo em segundo plano neste chat (use process_start).')
+  if (!list.length)
+    return ok(
+      'Nenhum processo em segundo plano neste chat (use process_start; os parados com process_stop saem da lista).'
+    )
   const running = list.filter((p) => p.status === 'running').length
+  const failed = list.filter(exitedWithFailure).length
+  const done = list.length - running - failed
   const lines = list.map((p) => {
     const last = p.lastLine ? ` · último: "${p.lastLine.slice(0, 160)}"` : ''
     const own =
       ctx.sessionId && p.sessionId && p.sessionId !== ctx.sessionId ? ' · (outra sessão)' : ''
     return `${label(p)} · ${stateText(p)} · ${fmtNum(p.lines)} linhas · cwd ${p.cwd}${own}\n  $ ${p.command.replace(/\s+/g, ' ').slice(0, 300)}${last}`
   })
-  return ok(`[${list.length} processo(s); ${running} rodando]\n${lines.join('\n')}`)
+  const counts = [
+    `${running} rodando`,
+    done ? `${done} encerrado(s) com código 0` : '',
+    failed ? `${failed} com falha` : ''
+  ]
+    .filter(Boolean)
+    .join('; ')
+  const hint =
+    list.length > running
+      ? '\n[encerrados ficam na lista até process_stop id=… (dispensa); veja o motivo com process_logs]'
+      : ''
+  return ok(`[${list.length} processo(s); ${counts}]${hint}\n${lines.join('\n')}`)
 }
 
 // ---------------- process_stop ----------------
 
 const SIGNALS = ['SIGTERM', 'SIGINT', 'SIGKILL'] as const
 
-/** Para o processo (grupo inteiro). Retorna o snapshot final. */
+/**
+ * Para o processo (grupo inteiro) — agente (process_stop) ou usuário (Parar na UI). Parada pedida:
+ * ao morrer, sai da lista. Já encerrado → só o dispensa da lista (`removed` = estava nela).
+ * Retorna o snapshot final.
+ */
 export async function stopProcess(
   chatId: string,
   id: string,
   signal: NodeJS.Signals = 'SIGTERM'
-): Promise<{ info: ProcessInfo; already: boolean; forced: boolean }> {
+): Promise<{ info: ProcessInfo; already: boolean; forced: boolean; removed: boolean }> {
   const p = getProc(chatId, id)
   const pid = p.info.pid ?? undefined
   const already = p.info.status === 'exited'
+  const wasListed = listed(p)
   let forced = false
-  if (!already) {
+  if (already) p.dismissed = true
+  else {
+    p.stopRequested = true
     killGroup(pid, signal)
     if (!(await waitExit(p, signal === 'SIGKILL' ? 2000 : STOP_GRACE_MS))) {
       forced = true
@@ -700,7 +797,7 @@ export async function stopProcess(
   // membros do grupo que ainda seguram os pipes (filhos em segundo plano)
   if (!p.closed) killGroup(pid, 'SIGKILL')
   notify(chatId)
-  return { info: snapshot(p), already, forced }
+  return { info: snapshot(p), already, forced, removed: wasListed && !listed(p) }
 }
 
 export async function processStop(
@@ -713,15 +810,22 @@ export async function processStop(
   const sig = optString(args, 'signal') ?? 'SIGTERM'
   if (!(SIGNALS as readonly string[]).includes(sig))
     return fail(`Erro: signal deve ser um de ${SIGNALS.join(', ')}.`)
+  // já podado da memória: nada a parar nem a remover
+  const gone = registry.get(chatId)?.has(id.trim()) ? undefined : forgottenLog(chatId, id)
+  if (gone !== undefined)
+    return ok(
+      `O processo ${id.trim()} já tinha encerrado e não está mais na lista.${logHint(gone)}`
+    )
   const r = await stopProcess(chatId, id, sig as NodeJS.Signals)
   const p = getProc(chatId, id)
   const what = r.already
-    ? `O processo ${label(r.info)} já tinha encerrado (${stateText(r.info)}).`
-    : `Processo ${label(r.info)} parado: ${stateText(r.info)}${r.forced ? ` (não saiu com ${sig} em ${STOP_GRACE_MS / 1000} s — SIGKILL)` : ''}.`
+    ? `O processo ${label(r.info)} já tinha encerrado (${stateText(r.info)}) — ${r.removed ? 'removido da lista' : 'já estava fora da lista'}.`
+    : `Processo ${label(r.info)} parado: ${stateText(r.info)}${r.forced ? ` (não saiu com ${sig} em ${STOP_GRACE_MS / 1000} s — SIGKILL)` : ''}${r.removed ? ' — removido da lista' : ''}.`
   const budget = Math.max(1000, maxOutputOf(ctx) - 600)
-  return ok(
-    `${what}\n${r.info.logFile ? `log completo: ${r.info.logFile}\n` : ''}--- fim do log ---\n${tailText(p, 20, budget)}`
-  )
+  const log = r.info.logFile
+    ? `log completo: ${r.info.logFile} (fica no disco; leia com process_logs id=${r.info.id} ou read_file)\n`
+    : ''
+  return ok(`${what}\n${log}--- fim do log ---\n${tailText(p, 20, budget)}`)
 }
 
 // ---------------- ciclo de vida ----------------
@@ -729,15 +833,21 @@ export async function processStop(
 /** Apagar o chat: para todos os processos dele e apaga os logs. */
 export async function stopChatProcesses(chatId: string): Promise<void> {
   const m = registry.get(chatId)
-  if (!m) return
+  if (!m) {
+    for (const f of forgotten.get(chatId)?.values() ?? []) if (f) rmSync(f, { force: true })
+    forgotten.delete(chatId)
+    return
+  }
   await Promise.all(
     [...m.keys()].map((id) => stopProcess(chatId, id, 'SIGTERM').catch(() => undefined))
   )
   for (const p of m.values()) {
     if (p.info.logFile) rmSync(p.info.logFile, { force: true })
   }
+  for (const f of forgotten.get(chatId)?.values() ?? []) if (f) rmSync(f, { force: true })
   registry.delete(chatId)
   counters.delete(chatId)
+  forgotten.delete(chatId)
   listener?.(chatId, [])
 }
 
@@ -756,13 +866,16 @@ function sleepSync(ms: number): void {
 
 /**
  * Fechamento do app (before-quit / exit): SIGTERM em todos os grupos, até ~300 ms de espera e
- * SIGKILL nos que restarem. Síncrono — não deixa órfãos.
+ * SIGKILL nos que restarem. Síncrono — não deixa órfãos. Conta como parada pedida (os mortos aqui
+ * não viram "falha" no evento que ainda sair); o registro é só memória — nada persiste.
  */
 export function killAllProcesses(graceMs = 300): number {
   const pids: number[] = []
   for (const m of registry.values())
-    for (const p of m.values())
+    for (const p of m.values()) {
+      if (p.info.status === 'running') p.stopRequested = true
       if (p.info.pid && (p.info.status === 'running' || !p.closed)) pids.push(p.info.pid)
+    }
   for (const pid of pids) killGroup(pid, 'SIGTERM')
   const until = Date.now() + graceMs
   while (pids.some(alive) && Date.now() < until) sleepSync(20)
@@ -789,4 +902,5 @@ export function processLogLines(
 export function _resetProcesses(): void {
   registry.clear()
   counters.clear()
+  forgotten.clear()
 }

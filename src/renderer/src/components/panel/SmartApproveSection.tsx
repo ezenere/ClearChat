@@ -1,6 +1,7 @@
-// Seção "Smart-Approve" da aba Tools (painel do chat e editor de personas): modelo juiz, itens que
-// ele decide (os em modo Smart-Approve na seção Aprovações), rótulos, contexto/tempo, prompt +
-// template editáveis e "Testar". Sem liga/desliga: o juiz age nos itens em modo Smart-Approve
+// Seção "Smart-Approve" da aba Tools (painel do chat e editor de personas): modelo juiz (sempre
+// visível), itens que ele decide (os em modo Smart-Approve na seção Aprovações), "Avançado"
+// recolhido (O juiz pode negar, Consultar também o que a whitelist libera, rótulos, contexto/tempo,
+// prompt + template editáveis) e "Testar". Sem liga/desliga: o juiz age nos itens em modo Smart-Approve
 // quando há modelo; sem modelo, esses itens perguntam a você.
 import { AlertTriangle, FlaskConical, X } from 'lucide-react'
 import { useState } from 'react'
@@ -32,15 +33,18 @@ import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
 import { Select } from '../ui/Select'
 import { ApiInfo, C, Tip } from '../ui/Tooltip'
-import { smartApproveSummary } from '../../lib/configSummary'
+import { smartAdvancedSummary, smartApproveSummary } from '../../lib/configSummary'
 import type { CfgProps } from './editors'
-import { CollapsibleSection, NumberInput, RestoreButton } from './fields'
+import { CollapsibleSection, NumberInput, RestoreButton, ToggleRow } from './fields'
 
 const LABEL_FIELDS: { key: keyof SmartApproveLabels; caption: string }[] = [
   { key: 'approve', caption: 'Aprovar' },
   { key: 'reject', caption: 'Rejeitar' },
   { key: 'ask', caption: 'Perguntar' }
 ]
+const LABEL_TITLE: Partial<Record<keyof SmartApproveLabels, string>> = {
+  reject: 'Só oferecido ao juiz com “O juiz pode negar”; sem ela, esta resposta vira “perguntar”.'
+}
 
 const TEST_TOOLS: ToolName[] = APPROVAL_TOOLS
 
@@ -91,9 +95,16 @@ function SmartRequestInfo({
         assinatura do app deste chat.
       </p>
       <p>
-        Rejeitada → o agente recebe <C>{'role: "tool"'}</C>{' '}
-        <C>Rejeitado pelo Smart-Approve (modelo): motivo</C>. Erro, tempo esgotado ou resposta sem
-        exatamente um rótulo → você decide.
+        O template recebe o contexto montado pelo app (limitado a ~6.000 caracteres): as últimas
+        mensagens que você digitou na conversa principal, a tarefa do subagente, as últimas chamadas
+        de tool, os arquivos que o agente criou/editou e o que já foi aprovado antes. Nos itens com
+        listas, o juiz vê os sub-comandos já liberados pela whitelist só como contexto e decide os
+        marcados <C>TO DECIDE</C>.
+      </p>
+      <p>
+        Com “O juiz pode negar”: negada → o agente recebe <C>{'role: "tool"'}</C>{' '}
+        <C>Rejeitado pelo Smart-Approve (modelo): motivo</C>. Sem ela, “negar” vira pergunta. Erro,
+        tempo esgotado ou resposta sem exatamente um rótulo → você decide.
       </p>
     </ApiInfo>
   )
@@ -179,7 +190,9 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
     >
       <p className="-mt-1 text-[11.5px] leading-snug text-subtle">
         Um modelo avalia as chamadas dos itens em modo “Smart-Approve” (seção Aprovações acima) e
-        aprova, rejeita ou pergunta a você. Erro, demora ou resposta ambígua → pergunta a você.
+        aprova ou pergunta a você, sabendo o que você pediu e o que o agente está fazendo. Em
+        Comandos/Processos/Páginas ele só complementa as listas: o que a whitelist libera roda sem
+        ele; a blacklist bloqueia. Erro, demora ou resposta ambígua → pergunta a você.
       </p>
 
       <div data-testid="smart-approve-model" className="flex items-center gap-1.5">
@@ -225,135 +238,163 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
       </div>
 
       <div className={cn('space-y-3 transition-opacity', !hasModel && 'opacity-60')}>
-        <div>
-          <div className="mb-1 text-[11px] text-subtle">Rótulos (1ª linha da resposta)</div>
-          <div className="grid grid-cols-3 gap-1.5">
-            {LABEL_FIELDS.map(({ key, caption }) => (
-              <label key={key} className="min-w-0">
-                <span className="mb-0.5 block text-[10.5px] text-faint">{caption}</span>
-                <input
-                  value={labels[key]}
-                  aria-label={`Rótulo ${caption}`}
-                  onChange={(e) => {
-                    const next = { ...labels, [key]: e.target.value }
-                    setLabels(next)
-                    if (!validateLabels(next))
-                      set({
-                        labels: {
-                          approve: next.approve.trim(),
-                          reject: next.reject.trim(),
-                          ask: next.ask.trim()
-                        }
-                      })
-                  }}
-                  className={cn(
-                    'field h-7 w-full px-2 py-0 font-mono text-[11.5px]',
-                    labelError && !labels[key].trim() && 'border-danger/60'
-                  )}
-                />
-              </label>
-            ))}
-          </div>
-          {labelError && (
-            <p data-testid="smart-label-error" className="mt-1 text-[11px] text-danger/90">
-              {labelError} (não salvo)
-            </p>
-          )}
-        </div>
-
-        <div className="flex items-center gap-2.5">
-          <span className="min-w-0 flex-1 text-[12.5px] text-fg/90">
-            Mensagens recentes no contexto
-          </span>
-          <NumberInput
-            value={sa.contextMessages}
-            disabled={false}
-            step={1}
-            min={0}
-            max={SMART_APPROVE_DEFAULTS.maxContextMessages}
-            int
-            label="Mensagens recentes no contexto do juiz"
-            onCommit={(v) =>
-              v >= 0 &&
-              v <= SMART_APPROVE_DEFAULTS.maxContextMessages &&
-              set({ contextMessages: v })
-            }
-          />
-        </div>
-        <div className="flex items-center gap-2.5">
-          <span className="min-w-0 flex-1 text-[12.5px] text-fg/90">Tempo máximo</span>
-          <NumberInput
-            value={sa.timeoutS}
-            disabled={false}
-            step={5}
-            min={SMART_APPROVE_DEFAULTS.minTimeoutS}
-            max={SMART_APPROVE_DEFAULTS.maxTimeoutS}
-            int
-            label="Tempo máximo do juiz (segundos)"
-            onCommit={(v) =>
-              v >= SMART_APPROVE_DEFAULTS.minTimeoutS &&
-              v <= SMART_APPROVE_DEFAULTS.maxTimeoutS &&
-              set({ timeoutS: v })
-            }
-          />
-          <span className="text-[12px] text-subtle">s</span>
-        </div>
-
         <CollapsibleSection
-          id="smart-prompt"
+          id="smart-advanced"
           level="sub"
-          title="Prompt do juiz"
-          summary={
-            customPrompt
-              ? { text: 'personalizado', changed: true }
-              : { text: 'padrão', changed: false }
-          }
-          aside={
-            customPrompt ? (
-              <RestoreButton onClick={() => set({ prompt: null, template: null })} />
-            ) : null
-          }
+          title="Avançado"
+          summary={smartAdvancedSummary(cfg)}
+          error={labelError ? 'rótulos inválidos' : null}
         >
-          <div className="animate-fade-in space-y-2">
+          <div className="space-y-3">
+            <ToggleRow
+              label="O juiz pode negar"
+              description="Desligado (padrão): o juiz só aprova ou pergunta a você — uma resposta “negar” vira pergunta, com o motivo como dica no card. Ligado: a chamada negada não roda e o agente recebe o motivo."
+              checked={sa.canDeny}
+              onChange={(canDeny) => set({ canDeny })}
+            />
+            <ToggleRow
+              label="Consultar o Smart-Approve também para o que a whitelist já libera"
+              description="Desligado (padrão): Comandos/Processos/Páginas cobertos inteiros pela whitelist rodam sem o juiz, e ele decide só o que as listas não decidem. Ligado: o juiz também avalia o que a whitelist libera."
+              checked={sa.judgeWhitelisted}
+              onChange={(judgeWhitelisted) => set({ judgeWhitelisted })}
+            />
             <div>
-              <div className="mb-0.5 text-[10.5px] text-faint">
-                System (<C>{'role: "system"'}</C>)
-              </div>
-              <AutoTextarea
-                value={sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT}
-                aria-label="Prompt do Smart-Approve"
-                onChange={(e) => set({ prompt: e.target.value })}
-                minRows={5}
-                maxRows={16}
-                className="field font-mono text-[11px] leading-relaxed"
-              />
-            </div>
-            <div>
-              <div className="mb-0.5 text-[10.5px] text-faint">
-                Template da mensagem (<C>{'role: "user"'}</C>)
-              </div>
-              <AutoTextarea
-                value={sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE}
-                aria-label="Template do Smart-Approve"
-                onChange={(e) => set({ template: e.target.value })}
-                minRows={5}
-                maxRows={16}
-                className="field font-mono text-[11px] leading-relaxed"
-              />
-            </div>
-            <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
-              <div className="mb-1 text-[10.5px] font-medium text-subtle">
-                Placeholders (system e template)
-              </div>
-              <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
-                {SMART_APPROVE_PLACEHOLDERS.map((p) => (
-                  <div key={p.key} className="contents">
-                    <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
-                    <dd className="text-subtle">{p.desc}</dd>
-                  </div>
+              <div className="mb-1 text-[11px] text-subtle">Rótulos (1ª linha da resposta)</div>
+              <div className="grid grid-cols-3 gap-1.5">
+                {LABEL_FIELDS.map(({ key, caption }) => (
+                  <label key={key} className="min-w-0">
+                    <span
+                      className="mb-0.5 block text-[10.5px] text-faint"
+                      title={LABEL_TITLE[key]}
+                    >
+                      {caption}
+                      {key === 'reject' && !sa.canDeny ? ' (→ perguntar)' : ''}
+                    </span>
+                    <input
+                      value={labels[key]}
+                      aria-label={`Rótulo ${caption}`}
+                      onChange={(e) => {
+                        const next = { ...labels, [key]: e.target.value }
+                        setLabels(next)
+                        if (!validateLabels(next))
+                          set({
+                            labels: {
+                              approve: next.approve.trim(),
+                              reject: next.reject.trim(),
+                              ask: next.ask.trim()
+                            }
+                          })
+                      }}
+                      className={cn(
+                        'field h-7 w-full px-2 py-0 font-mono text-[11.5px]',
+                        labelError && !labels[key].trim() && 'border-danger/60'
+                      )}
+                    />
+                  </label>
                 ))}
-              </dl>
+              </div>
+              {labelError && (
+                <p data-testid="smart-label-error" className="mt-1 text-[11px] text-danger/90">
+                  {labelError} (não salvo)
+                </p>
+              )}
             </div>
+
+            <div className="flex items-center gap-2.5">
+              <span className="min-w-0 flex-1 text-[12.5px] text-fg/90">
+                Mensagens recentes no contexto
+              </span>
+              <NumberInput
+                value={sa.contextMessages}
+                disabled={false}
+                step={1}
+                min={0}
+                max={SMART_APPROVE_DEFAULTS.maxContextMessages}
+                int
+                label="Mensagens recentes no contexto do juiz"
+                onCommit={(v) =>
+                  v >= 0 &&
+                  v <= SMART_APPROVE_DEFAULTS.maxContextMessages &&
+                  set({ contextMessages: v })
+                }
+              />
+            </div>
+            <div className="flex items-center gap-2.5">
+              <span className="min-w-0 flex-1 text-[12.5px] text-fg/90">Tempo máximo</span>
+              <NumberInput
+                value={sa.timeoutS}
+                disabled={false}
+                step={5}
+                min={SMART_APPROVE_DEFAULTS.minTimeoutS}
+                max={SMART_APPROVE_DEFAULTS.maxTimeoutS}
+                int
+                label="Tempo máximo do juiz (segundos)"
+                onCommit={(v) =>
+                  v >= SMART_APPROVE_DEFAULTS.minTimeoutS &&
+                  v <= SMART_APPROVE_DEFAULTS.maxTimeoutS &&
+                  set({ timeoutS: v })
+                }
+              />
+              <span className="text-[12px] text-subtle">s</span>
+            </div>
+
+            <CollapsibleSection
+              id="smart-prompt"
+              level="sub"
+              title="Prompt do juiz"
+              summary={
+                customPrompt
+                  ? { text: 'personalizado', changed: true }
+                  : { text: 'padrão', changed: false }
+              }
+              aside={
+                customPrompt ? (
+                  <RestoreButton onClick={() => set({ prompt: null, template: null })} />
+                ) : null
+              }
+            >
+              <div className="animate-fade-in space-y-2">
+                <div>
+                  <div className="mb-0.5 text-[10.5px] text-faint">
+                    System (<C>{'role: "system"'}</C>)
+                  </div>
+                  <AutoTextarea
+                    value={sa.prompt ?? DEFAULT_SMART_APPROVE_PROMPT}
+                    aria-label="Prompt do Smart-Approve"
+                    onChange={(e) => set({ prompt: e.target.value })}
+                    minRows={5}
+                    maxRows={16}
+                    className="field font-mono text-[11px] leading-relaxed"
+                  />
+                </div>
+                <div>
+                  <div className="mb-0.5 text-[10.5px] text-faint">
+                    Template da mensagem (<C>{'role: "user"'}</C>)
+                  </div>
+                  <AutoTextarea
+                    value={sa.template ?? DEFAULT_SMART_APPROVE_TEMPLATE}
+                    aria-label="Template do Smart-Approve"
+                    onChange={(e) => set({ template: e.target.value })}
+                    minRows={5}
+                    maxRows={16}
+                    className="field font-mono text-[11px] leading-relaxed"
+                  />
+                </div>
+                <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
+                  <div className="mb-1 text-[10.5px] font-medium text-subtle">
+                    Placeholders (system e template)
+                  </div>
+                  <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
+                    {SMART_APPROVE_PLACEHOLDERS.map((p) => (
+                      <div key={p.key} className="contents">
+                        <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
+                        <dd className="text-subtle">{p.desc}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              </div>
+            </CollapsibleSection>
           </div>
         </CollapsibleSection>
 

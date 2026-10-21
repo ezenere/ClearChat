@@ -16,5 +16,23 @@ export function processState(p: ProcessInfo, now = Date.now()): string {
     ? `saiu (código ${p.exitCode})`
     : p.signal
       ? `encerrado (${p.signal})`
-      : 'encerrado'
+      : 'falhou ao iniciar'
+}
+
+/** Encerrado com falha (código ≠ 0, sinal ou erro ao iniciar). */
+export const processFailed = (p: ProcessInfo): boolean => p.status === 'exited' && p.exitCode !== 0
+
+export type ProcessesChip =
+  { kind: 'running'; count: number } | { kind: 'finished'; count: number; failed: number } | null
+
+/**
+ * Chip do header a partir da lista do chat (a mesma do process_list): verde com os que rodam;
+ * sem nenhum rodando mas com encerrados ainda listados → neutro (com aviso se algum falhou);
+ * lista vazia → sem chip.
+ */
+export function processesChip(list: readonly ProcessInfo[]): ProcessesChip {
+  const running = list.filter((p) => p.status === 'running').length
+  if (running) return { kind: 'running', count: running }
+  if (!list.length) return null
+  return { kind: 'finished', count: list.length, failed: list.filter(processFailed).length }
 }

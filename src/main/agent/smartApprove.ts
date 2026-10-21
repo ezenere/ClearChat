@@ -6,10 +6,12 @@ import {
   argsKey,
   buildJudgeBody,
   buildJudgeMessages,
+  mapJudgeDecision,
   parseJudgeOutput,
   SMART_APPROVE_DEFAULTS,
   type JudgeContext
 } from '@shared/smartApprove'
+import { judgedLabels } from '@shared/smartApproveContext'
 import type {
   ChatConfig,
   Provider,
@@ -77,15 +79,18 @@ const RESPONSE_MAX = 2000
 
 /**
  * Chama o juiz e devolve a avaliação. NUNCA lança por falha do juiz: erro HTTP/rede, tempo
- * esgotado, resposta vazia/ambígua → decisão 'ask' (com `fallback`). Só o abort da sessão
+ * esgotado, resposta vazia/ambígua → decisão 'ask' (com `fallback`) — nunca 'reject'. Rejeitar
+ * só sai daqui com `sa.canDeny`; sem ele vira 'ask' + `wouldReject`. Só o abort da sessão
  * propaga como decisão 'ask' + fallback 'error' — quem chama confere `signal.aborted`.
  */
 export async function runJudge(input: JudgeInput): Promise<SmartApproveRecord> {
   const t0 = Date.now()
   const { sa, provider } = input
+  const judged = judgedLabels(input.ctx.check, input.ctx.judgeIdx)
   const base = {
     providerId: sa.providerId ?? '',
-    model: sa.model ?? ''
+    model: sa.model ?? '',
+    ...(judged.length ? { judged } : {})
   }
   const req = buildJudgeRequest(input)
   if (!req || !provider) {
@@ -127,10 +132,13 @@ export async function runJudge(input: JudgeInput): Promise<SmartApproveRecord> {
   }
   clearTimeout(timer)
   const parsed = parseJudgeOutput(acc.content, sa.labels)
+  // sem "O juiz pode negar": rejeitar vira perguntar (o motivo fica como dica no card)
+  const mapped = parsed.decision ? mapJudgeDecision(parsed.decision, sa.canDeny) : null
   const rec: SmartApproveRecord = {
     ...base,
     model: base.model,
-    decision: parsed.decision ?? 'ask',
+    decision: mapped?.decision ?? 'ask',
+    ...(mapped?.wouldReject ? { wouldReject: true } : {}),
     // sem decisão, o texto do juiz não vira "motivo" (fica em `response`)
     reason: parsed.decision ? parsed.reason : '',
     ...(acc.usage ? { usage: acc.usage } : {}),

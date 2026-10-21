@@ -148,6 +148,20 @@ export function smartApproveSummary(cfg: Pick<ChatConfig, 'smartApprove'>): Sect
   const sa = normalizeSmartApprove(cfg.smartApprove)
   const changes: string[] = []
   if (sa.model) changes.push(shortModel(sa.model))
+  changes.push(...smartAdvancedChanges(cfg))
+  return changedSummary(changes, 'sem modelo')
+}
+
+/** Resumo do "Avançado" do Smart-Approve (o que difere do padrão). */
+export function smartAdvancedSummary(cfg: Pick<ChatConfig, 'smartApprove'>): SectionSummary {
+  return changedSummary(smartAdvancedChanges(cfg), 'padrão')
+}
+
+function smartAdvancedChanges(cfg: Pick<ChatConfig, 'smartApprove'>): string[] {
+  const sa = normalizeSmartApprove(cfg.smartApprove)
+  const changes: string[] = []
+  if (sa.canDeny) changes.push('pode negar')
+  if (sa.judgeWhitelisted) changes.push('julga a whitelist')
   if (
     sa.labels.approve !== DEFAULT_SMART_APPROVE_LABELS.approve ||
     sa.labels.reject !== DEFAULT_SMART_APPROVE_LABELS.reject ||
@@ -158,7 +172,7 @@ export function smartApproveSummary(cfg: Pick<ChatConfig, 'smartApprove'>): Sect
     changes.push(`${sa.contextMessages} msgs`)
   if (sa.timeoutS !== SMART_APPROVE_DEFAULTS.timeoutS) changes.push(`${sa.timeoutS} s`)
   if (sa.prompt != null || sa.template != null) changes.push('prompt personalizado')
-  return changedSummary(changes, 'sem modelo')
+  return changes
 }
 
 export function toolsSendingSummary(cfg: ChatConfig): SectionSummary {

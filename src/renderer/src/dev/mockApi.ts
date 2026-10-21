@@ -88,6 +88,41 @@ export function createMockApi(scenario: string): ClearApi {
       logFile: `${HOME}/.config/ClearChat/processes/c1-p1.log`
     }
   ]
+  // ?scenario=processes → também encerrados ainda listados (código 0 e falha), para o chip neutro;
+  // ?scenario=processes-many → 30 processos (lista do popover rola)
+  if (scenario === 'processes' || scenario === 'processes-many') {
+    const done = (
+      pid: string,
+      name: string,
+      command: string,
+      exitCode: number,
+      lastLine: string
+    ): ProcessInfo => ({
+      ...processes[0],
+      id: pid,
+      name,
+      command,
+      pid: null,
+      status: 'exited',
+      exitCode,
+      startedAt: now - 5 * 60_000,
+      endedAt: now - 4 * 60_000,
+      lines: 12,
+      lastLine,
+      logFile: `${HOME}/.config/ClearChat/processes/c1-${pid}.log`
+    })
+    processes.push(
+      done('p2', 'build', 'npm run build', 0, '✓ built in 3.2s'),
+      done('p3', 'testes', 'npm test', 1, 'Tests: 2 failed, 41 passed')
+    )
+    if (scenario === 'processes-many')
+      for (let i = 4; i <= 30; i++)
+        processes.push(
+          i % 3
+            ? done(`p${i}`, `job ${i}`, `./scripts/job.sh ${i}`, i % 5 ? 0 : 2, `job ${i} fim`)
+            : { ...processes[0], id: `p${i}`, name: `worker ${i}`, pid: 5000 + i }
+        )
+  }
   const emit = (e: AgentEvent): void => listeners.forEach((l) => l(e))
   // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
   ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
@@ -442,6 +477,87 @@ export function createMockApi(scenario: string): ClearApi {
       content:
         'Encontre todos os lugares em src/ que chamam parseSSE e liste arquivo:linha com um resumo de como o retorno é usado.'
     }),
+    // resultado das aprovações no card: aprovada → detalhes no selo "ok" (lista, Smart-Approve,
+    // você); negada/bloqueada → faixa compacta
+    msg(
+      's1a',
+      {
+        role: 'assistant',
+        content: 'Vou procurar os usos e limpar o arquivo temporário que criei.',
+        tool_calls: [
+          {
+            id: 'tsa1',
+            type: 'function',
+            function: { name: 'shell', arguments: '{"command":"ls src/main/agent"}' }
+          },
+          {
+            id: 'tsa2',
+            type: 'function',
+            function: {
+              name: 'shell',
+              arguments: '{"command":"git diff --stat && rm -f tmp-usos.txt"}'
+            }
+          },
+          {
+            id: 'tsa3',
+            type: 'function',
+            function: { name: 'shell', arguments: '{"command":"rm -rf ~/.cache/clearchat"}' }
+          }
+        ]
+      },
+      { usage: { promptTokens: 900, completionTokens: 60 }, model: 'anthropic/claude-haiku-4.5' }
+    ),
+    msg(
+      's1a',
+      { role: 'tool', tool_call_id: 'tsa1', content: 'llm.ts\npreview.ts\nrunner.ts' },
+      {
+        toolStatus: 'ok',
+        approval: {
+          item: 'commands',
+          mode: 'lists',
+          allowed: [{ text: 'ls src/main/agent', entry: 'ls *' }]
+        }
+      }
+    ),
+    msg(
+      's1a',
+      { role: 'tool', tool_call_id: 'tsa2', content: ' 1 file changed, 2 insertions(+)' },
+      {
+        toolStatus: 'ok',
+        approval: {
+          item: 'commands',
+          mode: 'smart',
+          allowed: [{ text: 'git diff --stat', entry: 'git diff *' }],
+          judgeAllowed: ['rm -f tmp-usos.txt']
+        },
+        smartApprove: {
+          decision: 'approve',
+          reason: 'Apaga o arquivo temporário que o próprio subagente criou para a tarefa.',
+          providerId: '',
+          model: 'mock/judge',
+          judged: ['rm -f tmp-usos.txt'],
+          durationMs: 640,
+          usage: { promptTokens: 1800, completionTokens: 18, cost: 0.00004 }
+        }
+      }
+    ),
+    msg(
+      's1a',
+      {
+        role: 'tool',
+        tool_call_id: 'tsa3',
+        content:
+          'Bloqueado pela blacklist (comandos): "rm -rf *" casou com "rm -rf ~/.cache/clearchat"'
+      },
+      {
+        toolStatus: 'denied',
+        approval: {
+          item: 'commands',
+          mode: 'smart',
+          blocked: { text: 'rm -rf ~/.cache/clearchat', entry: 'rm -rf *' }
+        }
+      }
+    ),
     msg(
       's1a',
       {
@@ -1757,15 +1873,11 @@ export function createMockApi(scenario: string): ClearApi {
     },
     processes: {
       list: (chatId) => delay(processes.filter((p) => p.chatId === chatId)),
+      // como o main: parar (ou dispensar um encerrado) tira da lista
       stop: async (chatId, pid) => {
-        const p = processes.find((x) => x.chatId === chatId && x.id === pid)
-        if (p && p.status === 'running') {
-          Object.assign(p, {
-            status: 'exited',
-            exitCode: null,
-            signal: 'SIGTERM',
-            endedAt: Date.now()
-          })
+        const i = processes.findIndex((x) => x.chatId === chatId && x.id === pid)
+        if (i >= 0) {
+          processes.splice(i, 1)
           emit({
             type: 'processes-updated',
             chatId,

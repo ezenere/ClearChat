@@ -35,6 +35,17 @@ export function SmartApproveInfo({ rec }: { rec: SmartApproveRecord }): React.JS
           <C>Rejeitado pelo Smart-Approve (modelo): motivo</C>.
         </p>
       )}
+      {rec.wouldReject && (
+        <p>
+          O juiz respondeu o rótulo de negar; com “O juiz pode negar” desligado, a decisão ficou com
+          você (o motivo aparece como dica).
+        </p>
+      )}
+      {rec.judged && rec.judged.length > 0 && (
+        <p>
+          Avaliou só o que as listas não decidiram: <C>{rec.judged.join(' · ')}</C>.
+        </p>
+      )}
       {rec.error && <p className="text-warning/90">{rec.error}</p>}
       {rec.response != null && (
         <div>
@@ -69,9 +80,9 @@ export function SmartApproveLine({
   const run = useStore((s) => s.run)
   const head =
     rec.decision === 'approve'
-      ? { icon: ShieldCheck, text: 'Aprovado pelo Smart-Approve', cls: 'text-success/90' }
+      ? { icon: ShieldCheck, text: 'Liberado pelo Smart-Approve', cls: 'text-success/90' }
       : rec.decision === 'reject'
-        ? { icon: ShieldX, text: 'Rejeitado pelo Smart-Approve', cls: 'text-danger/90' }
+        ? { icon: ShieldX, text: 'Negado pelo Smart-Approve', cls: 'text-danger/90' }
         : rec.fallback
           ? {
               icon: ShieldAlert,
@@ -80,7 +91,7 @@ export function SmartApproveLine({
             }
           : {
               icon: ShieldQuestion,
-              text: 'Smart-Approve pediu sua decisão',
+              text: 'Smart-Approve sugeriu perguntar',
               cls: 'text-warning/90'
             }
   const Icon = head.icon
@@ -131,7 +142,24 @@ export function SmartApproveLine({
           </span>
         )}
         <SmartApproveInfo rec={rec} />
+        {rec.wouldReject && (
+          <span
+            data-testid="smart-would-reject"
+            title="O juiz respondeu negar, mas “O juiz pode negar” está desligado (aba Tools → Smart-Approve → Avançado): a decisão fica com você."
+            className="shrink-0 rounded bg-warning/10 px-1.5 py-px text-[10.5px] text-warning/90"
+          >
+            teria negado
+          </span>
+        )}
       </div>
+      {rec.judged && rec.judged.length > 0 && rec.decision !== 'approve' && (
+        <p
+          className="mt-0.5 truncate pl-5 font-mono text-[11px] text-subtle"
+          title={rec.judged.join('\n')}
+        >
+          avaliou: {rec.judged.join(' · ')}
+        </p>
+      )}
       {(reason || action) && (
         <div className="mt-1 flex min-w-0 items-start gap-3 pl-5">
           <p
