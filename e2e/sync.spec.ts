@@ -85,7 +85,7 @@ async function startLlm(): Promise<void> {
                 type: 'function',
                 function: {
                   name: 'shell',
-                  arguments: JSON.stringify({ command: 'echo remoto-ok' })
+                  arguments: JSON.stringify({ command: 'expr remoto-ok' })
                 }
               }
             ]

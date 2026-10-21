@@ -35,35 +35,40 @@ export interface JudgeInput {
   signal: AbortSignal
 }
 
-/** Request exata da chamada ao juiz. */
-export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltRequest | null {
-  const { sa, provider } = input
-  if (!provider || !sa.model) return null
+/**
+ * Request de uma chamada "lateral" (fora do histórico): juiz do Smart-Approve e resumidor da coleta
+ * de contexto. System + user, temperatura 0, `maxTokens`, streaming acumulado.
+ */
+export function buildSideRequest(input: {
+  provider: Provider
+  model: string
+  messages: { role: 'system' | 'user'; content: string }[]
+  maxTokens: number
+  chatConfig: Pick<ChatConfig, 'appSignature' | 'appSignatureCustom'>
+}): BuiltRequest {
+  const { provider, model, messages } = input
   const signature = resolveAppSignatureHeaders(
     input.chatConfig.appSignature ?? DEFAULT_APP_SIGNATURE,
     input.chatConfig.appSignatureCustom
   )
   const kind = providerKind(provider)
   const adapter = adapterFor(kind)
-  const messages = buildJudgeMessages(sa, input.ctx)
   // Parâmetros fixos (temperature 0, max_tokens) passam pelo mesmo filtro do chat: modelos que
   // rejeitam temperature (ex.: claude-sonnet-5-5 nativo → 400) recebem a request sem ele.
   const support = filterParams(
-    {
-      temperature: SMART_APPROVE_DEFAULTS.temperature,
-      max_tokens: SMART_APPROVE_DEFAULTS.maxTokens
-    },
+    { temperature: SMART_APPROVE_DEFAULTS.temperature, max_tokens: input.maxTokens },
     kind,
     provider.id,
-    sa.model,
+    model,
     null
   )
   let body: Record<string, unknown>
   if (kind === 'anthropic') {
     // max_tokens é obrigatório na API nativa (o filtro nunca o tira na Anthropic)
-    body = buildAnthropicBody({ model: sa.model, messages, params: support.send })
+    body = buildAnthropicBody({ model, messages, params: support.send })
   } else {
-    body = buildJudgeBody(sa.model, messages, kind === 'openrouter')
+    body = buildJudgeBody(model, messages, kind === 'openrouter')
+    body.max_tokens = input.maxTokens
     for (const k of ['temperature', 'max_tokens'] as const) if (!(k in support.send)) delete body[k]
   }
   return {
@@ -73,6 +78,19 @@ export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltReque
     kind,
     ...(support.notes.length ? { notes: support.notes } : {})
   }
+}
+
+/** Request exata da chamada ao juiz. */
+export function buildJudgeRequest(input: Omit<JudgeInput, 'signal'>): BuiltRequest | null {
+  const { sa, provider } = input
+  if (!provider || !sa.model) return null
+  return buildSideRequest({
+    provider,
+    model: sa.model,
+    messages: buildJudgeMessages(sa, input.ctx),
+    maxTokens: SMART_APPROVE_DEFAULTS.maxTokens,
+    chatConfig: input.chatConfig
+  })
 }
 
 const RESPONSE_MAX = 2000
@@ -139,6 +157,10 @@ export async function runJudge(input: JudgeInput): Promise<SmartApproveRecord> {
     model: base.model,
     decision: mapped?.decision ?? 'ask',
     ...(mapped?.wouldReject ? { wouldReject: true } : {}),
+    // categoria (perguntar/negar): da linha CATEGORY:; templates antigos sem ela → ausente
+    ...(parsed.decision && parsed.decision !== 'approve' && parsed.category
+      ? { category: parsed.category }
+      : {}),
     // sem decisão, o texto do juiz não vira "motivo" (fica em `response`)
     reason: parsed.decision ? parsed.reason : '',
     ...(acc.usage ? { usage: acc.usage } : {}),

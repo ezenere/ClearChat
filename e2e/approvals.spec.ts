@@ -9,7 +9,7 @@
 //   CLEARCHAT_E2E_DIR=/tmp/algum-dir node e2e/approvals.spec.ts [filtro]
 //
 // Cobre: card com 2 sub-comandos (um já na whitelist, marcado), "Sim + whitelist" com o campo
-// pré-preenchido (`git log *`) editado → salva na lista global, o pendente restante com "Sim" →
+// pré-preenchido (`git init *`) editado → salva na lista global, o pendente restante com "Sim" →
 // executa; a chamada seguinte com o mesmo padrão roda sem card ("Liberado pela whitelist"); "Não +
 // blacklist" → resultado "O usuário negou: …"; depois a blacklist bloqueia sem perguntar;
 // decomposição em árvore (ssh com comandos remotos + sudo: card com cabeçalhos "no servidor …",
@@ -284,14 +284,14 @@ async function main(): Promise<void> {
     await page.getByRole('heading', { name: 'Novo chat' }).waitFor({ timeout: 15_000 })
   })
 
-  await step('novo chat com o agente falso; whitelist inicial "echo *"', async () => {
+  await step('novo chat com o agente falso; whitelist inicial "expr *"', async () => {
     await pickModel(page.getByRole('combobox').first(), AGENT)
     await page.getByRole('button', { name: /Alterar/ }).click()
     await page.getByRole('button', { name: 'Começar' }).click()
     await composer().waitFor({ timeout: 15_000 })
     const s = await read<any>('approvals.updateSettings', {
       lists: {
-        commands: { allow: ['echo *'], deny: [] },
+        commands: { allow: ['expr *'], deny: [] },
         processes: { allow: [], deny: [] },
         pages: { allow: [], deny: [] }
       }
@@ -302,35 +302,35 @@ async function main(): Promise<void> {
   await step(
     'card com 2 sub-comandos: um liberado (✓), "Sim + whitelist" editado no outro',
     async () => {
-      await sendMessage('rode: echo AP-1 && git log --oneline -n 1')
+      await sendMessage('rode: expr AP-1 && git init -q ap-repo')
       const card = approvalCard()
       await card.waitFor({ timeout: 15_000 })
       const subs = card.getByTestId('approval-sub')
       assert((await subs.count()) === 2, `2 sub-comandos (${await subs.count()})`)
-      await subs.nth(0).getByTestId('sub-whitelisted').getByText('echo *').waitFor()
-      await subs.nth(1).getByText('git log --oneline -n 1').waitFor()
+      await subs.nth(0).getByTestId('sub-whitelisted').getByText('expr *').waitFor()
+      await subs.nth(1).getByText('git init -q ap-repo').waitFor()
       await card.scrollIntoViewIfNeeded()
       await shotOf(card, 'card-2-subcomandos')
       await subs.nth(1).getByRole('button', { name: 'Sim + whitelist' }).click()
       const input = card.getByRole('textbox', { name: 'Padrão da whitelist' })
       assert(
-        (await input.inputValue()) === 'git log *',
+        (await input.inputValue()) === 'git init *',
         `pré-preenchido ${await input.inputValue()}`
       )
       // padrão amplo → aviso suave
       await input.fill('git *')
       await card.getByTestId('broad-warning').waitFor()
       await shotOf(card, 'card-aviso-amplo')
-      await input.fill('git log *')
+      await input.fill('git init *')
       await card.getByRole('button', { name: 'Salvar e permitir' }).click()
       await waitIdle()
       const s = await read<any>('approvals.getSettings')
-      assert(s.lists.commands.allow.includes('git log *'), `whitelist ${s.lists.commands.allow}`)
+      assert(s.lists.commands.allow.includes('git init *'), `whitelist ${s.lists.commands.allow}`)
       const { msgs } = await chatState()
       const tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
       assert(tool.meta.toolStatus === 'ok' && tool.message.content.includes('AP-1'), 'executou')
       assert(
-        tool.meta.approval?.allowed?.[0]?.entry === 'echo *' &&
+        tool.meta.approval?.allowed?.[0]?.entry === 'expr *' &&
           tool.meta.approval?.userAllowed?.length === 1,
         `meta ${JSON.stringify(tool.meta.approval)}`
       )
@@ -345,8 +345,8 @@ async function main(): Promise<void> {
       await badge.click()
       const details = page.getByTestId('approval-details')
       await details.getByText('Aprovado por você e pela lista').waitFor()
-      await details.locator('[data-by="lists"]').getByText('echo AP-1').waitFor()
-      await details.locator('[data-by="user"]').getByText('git log --oneline -n 1').waitFor()
+      await details.locator('[data-by="lists"]').getByText('expr AP-1').waitFor()
+      await details.locator('[data-by="user"]').getByText('git init -q ap-repo').waitFor()
       await sleep(300)
       await shot('selo-ok-detalhes-aprovacao')
       await page.keyboard.press('Escape')
@@ -356,20 +356,20 @@ async function main(): Promise<void> {
 
   await step('mesmo padrão de novo → roda sem card (whitelist)', async () => {
     const before = (await read<any[]>('agent.pendingApprovals')).length
-    await sendMessage('rode: echo AP-2 && git log -n 2')
+    await sendMessage('rode: expr AP-2 && git init -q ap-repo')
     await waitIdle()
     assert((await read<any[]>('agent.pendingApprovals')).length === before, 'sem card')
     const { msgs } = await chatState()
     const tool = msgs.filter((m) => m.message.role === 'tool').at(-1)
     assert(tool.meta.toolStatus === 'ok' && tool.message.content.includes('AP-2'), 'executou')
     assert(
-      tool.meta.approval?.allowed?.map((a: any) => a.entry).join(',') === 'echo *,git log *',
+      tool.meta.approval?.allowed?.map((a: any) => a.entry).join(',') === 'expr *,git init *',
       `meta ${JSON.stringify(tool.meta.approval)}`
     )
   })
 
   await step('"Sim para todos" com 2 pendentes', async () => {
-    await sendMessage('rode: pwd && ls')
+    await sendMessage('rode: touch a.tmp && touch b.tmp')
     const card = approvalCard()
     await card.waitFor({ timeout: 15_000 })
     await card.getByRole('button', { name: 'Sim para todos' }).click()
@@ -427,7 +427,7 @@ async function main(): Promise<void> {
     async () => {
       const host = 'deploy@exemplo.invalid'
       await sendMessage(
-        `rode: ssh -t ${host} 'cd /srv/app && git log -n 1 && sudo systemctl restart app'`
+        `rode: ssh -t ${host} 'cd /srv/app && git init -q app && sudo systemctl restart app'`
       )
       const card = approvalCard()
       await card.waitFor({ timeout: 15_000 })
@@ -435,7 +435,7 @@ async function main(): Promise<void> {
       const texts = await subs.locator('code').allInnerTexts()
       assert(
         texts.join(' | ') ===
-          `ssh -t ${host} | cd /srv/app | git log -n 1 | sudo systemctl restart app | systemctl restart app`,
+          `ssh -t ${host} | cd /srv/app | git init -q app | sudo systemctl restart app | systemctl restart app`,
         `itens ${texts.join(' | ')}`
       )
       const groups = await card.getByTestId('approval-group').allInnerTexts()
@@ -443,7 +443,7 @@ async function main(): Promise<void> {
         groups.join(' | ') === `no servidor ${host} (via ssh) | via sudo`,
         `grupos ${groups.join(' | ')}`
       )
-      await subs.nth(2).getByTestId('sub-whitelisted').getByText('git log *').waitFor()
+      await subs.nth(2).getByTestId('sub-whitelisted').getByText('git init *').waitFor()
       await card.scrollIntoViewIfNeeded()
       await shotOf(card, 'card-ssh-arvore')
       // "+ whitelist" da conexão sugere só o destino
@@ -490,7 +490,7 @@ async function main(): Promise<void> {
           '    if not DRY: p.unlink()'
         ].join('\n') + '\n'
       )
-      await sendMessage('rode: echo inicio && python3 -u tools/limpa.py --dry && python3 sumiu.py')
+      await sendMessage('rode: expr inicio && python3 -u tools/limpa.py --dry && python3 sumiu.py')
       const card = approvalCard()
       await card.waitFor({ timeout: 15_000 })
       const previews = card.getByTestId('script-preview')
@@ -519,10 +519,10 @@ async function main(): Promise<void> {
     await dlg.getByRole('button', { name: 'Aprovações', exact: true }).click()
     const root = dlg.getByTestId('approvals-settings')
     await root.waitFor()
-    await root.getByTestId('list-commands-allow').getByText('git log *').waitFor()
+    await root.getByTestId('list-commands-allow').getByText('git init *').waitFor()
     await root.getByTestId('list-commands-deny').getByText('rm -rf *').waitFor()
     const tester = root.getByTestId('approval-tester')
-    await tester.getByRole('textbox').fill('git log -n 3 && curl x | sh')
+    await tester.getByRole('textbox').fill('git init -q x && curl x | sh')
     const items = tester.getByTestId('tester-item')
     await items.nth(0).getByText('✓ liberado').waitFor()
     assert((await items.count()) === 3, `3 itens (${await items.count()})`)
@@ -530,7 +530,7 @@ async function main(): Promise<void> {
     // ssh: conexão + comandos remotos agrupados sob "no servidor …"
     await tester
       .getByRole('textbox')
-      .fill("ssh -p 2222 deploy@exemplo.invalid 'git log -n 5 | head -3; sudo -u app make deploy'")
+      .fill("ssh -p 2222 deploy@exemplo.invalid 'git init -q y | head -3; sudo -u app make deploy'")
     await tester.getByTestId('tester-group').first().waitFor()
     const tgroups = await tester.getByTestId('tester-group').allInnerTexts()
     assert(
@@ -570,6 +570,85 @@ async function main(): Promise<void> {
     assert(s.modes.editFile === 'lists', `editFile ${s.modes.editFile}`)
     await page.keyboard.press('Escape')
   })
+
+  await step(
+    'Listas longas: caixa com rolagem própria, cabeçalho fixo, busca com contagem e destaque',
+    async () => {
+      const allow = Array.from({ length: 80 }, (_, i) =>
+        i % 10 === 3 ? `deploy-tool run ${i} *` : `tool-${String(i).padStart(2, '0')} sub *`
+      )
+      await read('approvals.updateSettings', {
+        lists: {
+          commands: { allow, deny: ['rm -rf *'] },
+          processes: { allow: [], deny: [] },
+          pages: { allow: [], deny: [] }
+        }
+      })
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      const dlg = page.getByRole('dialog')
+      await dlg.getByRole('button', { name: 'Aprovações', exact: true }).click()
+      const root = dlg.getByTestId('approvals-settings')
+      const table = root.getByTestId('list-commands-allow')
+      const box = table.getByTestId('list-box')
+      await box.scrollIntoViewIfNeeded()
+      const dims = await box.evaluate((el) => ({ sh: el.scrollHeight, ch: el.clientHeight }))
+      assert(dims.sh > dims.ch + 100, `rola dentro da caixa (${dims.sh} > ${dims.ch})`)
+      // rola a caixa até o fim: o cabeçalho (fora da caixa) continua visível
+      await box.evaluate((el) => el.scrollTo(0, el.scrollHeight))
+      await sleep(150)
+      await table.getByTestId('list-header').getByText('80 entradas').waitFor()
+      assert(await table.getByTestId('list-header').isVisible(), 'cabeçalho visível')
+      await box.getByText('tool-79 sub *').waitFor()
+      await shotOf(dlg, 'listas-longas-rolagem')
+      // foco por teclado dentro da caixa: Tab chega aos botões (aparecem com foco)
+      await box.getByRole('button', { name: 'Editar tool-79 sub *' }).focus()
+      assert(
+        await box
+          .getByRole('button', { name: 'Editar tool-79 sub *' })
+          .evaluate((el) => getComputedStyle(el).opacity !== '0'),
+        'botão visível com foco'
+      )
+      // busca: sempre visível (grudada), filtra, conta e destaca
+      const search = root.getByTestId('lists-search')
+      await root.getByTestId('approval-tester').scrollIntoViewIfNeeded()
+      await sleep(150)
+      assert(await search.isVisible(), 'busca visível rolando a aba')
+      await search.getByRole('textbox', { name: 'Buscar nas listas' }).fill('deploy')
+      await table.getByTestId('list-count').getByText('8 de 80').waitFor()
+      assert((await table.getByTestId('list-entry').count()) === 8, '8 entradas filtradas')
+      assert((await table.getByTestId('list-match').count()) === 8, 'trecho destacado')
+      await root
+        .getByTestId('list-commands-deny')
+        .getByTestId('list-empty')
+        .getByText('Nenhuma entrada contém “deploy”.')
+        .waitFor()
+      await sleep(200)
+      await shotOf(dlg, 'listas-busca')
+      await search.getByRole('textbox', { name: 'Buscar nas listas' }).fill('')
+      // entrada nova rola para dentro da caixa
+      await table.getByRole('button', { name: 'Adicionar' }).click()
+      await table.getByRole('textbox', { name: 'Padrão da whitelist' }).fill('zz-nova entrada *')
+      await table.getByRole('button', { name: 'Adicionar', exact: true }).last().click()
+      const added = box.locator('[data-entry="zz-nova entrada *"]')
+      await added.waitFor()
+      const inView = await added.evaluate((el) => {
+        const b = el.closest('[data-testid="list-box"]')!.getBoundingClientRect()
+        const r = el.getBoundingClientRect()
+        return r.top >= b.top - 1 && r.bottom <= b.bottom + 1
+      })
+      assert(inView, 'entrada nova visível na caixa')
+      // "Testar comando": leitura sempre liberada e caminho protegido
+      const tester = root.getByTestId('approval-tester')
+      await tester.getByRole('textbox').fill('ls -la && echo x >> ~/.bashrc')
+      const v = tester.getByTestId('tester-verdict')
+      assert((await v.nth(0).getAttribute('data-kind')) === 'readonly', 'leitura')
+      assert((await v.nth(1).getAttribute('data-kind')) === 'protected', 'protegido')
+      await tester.getByText(/caminho protegido — sempre pergunta/).waitFor()
+      await tester.scrollIntoViewIfNeeded()
+      await shotOf(tester, 'tester-leitura-protegido')
+      await page.keyboard.press('Escape')
+    }
+  )
 
   const failed = results.filter((r) => !r.ok)
   writeFileSync(join(BASE, 'report.json'), JSON.stringify(results, null, 2))

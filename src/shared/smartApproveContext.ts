@@ -1,12 +1,20 @@
 // Smart-Approve: contexto do juiz além da chamada em si — o objetivo do usuário (mensagens digitadas
 // na sessão principal), a tarefa do subagente, a atividade recente da sessão, os arquivos que o
-// agente criou/editou e o que já foi aprovado antes (whitelist parecida, aprovações suas). Funções
+// agente criou/editou, o que já foi aprovado antes (whitelist parecida, aprovações suas) e a
+// descrição do ambiente (sua + a capturada pelo resumidor). Funções
 // puras e determinísticas (mesma entrada → mesmo texto): o main monta a partir do histórico
 // persistido; o renderer usa o mesmo código no (i) e no "Testar" com o histórico de exemplo.
 // Ver SPEC.md → "Smart-Approve → Contexto do juiz".
 //
 // Orçamento (JUDGE_CONTEXT_LIMITS): cada seção tem o próprio teto de caracteres e a soma fica em
-// ~6.000 chars — o prompt do juiz não cresce com o tamanho da conversa.
+// ~6.000 chars (+ até ~2.700 da descrição do ambiente) — o prompt do juiz não cresce com o tamanho
+// da conversa.
+//
+// Defesa contra prompt injection (SPEC → "Contexto do juiz"): o juiz NUNCA vê resultados de tool
+// (páginas, arquivos lidos, saída de comandos) nem a prosa do agente (que pode repetir esse
+// conteúdo literalmente — por isso a "última fala do agente" saiu em 0.8.5). Vê só: o que o usuário
+// digitou, a tarefa do subagente, nomes + args curtos + status das chamadas, caminhos tocados, o
+// que já foi aprovado, a decomposição e o começo dos scripts que o comando vai EXECUTAR.
 import { contentText } from './attachments'
 import { checkItemLabel, ITEM_TOOL } from './approvalPolicy'
 import { scriptJudgeText } from './scriptPreview'
@@ -29,8 +37,9 @@ export const JUDGE_CONTEXT_LIMITS = {
   toolCalls: 12,
   toolArgChars: 140,
   toolChars: 1100,
-  /** Última fala do agente (o que ele disse que ia fazer). */
-  agentTextChars: 300,
+  /** Descrição do ambiente: a sua (chat/global) e a capturada da conversa. */
+  environmentChars: 1500,
+  capturedChars: 1200,
   /** Arquivos criados/editados (sessão + cadeia de pais). */
   files: 30,
   filesChars: 1000,
@@ -71,8 +80,6 @@ export interface JudgeExtras {
   subagent: JudgeSubagent | null
   /** Últimas chamadas de tool da sessão chamadora (a mais antiga primeiro). */
   recentTools: JudgeToolCall[]
-  /** Último texto do assistente na sessão chamadora (cortado). */
-  lastAgentText: string
   /** Mais recente primeiro; da própria sessão antes das dos pais. */
   touchedFiles: JudgeTouchedFile[]
   /** Entradas da whitelist parecidas com o que o juiz decide (mesmo programa/host/domínio). */
@@ -85,7 +92,6 @@ export const EMPTY_JUDGE_EXTRAS: JudgeExtras = {
   userGoal: [],
   subagent: null,
   recentTools: [],
-  lastAgentText: '',
   touchedFiles: [],
   approvedWhitelist: [],
   approvedByUser: []
@@ -204,17 +210,6 @@ export function recentToolCallsFrom(history: StoredMessage[]): JudgeToolCall[] {
     out.unshift(all[i])
   }
   return out
-}
-
-/** Último texto do assistente (o que o agente disse que ia fazer). */
-export function lastAgentTextFrom(history: StoredMessage[]): string {
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i]
-    if (m.message.role !== 'assistant' || m.meta?.kind === 'error') continue
-    const t = flat(m.message.content ?? '')
-    if (t) return cut(t, JUDGE_CONTEXT_LIMITS.agentTextChars)
-  }
-  return ''
 }
 
 // ---------------- arquivos tocados ----------------
@@ -437,7 +432,6 @@ export function buildJudgeExtras(input: JudgeExtrasInput): JudgeExtras {
     userGoal: userGoalFrom(main),
     subagent: subagentInfo(input),
     recentTools: recentToolCallsFrom(input.history),
-    lastAgentText: lastAgentTextFrom(input.history),
     touchedFiles: touchedFilesFrom(sources, input.cwd),
     approvedWhitelist: relevantWhitelist(input.check, input.judgeIdx, input.lists),
     approvedByUser: userApprovedFrom(input.history, input.item)
@@ -509,17 +503,44 @@ export function approvedBlock(x: JudgeExtras): string {
   return `\nPreviously approved (context only):\n${parts.join('\n')}\n`
 }
 
-/** {{recent_activity}}: últimas chamadas de tool (status + nome + args curtos) e a última fala. */
+/** {{recent_activity}}: últimas chamadas de tool (status + nome + args curtos; nunca o resultado). */
 export function recentActivityBlock(x: JudgeExtras): string {
-  if (!x.recentTools.length && !x.lastAgentText) return ''
-  const lines: string[] = []
-  if (x.recentTools.length) {
-    lines.push("Agent's recent tool calls (oldest first):")
-    for (const t of x.recentTools)
-      lines.push(`- [${t.status}] ${t.name}${t.summary ? `: ${t.summary}` : ''}`)
-  }
-  if (x.lastAgentText) lines.push(`Agent's latest message: "${x.lastAgentText}"`)
+  if (!x.recentTools.length) return ''
+  const lines: string[] = ["Agent's recent tool calls (oldest first; outputs are never shown):"]
+  for (const t of x.recentTools)
+    lines.push(`- [${t.status}] ${t.name}${t.summary ? `: ${t.summary}` : ''}`)
   return `\n${lines.join('\n')}\n`
+}
+
+/** {{environment}}: a descrição do ambiente escrita por você e o contexto capturado da conversa. */
+export interface JudgeEnvironment {
+  /** Descrição do ambiente (usuário): a do chat/persona ou a global. */
+  user?: string
+  /** Contexto capturado da conversa (resumidor; no subagente, a descrição derivada dele). */
+  captured?: string
+}
+
+/**
+ * Texto de {{environment}} (vazio sem nada). Fica no começo do template (muda pouco → cache). As
+ * duas partes são separadas: a sua descrição é informação confiável sobre as máquinas e o que pode
+ * ser feito; a capturada resume só o que você disse na conversa.
+ */
+export function environmentBlock(env: JudgeEnvironment | undefined): string {
+  const L = JUDGE_CONTEXT_LIMITS
+  const clip = (t: string, max: number): string => {
+    const s = t.replace(/\r/g, '').trim()
+    return s.length > max ? `${s.slice(0, max)}… [+${s.length - max} chars]` : s
+  }
+  const parts: string[] = []
+  if (env?.user?.trim())
+    parts.push(
+      `Descrição do ambiente (usuário) — written by the user about their machines and what may be done there:\n"""\n${clip(env.user, L.environmentChars)}\n"""`
+    )
+  if (env?.captured?.trim())
+    parts.push(
+      `Contexto capturado da conversa — summarized by the app from what the user typed (goals, constraints, permissions they gave):\n"""\n${clip(env.captured, L.capturedChars)}\n"""`
+    )
+  return parts.length ? `${parts.join('\n')}\n` : ''
 }
 
 /**
@@ -538,7 +559,8 @@ export function checkBlock(check: ApprovalCheck, judgeIdx: number[], maxLines = 
     open[d] = it.group
     open.length = d + 1
     const tags: string[] = []
-    if (judge.has(i)) {
+    if (it.readOnly && !judge.has(i)) tags.push('read-only (always allowed)')
+    else if (judge.has(i)) {
       tags.push(
         it.verdict === 'allow' && it.entry
           ? `TO DECIDE — matches whitelist "${it.entry}"`

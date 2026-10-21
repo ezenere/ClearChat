@@ -33,6 +33,7 @@ export const PRESET_FIELDS = [
   'cacheEnabled',
   'subagentSystemPrompt',
   'approvalModes',
+  'acceptEditsInRoot',
   'smartApprove',
   'appSignature',
   'appSignatureCustom',

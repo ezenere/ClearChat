@@ -66,7 +66,8 @@ export const IPC = {
     get: 'chats:get',
     create: 'chats:create',
     update: 'chats:update',
-    delete: 'chats:delete'
+    delete: 'chats:delete',
+    generateTitle: 'chats:generateTitle'
   },
   sessions: {
     list: 'sessions:list',
@@ -92,7 +93,9 @@ export const IPC = {
     compact: 'agent:compact',
     stopSubagents: 'agent:stopSubagents',
     smartOverride: 'agent:smartOverride',
-    smartApproveTest: 'agent:smartApproveTest'
+    smartApproveTest: 'agent:smartApproveTest',
+    setCapturedContext: 'agent:setCapturedContext',
+    undoCapturedContext: 'agent:undoCapturedContext'
   },
   fs: {
     listDir: 'fs:listDir',
@@ -267,6 +270,8 @@ export interface SmartApproveTestInput {
   args: unknown
   /** Histórico de exemplo para {{recent_context}} / {{last_user_message}}. */
   history?: StoredMessage[]
+  /** Contexto capturado do chat (o "Testar" usa o do chat aberto). */
+  captured?: string
 }
 
 /** Request EXATA da próxima chamada (apiKey mascarada). */
@@ -421,6 +426,11 @@ export interface ClearApi {
     create(input: ChatCreateInput): Promise<Chat>
     update(id: string, patch: ChatUpdateInput): Promise<Chat>
     delete(id: string): Promise<void>
+    /**
+     * "Gerar título": o modelo do título (Configurações → Novos chats) dá nome ao chat a partir da
+     * 1ª mensagem; erro legível sem modelo/mensagem ou se a chamada falhar.
+     */
+    generateTitle(id: string): Promise<Chat>
   }
   sessions: {
     list(chatId: string): Promise<Session[]>
@@ -492,6 +502,13 @@ export interface ClearApi {
     smartOverride(messageId: string): Promise<void>
     /** Roda o juiz numa chamada de exemplo (nada é salvo). */
     smartApproveTest(input: SmartApproveTestInput): Promise<SmartApproveRecord>
+    /**
+     * Smart-Approve → "Contexto capturado da conversa": grava a sua edição da descrição (sessionId
+     * null = a do chat; um subagente = a dele). A versão anterior fica para desfazer.
+     */
+    setCapturedContext(chatId: string, sessionId: string | null, text: string): Promise<void>
+    /** Desfaz a última mudança da descrição capturada. */
+    undoCapturedContext(chatId: string, sessionId: string | null): Promise<void>
   }
   fs: {
     listDir(path: string): Promise<DirEntry[]>

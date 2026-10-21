@@ -9,6 +9,7 @@ import {
   normalizeApprovalSettings,
   validateListEntry
 } from '@shared/approvalPolicy'
+import { normalizeSmartDefaults, SMART_DEFAULTS_SETTING } from '@shared/smartDefaults'
 import type { ApprovalListItem, ApprovalSettings } from '@shared/types'
 import { emit } from './events'
 import { settingsRepo } from './repo'
@@ -16,7 +17,8 @@ import { settingsRepo } from './repo'
 export function getApprovalSettings(): ApprovalSettings {
   return normalizeApprovalSettings(
     settingsRepo.get(APPROVAL_MODES_SETTING),
-    settingsRepo.get(APPROVAL_LISTS_SETTING)
+    settingsRepo.get(APPROVAL_LISTS_SETTING),
+    settingsRepo.get(SMART_DEFAULTS_SETTING)
   )
 }
 
@@ -34,9 +36,13 @@ function changed(listsChanged: boolean): ApprovalSettings {
   return s
 }
 
-/** Substitui modos e/ou listas (cada um inteiro). Entradas inválidas nas listas → erro legível. */
+/**
+ * Substitui modos, listas e/ou os padrões do Smart-Approve (cada um inteiro). Entradas inválidas nas
+ * listas → erro legível. `smart` é local (setting `smartApproveDefaults`, fora do sync).
+ */
 export function updateApprovalSettings(patch: Partial<ApprovalSettings>): ApprovalSettings {
   if (patch?.modes) settingsRepo.set(APPROVAL_MODES_SETTING, normalizeApprovalModes(patch.modes))
+  if (patch?.smart) settingsRepo.set(SMART_DEFAULTS_SETTING, normalizeSmartDefaults(patch.smart))
   if (patch?.lists) {
     const lists = normalizeApprovalLists(patch.lists)
     for (const item of Object.keys(lists) as ApprovalListItem[]) {

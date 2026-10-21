@@ -2,6 +2,7 @@
 // Ver SPEC.md → "Runner / fila / interrupção".
 import { randomUUID } from 'crypto'
 import { homedir } from 'os'
+import { dirname } from 'path'
 import type {
   ApiMessage,
   ApprovalCheck,
@@ -39,7 +40,7 @@ import {
   validateListEntry,
   type ApprovalItemDecision
 } from '@shared/approvalPolicy'
-import type { ApprovalListItem } from '@shared/types'
+import type { ApprovalListItem, ApprovalMode, CapturedContextState } from '@shared/types'
 import { addListEntries, getApprovalSettings, onApprovalListsChanged } from '../approvalSettings'
 import type {
   ApprovalDecision,
@@ -69,7 +70,7 @@ import {
 } from '@shared/context'
 import { emit } from '../events'
 import { chatsRepo, messagesRepo, providersRepo, sessionsRepo, settingsRepo } from '../repo'
-import { getDb } from '../db'
+import { getDb, getDbPath } from '../db'
 import { historyStore } from '../historyStore'
 import { parseToolArgs, runLocalTool, shellStateFor } from '../tools'
 import { registerPresented, viewerDevice } from '../fileViewer'
@@ -138,6 +139,11 @@ import {
 } from './compaction'
 import { getApproval, listApprovals, requestApproval, resolveApproval } from './approvals'
 import { addOverride, runJudge, takeOverride } from './smartApprove'
+import { ContextCaptureService } from './contextCapture'
+import { isInsideRoot, normalizePath, protectedRule, type SafetyCtx } from '@shared/approvalSafety'
+import { capturedTextFor, effectiveAcceptEdits, effectiveEnvironment } from '@shared/contextCapture'
+import { isTypedUserMessage } from '@shared/smartApproveContext'
+import { realpathDeep, resolvePath } from '../tools/util'
 import { fillScriptPreviews, resolveScriptPath } from '../scriptPreview'
 import { bwrapAvailable } from '../tools/bash'
 import {
@@ -163,6 +169,7 @@ import { cancelQuestion, getQuestion, listQuestions, requestQuestion } from './q
 import { resolveAskUserQuestions } from '../askUserImages'
 import { MEMORY_TOOL_NAMES, SKILL_TOOL_NAMES } from '@shared/tools'
 import { afterCompaction, ensureSnapshot, runMemoryToolFor } from '../memory'
+import { isTypedFirstMessage, scheduleAutoTitle } from '../autoTitle'
 import { manualSkillParts, sandboxSkillDirs, sessionSkills } from '../skills'
 import {
   activePath,
@@ -283,6 +290,12 @@ function append(sessionId: string, message: ApiMessage, meta: MessageMeta = {}):
   const s = sessionsRepo.get(sessionId)
   if (s) {
     chatsRepo.touch(s.chatId)
+    // coleta automática de contexto: mensagem digitada (ou do agente pai, no subagente)
+    if (
+      message.role === 'user' &&
+      (isTypedUserMessage(m) || (s.depth > 0 && meta.kind === 'parent-message'))
+    )
+      capture.onUserMessage(sessionId)
     // 1ª mensagem do ramo novo do regenerate: o `null` da seleção saiu (o caminho segue por ela)
     if (hasPendingBranch(before) && !selEquals(before, s.branchSel))
       emit({ type: 'session-updated', session: s })
@@ -452,18 +465,20 @@ export function repairTail(
   }
 }
 
-function maybeSetTitle(session: Session, text: string): void {
-  if (session.depth !== 0) return
+/** Título provisório (1ª mensagem truncada) de um chat novo; devolve o título gravado ou null. */
+function maybeSetTitle(session: Session, text: string): string | null {
+  if (session.depth !== 0) return null
   const chat = chatsRepo.get(session.chatId)
-  if (!chat) return
-  if (chat.title && chat.title !== 'Novo chat') return
+  if (!chat) return null
+  if (chat.title && chat.title !== 'Novo chat') return null
   const hasUser = messagesRepo.path(session.id).some((m) => m.message.role === 'user')
-  if (hasUser) return
+  if (hasUser) return null
   const line = text.replace(/\s+/g, ' ').trim()
-  if (!line) return
+  if (!line) return null
   const title = line.length > 50 ? line.slice(0, 50).trimEnd() + '…' : line
   const { chat: updated } = chatsRepo.update(chat.id, { title })
   emit({ type: 'chat-updated', chat: updated })
+  return title
 }
 
 function appendUser(
@@ -475,22 +490,26 @@ function appendUser(
 ): StoredMessage {
   // mensagem de outro chat: o título (se ainda não houver) vem do corpo, sem o cabeçalho
   const titleText = meta.kind === 'inter-chat' ? splitInterChatText(text).body : text
-  maybeSetTitle(
-    session,
-    titleText.trim()
-      ? titleText
-      : [
-          ...attachments.map((a) => a.name),
-          ...skillParts.flatMap((p) =>
-            p.type === 'text' && p._skill ? [`Skill ${p._skill.name}`] : []
-          )
-        ].join(', ')
-  )
-  return append(
+  const names = [
+    ...attachments.map((a) => a.name),
+    ...skillParts.flatMap((p) => (p.type === 'text' && p._skill ? [`Skill ${p._skill.name}`] : []))
+  ]
+  const provisional = maybeSetTitle(session, titleText.trim() ? titleText : names.join(', '))
+  const stored = append(
     session.id,
     { role: 'user', content: buildUserContent(text, attachments, skillParts) },
     meta
   )
+  // título automático (Configurações → Novos chats): só a 1ª mensagem DIGITADA, em segundo plano
+  if (provisional !== null && isTypedFirstMessage(meta))
+    scheduleAutoTitle({
+      chatId: session.chatId,
+      text,
+      attachments: names,
+      expectTitle: provisional,
+      messageId: stored.id
+    })
+  return stored
 }
 
 // ---------------- loop ----------------
@@ -1064,17 +1083,28 @@ async function listsGate(
   /** Modo smart: o juiz pediu sua decisão (ou não decidiu) — o card mostra o motivo. */
   smart?: SmartApproveRecord,
   /** Diretório em que o comando vai rodar (prévia dos scripts executados). */
-  runDir?: string
+  runDir?: string,
+  /** Modo efetivo do item (registro); ausente = smart com juiz → 'smart', senão 'lists'. */
+  mode?: ApprovalMode,
+  /** Regras fixas (leitura sempre liberada, caminhos protegidos). */
+  safety: SafetyCtx = {}
 ): Promise<{ outcome?: Omit<ToolOutcome, 'durationMs'>; record: ApprovalRecord }> {
   for (let round = 0; ; round++) {
-    const ev = evaluateLists(item, args, getApprovalSettings().lists)
+    const ev = evaluateLists(item, args, getApprovalSettings().lists, safety)
     const allowed = ev.check.items
       .filter((i) => i.verdict === 'allow' && i.entry)
       .map((i) => ({ text: i.text, entry: i.entry! }))
+    const readOnly = ev.check.items.filter((i) => i.readOnly).map((i) => checkItemLabel(i))
+    const prot = ev.check.items
+      .map((i) => i.protectedPath)
+      .filter(Boolean)
+      .join(', ')
     const record: ApprovalRecord = {
       item,
-      mode: smart ? 'smart' : 'lists',
-      ...(allowed.length ? { allowed } : {})
+      mode: mode ?? (smart ? 'smart' : 'lists'),
+      ...(allowed.length ? { allowed } : {}),
+      ...(readOnly.length ? { readOnly } : {}),
+      ...(prot ? { protectedPath: prot } : {})
     }
     if (ev.blocked) {
       const { text, entry, where } = ev.blocked
@@ -1144,12 +1174,107 @@ onApprovalListsChanged(() => {
   const lists = getApprovalSettings().lists
   for (const req of listApprovals()) {
     if (!req.check || req.check.item === 'search') continue
-    const ev = evaluateLists(req.check.item, req.args, lists)
+    const chat = chatsRepo.get(req.chatId)
+    const session = sessionsRepo.get(req.sessionId)
+    const safety =
+      chat && session
+        ? safetyCtxFor(chat, session, req.toolName, (req.args ?? {}) as Record<string, unknown>)
+        : {}
+    const ev = evaluateLists(req.check.item, req.args, lists, safety)
     const before = req.check.items.map((i) => `${i.verdict}:${i.entry ?? ''}`).join('|')
     const after = ev.check.items.map((i) => `${i.verdict}:${i.entry ?? ''}`).join('|')
     if (ev.blocked || before !== after) resolveApproval(req.id, { kind: 'reeval' })
   }
 })
+
+// ---------------- Smart-Approve: coleta automática de contexto (resumidor) ----------------
+
+/** Grava a descrição capturada na config do chat (sincroniza como o resto da config). */
+function saveCaptured(
+  chatId: string,
+  fn: (st: CapturedContextState | undefined) => CapturedContextState
+): void {
+  if (shuttingDown) return
+  const chat = chatsRepo.get(chatId)
+  if (!chat) return
+  const { chat: updated } = chatsRepo.update(chatId, {
+    config: { capturedContext: fn(chat.config.capturedContext) }
+  })
+  emit({ type: 'chat-updated', chat: updated })
+}
+
+const capture = new ContextCaptureService({
+  getChat: (id) => chatsRepo.get(id),
+  getSession: (id) => sessionsRepo.get(id),
+  history: (id) => messagesRepo.path(id),
+  getProvider: (id) => providersRepo.get(id),
+  globalModes: () => getApprovalSettings().modes,
+  defaults: () => getApprovalSettings().smart,
+  save: saveCaptured,
+  log: (...a) => dbg(...a)
+})
+
+/** Edição sua da descrição capturada (sessionId null = a do chat). */
+export function setCapturedContext(chatId: string, sessionId: string | null, text: string): void {
+  capture.setText(chatId, sessionId, text)
+}
+
+/** Desfaz a última mudança da descrição capturada. */
+export function undoCapturedContext(chatId: string, sessionId: string | null): void {
+  capture.undo(chatId, sessionId)
+}
+
+/** Ids dos subagentes acima (o mais próximo primeiro), sem a principal. */
+function parentChain(session: Session): string[] {
+  const out: string[] = []
+  let cur: Session | null = session
+  for (let i = 0; cur?.parentSessionId && i < 4; i++) {
+    const p = sessionsRepo.get(cur.parentSessionId)
+    if (!p || p.depth === 0) break
+    out.push(p.id)
+    cur = p
+  }
+  return out
+}
+
+/** Regras fixas (approvalSafety.ts): home, diretório do comando, raiz e os dados do app. */
+function safetyCtxFor(
+  chat: Chat,
+  session: Session,
+  name: ToolName,
+  args: Record<string, unknown>
+): SafetyCtx {
+  const root = chat.config.cwd
+  return {
+    home: homedir(),
+    root,
+    cwd: name === 'shell' || name === 'process_start' ? runDirFor(chat, session, name, args) : root,
+    appData: [dirname(getDbPath())]
+  }
+}
+
+/**
+ * write_file/edit_file: o caminho é protegido? Fica dentro da raiz (após realpath, seguindo links)?
+ * — "Aceitar edições dentro da raiz" e caminhos protegidos.
+ */
+async function fileGateInfo(
+  chat: Chat,
+  args: Record<string, unknown>,
+  safety: SafetyCtx
+): Promise<{ protectedPath?: string; inside: boolean }> {
+  const raw = typeof args.path === 'string' ? args.path.trim() : ''
+  if (!raw) return { inside: false }
+  const abs = resolvePath(chat.config.cwd, raw)
+  const real = await realpathDeep(abs).catch(() => abs)
+  const rootReal = await realpathDeep(chat.config.cwd).catch(() => chat.config.cwd)
+  const rule =
+    protectedRule(normalizePath(abs, safety), safety) ??
+    protectedRule(normalizePath(real, safety), safety)
+  return {
+    ...(rule ? { protectedPath: `${raw} (${rule.label})` } : {}),
+    inside: isInsideRoot(rootReal, real)
+  }
+}
 
 /** Diretório em que shell/process_start vai rodar: o cwd do shell da sessão (ou o `cwd` do processo). */
 function runDirFor(
@@ -1254,6 +1379,39 @@ async function executeTool(
     smartOverride = true
     route = { kind: 'run' }
   }
+  // Regras fixas (@shared/approvalSafety): caminho protegido SEMPRE pergunta (whitelist, juiz,
+  // "Sempre permitir" e "Aceitar edições" não liberam; a blacklist continua bloqueando); comando só
+  // de leitura SEMPRE roda (sem card, sem juiz); "Aceitar edições dentro da raiz" libera
+  // write_file/edit_file na raiz. "Executar mesmo assim" (smartOverride) já é a sua aprovação.
+  const safety = item ? safetyCtxFor(chat, session, name, args) : {}
+  let protectedFile: string | undefined
+  if (item && mode && !smartOverride && (name === 'write_file' || name === 'edit_file')) {
+    const f = await fileGateInfo(chat, args, safety).catch(() => ({ inside: false }) as const)
+    if ('protectedPath' in f && f.protectedPath) {
+      protectedFile = f.protectedPath
+      route = { kind: 'user' }
+    } else if (
+      route.kind !== 'run' &&
+      f.inside &&
+      effectiveAcceptEdits(chat.config, settings.smart)
+    ) {
+      route = { kind: 'run' }
+      approval = { item, mode, acceptEdits: true }
+    }
+  }
+  if (item && mode && !smartOverride && (name === 'shell' || name === 'process_start')) {
+    const ev = evaluateLists(item, args, settings.lists, safety)
+    if (route.kind === 'run') {
+      // "Sempre permitir" + caminho protegido → card das listas
+      if (ev.protected) route = { kind: 'lists' }
+    } else if (!ev.blocked && ev.readOnly) {
+      route = { kind: 'run' }
+      approval = { item, mode, readOnly: ev.check.items.map((i) => checkItemLabel(i)) }
+    } else if (!ev.blocked && ev.protected) {
+      // juiz não é chamado (não poderia liberar); Smart sem modelo → o card das listas também
+      route = { kind: 'lists' }
+    }
+  }
   // Modo smart: nos itens com listas, as listas decidem primeiro (smartListPlan) — blacklist
   // bloqueia sem juiz; 100% whitelist roda sem juiz (a menos que `judgeWhitelisted`); o juiz decide
   // só os itens que sobraram (os liberados vão como contexto). Juiz pede/falha → card das listas
@@ -1264,18 +1422,26 @@ async function executeTool(
     let judgeIdx: number[] | undefined
     if (isListItem(item)) {
       const plan = smartListPlan(item, args, settings.lists, {
-        judgeWhitelisted: sa.judgeWhitelisted
+        judgeWhitelisted: sa.judgeWhitelisted,
+        safety
       })
       const allowed = plan.ev.check.items
         .filter((i) => i.verdict === 'allow' && i.entry)
         .map((i) => ({ text: i.text, entry: i.entry! }))
-      approval = { item, mode: 'smart', ...(allowed.length ? { allowed } : {}) }
+      const readOnly = plan.ev.check.items.filter((i) => i.readOnly).map((i) => checkItemLabel(i))
+      approval = {
+        item,
+        mode: 'smart',
+        ...(allowed.length ? { allowed } : {}),
+        ...(readOnly.length ? { readOnly } : {})
+      }
       if (plan.kind === 'blocked') {
         const { text, entry, where } = plan.ev.blocked!
         approval.blocked = { text: where ? `${text} — ${where}` : text, entry }
         return done({ content: blockedText(item, plan.ev.blocked!), status: 'denied' })
       }
       if (plan.kind === 'run') route = { kind: 'run' }
+      else if (plan.kind === 'protected') route = { kind: 'lists' }
       else {
         // o juiz vê o começo dos scripts que o comando executa
         smartCheck = await fillScriptPreviews(plan.ev.check, runDirFor(chat, session, name, args))
@@ -1291,6 +1457,10 @@ async function executeTool(
         judging: true
       })
       try {
+        // o juiz espera o resumo da sessão (descrição atualizada); teto de 20 s → julga assim mesmo
+        await capture.waitIdle(session.id)
+        if (signal.aborted) return done({ content: CANCELLED_TEXT, status: 'cancelled' })
+        const fresh = chatsRepo.get(chat.id) ?? chat
         const history = messagesRepo.path(session.id)
         smart = await runJudge({
           sa,
@@ -1309,7 +1479,15 @@ async function executeTool(
               check: smartCheck,
               judgeIdx,
               lists: settings.lists
-            })
+            }),
+            environment: {
+              user: effectiveEnvironment(fresh.config.smartApprove, settings.smart),
+              captured: capturedTextFor(
+                fresh.config.capturedContext,
+                session.depth > 0 ? session.id : null,
+                parentChain(session)
+              )
+            }
           },
           signal
         })
@@ -1345,7 +1523,9 @@ async function executeTool(
       args,
       signal,
       mode === 'smart' ? smart : undefined,
-      runDirFor(chat, session, name, args)
+      runDirFor(chat, session, name, args),
+      mode ?? undefined,
+      safety
     )
     approval = r.record
     if (r.outcome) return done(r.outcome)
@@ -1359,11 +1539,16 @@ async function executeTool(
         toolName: name,
         args,
         ...(smart ? { smartApprove: smart } : {}),
-        ...(route.smartMissing ? { smartMissing: true } : {})
+        ...('smartMissing' in route && route.smartMissing && !protectedFile
+          ? { smartMissing: true }
+          : {}),
+        ...(protectedFile ? { protectedPath: protectedFile } : {})
       },
       signal
     )
     if (!signal.aborted) setStatus(session.id, 'running')
+    if (protectedFile && item && mode)
+      approval = { ...(approval ?? { item, mode }), protectedPath: protectedFile }
     if (outcome.kind === 'deny') {
       if (item && mode)
         approval = { ...(approval ?? { item, mode }), denied: argsSummary(name, args) }
@@ -1561,7 +1746,9 @@ async function runDelegate(
     status: 'running'
   })
   emit({ type: 'session-created', session: child })
-  append(child.id, { role: 'user', content: task }, { synthetic: true })
+  const taskMsg = append(child.id, { role: 'user', content: task }, { synthetic: true })
+  // coleta de contexto: a descrição do subagente = a do pai + a tarefa (o juiz dele usa esta)
+  capture.deriveForSubagent(session, child, task, taskMsg)
 
   if (background) {
     // sem o signal do pai: Parar/⚡ na sessão pai não derrubam subagentes em segundo plano
@@ -2082,6 +2269,7 @@ function appendAppClosedCallback(
  */
 async function stopSubtree(session: Session): Promise<void> {
   const ids = subtreeIds(sessionsRepo.list(session.chatId), [session.id])
+  for (const id of ids) capture.cancel(id)
   const set = new Set(ids)
   for (const r of reports.all())
     if (set.has(r.sessionId) && r.sessionId !== session.id && !r.outcome) r.silent = true
@@ -2688,6 +2876,8 @@ async function waitDone(st: RunState, ms = 15_000): Promise<void> {
 }
 
 export async function stop(sessionId: string): Promise<void> {
+  // Parar também cancela o resumo da coleta de contexto (nada roda até a próxima mensagem sua)
+  capture.cancel(sessionId)
   const session = sessionsRepo.get(sessionId)
   // subagente: para ele e todos os descendentes (inclusive os em segundo plano)
   if (session && session.depth > 0) return stopSubtree(session)
@@ -2941,7 +3131,10 @@ export async function smartApproveTest(input: SmartApproveTestInput): Promise<Sm
   const item = TOOL_ITEM[input.tool]
   const lists = getApprovalSettings().lists
   const plan = isListItem(item)
-    ? smartListPlan(item, input.args, lists, { judgeWhitelisted: sa.judgeWhitelisted })
+    ? smartListPlan(item, input.args, lists, {
+        judgeWhitelisted: sa.judgeWhitelisted,
+        safety: { home: homedir(), root: input.config.cwd, cwd: input.config.cwd }
+      })
     : null
   const ctx = {
     tool: input.tool,
@@ -2950,6 +3143,10 @@ export async function smartApproveTest(input: SmartApproveTestInput): Promise<Sm
     confine: input.config.confineToRoot !== false,
     sandbox: !!input.config.sandboxBash && bwrapAvailable(),
     history: input.history ?? [],
+    environment: {
+      user: effectiveEnvironment(input.config.smartApprove, getApprovalSettings().smart),
+      ...(input.captured ? { captured: input.captured } : {})
+    },
     ...(plan?.kind === 'judge'
       ? {
           check: await fillScriptPreviews(plan.ev.check, input.config.cwd || homedir()),
@@ -3033,6 +3230,7 @@ export function isRunning(sessionId: string): boolean {
 
 /** Aborta todas as sessões de um chat (antes de apagá-lo). */
 export async function stopChat(chatId: string): Promise<void> {
+  capture.cancelChat(chatId)
   reports.drop(sessionsRepo.list(chatId).map((s) => s.id)) // chat sendo apagado: sem callbacks
   const sts = [...runs.values()].filter((s) => s.chatId === chatId)
   for (const st of sts) {

@@ -14,6 +14,7 @@ import {
 import { smartApproveActive } from '@shared/smartApprove'
 import type { ApprovalItem, ApprovalMode } from '@shared/types'
 import { approvalsSummary } from '../../lib/configSummary'
+import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { AutoApproveInfo } from '../apiDocs'
 import type { CfgProps } from '../panel/editors'
@@ -29,6 +30,7 @@ export function ChatApprovalSection({
   chatScope?: boolean
 }): React.JSX.Element {
   const global = useStore((s) => s.approvalSettings.modes)
+  const globalAccept = useStore((s) => s.approvalSettings.smart.acceptEditsInRoot)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const focusConfig = useStore((s) => s.focusConfig)
   const overrides = normalizeChatModes(cfg.approvalModes)
@@ -90,6 +92,11 @@ export function ChatApprovalSection({
           })}
         </div>
       ))}
+      <AcceptEditsRow
+        value={typeof cfg.acceptEditsInRoot === 'boolean' ? cfg.acceptEditsInRoot : null}
+        globalValue={globalAccept}
+        onChange={(v) => patch({ acceptEditsInRoot: v === globalAccept ? null : v })}
+      />
       {!judge && (
         <p data-testid="smart-needs-model" className="text-[11px] leading-snug text-faint">
           Smart-Approve indisponível:{' '}
@@ -115,5 +122,66 @@ export function ChatApprovalSection({
         <Settings2 className="size-3.5" /> Padrões globais e listas (Configurações → Aprovações)
       </button>
     </CollapsibleSection>
+  )
+}
+
+/**
+ * "Aceitar edições dentro da raiz do chat": Ligado / Desligado com ★ no padrão global (escolher a
+ * opção ★ volta a seguir o global, como nos modos dos itens).
+ */
+function AcceptEditsRow({
+  value,
+  globalValue,
+  onChange
+}: {
+  /** null = segue o global. */
+  value: boolean | null
+  globalValue: boolean
+  onChange: (v: boolean) => void
+}): React.JSX.Element {
+  const shown = value ?? globalValue
+  return (
+    <div className="space-y-1 border-t border-border/50 pt-2.5">
+      <div className="flex items-baseline gap-2">
+        <span className="text-[12.5px] text-fg/90">Aceitar edições dentro da raiz do chat</span>
+        <span className="font-mono text-[10.5px] text-faint">write_file · edit_file</span>
+      </div>
+      <div
+        role="radiogroup"
+        aria-label="Aceitar edições dentro da raiz do chat"
+        data-testid="chat-accept-edits"
+        data-inherit={value == null ? 'true' : undefined}
+        className="flex rounded-lg border border-border bg-bg/60 p-0.5"
+      >
+        {[true, false].map((v) => {
+          const selected = shown === v
+          const star = globalValue === v
+          return (
+            <button
+              key={String(v)}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              data-value={v ? 'on' : 'off'}
+              data-global={star || undefined}
+              title={star ? '★ Padrão global' : undefined}
+              onClick={() => onChange(v)}
+              className={cn(
+                'flex min-w-0 flex-1 items-center justify-center gap-1 rounded-md px-1.5 py-1 text-[11.5px] transition-colors',
+                selected ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
+              )}
+            >
+              {v ? 'Ligado' : 'Desligado'}
+              {star && <Star aria-hidden className="size-2.5 shrink-0 fill-current opacity-70" />}
+            </button>
+          )
+        })}
+      </div>
+      <p className="text-[11px] leading-snug text-subtle">
+        Ligado: escrever/editar arquivos cujo caminho (após seguir links) fica dentro da raiz roda
+        sem perguntar e sem o juiz, em qualquer modo. Caminhos protegidos (.env, .git/hooks,
+        ~/.ssh…) continuam perguntando.
+      </p>
+    </div>
   )
 }

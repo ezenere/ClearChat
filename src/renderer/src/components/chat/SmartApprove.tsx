@@ -1,6 +1,7 @@
 // Smart-Approve no chat: linha compacta da avaliação do juiz (cards de tool e de aprovação) e o (i)
 // com a request exata enviada ao juiz.
 import { ShieldAlert, ShieldCheck, ShieldQuestion, ShieldX } from 'lucide-react'
+import { categoryLabel } from '@shared/smartApprove'
 import type { SmartApproveRecord } from '@shared/types'
 import { cn, formatCost, formatDuration } from '../../lib/format'
 import { useStore } from '../../store'
@@ -142,6 +143,16 @@ export function SmartApproveLine({
           </span>
         )}
         <SmartApproveInfo rec={rec} />
+        {rec.category && (
+          <span
+            data-testid="smart-category"
+            data-category={rec.category}
+            title="Categoria dada pelo juiz"
+            className="shrink-0 rounded bg-hover px-1.5 py-px text-[10.5px] text-muted"
+          >
+            {categoryLabel(rec.category)}
+          </span>
+        )}
         {rec.wouldReject && (
           <span
             data-testid="smart-would-reject"

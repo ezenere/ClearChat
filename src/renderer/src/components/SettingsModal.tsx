@@ -23,6 +23,7 @@ import { MemorySettings } from './memory/MemorySettings'
 import { SkillsSettings } from './skills/SkillsSettings'
 import { AccountSettings } from './sync/AccountSettings'
 import { VersionFooter } from './UpdateNotice'
+import { AutoTitleSettings } from './AutoTitleSettings'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -260,6 +261,7 @@ function DefaultsSection(): React.JSX.Element {
           <span className="text-xs text-subtle group-hover:text-fg">Alterar</span>
         </button>
       </div>
+      <AutoTitleSettings />
     </div>
   )
 }

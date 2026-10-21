@@ -36,6 +36,20 @@ import { ApiInfo, C, Tip } from '../ui/Tooltip'
 import { smartAdvancedSummary, smartApproveSummary } from '../../lib/configSummary'
 import type { CfgProps } from './editors'
 import { CollapsibleSection, NumberInput, RestoreButton, ToggleRow } from './fields'
+import { SmartContextSection } from './SmartContextFields'
+
+/** Resumo da subseção "Ambiente e contexto" (fechada). */
+function environmentSummary(cfg: CfgProps['cfg']): { text: string; changed: boolean } {
+  const sa = cfg.smartApprove
+  const parts: string[] = []
+  if (typeof sa?.environment === 'string')
+    parts.push(sa.environment.trim() ? 'ambiente do chat' : 'sem ambiente')
+  if (sa?.capture) parts.push(sa.capture.enabled ? 'coleta ligada' : 'coleta desligada')
+  if (cfg.capturedContext?.main?.text) parts.push('contexto capturado')
+  return parts.length
+    ? { text: parts.join(' · '), changed: true }
+    : { text: 'padrão global', changed: false }
+}
 
 const LABEL_FIELDS: { key: keyof SmartApproveLabels; caption: string }[] = [
   { key: 'approve', caption: 'Aprovar' },
@@ -112,7 +126,14 @@ function SmartRequestInfo({
 
 const joinItems = (items: ApprovalItem[]): string => items.map((i) => ITEM_LABEL[i]).join(', ')
 
-export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element {
+export function SmartApproveSection({
+  cfg,
+  patch,
+  chatId
+}: CfgProps & {
+  /** Painel do chat: mostra o "Contexto capturado da conversa" (editável). */
+  chatId?: string
+}): React.JSX.Element {
   const sa = normalizeSmartApprove(cfg.smartApprove)
   const set = (p: Partial<SmartApproveConfig>): void => patch({ smartApprove: { ...sa, ...p } })
   const hasModel = !!sa.providerId && !!sa.model
@@ -159,7 +180,8 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
           },
           tool: testTool,
           args: parsedArgs,
-          history: SMART_APPROVE_SAMPLE.history
+          history: SMART_APPROVE_SAMPLE.history,
+          ...(cfg.capturedContext?.main?.text ? { captured: cfg.capturedContext.main.text } : {})
         })
       )
     } catch (e) {
@@ -238,6 +260,25 @@ export function SmartApproveSection({ cfg, patch }: CfgProps): React.JSX.Element
       </div>
 
       <div className={cn('space-y-3 transition-opacity', !hasModel && 'opacity-60')}>
+        <CollapsibleSection
+          id="smart-environment"
+          level="sub"
+          title="Ambiente e contexto"
+          summary={environmentSummary(cfg)}
+        >
+          <SmartContextSection
+            cfg={cfg}
+            chatId={chatId}
+            set={(p) => {
+              const next: Record<string, unknown> = { ...sa }
+              for (const [k, v] of Object.entries(p)) {
+                if (v === null) delete next[k]
+                else next[k] = v
+              }
+              patch({ smartApprove: next as unknown as SmartApproveConfig })
+            }}
+          />
+        </CollapsibleSection>
         <CollapsibleSection
           id="smart-advanced"
           level="sub"

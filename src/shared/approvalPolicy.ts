@@ -17,6 +17,14 @@
 import { analyzeShell, shellQuote, type ShellCommand } from './shellParse'
 import { detectScript, SCRIPT_PREVIEW, scriptHead } from './scriptPreview'
 import {
+  isReadOnlyTokens,
+  protectedHits,
+  protectedText,
+  type ProtectedHit,
+  type SafetyCtx
+} from './approvalSafety'
+import { normalizeSmartDefaults } from './smartDefaults'
+import {
   CONFIRM_TOOLS,
   type ApprovalCheck,
   type ApprovalCheckItem,
@@ -197,8 +205,16 @@ export function normalizeApprovalLists(v: unknown): Record<ApprovalListItem, App
   return out
 }
 
-export function normalizeApprovalSettings(modes: unknown, lists: unknown): ApprovalSettings {
-  return { modes: normalizeApprovalModes(modes), lists: normalizeApprovalLists(lists) }
+export function normalizeApprovalSettings(
+  modes: unknown,
+  lists: unknown,
+  smart?: unknown
+): ApprovalSettings {
+  return {
+    modes: normalizeApprovalModes(modes),
+    lists: normalizeApprovalLists(lists),
+    smart: normalizeSmartDefaults(smart)
+  }
 }
 
 /** Modo efetivo de um item num chat. */
@@ -552,8 +568,12 @@ export interface ListEvaluation {
   /** Bloqueado pela blacklist (comando inteiro / a URL). `where`: contexto do sub-comando. */
   blocked?: { text: string; entry: string; where?: string }
   check: ApprovalCheck
-  /** Todos os itens liberados pela whitelist. */
+  /** Todos os itens liberados (whitelist ou leitura). */
   allAllowed: boolean
+  /** Todos os itens são só de leitura (sempre liberado — approvalSafety.ts). */
+  readOnly?: boolean
+  /** Algum item toca um caminho protegido (sempre pergunta, sem juiz). */
+  protected?: boolean
 }
 
 /** Programas que elevam privilégio: o item próprio só casa com entrada que nomeia o comando. */
@@ -651,7 +671,35 @@ function remoteFlags(cmds: ShellCommand[]): boolean[] {
   })
 }
 
-function subItem(c: ShellCommand, list: ApprovalList, remote = false): ApprovalCheckItem {
+/**
+ * Para cada sub-comando: pode ser liberado como "só leitura"? Não sob sudo/su/container; dentro de
+ * um ssh, só se a CONEXÃO estiver na whitelist (decisão: ler no servidor é liberado só para hosts
+ * que você já liberou). Os itens próprios dos wrappers nunca são leitura.
+ */
+function readOnlyFlags(cmds: ShellCommand[], list: ApprovalList, ctx: SafetyCtx): boolean[] {
+  const chain: (ShellCommand | undefined)[] = []
+  return cmds.map((c) => {
+    const d = c.depth ?? 0
+    chain.length = d
+    const above = chain.filter(Boolean) as ShellCommand[]
+    chain[d] = c
+    if (c.unsafe || c.role) return false
+    for (const w of above) {
+      if (w.role === 'elevate' || w.role === 'container') return false
+      if (w.role === 'ssh' && !list.allow.some((p) => matchCommandPattern(p, w.match ?? w.tokens)))
+        return false
+    }
+    return isReadOnlyTokens(c.tokens, ctx)
+  })
+}
+
+function subItem(
+  c: ShellCommand,
+  list: ApprovalList,
+  remote = false,
+  readOnly = false,
+  hits: ProtectedHit[] = []
+): ApprovalCheckItem {
   const text = c.tokens.length ? c.tokens.map(shellQuote).join(' ') : c.text
   const tokens = c.match ?? c.tokens
   const suggestion =
@@ -669,10 +717,22 @@ function subItem(c: ShellCommand, list: ApprovalList, remote = false): ApprovalC
     ...(c.group ? { group: c.group } : {}),
     ...(script ? { script } : {})
   }
+  // caminho protegido: sempre pergunta (nem whitelist, nem juiz, nem "Sempre permitir")
+  if (hits.length) {
+    const prot = protectedText(hits)
+    return {
+      ...base,
+      verdict: 'ask',
+      protectedPath: prot,
+      reason: `caminho protegido: ${prot}${c.unsafe ? `; ${c.unsafe}` : ''}`
+    }
+  }
   if (c.unsafe) return { ...base, verdict: 'ask', reason: c.unsafe }
   const entry = list.allow.find(
     (p) => matchCommandPattern(p, tokens) && (c.role !== 'elevate' || isSpecificElevatePattern(p))
   )
+  // só leitura: sempre liberado (a entrada da whitelist, se casar, fica só como registro)
+  if (readOnly) return { ...base, verdict: 'allow', readOnly: true, ...(entry ? { entry } : {}) }
   return entry ? { ...base, verdict: 'allow', entry } : { ...base, verdict: 'ask' }
 }
 
@@ -680,12 +740,19 @@ function subItem(c: ShellCommand, list: ApprovalList, remote = false): ApprovalC
 export function evaluateCommand(
   item: 'commands' | 'processes',
   command: string,
-  list: ApprovalList
+  list: ApprovalList,
+  ctx: SafetyCtx = {}
 ): ListEvaluation {
   const a = analyzeShell(command)
   const cmds = a.commands.length
     ? a.commands
     : [{ tokens: [], text: command.trim() || '(vazio)', unsafe: 'comando vazio' } as ShellCommand]
+  const ro = readOnlyFlags(cmds, list, ctx)
+  const hits = cmds.map((c) => protectedHits(c, ctx))
+  const build = (): ApprovalCheckItem[] => {
+    const remote = remoteFlags(cmds)
+    return cmds.map((x, i) => subItem(x, list, remote[i], ro[i], hits[i]))
+  }
   for (const c of cmds) {
     // blacklist: o comando como escrito E (wrappers) a forma de casamento sem o comando interno
     const entry = list.deny.find(
@@ -694,8 +761,7 @@ export function evaluateCommand(
         (!!c.match && matchCommandPattern(p, c.match, { basenameProgram: true }))
     )
     if (entry) {
-      const remote = remoteFlags(cmds)
-      const items = cmds.map((x, i) => subItem(x, list, remote[i]))
+      const items = build()
       return {
         blocked: {
           text: c.tokens.map(shellQuote).join(' ') || c.text,
@@ -707,9 +773,13 @@ export function evaluateCommand(
       }
     }
   }
-  const remote = remoteFlags(cmds)
-  const items = cmds.map((c, i) => subItem(c, list, remote[i]))
-  return { check: { item, items }, allAllowed: items.every((i) => i.verdict === 'allow') }
+  const items = build()
+  return {
+    check: { item, items },
+    allAllowed: items.every((i) => i.verdict === 'allow'),
+    ...(items.every((i) => i.readOnly) ? { readOnly: true } : {}),
+    ...(items.some((i) => i.protectedPath) ? { protected: true } : {})
+  }
 }
 
 export function evaluateUrl(raw: string, list: ApprovalList): ListEvaluation {
@@ -751,12 +821,13 @@ export function evaluateUrl(raw: string, list: ApprovalList): ListEvaluation {
 export function evaluateLists(
   item: ApprovalItem,
   args: unknown,
-  lists: Record<ApprovalListItem, ApprovalList>
+  lists: Record<ApprovalListItem, ApprovalList>,
+  ctx: SafetyCtx = {}
 ): ListEvaluation {
   const a = (args && typeof args === 'object' ? args : {}) as Record<string, unknown>
   const str = (k: string): string => (typeof a[k] === 'string' ? (a[k] as string) : '')
   if (item === 'commands' || item === 'processes')
-    return evaluateCommand(item, str('command'), lists[item])
+    return evaluateCommand(item, str('command'), lists[item], ctx)
   if (item === 'pages') return evaluateUrl(str('url'), lists.pages)
   return {
     check: { item, items: [{ text: str('query'), verdict: 'ask', suggestion: '' }] },
@@ -825,21 +896,26 @@ export function approvalRoute(
 export type SmartListPlan =
   | { kind: 'blocked'; ev: ListEvaluation }
   | { kind: 'run'; ev: ListEvaluation }
+  /** Caminho protegido: card das listas direto, sem juiz (ele não poderia liberar). */
+  | { kind: 'protected'; ev: ListEvaluation }
   | { kind: 'judge'; ev: ListEvaluation; judgeIdx: number[] }
 
 export function smartListPlan(
   item: ApprovalListItem,
   args: unknown,
   lists: Record<ApprovalListItem, ApprovalList>,
-  opts: { judgeWhitelisted?: boolean } = {}
+  opts: { judgeWhitelisted?: boolean; safety?: SafetyCtx } = {}
 ): SmartListPlan {
-  const ev = evaluateLists(item, args, lists)
+  const ev = evaluateLists(item, args, lists, opts.safety)
   if (ev.blocked) return { kind: 'blocked', ev }
+  if (ev.protected) return { kind: 'protected', ev }
   if (ev.allAllowed && !opts.judgeWhitelisted) return { kind: 'run', ev }
+  // leitura nunca vai ao juiz (nem com "consultar também o que a whitelist libera")
   const judgeIdx = ev.check.items
     .map((it, i) => ({ it, i }))
-    .filter(({ it }) => opts.judgeWhitelisted || it.verdict !== 'allow')
+    .filter(({ it }) => !it.readOnly && (opts.judgeWhitelisted || it.verdict !== 'allow'))
     .map(({ i }) => i)
+  if (!judgeIdx.length) return { kind: 'run', ev }
   return { kind: 'judge', ev, judgeIdx }
 }
 

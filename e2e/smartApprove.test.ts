@@ -25,6 +25,7 @@ import {
   parseJudgeOutput,
   recentContext,
   renderSmartTemplate,
+  SMART_CATEGORY_KEYS,
   smartApproveActive,
   smartRejectText,
   validateLabels
@@ -228,10 +229,16 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
   assert.ok(u.includes('Shell sandboxed (only the root is writable): no'))
   // objetivo: mensagens digitadas, a mais recente primeiro
   assert.ok(u.includes('[1] Liste os arquivos, por favor.\n[2] mensagem antiga'))
-  // atividade: só chamadas com resultado (a pendente c2 fica de fora) + a última fala
-  assert.ok(u.includes("Agent's recent tool calls (oldest first):\n- [ok] read_file: a\n"))
+  // atividade: só chamadas com resultado (a pendente c2 fica de fora); a fala do agente não vai
+  // (0.8.5: pode repetir saída de tool — defesa contra prompt injection)
+  assert.ok(
+    u.includes(
+      "Agent's recent tool calls (oldest first; outputs are never shown):\n- [ok] read_file: a\n"
+    )
+  )
   assert.ok(!u.includes('- [ok] shell'))
-  assert.ok(u.includes(`Agent's latest message: "Vou listar."`))
+  assert.ok(!u.includes("Agent's latest message"))
+  assert.ok(!u.includes('Vou listar.'))
   assert.ok(!u.includes('Caller: a SUBAGENT'), 'principal: sem seção de subagente')
   assert.ok(!u.includes('erro'))
   // {{recent_context}} continua disponível para templates personalizados
@@ -240,8 +247,11 @@ test('mensagens do juiz: system + user renderizados com contexto compacto', () =
     { tool: 'shell', args: {}, cwd: '/w', confine: true, sandbox: false, history }
   )[1].content
   assert.ok(custom.startsWith('Liste os arquivos, por favor.\n'))
-  assert.ok(custom.includes('[tool read_file] ' + 'x'.repeat(300) + '… [+1700 chars]'))
-  assert.ok(custom.includes('[assistant] Vou listar.\n  → shell({"command":"ls -la"})'))
+  // nunca o resultado de tool nem a prosa do agente — só status e chamadas
+  assert.ok(custom.includes('[tool read_file] (ok; output omitted)'))
+  assert.ok(!custom.includes('xxxxxxxxxx'))
+  assert.ok(custom.includes('[assistant] → shell({"command":"ls -la"})'))
+  assert.ok(!custom.includes('Vou listar.'))
   // com "O juiz pode negar": rótulo e regra de rejeitar no prompt
   const deny = buildJudgeMessages(
     { ...sa, canDeny: true },
@@ -265,9 +275,17 @@ test('contexto: N=0, fronteira de compactação, última mensagem do usuário', 
   assert.ok(!recentContext(h, 10).includes('antes'))
   assert.equal(lastUserMessage(h), 'depois')
   assert.equal(lastUserMessage([]), '(none)')
-  // subsessão: a tarefa (synthetic) conta como mensagem do usuário
+  // subsessão: só mensagens digitadas contam; sem nenhuma → a tarefa (fallback)
   assert.equal(
     lastUserMessage([sm({ role: 'user', content: 'Tarefa X' }, { synthetic: true })]),
+    '(none)'
+  )
+  assert.equal(
+    lastUserMessage(
+      [sm({ role: 'user', content: 'Tarefa X' }, { synthetic: true })],
+      2000,
+      'Tarefa X'
+    ),
     'Tarefa X'
   )
 })
@@ -483,7 +501,8 @@ test('juiz: aprovar / rejeitar / perguntar; request exata e usage', async () => 
         approve: 'APPROVED',
         reject: 'REJECTED',
         ask: 'ASK-USER',
-        reject_rule: ''
+        reject_rule: '',
+        categories: SMART_CATEGORY_KEYS
       })
     )
     assert.ok(
@@ -591,12 +610,17 @@ test('rota smart com listas: whitelist inteira → sem juiz; parcial → só os 
   p = smartListPlan('commands', { command: 'git status && rm tmp.txt' }, LISTS)
   assert.equal(p.kind, 'judge')
   assert.deepEqual(p.kind === 'judge' && p.judgeIdx, [1])
-  // "Consultar também o que a whitelist libera" → juiz em tudo, inclusive o 100% liberado
-  p = smartListPlan('commands', { command: 'git status && ls -la' }, LISTS, {
+  // "Consultar também o que a whitelist libera" → juiz no que a whitelist libera, mas NUNCA no
+  // que é só leitura (0.8.5: git status/ls são sempre liberados)
+  p = smartListPlan('commands', { command: 'ssh deploy@prod.example.com && git status' }, LISTS, {
     judgeWhitelisted: true
   })
   assert.equal(p.kind, 'judge')
-  assert.deepEqual(p.kind === 'judge' && p.judgeIdx, [0, 1])
+  assert.deepEqual(p.kind === 'judge' && p.judgeIdx, [0])
+  p = smartListPlan('commands', { command: 'git status && ls -la' }, LISTS, {
+    judgeWhitelisted: true
+  })
+  assert.equal(p.kind, 'run')
   // a blacklist continua precedendo com a opção ligada
   assert.equal(
     smartListPlan('commands', { command: 'rm -rf /tmp' }, LISTS, { judgeWhitelisted: true }).kind,
@@ -744,7 +768,8 @@ test('contexto: objetivo da principal, tarefa do subagente, atividade, arquivos 
     x.recentTools.map((t) => `${t.status} ${t.name} ${t.summary}`),
     ['ok write_file draft.txt', 'error edit_file /abs/a.ts', 'ok shell rm -rf dist']
   )
-  assert.equal(x.lastAgentText, 'Agora apago o rascunho.')
+  // 0.8.5: a fala do agente não entra mais no contexto do juiz (pode repetir saída de tool)
+  assert.ok(!('lastAgentText' in x))
   // só os ok; relativos resolvidos pela raiz; do pai marcados
   assert.deepEqual(x.touchedFiles, [
     { path: '/proj/draft.txt', action: 'written' },
@@ -772,7 +797,7 @@ test('contexto: objetivo da principal, tarefa do subagente, atividade, arquivos 
   assert.ok(u.includes('- /proj/draft.txt (created/overwritten)'))
   assert.ok(u.includes('- /proj/docs/base.md (created/overwritten, by a parent agent)'))
   assert.ok(u.includes('approved by the user earlier in this session: rm -rf dist'))
-  assert.ok(u.includes('- git status   [already allowed by whitelist "git status"]'))
+  assert.ok(u.includes('- git status   [read-only (always allowed)]'))
   assert.ok(u.includes('- rm draft.txt   [TO DECIDE]'))
   // determinístico: mesma entrada → mesmo texto
   const again = buildJudgeMessages(sa, {
@@ -890,10 +915,7 @@ test('juiz: com a avaliação das listas, registra os itens julgados; timeout nu
     assert.equal(r.decision, 'approve')
     assert.deepEqual(r.judged, ['rm x.txt'])
     const u = hits.at(-1).body.messages[1].content
-    assert.ok(
-      u.includes('- rm x.txt   [TO DECIDE]') &&
-        u.includes('[already allowed by whitelist "git status"]')
-    )
+    assert.ok(u.includes('- rm x.txt   [TO DECIDE]') && u.includes('[read-only (always allowed)]'))
     script = { body: 'REJECTED\nnão', delayMs: 1500 }
     const t = await judge({ canDeny: true, timeoutS: 0.3 })
     assert.equal(t.decision, 'ask')

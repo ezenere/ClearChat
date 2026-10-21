@@ -22,7 +22,8 @@ const api: ClearApi = {
     get: (id) => invoke(IPC.chats.get, id),
     create: (input) => invoke(IPC.chats.create, input),
     update: (id, patch) => invoke(IPC.chats.update, id, patch),
-    delete: (id) => invoke(IPC.chats.delete, id)
+    delete: (id) => invoke(IPC.chats.delete, id),
+    generateTitle: (id) => invoke(IPC.chats.generateTitle, id)
   },
   sessions: {
     list: (chatId) => invoke(IPC.sessions.list, chatId),
@@ -49,7 +50,11 @@ const api: ClearApi = {
     compact: (sessionId, opts) => invoke(IPC.agent.compact, sessionId, opts),
     stopSubagents: (chatId) => invoke(IPC.agent.stopSubagents, chatId),
     smartOverride: (messageId) => invoke(IPC.agent.smartOverride, messageId),
-    smartApproveTest: (input) => invoke(IPC.agent.smartApproveTest, input)
+    smartApproveTest: (input) => invoke(IPC.agent.smartApproveTest, input),
+    setCapturedContext: (chatId, sessionId, text) =>
+      invoke(IPC.agent.setCapturedContext, chatId, sessionId, text),
+    undoCapturedContext: (chatId, sessionId) =>
+      invoke(IPC.agent.undoCapturedContext, chatId, sessionId)
   },
   fs: {
     listDir: (path) => invoke(IPC.fs.listDir, path),

@@ -513,7 +513,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the shell tool to run: ls -la. If it is denied, just say "ok, denied" and do not retry.'
+      'Use the shell tool to run: touch denied-e2e.txt. If it is denied, just say "ok, denied" and do not retry.'
     )
     const ap = await waitApproval(sid)
     await api('agent.approve', ap.id, 'deny')
@@ -536,7 +536,7 @@ async function main(): Promise<void> {
     await api(
       'agent.send',
       sid,
-      'Use the shell tool to run: sleep 4; echo slept-ok. Then report the output.'
+      'Use the shell tool to run: sleep 4; touch slept-ok.txt; echo slept-ok. Then report the output.'
     )
     const ap = await waitApproval(sid)
     // card do modo Listas: "Sim + whitelist" em cada sub-comando pendente (padrão sugerido)
@@ -551,7 +551,8 @@ async function main(): Promise<void> {
       }))
     await api('agent.approve', ap.id, 'allow', items)
     const st = await api<any>('approvals.getSettings')
-    assert(st.lists.commands.allow.includes('sleep *'), `whitelist ${st.lists.commands.allow}`)
+    // 0.8.5: sleep/echo são só leitura (sempre liberados); o pendente é o touch
+    assert(st.lists.commands.allow.includes('touch *'), `whitelist ${st.lists.commands.allow}`)
     await sleep(500)
     const q = await api('agent.send', sid, 'Also: what is 2+2? Answer with just the number.')
     assert(q.queued === true, 'deveria enfileirar')

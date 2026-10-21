@@ -127,11 +127,11 @@ async function startFake(): Promise<void> {
       }
       if (lastUser.startsWith('delegue3'))
         return tools([
-          delegate('Sub-A', 'rode: echo SUB-A'),
-          delegate('Sub-B', 'rode: echo SUB-B'),
-          delegate('Sub-C', 'rode: echo SUB-C')
+          delegate('Sub-A', 'rode: expr SUB-A'),
+          delegate('Sub-B', 'rode: expr SUB-B'),
+          delegate('Sub-C', 'rode: expr SUB-C')
         ])
-      if (lastUser.startsWith('delegue1')) return tools([delegate('Sub-V', 'rode: echo SUB-V')])
+      if (lastUser.startsWith('delegue1')) return tools([delegate('Sub-V', 'rode: expr SUB-V')])
       if (lastUser.startsWith('delegue-falha'))
         return tools([delegate('Sub-X', 'falhe agora, por favor')])
       full('OK.')
@@ -275,7 +275,7 @@ async function main(): Promise<void> {
     assert(count === '1 de 3', `contador: ${count}`)
     const who = await page.getByTestId('approval-queue-who').innerText()
     assert(/Subagente “Sub-A”/.test(who), `identificação: ${who}`)
-    await queue().getByText('echo SUB-A').waitFor()
+    await queue().getByText('expr SUB-A').waitFor()
     await queue().getByRole('button', { name: 'Abrir subsessão' }).waitFor()
     // sem duplicar: nenhum card de aprovação dentro dos cards do delegate (fora da tela)
     const inCards = await delegateCards().getByTestId('approval-card').count()

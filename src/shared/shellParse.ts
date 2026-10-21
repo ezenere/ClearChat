@@ -50,6 +50,12 @@ export interface ShellCommand {
   match?: string[]
   /** Item próprio de um wrapper: conexão ssh, elevação (sudo/doas/su) ou container (docker/kubectl exec). */
   role?: 'ssh' | 'elevate' | 'container'
+  /**
+   * Destinos de redirecionamento de SAÍDA para arquivo (`> f`, `>> f`, `&> f`…; sem aspas, como o
+   * shell veria — expansões ficam literais). Usado pela detecção de caminhos protegidos
+   * (approvalSafety.ts); esses itens já são `unsafe`.
+   */
+  writes?: string[]
 }
 
 export interface ShellAnalysis {
@@ -727,6 +733,7 @@ class Parser {
     if ((op === '>&' || op === '<&') && /^(\d+|-)$/.test(w.value)) return
     if (SAFE_REDIR_TARGETS.has(w.value) && !w.expansion) return
     cmd.unsafe.push(`redireciona para arquivo: ${w.raw}`)
+    ;(cmd.writes ??= []).push(w.value)
   }
 
   /** Contexto dos itens emitidos agora (nível, grupo, nota, camadas). */
@@ -757,7 +764,8 @@ class Parser {
       ...(ctx.depth ? { depth: ctx.depth } : {}),
       ...(ctx.group ? { group: ctx.group } : {}),
       ...(o.match ? { match: o.match } : {}),
-      ...(o.role ? { role: o.role } : {})
+      ...(o.role ? { role: o.role } : {}),
+      ...(cmd.writes?.length ? { writes: [...cmd.writes] } : {})
     }
     ;(cmd.emitted ??= []).push(c)
     this.out.push(c)
@@ -1008,6 +1016,8 @@ interface Pending {
   words: Word[]
   redirs: string[]
   unsafe: string[]
+  /** Destinos de redirecionamento de saída para arquivo (ver ShellCommand.writes). */
+  writes?: string[]
   heredoc?: boolean
   /** De onde vem a entrada do comando (pipe, arquivo, heredoc…). */
   stdin?: Stdin

@@ -1547,6 +1547,13 @@ export function createMockApi(scenario: string): ClearApi {
           chats.findIndex((x) => x.id === cid),
           1
         )
+      },
+      // título automático (mock): um título "gerado" a partir do atual, sem chamada nenhuma
+      generateTitle: async (cid) => {
+        const c = chats.find((x) => x.id === cid)!
+        c.title = `${(c.title || 'Chat').split(/\s+/).slice(0, 4).join(' ')} (gerado)`
+        emit({ type: 'chat-updated', chat: c })
+        return delay(c, 700)
       }
     },
     sessions: {
@@ -1680,6 +1687,24 @@ export function createMockApi(scenario: string): ClearApi {
       },
       pendingApprovals: () => delay(approvals),
       smartOverride: async () => {},
+      setCapturedContext: async (chatId, sessionId, text) => {
+        const c = chats.find((x) => x.id === chatId)
+        if (!c) return
+        const st = { ...(c.config.capturedContext ?? {}) }
+        const now = Date.now()
+        const e = { text, updatedAt: now, by: 'user' as const }
+        if (sessionId) st.sessions = { ...(st.sessions ?? {}), [sessionId]: e }
+        else
+          st.main = {
+            ...e,
+            ...(st.main
+              ? { prev: { text: st.main.text, updatedAt: st.main.updatedAt, by: st.main.by } }
+              : {})
+          }
+        c.config = { ...c.config, capturedContext: st }
+        emit({ type: 'chat-updated', chat: { ...c } })
+      },
+      undoCapturedContext: async () => {},
       smartApproveTest: async () =>
         delay({
           decision: 'approve' as const,

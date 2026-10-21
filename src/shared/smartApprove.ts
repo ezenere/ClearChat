@@ -8,6 +8,7 @@
 // vira perguntar (mapJudgeDecision). Qualquer erro, tempo esgotado ou resposta ambígua do juiz →
 // pergunta ao usuário (nunca libera nem nega). Contexto extra: smartApproveContext.ts.
 import { contentText } from './attachments'
+import { normalizeCapture } from './smartDefaults'
 import { describeShell } from './shellParse'
 import { activeHistory, isDisplayOnly } from './context'
 import {
@@ -19,15 +20,18 @@ import {
   approvedBlock,
   buildJudgeExtras,
   checkBlock,
+  environmentBlock,
+  isTypedUserMessage,
   recentActivityBlock,
   subagentBlock,
   touchedFilesBlock,
   userGoalText,
+  type JudgeEnvironment,
   type JudgeExtras
 } from './smartApproveContext'
 import {
-  type ApiMessage,
   type ApprovalCheck,
+  type SmartApproveCategory,
   type SmartApproveConfig,
   type SmartApproveDecision,
   type SmartApproveLabels,
@@ -75,11 +79,25 @@ export const SMART_APPROVE_PLACEHOLDERS: { key: string; desc: string }[] = [
     key: 'recent_activity',
     desc: 'últimas 12 chamadas de tool da sessão (status, nome, args curtos) + a última fala do agente'
   },
+  {
+    key: 'environment',
+    desc: 'descrição do ambiente (a sua — do chat ou global) + o contexto capturado da conversa pelo resumidor; vazio se nada'
+  },
+  {
+    key: 'categories',
+    desc: 'as categorias aceitas na linha CATEGORY: (destructive | secrets | deploy | …)'
+  },
   { key: 'cwd', desc: 'diretório raiz do chat' },
   { key: 'confine', desc: 'tools de arquivo confinadas à raiz (yes/no)' },
   { key: 'sandbox', desc: 'shell em sandbox (yes/no)' },
-  { key: 'last_user_message', desc: 'última mensagem do usuário na sessão' },
-  { key: 'recent_context', desc: 'últimas N mensagens da sessão, compactas' },
+  {
+    key: 'last_user_message',
+    desc: 'última mensagem digitada por você na sessão (no subagente: a tarefa)'
+  },
+  {
+    key: 'recent_context',
+    desc: 'últimas N mensagens da sessão, compactas: o que você digitou + as chamadas de tool com status (nunca resultados de tool nem o texto do agente)'
+  },
   {
     key: 'labels',
     desc: 'os rótulos aceitos separados por " | " (o de rejeitar só com “O juiz pode negar”)'
@@ -149,7 +167,10 @@ export function normalizeSmartApprove(
     // 0.8.4: ausentes (configs anteriores) = desligados — quem já usava o juiz passa a ter
     // rejeição → perguntar e a whitelist decidindo sozinha o que ela cobre
     canDeny: s.canDeny === true,
-    judgeWhitelisted: s.judgeWhitelisted === true
+    judgeWhitelisted: s.judgeWhitelisted === true,
+    // 0.8.5: ajustes do chat/persona sobre os padrões globais (ausente/null = o global)
+    ...(typeof s.environment === 'string' ? { environment: s.environment } : {}),
+    ...(s.capture && typeof s.capture === 'object' ? { capture: normalizeCapture(s.capture) } : {})
   }
 }
 
@@ -170,6 +191,60 @@ export function mapJudgeDecision(
  */
 export function smartApproveActive(sa: Partial<SmartApproveConfig> | null | undefined): boolean {
   return !!sa?.providerId && !!sa.model?.trim()
+}
+
+// ---------------- categorias ----------------
+
+/**
+ * Categorias fixas do juiz ao perguntar/negar (linha `CATEGORY:` da resposta). `key` é o que o
+ * prompt pede (inglês); `label` é o que a UI mostra. `match` = palavras reconhecidas (sem acento).
+ */
+export const SMART_CATEGORIES: {
+  key: SmartApproveCategory
+  label: string
+  match: string[]
+}[] = [
+  {
+    key: 'destructive',
+    label: 'Destrutivo fora do trabalho',
+    match: ['destructive', 'destrutivo', 'destroy', 'delete']
+  },
+  {
+    key: 'secrets',
+    label: 'Exfiltração/segredos',
+    match: ['secret', 'exfiltra', 'segredo', 'credential', 'credencia']
+  },
+  { key: 'deploy', label: 'Deploy/produção', match: ['deploy', 'production', 'producao', 'prod'] },
+  { key: 'system', label: 'Sistema/privilégios', match: ['system', 'sistema', 'privileg', 'sudo'] },
+  {
+    key: 'shared-history',
+    label: 'Histórico compartilhado (force-push)',
+    match: ['shared-history', 'history', 'historico', 'force-push', 'force']
+  },
+  {
+    key: 'spending',
+    label: 'Gasto/publicação',
+    match: ['spending', 'spend', 'gasto', 'publish', 'publica', 'cost', 'money']
+  },
+  { key: 'out-of-scope', label: 'Fora do escopo', match: ['scope', 'escopo'] },
+  { key: 'uncertain', label: 'Incerto', match: ['uncertain', 'incerto', 'unclear', 'unknown'] }
+]
+
+export const SMART_CATEGORY_KEYS = SMART_CATEGORIES.map((c) => c.key).join(' | ')
+
+export const categoryLabel = (k: SmartApproveCategory | undefined): string =>
+  SMART_CATEGORIES.find((c) => c.key === k)?.label ?? ''
+
+/** Texto livre → categoria (sem caixa/acento; desconhecida → 'uncertain'). */
+export function categoryFrom(text: string): SmartApproveCategory {
+  const t = text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+  for (const c of SMART_CATEGORIES) if (t.includes(c.key)) return c.key
+  for (const c of SMART_CATEGORIES) if (c.match.some((m) => t.includes(m))) return c.key
+  return 'uncertain'
 }
 
 // ---------------- parse da resposta ----------------
@@ -203,6 +278,8 @@ const PREFIX_RE =
 export interface ParsedJudge {
   decision: SmartApproveDecision | null
   reason: string
+  /** Linha `CATEGORY: …` (ou `[categoria]` no início do motivo); ausente = template antigo. */
+  category?: SmartApproveCategory
   /** Sem decisão: resposta vazia, sem rótulo no início da 1ª linha, ou mais de um rótulo distinto. */
   problem?: 'empty' | 'no-label' | 'multiple'
 }
@@ -232,16 +309,37 @@ export function parseJudgeOutput(raw: string, labelsIn?: Partial<SmartApproveLab
   const atStart = findLabels(head, labels, true).find((f) => f.index === 0)
   if (!atStart) return { decision: null, reason: flat(lines.join(' ')), problem: 'no-label' }
   const key = atStart.key
-  const restFirst = head.slice(atStart.length)
-  const rest = [restFirst, ...lines.slice(firstIdx + 1)].join('\n')
-  const reason = flat(rest.replace(/^[\s:.\-–—,;)\]"'»”]+/u, ''))
+  let restFirst = head.slice(atStart.length)
+  // categoria: linha "CATEGORY: x" / "Categoria — x" (em qualquer linha depois do rótulo) ou tag
+  // "[x]" logo depois do rótulo / no começo do motivo
+  let category: SmartApproveCategory | undefined
+  const after = lines.slice(firstIdx + 1).filter((l) => {
+    const m = CATEGORY_LINE_RE.exec(l)
+    if (!m || category) return true
+    category = categoryFrom(m[1])
+    return false
+  })
+  const inlineCat = CATEGORY_LINE_RE.exec(restFirst.replace(/^[\s:.\-–—,;]+/u, ''))
+  if (!category && inlineCat) {
+    category = categoryFrom(inlineCat[1])
+    restFirst = ''
+  }
+  const rest = [restFirst, ...after].join('\n')
+  let reason = flat(rest.replace(/^[\s:.\-–—,;)\]"'»”]+/u, ''))
+  const tag = /^\[([^\]]{2,40})\]\s*/.exec(reason)
+  if (!category && tag) {
+    category = categoryFrom(tag[1])
+    reason = reason.slice(tag[0].length)
+  }
   const otherInLine = findLabels(restFirst, labels, true).some((f) => f.key !== key)
   const otherAfter = findLabels(lines.slice(firstIdx + 1).join('\n'), labels, false).some(
     (f) => f.key !== key
   )
   if (otherInLine || otherAfter) return { decision: null, reason, problem: 'multiple' }
-  return { decision: key, reason }
+  return { decision: key, reason, ...(category ? { category } : {}) }
 }
+
+const CATEGORY_LINE_RE = /^(?:category|categoria|cat)\s*[:\-–—=]\s*(.+)$/iu
 
 // ---------------- template e contexto ----------------
 
@@ -260,39 +358,50 @@ const cut = (s: string, max: number): string => {
   return t.length > max ? `${t.slice(0, max)}… [+${t.length - max} chars]` : t
 }
 
-/** Última mensagem "do usuário" da sessão (na subsessão: a tarefa ou a última mensagem recebida). */
-export function lastUserMessage(history: StoredMessage[], max = 2000): string {
+/**
+ * Última mensagem DIGITADA pelo usuário na sessão (isTypedUserMessage). Nunca resultados de tool,
+ * callbacks de subagente, mensagens de outros chats/irmãos/do agente pai (podem repetir saída de
+ * tool — defesa contra prompt injection). Sem nenhuma → `fallback` (no subagente: a tarefa).
+ */
+export function lastUserMessage(history: StoredMessage[], max = 2000, fallback?: string): string {
+  const clip = (t: string): string =>
+    t.length > max ? `${t.slice(0, max)}… [+${t.length - max} chars]` : t
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i]
-    if (m.message.role !== 'user') continue
-    if (m.meta?.kind === 'compaction' || isDisplayOnly(m.meta)) continue
-    if (m.meta?.kind === 'subagent-callback') continue
+    if (!isTypedUserMessage(m) || isDisplayOnly(m.meta)) continue
     const text = contentText(m.message.content).trim()
     if (!text || text.startsWith('<tool_result')) continue
-    return text.length > max ? `${text.slice(0, max)}… [+${text.length - max} chars]` : text
+    return clip(text)
   }
-  return '(none)'
+  return fallback?.trim() ? clip(fallback.trim()) : '(none)'
 }
 
-function messageLine(m: ApiMessage, toolNames: Map<string, string>): string {
+/**
+ * Uma linha do {{recent_context}}. Defesa contra prompt injection: só o que o usuário DIGITOU vai
+ * como texto; do agente, só as chamadas de tool (nome + args curtos), nunca a prosa (pode repetir
+ * uma página/arquivo lido); resultados de tool só com o status.
+ */
+function messageLine(sm: StoredMessage, toolNames: Map<string, string>): string {
+  const m = sm.message
   switch (m.role) {
     case 'user':
+      if (!isTypedUserMessage(sm))
+        return `[user: ${sm.meta?.kind ?? 'automatic'}] (omitted — not typed by the user)`
       return `[user] ${cut(contentText(m.content), 600) || '(attachments only)'}`
     case 'system':
-      return `[system] ${cut(contentText(m.content), 300)}`
+      return '[system] (omitted)'
     case 'assistant': {
       const parts: string[] = []
-      if (m.content?.trim()) parts.push(cut(m.content, 600))
       for (const tc of m.tool_calls ?? [])
         parts.push(`→ ${tc.function.name}(${cut(tc.function.arguments, 300)})`)
-      return `[assistant] ${parts.join('\n  ') || '(empty)'}`
+      return `[assistant] ${parts.join('\n  ') || '(text omitted)'}`
     }
     case 'tool':
-      return `[tool ${toolNames.get(m.tool_call_id) ?? '?'}] ${cut(contentText(m.content), 300)}`
+      return `[tool ${toolNames.get(m.tool_call_id) ?? '?'}] (${sm.meta?.toolStatus ?? 'ok'}; output omitted)`
   }
 }
 
-/** As últimas `n` mensagens ativas da sessão em texto compacto (resultados de tool cortados). */
+/** As últimas `n` mensagens ativas da sessão em texto compacto (sem resultados de tool). */
 export function recentContext(history: StoredMessage[], n: number): string {
   if (n <= 0) return '(omitted)'
   const active = activeHistory(history).filter((m) => !isDisplayOnly(m.meta))
@@ -302,7 +411,7 @@ export function recentContext(history: StoredMessage[], n: number): string {
       for (const tc of m.message.tool_calls ?? []) toolNames.set(tc.id, tc.function.name)
   const slice = active.slice(-n)
   if (!slice.length) return '(empty)'
-  return slice.map((m) => messageLine(m.message, toolNames)).join('\n')
+  return slice.map((m) => messageLine(m, toolNames)).join('\n')
 }
 
 export function prettyArgs(args: unknown): string {
@@ -326,6 +435,8 @@ export interface JudgeContext {
   judgeIdx?: number[]
   /** Contexto extra montado no main; ausente = derivado de `history` como sessão principal. */
   extra?: JudgeExtras
+  /** {{environment}}: a descrição do ambiente (sua) + o contexto capturado da conversa. */
+  environment?: JudgeEnvironment
 }
 
 /**
@@ -370,13 +481,15 @@ export function judgeVars(sa: SmartApproveConfig, ctx: JudgeContext): Record<str
     cwd: ctx.cwd,
     confine: ctx.confine ? 'yes' : 'no',
     sandbox: ctx.sandbox ? 'yes' : 'no',
-    last_user_message: lastUserMessage(ctx.history),
+    last_user_message: lastUserMessage(ctx.history, 2000, x.subagent?.task),
     recent_context: recentContext(ctx.history, sa.contextMessages),
     user_goal: userGoalText(x),
     subagent: subagentBlock(x),
     touched_files: touchedFilesBlock(x),
     approved_before: approvedBlock(x),
     recent_activity: recentActivityBlock(x),
+    environment: environmentBlock(ctx.environment),
+    categories: SMART_CATEGORY_KEYS,
     labels: sa.canDeny ? `${l.approve} | ${l.reject} | ${l.ask}` : `${l.approve} | ${l.ask}`,
     approve: l.approve,
     reject: l.reject,

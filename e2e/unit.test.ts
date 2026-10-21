@@ -1569,11 +1569,15 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
     confineToRoot: false,
     sandboxBash: true,
     smartApprove: { providerId: 'p1', model: 'judge' },
+    acceptEditsInRoot: true,
     memory: { enabled: true, collections: ['c1'], chatMemory: true },
     skills: { enabled: true, disabled: ['pdf'] },
+    // estado do chat (não vai para a persona)
+    capturedContext: { main: { text: '- x', updatedAt: 1, by: 'model' } },
     presetId: 'old'
   } as any
   const snap = snapshotPreset(cfg)
+  assert.ok(!('capturedContext' in snap), 'contexto capturado não vai para a persona')
   // todos os campos de persona, nada além deles
   assert.deepEqual(Object.keys(snap).sort(), [...PRESET_FIELDS].sort())
   assert.equal(snap.model, 'm1')

@@ -35,6 +35,7 @@ import { tmpdir } from 'node:os'
 const FAKE_KEY = 'fake-key-smart-approve'
 const AGENT = 'fake/agent-1'
 const JUDGE = 'fake/judge-1'
+const SUMMARY = 'fake/summary-1'
 const ROOT = resolve(import.meta.dirname, '..')
 const BASE = resolve(process.env.CLEARCHAT_E2E_DIR || join(tmpdir(), 'clearchat-smart-e2e'))
 const USER_DATA = join(BASE, 'userdata')
@@ -49,6 +50,9 @@ interface JudgeReply {
   delayMs?: number
 }
 const judgeQueue: JudgeReply[] = []
+/** Respostas do resumidor (coleta de contexto); derivação de subagente → summaryDerive. */
+const summaryQueue: string[] = []
+let summaryDerive = '- (derivado)'
 const hits: { model: string; body: any }[] = []
 let server: Server | null = null
 let fakeBase = ''
@@ -109,6 +113,18 @@ async function startFake(): Promise<void> {
           `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })}\n\n`
         )
         res.end('data: [DONE]\n\n')
+      }
+      if (body.model === SUMMARY) {
+        const u = String(body.messages?.[1]?.content ?? '')
+        const text = u.includes('Task delegated to the subagent')
+          ? summaryDerive
+          : (summaryQueue.shift() ?? 'KEEP')
+        sse([{ role: 'assistant', content: text }], {
+          prompt_tokens: 200,
+          completion_tokens: 20,
+          cost: 0.000011
+        })
+        return
       }
       if (body.model === JUDGE) {
         const r = judgeQueue.shift() ?? { text: 'ASK-USER\n(sem roteiro)' }
@@ -352,6 +368,7 @@ async function expand(scope: Locator, id: string): Promise<void> {
 }
 
 const judgeHits = (): { model: string; body: any }[] => hits.filter((h) => h.model === JUDGE)
+const summaryHits = (): { model: string; body: any }[] => hits.filter((h) => h.model === SUMMARY)
 
 // ---------------- passos ----------------
 
@@ -566,7 +583,7 @@ async function main(): Promise<void> {
   await step('APPROVED → executa (linha verde, custo do juiz no rodapé)', async () => {
     judgeQueue.push({ text: '**APPROVED** — Só imprime um texto.' })
     const before = judgeHits().length
-    await sendMessage('rode: echo SA-APPROVED')
+    await sendMessage('rode: expr SA-APPROVED')
     await waitIdle()
     const card = bashCards().last()
     await card.getByText('ok', { exact: true }).waitFor()
@@ -587,7 +604,7 @@ async function main(): Promise<void> {
     await page.keyboard.press('Escape')
     await details.waitFor({ state: 'detached', timeout: 5000 })
     await page.getByTestId('judge-usage').last().waitFor()
-    const r = await toolResultFor('echo SA-APPROVED')
+    const r = await toolResultFor('expr SA-APPROVED')
     assert(r.message.content.includes('SA-APPROVED'), 'saída do bash')
     assert(r.meta.smartApprove.decision === 'approve', 'meta')
     assert(r.meta.smartApprove.usage?.cost === 0.000042, 'custo')
@@ -599,9 +616,9 @@ async function main(): Promise<void> {
       jb.messages[0].role === 'system' && jb.messages[0].content.includes('Smart-Approve'),
       'system'
     )
-    assert(jb.messages[1].content.includes('"command": "echo SA-APPROVED"'), 'args no template')
+    assert(jb.messages[1].content.includes('"command": "expr SA-APPROVED"'), 'args no template')
     assert(
-      jb.messages[1].content.includes('[1] rode: echo SA-APPROVED'),
+      jb.messages[1].content.includes('[1] rode: expr SA-APPROVED'),
       'objetivo do usuário (mensagem digitada mais recente)'
     )
     assert(!jb.messages[0].content.includes('REJECTED'), 'sem "pode negar": juiz não oferece negar')
@@ -614,7 +631,7 @@ async function main(): Promise<void> {
 
   await step('REJECTED sem "O juiz pode negar" → vira pergunta (motivo como dica)', async () => {
     judgeQueue.push({ text: 'REJECTED\nParece desnecessário.' })
-    await sendMessage('rode: echo SA-WOULD-REJECT')
+    await sendMessage('rode: expr SA-WOULD-REJECT')
     const card = bashCards().last()
     await card.getByRole('button', { name: 'Sim', exact: true }).waitFor({ timeout: 15_000 })
     await card.getByText('Smart-Approve sugeriu perguntar').waitFor()
@@ -624,7 +641,7 @@ async function main(): Promise<void> {
     await shotOf(card, 'card-sugeriu-perguntar')
     await card.getByRole('button', { name: 'Não', exact: true }).click()
     await waitIdle()
-    const r = await toolResultFor('echo SA-WOULD-REJECT')
+    const r = await toolResultFor('expr SA-WOULD-REJECT')
     assert(r.meta.toolStatus === 'denied', 'você negou')
     assert(r.meta.smartApprove.decision === 'ask' && r.meta.smartApprove.wouldReject, 'mapeado')
     assert(!r.message.content.startsWith('Rejeitado pelo Smart-Approve'), 'não foi o juiz')
@@ -642,7 +659,7 @@ async function main(): Promise<void> {
     assert((await chatState()).chat.config.smartApprove.canDeny === true, 'pode negar salvo')
     await shot('smart-avancado-pode-negar')
     judgeQueue.push({ text: 'REJECTED\nApagaria arquivos fora da raiz.' })
-    await sendMessage('rode: echo SA-REJECTED')
+    await sendMessage('rode: expr SA-REJECTED')
     await waitIdle()
     const card = bashCards().last()
     await card.getByText('negada', { exact: true }).waitFor()
@@ -658,7 +675,7 @@ async function main(): Promise<void> {
     await strip.getByRole('button', { name: /Negado pelo Smart-Approve/ }).click()
     const line = strip.getByTestId('smart-approve-line')
     assert((await line.getAttribute('data-decision')) === 'reject', 'linha reject')
-    const r = await toolResultFor('echo SA-REJECTED')
+    const r = await toolResultFor('expr SA-REJECTED')
     assert(
       r.message.content ===
         'Rejeitado pelo Smart-Approve (fake/judge-1): Apagaria arquivos fora da raiz.',
@@ -683,7 +700,7 @@ async function main(): Promise<void> {
         .getByTestId('approval-denied-strip')
         .getByRole('button', { name: 'Executar mesmo assim' })
         .click()
-      await page.getByText('Pode executar shell `echo SA-REJECTED`; eu aprovo.').first().waitFor()
+      await page.getByText('Pode executar shell `expr SA-REJECTED`; eu aprovo.').first().waitFor()
       await waitIdle()
       await card.getByTestId('smart-overridden').waitFor()
       const runCard = bashCards().last()
@@ -710,7 +727,7 @@ async function main(): Promise<void> {
       )
       // a liberação é de uma vez só: a mesma chamada de novo volta ao juiz
       judgeQueue.push({ text: 'REJECTED\nDe novo não.' })
-      await sendMessage('rode: echo SA-REJECTED')
+      await sendMessage('rode: expr SA-REJECTED')
       await waitIdle()
       await bashCards().last().getByText('negada', { exact: true }).waitFor()
       assert(judgeHits().length === before + 1, 'voltou ao juiz')
@@ -719,7 +736,7 @@ async function main(): Promise<void> {
 
   await step('ASK-USER → card de aprovação com o motivo do juiz', async () => {
     judgeQueue.push({ text: 'ASK-USER\nPode ser intencional; confirme você.' })
-    await sendMessage('rode: echo SA-ASK')
+    await sendMessage('rode: expr SA-ASK')
     const card = bashCards().last()
     await card.getByRole('button', { name: 'Sim', exact: true }).waitFor({ timeout: 15_000 })
     await card.getByText('Smart-Approve sugeriu perguntar').waitFor()
@@ -728,7 +745,7 @@ async function main(): Promise<void> {
     await shotOf(card, 'card-ask-user')
     await card.getByRole('button', { name: 'Sim', exact: true }).click()
     await waitIdle()
-    const r = await toolResultFor('echo SA-ASK')
+    const r = await toolResultFor('expr SA-ASK')
     assert(
       r.meta.toolStatus === 'ok' && r.message.content.includes('SA-ASK'),
       'rodou após permitir'
@@ -738,14 +755,14 @@ async function main(): Promise<void> {
 
   await step('resposta malformada → card de aprovação (Negar)', async () => {
     judgeQueue.push({ text: 'Claro! Vou aprovar isso para você.' })
-    await sendMessage('rode: echo SA-MALFORMED')
+    await sendMessage('rode: expr SA-MALFORMED')
     const card = bashCards().last()
     await card.getByRole('button', { name: 'Não', exact: true }).waitFor({ timeout: 15_000 })
     await card.getByText('Smart-Approve não decidiu (resposta ambígua)').waitFor()
     await shotOf(card, 'card-ambiguo')
     await card.getByRole('button', { name: 'Não', exact: true }).click()
     await waitIdle()
-    const r = await toolResultFor('echo SA-MALFORMED')
+    const r = await toolResultFor('expr SA-MALFORMED')
     assert(r.meta.toolStatus === 'denied', 'negado pelo usuário')
     assert(r.meta.smartApprove?.fallback === 'ambiguous', 'fallback ambiguous')
   })
@@ -753,7 +770,7 @@ async function main(): Promise<void> {
   await step('timeout do juiz → card de aprovação', async () => {
     judgeQueue.push({ text: 'APPROVED\ntarde demais', delayMs: 8000 })
     const t0 = Date.now()
-    await sendMessage('rode: echo SA-TIMEOUT')
+    await sendMessage('rode: expr SA-TIMEOUT')
     const card = bashCards().last()
     await card.getByText('Smart-Approve avaliando').waitFor({ timeout: 5000 })
     await card.getByRole('button', { name: 'Sim', exact: true }).waitFor({ timeout: 10_000 })
@@ -761,7 +778,7 @@ async function main(): Promise<void> {
     await card.getByText('Smart-Approve não decidiu (tempo esgotado)').waitFor()
     await card.getByRole('button', { name: 'Sim', exact: true }).click()
     await waitIdle()
-    const r = await toolResultFor('echo SA-TIMEOUT')
+    const r = await toolResultFor('expr SA-TIMEOUT')
     assert(r.meta.smartApprove?.fallback === 'timeout', 'fallback timeout')
     assert(r.meta.toolStatus === 'ok', 'rodou após permitir')
     return `aprovação apareceu após ${waited}ms (timeout 3s)`
@@ -837,15 +854,15 @@ async function main(): Promise<void> {
             pages: { allow: [], deny: [] }
           }
         })
-      await lists(['echo *'], ['rm -rf *'])
+      await lists(['expr *'], ['rm -rf *'])
       let before = judgeHits().length
-      await sendMessage('rode: echo SA-WL')
+      await sendMessage('rode: expr SA-WL')
       await waitIdle()
       assert(judgeHits().length === before, 'whitelist inteira: juiz não chamado')
-      let r = await toolResultFor('echo SA-WL')
+      let r = await toolResultFor('expr SA-WL')
       assert(r.meta.toolStatus === 'ok' && !r.meta.smartApprove, 'rodou sem juiz')
       assert(
-        r.meta.approval.mode === 'smart' && r.meta.approval.allowed[0].entry === 'echo *',
+        r.meta.approval.mode === 'smart' && r.meta.approval.allowed[0].entry === 'expr *',
         'lista'
       )
       assert(
@@ -858,13 +875,13 @@ async function main(): Promise<void> {
       // parcial: só o que a whitelist não cobre vai ao juiz (o resto como contexto)
       judgeQueue.push({ text: 'APPROVED\nCria um arquivo na raiz, parte da tarefa.' })
       before = judgeHits().length
-      await sendMessage('rode: echo SA-PART && touch sa-part.txt')
+      await sendMessage('rode: expr SA-PART && touch sa-part.txt')
       await waitIdle()
       assert(judgeHits().length === before + 1, 'parcial: uma chamada ao juiz')
       const u = judgeHits().at(-1)!.body.messages[1].content
-      assert(u.includes('- echo SA-PART   [already allowed by whitelist "echo *"]'), 'contexto')
+      assert(u.includes('- expr SA-PART   [already allowed by whitelist "expr *"]'), 'contexto')
       assert(u.includes('- touch sa-part.txt   [TO DECIDE]'), 'só o resto a decidir')
-      r = await toolResultFor('echo SA-PART && touch sa-part.txt')
+      r = await toolResultFor('expr SA-PART && touch sa-part.txt')
       assert(r.meta.approval.judgeAllowed?.[0] === 'touch sa-part.txt', 'liberado pelo juiz')
       await bashCards().last().getByTestId('approval-badge').click()
       await page
@@ -892,13 +909,13 @@ async function main(): Promise<void> {
       await sleep(700)
       judgeQueue.push({ text: 'APPROVED\nSó imprime.' })
       before = judgeHits().length
-      await sendMessage('rode: echo SA-WL-JUDGED')
+      await sendMessage('rode: expr SA-WL-JUDGED')
       await waitIdle()
       assert(judgeHits().length === before + 1, 'com a opção: juiz chamado')
       assert(
         judgeHits()
           .at(-1)!
-          .body.messages[1].content.includes('TO DECIDE — matches whitelist "echo *"'),
+          .body.messages[1].content.includes('TO DECIDE — matches whitelist "expr *"'),
         'item da whitelist enviado ao juiz'
       )
       await wlSwitch.click()
@@ -962,6 +979,192 @@ async function main(): Promise<void> {
   )
 
   await step(
+    'leitura sempre liberada: ls roda sem card e sem juiz, até em "Listas" vazio',
+    async () => {
+      const { chat } = await chatState()
+      const modes = chat.config.approvalModes
+      await read('chats.update', chat.id, {
+        config: { approvalModes: { ...modes, commands: 'lists' } }
+      })
+      await read('approvals.updateSettings', {
+        lists: {
+          commands: { allow: [], deny: [] },
+          processes: { allow: [], deny: [] },
+          pages: { allow: [], deny: [] }
+        }
+      })
+      const before = judgeHits().length
+      await sendMessage('rode: ls -la && git status')
+      await waitIdle()
+      const card = bashCards().last()
+      assert((await card.getByTestId('approval-card').count()) === 0, 'sem card')
+      const r = await toolResultFor('ls -la && git status')
+      assert(r.meta.toolStatus !== 'denied', 'rodou')
+      assert(r.meta.approval?.readOnly?.length === 2, `readOnly ${JSON.stringify(r.meta.approval)}`)
+      assert(judgeHits().length === before, 'sem juiz')
+      const badge = card.getByTestId('approval-badge')
+      assert((await badge.getAttribute('data-approved-by')) === 'readonly', 'selo: leitura')
+      await badge.click()
+      await page
+        .getByTestId('approval-details')
+        .getByText('leitura (sempre liberada)')
+        .first()
+        .waitFor()
+      await sleep(300)
+      await shot('selo-leitura-sempre-liberada')
+      await page.keyboard.press('Escape')
+      await read('chats.update', chat.id, { config: { approvalModes: modes } })
+    }
+  )
+
+  await step(
+    'caminho protegido: pergunta mesmo na whitelist e no Smart-Approve (sem juiz)',
+    async () => {
+      await read('approvals.updateSettings', {
+        lists: {
+          commands: { allow: ['tee *'], deny: [] },
+          processes: { allow: [], deny: [] },
+          pages: { allow: [], deny: [] }
+        }
+      })
+      const before = judgeHits().length
+      await sendMessage('rode: expr SA-PROT | tee .env.local')
+      const card = bashCards().last()
+      await card.getByTestId('sub-protected').waitFor({ timeout: 15_000 })
+      assert(judgeHits().length === before, 'o juiz não foi chamado')
+      const sub = card
+        .getByTestId('approval-sub')
+        .filter({ has: page.getByTestId('sub-protected') })
+      assert(
+        (await sub.getByRole('button', { name: 'Sim + whitelist' }).isDisabled()) === true,
+        '"Sim + whitelist" desabilitado'
+      )
+      await card.scrollIntoViewIfNeeded()
+      await shotOf(card, 'card-caminho-protegido')
+      await card.getByRole('button', { name: 'Não', exact: true }).first().click()
+      await waitIdle()
+      const r = await toolResultFor('expr SA-PROT | tee .env.local')
+      assert(r.meta.toolStatus === 'denied', 'negado')
+      assert(
+        /\.env\.local/.test(r.meta.approval?.protectedPath ?? ''),
+        'registro do caminho protegido'
+      )
+      await read('approvals.updateSettings', {
+        lists: {
+          commands: { allow: [], deny: [] },
+          processes: { allow: [], deny: [] },
+          pages: { allow: [], deny: [] }
+        }
+      })
+    }
+  )
+
+  await step(
+    'coleta de contexto: o resumo atualiza a descrição e o juiz recebe (espera o resumo)',
+    async () => {
+      const { chat } = await chatState()
+      const pid = chat.config.providerId
+      await read('chats.update', chat.id, {
+        config: {
+          smartApprove: {
+            ...chat.config.smartApprove,
+            environment: '172.16.1.7 é meu servidor de testes; pode reiniciar containers lá.',
+            capture: {
+              enabled: true,
+              providerId: pid,
+              model: SUMMARY,
+              maxTokens: null,
+              lookback: 2
+            }
+          }
+        }
+      })
+      summaryQueue.push('APPEND\n- Usuário quer reiniciar o container api no 172.16.1.7')
+      judgeQueue.push({ text: 'APPROVED\nO usuário pediu.' })
+      const sBefore = summaryHits().length
+      await sendMessage('rode: touch sa-capture.txt e reinicie o container api no 172.16.1.7')
+      await waitIdle()
+      assert(summaryHits().length === sBefore + 1, 'uma chamada ao resumidor')
+      const sb = summaryHits().at(-1)!.body
+      assert(sb.messages[1].content.includes('reinicie o container api'), 'mensagem do usuário')
+      // só system + user; do agente, no máximo `lookback` (2) falas — nunca mensagens de tool
+      assert(sb.messages.length === 2, 'system + user')
+      const agentBlock = String(sb.messages[1].content).split('New message(s)')[0]
+      assert(agentBlock.split('\n---\n').length <= 2, 'até 2 falas do agente')
+      const u = judgeHits().at(-1)!.body.messages[1].content
+      assert(u.startsWith('Descrição do ambiente (usuário)'), 'ambiente no começo')
+      assert(u.includes('pode reiniciar containers lá'), 'descrição do usuário')
+      assert(u.includes('Contexto capturado da conversa'), 'bloco capturado')
+      assert(
+        u.includes('- Usuário quer reiniciar o container api no 172.16.1.7'),
+        'o juiz esperou o resumo'
+      )
+      const cc = (await chatState()).chat.config.capturedContext
+      assert(cc?.main?.text === '- Usuário quer reiniciar o container api no 172.16.1.7', 'salvo')
+      assert(cc?.main?.cost === 0.000011, 'custo registrado')
+      // UI: Ambiente e contexto → descrição editável
+      await openToolsTab()
+      const panel = page.getByTestId('right-panel')
+      await expand(panel, 'smart-approve')
+      await expand(section(), 'smart-environment')
+      const box = section().getByTestId('captured-context')
+      await box.getByRole('textbox').waitFor()
+      assert(
+        (await box.getByRole('textbox').inputValue()).includes('reiniciar o container api'),
+        'descrição na UI'
+      )
+      await box
+        .getByTestId('captured-meta')
+        .getByText(/atualizado há/)
+        .waitFor()
+      assert(
+        (await section().getByTestId('capture-status').getAttribute('data-active')) === 'true',
+        'coleta ativa'
+      )
+      await section().getByTestId('smart-context').scrollIntoViewIfNeeded()
+      await sleep(300)
+      await shotOf(section(), 'smart-ambiente-e-contexto')
+    }
+  )
+
+  await step('subagente: o juiz dele recebe a descrição derivada do pai + tarefa', async () => {
+    summaryDerive = '- Testes no 172.16.1.7\n- Tarefa do subagente: criar sa-sub.txt'
+    judgeQueue.push({ text: 'APPROVED\nParte da tarefa.' })
+    const before = judgeHits().length
+    await sendMessage('delegue: Sub contexto | rode: touch sa-sub.txt')
+    await waitIdle(45_000)
+    const derive = summaryHits().find((h) =>
+      String(h.body.messages[1].content).includes('Task delegated to the subagent')
+    )
+    assert(derive, 'derivação chamada')
+    assert(
+      String(derive!.body.messages[1].content).includes('reiniciar o container api'),
+      'parte da descrição do pai'
+    )
+    const jh = judgeHits().slice(before)
+    const subJudge = jh.find((h) =>
+      String(h.body.messages[1].content).includes('Caller: a SUBAGENT')
+    )
+    assert(subJudge, 'juiz do subagente chamado')
+    assert(
+      String(subJudge!.body.messages[1].content).includes(
+        '- Tarefa do subagente: criar sa-sub.txt'
+      ),
+      'descrição derivada no juiz do subagente'
+    )
+    const { chat } = await chatState()
+    const subs = Object.values(chat.config.capturedContext?.sessions ?? {}) as any[]
+    assert(
+      subs.some((e) => e.text.includes('criar sa-sub.txt')),
+      'salva por subsessão'
+    )
+    // desliga a coleta para os próximos passos
+    await read('chats.update', chat.id, {
+      config: { smartApprove: { ...chat.config.smartApprove, capture: null, environment: null } }
+    })
+  })
+
+  await step(
     'header: popover com os modos efetivos — revogar "Sempre"; sem modelo o selo some e pergunta',
     async () => {
       await openToolsTab()
@@ -999,7 +1202,7 @@ async function main(): Promise<void> {
       await badge.waitFor({ state: 'detached', timeout: 5000 })
       await page.getByRole('button', { name: 'Fechar painel' }).first().click()
       const before = judgeHits().length
-      await sendMessage('rode: echo SA-SEM-JUIZ')
+      await sendMessage('rode: expr SA-SEM-JUIZ')
       const card = bashCards().last()
       await card.getByRole('button', { name: 'Negar', exact: true }).waitFor({ timeout: 15_000 })
       await card

@@ -13,6 +13,7 @@ import {
   CornerDownRight,
   FileCode,
   Hand,
+  Lock,
   ShieldCheck
 } from 'lucide-react'
 import { Fragment, useState } from 'react'
@@ -75,6 +76,19 @@ export function ApprovalPrompt({
         <pre className="mt-2 max-h-40 overflow-auto rounded-lg bg-bg/70 px-3 py-2 font-mono text-[11.5px] whitespace-pre-wrap text-fg/85">
           {detail}
         </pre>
+      )}
+      {request.protectedPath && (
+        <p
+          data-testid="approval-protected"
+          className="mt-2 flex items-start gap-1.5 text-[11.5px] leading-snug text-warning/90"
+        >
+          <Lock className="mt-px size-3.5 shrink-0" />
+          <span>
+            <strong className="font-medium">caminho protegido</strong>: {request.protectedPath} —
+            sempre pergunta (nem “Sempre permitir”, nem o Smart-Approve, nem “Aceitar edições”
+            liberam).
+          </span>
+        </p>
       )}
       {request.smartMissing && (
         <div className="mt-2">
@@ -198,7 +212,23 @@ function ListsPrompt({
                   <code className="min-w-0 flex-1 font-mono text-[11.5px] break-all whitespace-pre-wrap text-fg/90">
                     {it.text || '(vazio)'}
                   </code>
-                  {it.verdict === 'allow' ? (
+                  {it.protectedPath && (
+                    <span
+                      data-testid="sub-protected"
+                      title={`Sempre pergunta: ${it.protectedPath}`}
+                      className="inline-flex shrink-0 items-center gap-1 rounded bg-danger/10 px-1.5 py-px text-[10.5px] text-danger/90"
+                    >
+                      <Lock className="size-3" /> caminho protegido
+                    </span>
+                  )}
+                  {it.verdict === 'allow' && it.readOnly ? (
+                    <span
+                      data-testid="sub-readonly"
+                      className="inline-flex shrink-0 items-center gap-1 text-[11px] text-success/90"
+                    >
+                      <Check className="size-3" /> leitura (sempre liberada)
+                    </span>
+                  ) : it.verdict === 'allow' ? (
                     <span
                       data-testid="sub-whitelisted"
                       className="inline-flex shrink-0 items-center gap-1 text-[11px] text-success/90"

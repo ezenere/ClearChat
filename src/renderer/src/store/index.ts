@@ -43,6 +43,8 @@ export interface AppSettings {
   defaultPresetId: string | null
   /** Versão cujo aviso de atualização foi dispensado (local; não sincroniza). */
   updateDismissedVersion: string | null
+  /** Título automático (valor cru; ler com normalizeAutoTitleSettings). Local; não sincroniza. */
+  autoTitle: unknown
 }
 
 export interface ToolRun {
@@ -256,6 +258,8 @@ interface Actions {
   loadMessages(sessionId: string, force?: boolean): Promise<void>
   createChat(input: { title?: string; config: Partial<ChatConfig> }): Promise<Chat | null>
   renameChat(chatId: string, title: string): Promise<void>
+  /** "Gerar título" (modelo do título de Configurações → Novos chats). */
+  generateTitle(chatId: string): Promise<void>
   deleteChat(chatId: string): Promise<void>
   patchConfig(chatId: string, patch: Partial<ChatConfig>): void
   flushConfig(chatId: string): Promise<void>
@@ -356,7 +360,8 @@ const SETTINGS_KEYS: (keyof AppSettings)[] = [
   'defaultSystemPrompt',
   'defaultCwd',
   'defaultPresetId',
-  'updateDismissedVersion'
+  'updateDismissedVersion',
+  'autoTitle'
 ]
 
 function sortChats(chats: Chat[]): Chat[] {
@@ -392,7 +397,8 @@ export const useStore = create<Store>()((set, get) => ({
     defaultSystemPrompt: null,
     defaultCwd: null,
     defaultPresetId: null,
-    updateDismissedVersion: null
+    updateDismissedVersion: null,
+    autoTitle: null
   },
   homeDir: null,
   view: { kind: 'new' },
@@ -795,6 +801,12 @@ export const useStore = create<Store>()((set, get) => ({
   async renameChat(chatId, title) {
     set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? { ...c, title } : c)) }))
     const chat = await get().run(() => api.chats.update(chatId, { title }), 'Erro ao renomear')
+    if (chat) set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? withPending(chat) : c)) }))
+  },
+
+  async generateTitle(chatId) {
+    // erro do main já vem legível ("Não foi possível gerar o título: …")
+    const chat = await get().run(() => api.chats.generateTitle(chatId))
     if (chat) set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? withPending(chat) : c)) }))
   },
 

@@ -896,11 +896,14 @@ function SpillField({ max }: { max: number }): React.JSX.Element {
  */
 export function ToolsEditor({
   chatScope,
+  chatId,
   onOpenMemory,
   ...props
 }: CfgProps & {
   /** Painel do chat (textos "neste chat" × "nesta persona"). */
   chatScope?: boolean
+  /** Painel do chat: id do chat (contexto capturado do Smart-Approve). */
+  chatId?: string
   /** Link "Memória" da seção de subagentes (editor de persona: troca de aba). */
   onOpenMemory?: () => void
 }): React.JSX.Element {
@@ -909,7 +912,7 @@ export function ToolsEditor({
       <ToolsListSection {...props} />
       <ChatApprovalSection {...props} chatScope={chatScope} />
       <SkillsSection {...props} chatScope={chatScope} />
-      <SmartApproveSection {...props} />
+      <SmartApproveSection {...props} chatId={chatId} />
       <SubagentSection {...props} chatScope={chatScope} onOpenMemory={onOpenMemory} />
       <ToolsPromptSection {...props} />
       <LimitsSection {...props} />

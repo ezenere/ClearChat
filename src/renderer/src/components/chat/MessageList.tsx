@@ -58,6 +58,7 @@ import {
 import { CompactionMessageInfo, MessageInfo } from '../apiDocs'
 import { ApiInfo } from '../ui/Tooltip'
 import { AutoTextarea, Button, Spinner } from '../ui/controls'
+import { AutoTitleBadge } from './AutoTitleBadge'
 import { Tip } from '../ui/Tooltip'
 import { CopyButton, Markdown } from './Markdown'
 import { OrphanApproval, ToolCard } from './ToolCard'
@@ -560,6 +561,7 @@ function UserMessage({
               onEdit={() => setEditing(true)}
               align="end"
             />
+            <AutoTitleBadge rec={msg.meta.autoTitle} />
           </BubbleFooter>
         </>
       )}

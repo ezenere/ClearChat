@@ -172,6 +172,8 @@ function smartAdvancedChanges(cfg: Pick<ChatConfig, 'smartApprove'>): string[] {
     changes.push(`${sa.contextMessages} msgs`)
   if (sa.timeoutS !== SMART_APPROVE_DEFAULTS.timeoutS) changes.push(`${sa.timeoutS} s`)
   if (sa.prompt != null || sa.template != null) changes.push('prompt personalizado')
+  if (typeof sa.environment === 'string') changes.push('ambiente do chat')
+  if (sa.capture) changes.push(sa.capture.enabled ? 'coleta de contexto' : 'sem coleta')
   return changes
 }
 

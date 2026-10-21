@@ -31,7 +31,7 @@ export function ModelTab({ chat }: { chat: Chat }): React.JSX.Element {
 }
 
 export function ToolsTab({ chat }: { chat: Chat }): React.JSX.Element {
-  return <ToolsEditor cfg={chat.config} patch={usePatch(chat)} chatScope />
+  return <ToolsEditor cfg={chat.config} patch={usePatch(chat)} chatScope chatId={chat.id} />
 }
 
 export function MemoryTab({ chat }: { chat: Chat }): React.JSX.Element {

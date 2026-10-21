@@ -663,7 +663,7 @@ async function main(): Promise<void> {
   )
 
   await step('bash → Permitir', async () => {
-    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-allow')
+    await sendMessage('Run this exact shell command with the shell tool: expr hello-ui-allow')
     await page.getByRole('button', { name: /^(Permitir|Sim)$/ }).waitFor({ timeout: 60_000 })
     await page.getByText('Aguardando aprovação').first().waitFor()
     await shot('approval-card')
@@ -680,7 +680,7 @@ async function main(): Promise<void> {
   })
 
   await step('bash → Negar', async () => {
-    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-deny')
+    await sendMessage('Run this exact shell command with the shell tool: expr hello-ui-deny')
     await page.getByRole('button', { name: /^(Negar|Não)$/ }).waitFor({ timeout: 60_000 })
     await page.getByRole('button', { name: /^(Negar|Não)$/ }).click()
     await waitIdle()
@@ -693,16 +693,16 @@ async function main(): Promise<void> {
   })
 
   await step('bash → Sim + whitelist (lista global) e a próxima roda sem card', async () => {
-    await sendMessage('Run this exact shell command with the shell tool: echo hello-ui-always')
+    await sendMessage('Run this exact shell command with the shell tool: expr hello-ui-always')
     const btn = page.getByRole('button', { name: 'Sim + whitelist' })
     await btn.first().waitFor({ timeout: 60_000 })
     await btn.first().click()
     const input = page.getByRole('textbox', { name: 'Padrão da whitelist' })
-    assert((await input.inputValue()) === 'echo *', `sugestão ${await input.inputValue()}`)
+    assert((await input.inputValue()) === 'expr *', `sugestão ${await input.inputValue()}`)
     await page.getByRole('button', { name: 'Salvar e permitir' }).click()
     await waitIdle()
     const st = await read<any>('approvals.getSettings')
-    assert(st.lists.commands.allow.includes('echo *'), 'whitelist echo *')
+    assert(st.lists.commands.allow.includes('expr *'), 'whitelist expr *')
     await shot('always')
     // os passos seguintes assumem o shell liberado neste chat (antes: "Sempre neste chat")
     const { chat } = await currentState()
@@ -1647,8 +1647,9 @@ async function main(): Promise<void> {
     await page.getByRole('button', { name: 'Começar' }).click()
     await composer().waitFor({ timeout: 10_000 })
     await sendMessage(
-      // printf (não echo): `echo *` foi para a whitelist global no passo "Sim + whitelist"
-      'Use the delegate_task tool to ask a subagent to run the bash command "printf sub-approval-ok" with its shell tool and report the output. Then tell me the output.'
+      // mkdir (não expr/echo): `expr *` foi para a whitelist no passo "Sim + whitelist" e echo/printf são
+      // só leitura (sempre liberados, 0.8.5) — precisa de algo que pergunte
+      'Use the delegate_task tool to ask a subagent to run the bash command "mkdir -p sub-approval-ok && echo sub-approval-ok" with its shell tool and report the output. Then tell me the output.'
     )
     // o indicador do topo é só para OUTROS chats; aqui a aprovação do subagente fica no card do
     // delegate (visível) — ou na fila acima do composer se o card estiver fora da tela

@@ -1,5 +1,6 @@
 import type { MemoryConfig, MemoryExtractionResult } from './memory'
 import type { SkillPartMeta, SkillsConfig } from './skills'
+import type { AutoTitleRecord } from './autoTitle'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
 export interface Provider {
@@ -146,6 +147,11 @@ export interface ApprovalSettings {
   modes: Record<ApprovalItem, ApprovalMode>
   /** Listas globais (settings `approvalLists`) — nunca por chat. */
   lists: Record<ApprovalListItem, ApprovalList>
+  /**
+   * Padrões globais do Smart-Approve (setting local `smartApproveDefaults`): descrição do ambiente,
+   * "Aceitar edições dentro da raiz" e coleta automática de contexto.
+   */
+  smart: SmartApproveDefaults
 }
 
 /** Nomes antigos de tools → atuais (alias de leitura: configs/históricos antigos, modelos). */
@@ -220,6 +226,19 @@ export interface ChatConfig {
    * rejeitar / perguntar ao usuário). Ausente/sem modelo = esses itens perguntam. Ver smartApprove.ts.
    */
   smartApprove?: SmartApproveConfig
+  /**
+   * "Aceitar edições dentro da raiz do chat" (aba Tools → Aprovações; também nas personas):
+   * write_file/edit_file com caminho resolvido dentro da raiz (e fora dos caminhos protegidos) rodam
+   * sem perguntar nem chamar o juiz. Ausente/null = padrão global (Configurações → Aprovações,
+   * desligado por padrão). Ver approvalSafety.ts.
+   */
+  acceptEditsInRoot?: boolean | null
+  /**
+   * Smart-Approve → "Contexto capturado da conversa": descrição mantida pelo resumidor (e editável
+   * por você) — do chat (`main`) e de cada subagente (`sessions`). Estado do chat (não vai para as
+   * personas); sincroniza com a config do chat. Ver contextCapture.ts.
+   */
+  capturedContext?: CapturedContextState
   /** Persona (preset) de onde o chat veio — só informativo (ver Preset). */
   presetId?: string
 }
@@ -260,6 +279,17 @@ export interface SmartApproveConfig {
    */
   judgeWhitelisted: boolean
   /**
+   * "Descrição do ambiente" deste chat/persona (texto livre: hosts, o que pode ser feito onde…),
+   * injetada no juiz em {{environment}}. Ausente/null = a descrição global (Configurações →
+   * Aprovações); '' = nenhuma neste chat.
+   */
+  environment?: string | null
+  /**
+   * "Coleta automática de contexto" (resumidor): ausente/null = o padrão global. Ver
+   * contextCapture.ts.
+   */
+  capture?: ContextCaptureConfig | null
+  /**
    * @deprecated (≤ 0.4.0) liga/desliga. Só alias de leitura: migrateSmartApproveConfig converte
    * (ver approvalPolicy.ts) e remove. Hoje o juiz age nos itens em modo `smart` quando há modelo.
    */
@@ -272,6 +302,73 @@ export interface SmartApproveConfig {
 }
 
 export type SmartApproveDecision = 'approve' | 'reject' | 'ask'
+
+/** Categoria que o juiz dá ao perguntar/negar (rótulo fixo; ver SMART_CATEGORIES). */
+export type SmartApproveCategory =
+  | 'destructive'
+  | 'secrets'
+  | 'deploy'
+  | 'system'
+  | 'shared-history'
+  | 'spending'
+  | 'out-of-scope'
+  | 'uncertain'
+
+/** Coleta automática de contexto (resumidor do Smart-Approve). */
+export interface ContextCaptureConfig {
+  /** Ligada (só age com modelo escolhido e algum item em Smart-Approve). */
+  enabled: boolean
+  /** Modelo do resumo (qualquer provedor; independente do juiz). */
+  providerId: string | null
+  model: string | null
+  /** max_tokens da chamada (null = padrão pequeno). */
+  maxTokens: number | null
+  /** Quantas mensagens do agente (só o texto dele) antes da sua entram como contexto (1–10). */
+  lookback: number
+}
+
+/** Uma descrição capturada (do chat ou de um subagente). */
+export interface CapturedEntry {
+  text: string
+  updatedAt: number
+  /** Quem escreveu a versão atual. */
+  by: 'model' | 'user' | 'derived'
+  /** Versão anterior (desfazer a última mudança). */
+  prev?: { text: string; updatedAt: number; by: CapturedEntry['by'] }
+  /** Última mensagem já resumida (o resumidor nunca reenvia o que já processou). */
+  cursor?: { id: string; seq: number; at: number }
+  /** Última chamada ao resumidor. */
+  lastRun?: {
+    at: number
+    providerId: string
+    model: string
+    decision?: 'keep' | 'append' | 'rewrite'
+    error?: string
+    usage?: Usage
+    durationMs: number
+    /** Linhas descartadas pela trava "só o que o usuário disse" (cópia do texto do agente). */
+    dropped?: number
+  }
+  /** Soma das chamadas (custo fora do histórico). */
+  calls?: number
+  cost?: number
+}
+
+export interface CapturedContextState {
+  main?: CapturedEntry
+  /** Subagentes (sessionId → descrição derivada do pai + tarefa). */
+  sessions?: Record<string, CapturedEntry>
+}
+
+/**
+ * Padrões GLOBAIS do Smart-Approve/aprovações (setting local `smartApproveDefaults`, Configurações
+ * → Aprovações; não sincroniza — ver SPEC).
+ */
+export interface SmartApproveDefaults {
+  environment: string
+  acceptEditsInRoot: boolean
+  capture: ContextCaptureConfig
+}
 
 /** Uma avaliação do juiz (meta da mensagem tool e da ApprovalRequest). Nunca entra no histórico enviado. */
 export interface SmartApproveRecord {
@@ -297,6 +394,8 @@ export interface SmartApproveRecord {
   wouldReject?: boolean
   /** Itens (sub-comandos/URL) que o juiz avaliou — os demais já estavam liberados pela whitelist. */
   judged?: string[]
+  /** Categoria dada pelo juiz ao perguntar/negar (linha `CATEGORY:`; ausente em templates antigos). */
+  category?: SmartApproveCategory
 }
 
 /**
@@ -530,6 +629,9 @@ export interface MessageMeta {
   // ---- visualizador de arquivos (mensagem tool de present_file) ----
   /** Arquivos apresentados ao usuário (cards no chat + painel de arquivo). Ver SPEC → present_file. */
   presentFiles?: PresentFilesRecord
+  // ---- título automático (1ª mensagem digitada da principal) ----
+  /** Título do chat gerado por modelo a partir desta mensagem (custo/modelo — fora do histórico). */
+  autoTitle?: AutoTitleRecord
 }
 
 /** Tipo de visualização de um arquivo no painel (SPEC → "Visualizador de arquivos"). */
@@ -607,6 +709,10 @@ export interface ApprovalCheckItem {
    * arquivo (lido no main, ≤ 64 KiB) ou o código inline — card e juiz mostram. Ver scriptPreview.ts.
    */
   script?: ApprovalScript
+  /** Só leitura: liberado sempre (approvalSafety.ts) — "leitura (sempre liberada)". */
+  readOnly?: boolean
+  /** Toca um caminho protegido (sempre pergunta): "~/.ssh/config (chaves e config do SSH)". */
+  protectedPath?: string
 }
 
 /** Prévia de script de um item do card (ver src/shared/scriptPreview.ts). */
@@ -651,6 +757,12 @@ export interface ApprovalRecord {
   userAllowed?: string[]
   /** Sub-comando que você negou. */
   denied?: string
+  /** Sub-comandos liberados por serem só de leitura (sempre liberados). */
+  readOnly?: string[]
+  /** Liberado por "Aceitar edições dentro da raiz do chat" (write_file/edit_file). */
+  acceptEdits?: boolean
+  /** Perguntou por tocar um caminho protegido. */
+  protectedPath?: string
 }
 
 export interface ApprovalRequest {
@@ -667,6 +779,8 @@ export interface ApprovalRequest {
   check?: ApprovalCheck
   /** Modo smart sem modelo do Smart-Approve → perguntou (o card avisa). */
   smartMissing?: boolean
+  /** Pergunta porque toca um caminho protegido (o card mostra "caminho protegido"). */
+  protectedPath?: string
 }
 
 // ---- Questionário (tool ask_user) — ver SPEC.md → "Questionário (ask_user)" ----

@@ -1,12 +1,27 @@
 // Configurações → Aprovações: modo GLOBAL por item (Sempre / Smart-Approve / Listas ou Perguntar)
 // — é aqui que se define o padrão (★ na aba Tools) — e as listas
 // globais (whitelist/blacklist) de comandos, processos e páginas, com busca, edição e "Testar".
-import { Ban, Check, CircleHelp, CornerDownRight, Pencil, Plus, Search, Trash2 } from 'lucide-react'
-import { Fragment, useState } from 'react'
+import {
+  Ban,
+  Check,
+  CircleHelp,
+  CornerDownRight,
+  Lock,
+  Pencil,
+  Plus,
+  Search,
+  Trash2,
+  X
+} from 'lucide-react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import { APPROVAL_ITEM_GROUPS, evaluateLists, ITEM_LABEL, ITEM_TOOL } from '@shared/approvalPolicy'
 import { analyzeShell, groupHeadings } from '@shared/shellParse'
 import type { ApprovalItem, ApprovalListItem, ApprovalMode } from '@shared/types'
+import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
+import { CaptureFields, ENVIRONMENT_PLACEHOLDER } from '../panel/SmartContextFields'
+import { ToggleRow } from '../panel/fields'
+import { AutoTextarea } from '../ui/controls'
 import { useStore } from '../../store'
 import { C } from '../ui/Tooltip'
 import { ListEntryEditor, ModeSelector } from './ApprovalControls'
@@ -74,6 +89,8 @@ export function ApprovalsSettings(): React.JSX.Element {
         confirmação.
       </p>
 
+      <SmartDefaults />
+
       <div className="border-t border-border pt-4">
         <div className="mb-3 flex items-center gap-1 border-b border-border">
           {(['commands', 'processes', 'pages'] as const).map((it) => (
@@ -102,21 +119,58 @@ function ListsEditor({ item }: { item: ApprovalListItem }): React.JSX.Element {
   const [query, setQuery] = useState('')
   return (
     <div className="space-y-4">
-      <div className="relative">
-        <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-faint" />
-        <input
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Buscar nas listas…"
-          aria-label="Buscar nas listas"
-          className="field h-8 pl-8 text-[12.5px]"
-        />
+      {/* busca sempre visível (gruda no topo da aba ao rolar) */}
+      <div
+        data-testid="lists-search"
+        className="sticky top-0 z-10 -mx-1 bg-surface px-1 pt-1 pb-2 shadow-[0_6px_8px_-8px_rgba(0,0,0,0.35)]"
+      >
+        <div className="relative">
+          <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-accent-strong" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Escape' && query && (e.stopPropagation(), setQuery(''))}
+            placeholder={`Buscar nas listas de ${ITEM_LABEL[item].toLowerCase()}…`}
+            aria-label="Buscar nas listas"
+            className="field h-9 border-accent/40 pl-9 text-[13px]"
+          />
+          {query && (
+            <button
+              type="button"
+              aria-label="Limpar busca"
+              onClick={() => setQuery('')}
+              className="absolute top-1/2 right-2 -translate-y-1/2 rounded p-1 text-subtle hover:text-fg"
+            >
+              <X className="size-3.5" />
+            </button>
+          )}
+        </div>
       </div>
       <ListTable item={item} list="allow" query={query} />
       <ListTable item={item} list="deny" query={query} />
       <Tester item={item} />
     </div>
   )
+}
+
+/** Texto com os trechos que casam com a busca destacados (sem caixa). */
+function Highlight({ text, query }: { text: string; query: string }): React.JSX.Element {
+  const q = query.trim().toLowerCase()
+  if (!q) return <>{text}</>
+  const parts: React.ReactNode[] = []
+  const low = text.toLowerCase()
+  let i = 0
+  for (let at = low.indexOf(q); at >= 0; at = low.indexOf(q, i)) {
+    if (at > i) parts.push(text.slice(i, at))
+    parts.push(
+      <mark key={at} data-testid="list-match" className="rounded-sm bg-accent/25 px-px text-fg">
+        {text.slice(at, at + q.length)}
+      </mark>
+    )
+    i = at + q.length
+  }
+  if (i < text.length) parts.push(text.slice(i))
+  return <>{parts}</>
 }
 
 function ListTable({
@@ -132,21 +186,40 @@ function ListTable({
   const update = useStore((s) => s.updateApprovalSettings)
   const entries = settings.lists[item][list]
   const [editing, setEditing] = useState<number | 'new' | null>(null)
+  const [justAdded, setJustAdded] = useState<string | null>(null)
+  const box = useRef<HTMLDivElement>(null)
   const q = query.trim().toLowerCase()
   const shown = entries
     .map((e, i) => ({ e, i }))
     .filter(({ e }) => !q || e.toLowerCase().includes(q))
-  const save = async (next: string[]): Promise<boolean> => {
+  const save = async (next: string[], added?: string): Promise<boolean> => {
     const ok = await update({
       lists: { ...settings.lists, [item]: { ...settings.lists[item], [list]: next } }
     })
-    if (ok) setEditing(null)
+    if (ok) {
+      setEditing(null)
+      if (added) setJustAdded(added)
+    }
     return ok
   }
+  // entrada nova (ou o editor de "Adicionar") rola para dentro da caixa
+  useEffect(() => {
+    if (!box.current) return
+    const target =
+      editing === 'new'
+        ? box.current.querySelector('[data-testid="list-entry-editor"]')
+        : justAdded
+          ? box.current.querySelector(`[data-entry="${CSS.escape(justAdded)}"]`)
+          : null
+    target?.scrollIntoView({ block: 'nearest' })
+  }, [editing, justAdded, entries.length])
   const allow = list === 'allow'
+  const count = q
+    ? `${shown.length} de ${entries.length}`
+    : `${entries.length} ${entries.length === 1 ? 'entrada' : 'entradas'}`
   return (
     <div data-testid={`list-${item}-${list}`}>
-      <div className="mb-1 flex items-center gap-1.5">
+      <div data-testid="list-header" className="mb-1 flex items-center gap-1.5">
         {allow ? (
           <Check className="size-3.5 text-success/90" />
         ) : (
@@ -155,8 +228,11 @@ function ListTable({
         <span className="text-[12px] font-medium text-fg/90">
           {allow ? 'Whitelist' : 'Blacklist'}
         </span>
-        <span className="text-[11px] text-faint">
-          {entries.length} {entries.length === 1 ? 'entrada' : 'entradas'}
+        <span
+          data-testid="list-count"
+          className={cn('text-[11px]', q ? 'text-accent-strong' : 'text-faint')}
+        >
+          {count}
         </span>
         <button
           type="button"
@@ -166,10 +242,14 @@ function ListTable({
           <Plus className="size-3" /> Adicionar
         </button>
       </div>
-      <div className="overflow-hidden rounded-lg border border-border">
+      <div
+        ref={box}
+        data-testid="list-box"
+        className="max-h-[34vh] overflow-y-auto overscroll-contain rounded-lg border border-border"
+      >
         {shown.length === 0 && editing !== 'new' && (
-          <p className="px-3 py-2 text-[11.5px] text-faint">
-            {entries.length ? 'Nada casa com a busca.' : 'Vazia.'}
+          <p data-testid="list-empty" className="px-3 py-2 text-[11.5px] text-faint">
+            {entries.length ? `Nenhuma entrada contém “${query.trim()}”.` : 'Vazia.'}
           </p>
         )}
         {shown.map(({ e, i }) =>
@@ -181,23 +261,35 @@ function ListTable({
                 initial={e}
                 confirmLabel="Salvar"
                 onCancel={() => setEditing(null)}
-                onConfirm={(v) => void save(entries.map((x, k) => (k === i ? v : x)))}
+                onConfirm={(v) =>
+                  void save(
+                    entries.map((x, k) => (k === i ? v : x)),
+                    v
+                  )
+                }
               />
             </div>
           ) : (
             <div
               key={i}
               data-testid="list-entry"
-              className="group flex h-8 items-center gap-2 border-b border-border/70 px-3 last:border-b-0 hover:bg-hover/40"
+              data-entry={e}
+              className={cn(
+                'group flex h-8 items-center gap-2 border-b border-border/70 px-3 last:border-b-0 hover:bg-hover/40 focus-within:bg-hover/40',
+                justAdded === e && 'bg-accent-soft/40'
+              )}
             >
-              <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg/90">
-                {e}
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-fg/90"
+                title={e}
+              >
+                <Highlight text={e} query={query} />
               </span>
               <button
                 type="button"
                 aria-label={`Editar ${e}`}
                 onClick={() => setEditing(i)}
-                className="rounded p-1 text-subtle opacity-0 group-hover:opacity-100 hover:text-fg"
+                className="rounded p-1 text-subtle opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 hover:text-fg focus-visible:opacity-100 focus-visible:outline-1 focus-visible:outline-accent"
               >
                 <Pencil className="size-3" />
               </button>
@@ -205,7 +297,7 @@ function ListTable({
                 type="button"
                 aria-label={`Remover ${e}`}
                 onClick={() => void save(entries.filter((_, k) => k !== i))}
-                className="rounded p-1 text-subtle opacity-0 group-hover:opacity-100 hover:text-danger"
+                className="rounded p-1 text-subtle opacity-0 group-focus-within:opacity-100 group-hover:opacity-100 hover:text-danger focus-visible:opacity-100 focus-visible:outline-1 focus-visible:outline-accent"
               >
                 <Trash2 className="size-3" />
               </button>
@@ -220,7 +312,7 @@ function ListTable({
               initial=""
               confirmLabel="Adicionar"
               onCancel={() => setEditing(null)}
-              onConfirm={(v) => void save(entries.includes(v) ? entries : [...entries, v])}
+              onConfirm={(v) => void save(entries.includes(v) ? entries : [...entries, v], v)}
             />
           </div>
         )}
@@ -233,9 +325,17 @@ function ListTable({
 function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
   const lists = useStore((s) => s.approvalSettings.lists)
   const [text, setText] = useState('')
+  const [home, setHome] = useState<string | undefined>()
+  useEffect(() => {
+    void api.fs.homeDir().then(setHome, () => {})
+  }, [])
   const isPages = item === 'pages'
+  // caminhos relativos: a partir do home (o "Testar" não tem chat; o card usa o diretório do comando)
   const ev = text.trim()
-    ? evaluateLists(item, isPages ? { url: text } : { command: text }, lists)
+    ? evaluateLists(item, isPages ? { url: text } : { command: text }, lists, {
+        home,
+        cwd: home
+      })
     : null
   const parseError = !isPages && text.trim() ? analyzeShell(text).error : undefined
   const heads = ev ? groupHeadings(ev.check.items) : []
@@ -281,12 +381,25 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
                 className="flex items-start gap-2 rounded-md bg-bg/60 px-2 py-1"
               >
                 <span
+                  data-testid="tester-verdict"
+                  data-kind={it.readOnly ? 'readonly' : it.protectedPath ? 'protected' : it.verdict}
                   className={cn(
-                    'mt-px shrink-0 text-[10.5px] font-medium',
-                    it.verdict === 'allow' ? 'text-success/90' : 'text-warning/90'
+                    'mt-px inline-flex shrink-0 items-center gap-1 text-[10.5px] font-medium',
+                    it.verdict === 'allow'
+                      ? 'text-success/90'
+                      : it.protectedPath
+                        ? 'text-danger/90'
+                        : 'text-warning/90'
                   )}
                 >
-                  {it.verdict === 'allow' ? '✓ liberado' : 'pergunta'}
+                  {it.protectedPath && <Lock className="size-3" />}
+                  {it.readOnly
+                    ? '✓ leitura (sempre liberada)'
+                    : it.verdict === 'allow'
+                      ? '✓ liberado'
+                      : it.protectedPath
+                        ? 'caminho protegido'
+                        : 'pergunta'}
                 </span>
                 <span className="min-w-0 flex-1">
                   <span className="block font-mono text-[11.5px] break-all text-fg/90">
@@ -308,13 +421,69 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
           ))}
           {!ev.blocked && (
             <p className="text-[11px] text-subtle">
-              {ev.allAllowed
-                ? 'Resultado: roda sem perguntar (modo Listas).'
-                : 'Resultado: pede sua decisão para os itens pendentes.'}
+              {ev.readOnly
+                ? 'Resultado: só leitura — roda sem perguntar em qualquer modo (sem juiz).'
+                : ev.allAllowed
+                  ? 'Resultado: roda sem perguntar (modo Listas).'
+                  : ev.protected
+                    ? 'Resultado: toca um caminho protegido — sempre pergunta (whitelist e juiz não liberam).'
+                    : 'Resultado: pede sua decisão para os itens pendentes.'}
             </p>
           )}
         </div>
       )}
+    </div>
+  )
+}
+
+/**
+ * Padrões globais do Smart-Approve (setting local, não sincroniza): descrição do ambiente,
+ * "Aceitar edições dentro da raiz" e a coleta automática de contexto. Cada chat/persona pode ajustar.
+ */
+function SmartDefaults(): React.JSX.Element {
+  const smart = useStore((s) => s.approvalSettings.smart)
+  const update = useStore((s) => s.updateApprovalSettings)
+  const [env, setEnv] = useState(smart.environment)
+  const [prevEnv, setPrevEnv] = useState(smart.environment)
+  if (prevEnv !== smart.environment) {
+    setPrevEnv(smart.environment)
+    setEnv(smart.environment)
+  }
+  const set = (p: Partial<typeof smart>): void => void update({ smart: { ...smart, ...p } })
+  return (
+    <div data-testid="smart-defaults" className="space-y-3 border-t border-border pt-4">
+      <div className="text-[11.5px] text-subtle">
+        Padrões globais (cada chat e persona pode ajustar)
+      </div>
+      <ToggleRow
+        label="Aceitar edições dentro da raiz do chat"
+        description="Desligado (padrão). Ligado: write_file/edit_file com caminho (após seguir links) dentro da raiz do chat rodam sem perguntar e sem o juiz. Caminhos protegidos continuam perguntando."
+        checked={smart.acceptEditsInRoot}
+        onChange={(acceptEditsInRoot) => set({ acceptEditsInRoot })}
+      />
+      <div>
+        <div className="mb-1 text-[12.5px] font-medium text-fg/90">
+          Descrição do ambiente (Smart-Approve)
+        </div>
+        <AutoTextarea
+          value={env}
+          aria-label="Descrição do ambiente global"
+          placeholder={ENVIRONMENT_PLACEHOLDER}
+          onChange={(e) => setEnv(e.target.value)}
+          onBlur={() => env !== smart.environment && set({ environment: env })}
+          minRows={2}
+          maxRows={10}
+          className="field text-[12px] leading-relaxed"
+        />
+        <p className="mt-1 text-[11px] leading-snug text-faint">
+          Vai para o juiz de todos os chats (salvo ajuste no chat). Fica só neste computador.
+        </p>
+      </div>
+      <CaptureFields
+        value={smart.capture}
+        onChange={(capture) => set({ capture })}
+        testId="global-capture-fields"
+      />
     </div>
   )
 }

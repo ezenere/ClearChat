@@ -5,8 +5,9 @@
 //   (Esc / clique fora desafixa).
 // - NEGADA/BLOQUEADA: faixa compacta de uma linha, visível (por que não rodou), que expande ao clicar.
 import * as RT from '@radix-ui/react-tooltip'
-import { Ban, Check, ChevronRight, ShieldCheck, ShieldX } from 'lucide-react'
+import { Ban, Check, ChevronRight, Lock, ShieldCheck, ShieldX } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
+import { categoryLabel } from '@shared/smartApprove'
 import type { MessageMeta } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
@@ -20,6 +21,8 @@ const ITEM_BY: Record<OutcomeItem['by'], { text: string; cls: string }> = {
   lists: { text: 'whitelist', cls: 'text-success/90' },
   smart: { text: 'Smart-Approve', cls: 'text-success/90' },
   user: { text: 'você', cls: 'text-success/90' },
+  readonly: { text: 'leitura (sempre liberada)', cls: 'text-success/90' },
+  edits: { text: 'aceitar edições na raiz', cls: 'text-success/90' },
   denied: { text: 'você negou', cls: 'text-danger/90' },
   blocked: { text: 'blacklist', cls: 'text-danger/90' }
 }
@@ -75,6 +78,15 @@ export function ApprovalDetails({
             </li>
           ))}
         </ul>
+      )}
+      {outcome.protectedPath && (
+        <p
+          data-testid="approval-protected"
+          className="flex items-start gap-1 text-[11.5px] text-warning/90"
+        >
+          <Lock className="mt-0.5 size-3 shrink-0" />
+          <span>Perguntou porque toca um caminho protegido: {outcome.protectedPath}</span>
+        </p>
       )}
       {meta.smartOverride && (
         <p data-testid="smart-override-run" className="text-[11.5px] text-subtle">
@@ -196,6 +208,14 @@ export function DeniedStrip({
             <ShieldX className="size-3.5 shrink-0 text-danger/90" />
           )}
           <span className="shrink-0 font-medium text-danger/90">{outcome.title}</span>
+          {outcome.deniedBy === 'smart' && sa?.category && (
+            <span
+              data-testid="strip-category"
+              className="shrink-0 rounded bg-hover px-1.5 py-px text-[10.5px] text-muted"
+            >
+              {categoryLabel(sa.category)}
+            </span>
+          )}
           {outcome.reason && (
             <span
               data-testid="approval-denied-reason"

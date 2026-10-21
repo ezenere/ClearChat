@@ -62,6 +62,7 @@ import {
 import { safeFileName } from '@shared/remoteFs'
 import * as runner from './agent/runner'
 import * as memory from './memory'
+import { generateTitleNow } from './autoTitle'
 import { answerQuestion } from './agent/questions'
 import { bwrapAvailable } from './tools/bash'
 import { listProcesses, processLogLines, stopChatProcesses, stopProcess } from './tools/processes'
@@ -223,6 +224,8 @@ export function registerIpc(): void {
       chatsRepo.delete(id)
       removeChatToolOutputs(id)
     },
+    // título automático: local (usa a config e o provedor deste dispositivo); o título sincroniza
+    [IPC.chats.generateTitle]: (id: string) => generateTitleNow(id),
 
     // ---- sessions ----
     [IPC.sessions.list]: (chatId: string) => sessionsRepo.list(chatId),
@@ -358,6 +361,10 @@ export function registerIpc(): void {
         runner.smartOverride(messageId)
       ),
     [IPC.agent.smartApproveTest]: (input: SmartApproveTestInput) => runner.smartApproveTest(input),
+    [IPC.agent.setCapturedContext]: (chatId: string, sessionId: string | null, text: string) =>
+      runner.setCapturedContext(chatId, sessionId ?? null, String(text ?? '')),
+    [IPC.agent.undoCapturedContext]: (chatId: string, sessionId: string | null) =>
+      runner.undoCapturedContext(chatId, sessionId ?? null),
 
     // ---- aprovações (modos globais + listas) ----
     [IPC.approvals.getSettings]: () => getApprovalSettings(),

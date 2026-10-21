@@ -4,7 +4,7 @@
 // Puro (sem React): testado em e2e/smartApprove.test.ts.
 import type { MessageMeta } from '@shared/types'
 
-export type ApprovedBy = 'user' | 'lists' | 'smart'
+export type ApprovedBy = 'user' | 'lists' | 'smart' | 'readonly' | 'edits'
 
 export interface OutcomeItem {
   text: string
@@ -24,12 +24,16 @@ export interface ApprovalOutcome {
   /** Negada: o motivo (sub-comando negado, entrada da blacklist, motivo do juiz). */
   reason?: string
   items: OutcomeItem[]
+  /** Perguntou por tocar um caminho protegido. */
+  protectedPath?: string
 }
 
 const BY_TEXT: Record<ApprovedBy, string> = {
   user: 'por você',
   lists: 'pela lista',
-  smart: 'pelo Smart-Approve'
+  smart: 'pelo Smart-Approve',
+  readonly: 'como leitura (sempre liberada)',
+  edits: 'por “Aceitar edições dentro da raiz”'
 }
 
 /** "Aprovado pela lista e pelo Smart-Approve". */
@@ -68,9 +72,13 @@ export function approvalOutcome(meta: MessageMeta | null | undefined): ApprovalO
       items: []
     }
   const items: OutcomeItem[] = []
-  for (const a of rec?.allowed ?? []) items.push({ text: a.text, by: 'lists', detail: a.entry })
+  const ro = new Set(rec?.readOnly ?? [])
+  for (const t of rec?.readOnly ?? []) items.push({ text: t, by: 'readonly' })
+  for (const a of rec?.allowed ?? [])
+    if (!ro.has(a.text)) items.push({ text: a.text, by: 'lists', detail: a.entry })
   for (const t of rec?.judgeAllowed ?? []) items.push({ text: t, by: 'smart' })
   for (const t of rec?.userAllowed ?? []) items.push({ text: t, by: 'user' })
+  const prot = rec?.protectedPath ? { protectedPath: rec.protectedPath } : {}
   if (rec?.denied || (status === 'denied' && (rec || sa))) {
     if (rec?.denied) items.push({ text: rec.denied, by: 'denied' })
     return {
@@ -79,18 +87,24 @@ export function approvalOutcome(meta: MessageMeta | null | undefined): ApprovalO
       deniedBy: 'user',
       title: 'Negado por você',
       ...(rec?.denied ? { reason: rec.denied } : {}),
-      items
+      items,
+      ...prot
     }
   }
   if (status === 'denied' || status === 'cancelled') return null
   const by: ApprovedBy[] = []
   if (rec?.userAllowed?.length || meta.smartOverride) by.push('user')
-  if (rec?.allowed?.length) by.push('lists')
+  if (rec?.allowed?.some((a) => !ro.has(a.text))) by.push('lists')
+  if (rec?.readOnly?.length) by.push('readonly')
+  if (rec?.acceptEdits) {
+    by.push('edits')
+    items.push({ text: 'esta edição', by: 'edits' })
+  }
   if (sa?.decision === 'approve' || rec?.judgeAllowed?.length) by.push('smart')
   // registros antigos: o juiz pediu e a chamada rodou → você permitiu
   if (!by.length && sa?.decision === 'ask') by.push('user')
   if (meta.smartOverride)
     items.push({ text: 'esta chamada', by: 'user', detail: 'Executar mesmo assim' })
   if (!by.length) return null
-  return { kind: 'approved', by, title: approvedTitle(by), items }
+  return { kind: 'approved', by, title: approvedTitle(by), items, ...prot }
 }

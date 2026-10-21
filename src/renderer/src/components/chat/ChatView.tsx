@@ -40,6 +40,7 @@ import { Tip } from '../ui/Tooltip'
 import { Composer } from './Composer'
 import { useAttachmentSupport } from './attachmentSupport'
 import { ContextMeter } from './ContextMeter'
+import { GenerateTitleButton } from './GenerateTitleButton'
 import { MessageList } from './MessageList'
 import { ProcessesBadge } from './ProcessesBadge'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
@@ -366,19 +367,22 @@ function ChatTitle({ chat }: { chat: Chat }): React.JSX.Element {
       />
     )
   return (
-    <Tip label="Renomear chat" side="bottom">
-      <button
-        type="button"
-        data-testid="chat-title"
-        onClick={() => {
-          setText(chat.title)
-          setEditing(true)
-        }}
-        className="no-drag -mx-1.5 min-w-0 truncate rounded-md px-1.5 py-0.5 text-[13px] font-medium hover:bg-hover"
-      >
-        {chat.title || 'Novo chat'}
-      </button>
-    </Tip>
+    <span className="group/title flex min-w-0 items-center gap-0.5">
+      <Tip label="Renomear chat" side="bottom">
+        <button
+          type="button"
+          data-testid="chat-title"
+          onClick={() => {
+            setText(chat.title)
+            setEditing(true)
+          }}
+          className="no-drag -mx-1.5 min-w-0 truncate rounded-md px-1.5 py-0.5 text-[13px] font-medium hover:bg-hover"
+        >
+          {chat.title || 'Novo chat'}
+        </button>
+      </Tip>
+      <GenerateTitleButton chat={chat} />
+    </span>
   )
 }
 
