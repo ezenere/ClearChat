@@ -1,7 +1,7 @@
-// Padrões globais do Smart-Approve/aprovações (setting LOCAL `smartApproveDefaults` — não
-// sincroniza; ver SPEC) e limites da coleta automática de contexto. Sem dependências (approvalPolicy
-// e contextCapture importam daqui).
-import type { ContextCaptureConfig, SmartApproveDefaults } from './types'
+// Padrões globais do Smart-Approve/aprovações (setting `smartApproveDefaults` — sincroniza desde o
+// protocolo 1.4.0; ver SPEC → Sync) e limites da coleta automática de contexto. Sem dependências
+// (approvalPolicy e contextCapture importam daqui).
+import type { CapturePrompts, ContextCaptureConfig, SmartApproveDefaults } from './types'
 
 export const SMART_DEFAULTS_SETTING = 'smartApproveDefaults'
 
@@ -65,12 +65,33 @@ export function normalizeCapture(v: unknown): ContextCaptureConfig {
   }
 }
 
-/** Padrões globais (setting local `smartApproveDefaults`). Aceitar edições: desligado. */
+/** Prompts do resumidor: todos os padrões (null). */
+export const DEFAULT_CAPTURE_PROMPTS: CapturePrompts = {
+  prompt: null,
+  template: null,
+  derivePrompt: null
+}
+
+/** Texto personalizado ou null (vazio/só espaços = o padrão). */
+const promptOrNull = (v: unknown): string | null =>
+  typeof v === 'string' && v.trim() ? v.replace(/\r/g, '') : null
+
+export function normalizeCapturePrompts(v: unknown): CapturePrompts {
+  const p = (v && typeof v === 'object' ? v : {}) as Partial<CapturePrompts>
+  return {
+    prompt: promptOrNull(p.prompt),
+    template: promptOrNull(p.template),
+    derivePrompt: promptOrNull(p.derivePrompt)
+  }
+}
+
+/** Padrões globais (setting `smartApproveDefaults`). Aceitar edições: desligado. */
 export function normalizeSmartDefaults(v: unknown): SmartApproveDefaults {
   const d = (v && typeof v === 'object' ? v : {}) as Partial<SmartApproveDefaults>
   return {
     environment: typeof d.environment === 'string' ? d.environment : '',
     acceptEditsInRoot: d.acceptEditsInRoot === true,
-    capture: normalizeCapture(d.capture)
+    capture: normalizeCapture(d.capture),
+    capturePrompts: normalizeCapturePrompts(d.capturePrompts)
   }
 }

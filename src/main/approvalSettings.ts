@@ -38,7 +38,7 @@ function changed(listsChanged: boolean): ApprovalSettings {
 
 /**
  * Substitui modos, listas e/ou os padrões do Smart-Approve (cada um inteiro). Entradas inválidas nas
- * listas → erro legível. `smart` é local (setting `smartApproveDefaults`, fora do sync).
+ * listas → erro legível. `smart` = setting `smartApproveDefaults` (sincroniza desde o protocolo 1.4.0).
  */
 export function updateApprovalSettings(patch: Partial<ApprovalSettings>): ApprovalSettings {
   if (patch?.modes) settingsRepo.set(APPROVAL_MODES_SETTING, normalizeApprovalModes(patch.modes))

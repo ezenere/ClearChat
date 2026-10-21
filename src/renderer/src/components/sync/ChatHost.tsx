@@ -31,6 +31,7 @@ import { useHostInfo, useTakeover, deviceName } from './hooks'
 import { useBranchView } from '../../lib/useBranchView'
 import { branchGroup } from '../../lib/branchView'
 import { BranchSwitcher } from '../chat/BranchSwitcher'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 
 // ---------------- selo no cabeçalho ----------------
 
@@ -41,6 +42,7 @@ export function HostBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
   const [open, setOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const { start, dialog } = useTakeover(chat)
+  const level = useBarLevel('host-badge')
   if (!info || info.mode === 'off' || !sync || sync.phase !== 'ready') return null
   const host = info.host
   const self = !!host?.self
@@ -72,27 +74,44 @@ export function HostBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           ? MonitorSmartphone
           : Laptop
   const handoverToMe = info.handover?.self
+  const fullLabel = handoverToMe ? `Aguardando ${host?.name ?? 'host'}` : label
+  // curto (cabeçalho apertado): só o nome do host (ou o estado, sem host)
+  const shortLabel =
+    info.mode === 'diverged'
+      ? 'Divergente'
+      : info.mode === 'host-offline'
+        ? `${host?.name ?? 'Host'} off`
+        : (host?.name ?? (info.mode === 'offline' ? 'Offline' : deviceName()))
+  const badge = (
+    <button
+      ref={anchor}
+      type="button"
+      data-testid="host-badge"
+      {...barAttrs('host-badge', level)}
+      aria-label={level > 0 ? fullLabel : undefined}
+      onClick={() => setOpen((o) => !o)}
+      className={cn(
+        'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs whitespace-nowrap transition-colors hover:brightness-125',
+        tone
+      )}
+    >
+      <Icon className="size-3.5 shrink-0" />
+      {info.mode === 'remote' && host?.status === 'online' && (
+        <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-success" />
+      )}
+      {level < 2 && (
+        <span className="truncate">
+          {level === 0 ? fullLabel : handoverToMe ? `→ ${host?.name ?? 'host'}` : shortLabel}
+        </span>
+      )}
+      {info.pinned && <Lock className="size-3 shrink-0 opacity-70" />}
+    </button>
+  )
   return (
     <>
-      <button
-        ref={anchor}
-        type="button"
-        data-testid="host-badge"
-        onClick={() => setOpen((o) => !o)}
-        className={cn(
-          'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors hover:brightness-125',
-          tone
-        )}
-      >
-        <Icon className="size-3.5 shrink-0" />
-        {info.mode === 'remote' && host?.status === 'online' && (
-          <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-success" />
-        )}
-        <span className="truncate">
-          {handoverToMe ? `Aguardando ${host?.name ?? 'host'}` : label}
-        </span>
-        {info.pinned && <Lock className="size-3 shrink-0 opacity-70" />}
-      </button>
+      <Tip side="bottom" label={`${fullLabel} · clique para detalhes`}>
+        {badge}
+      </Tip>
       <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} width={330} align="end">
         <div className="space-y-2.5 p-3 text-[12.5px]" data-testid="host-popover">
           <div>
@@ -351,14 +370,25 @@ export function OutdatedHostsBanner(): React.JSX.Element | null {
 /** Rodapé do composer no controle remoto. */
 export function RemoteHint({ chat }: { chat: Chat }): React.JSX.Element | null {
   const info = useHostInfo(chat.id)
+  const level = useBarLevel('remote-hint')
   if (info?.mode !== 'remote') return null
   return (
-    <Tip label="As mensagens, ⚡, aprovações e respostas vão cifradas para o host, que executa o chat.">
+    <Tip
+      label={
+        <span className="max-w-[300px]">
+          <span className="block font-medium">Controle remoto · {info.host?.name}</span>
+          As mensagens, ⚡, aprovações e respostas vão cifradas para o host, que executa o chat.
+        </span>
+      }
+    >
       <span
         data-testid="remote-hint"
+        {...barAttrs('remote-hint', level)}
+        aria-label={`Controle remoto · ${info.host?.name ?? 'host'}`}
         className="flex max-w-[180px] shrink-0 items-center gap-1 truncate text-[11px] whitespace-nowrap text-accent-strong/90"
       >
-        <Radio className="size-3" /> controle remoto · {info.host?.name}
+        <Radio className="size-3 shrink-0" />
+        {level === 0 && <span className="truncate">controle remoto · {info.host?.name}</span>}
       </span>
     </Tip>
   )

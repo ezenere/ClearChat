@@ -1767,3 +1767,294 @@ test('arquivos do host: fs.list / fs.read com as regras de raiz do chat, pedaço
     rmSync(TMP, { recursive: true, force: true })
   }
 })
+
+// ---------------- preferências sincronizadas (protocolo 1.4.0) ----------------
+
+const getSetting = (conn: Database.Database, key: string): any => {
+  const r = conn.prepare('SELECT value FROM settings WHERE key = ?').get(key) as any
+  return r ? JSON.parse(r.value) : undefined
+}
+const putSetting = (conn: Database.Database, key: string, value: unknown): void => {
+  conn
+    .prepare(
+      'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+    )
+    .run(key, JSON.stringify(value))
+}
+const settingIdsOnline = (email: string): string[] =>
+  srv
+    .records(srv.userIdOf(email)!)
+    .filter((r: any) => r.type === 'setting')
+    .map((r: any) => r.id)
+    .sort()
+
+test('1.4.0: preferências globais (Smart-Approve, título automático, spill) vão e voltam; as locais não sobem', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const pid = addProvider(A.conn, { name: 'OR', apiKey: 'k' })
+  const smart = {
+    environment: '172.16.1.7 é teste; produção nunca',
+    acceptEditsInRoot: true,
+    capture: { enabled: true, providerId: pid, model: 'resumo/m', maxTokens: 300, lookback: 3 },
+    capturePrompts: {
+      prompt: 'PROMPT GLOBAL KEEP APPEND REWRITE',
+      template: '{{current}} / {{user}}',
+      derivePrompt: null
+    }
+  }
+  const title = {
+    providerId: pid,
+    model: 'titulo/m',
+    useMemory: true,
+    maxTokens: 40,
+    prompt: 'Dê um título.'
+  }
+  putSetting(A.conn, 'smartApproveDefaults', smart)
+  putSetting(A.conn, 'autoTitle', title)
+  putSetting(A.conn, 'toolOutputSpillChars', 12000)
+  // estado do dispositivo / UI: nunca sobe
+  putSetting(A.conn, 'updateDismissedVersion', '9.9.9')
+  putSetting(A.conn, 'defaultCwd', '/home/a')
+  putSetting(A.conn, 'skillsSettings', { locations: ['/home/a/skills'] })
+  putSetting(A.conn, 'presetsSeeded', true)
+  await login(A, email)
+  await settled(A)
+  const ids = settingIdsOnline(email)
+  for (const id of ['smartApproveDefaults', 'autoTitle', 'toolOutputSpillChars'])
+    assert.ok(ids.includes(id), `${id} sobe (${ids})`)
+  for (const id of ['updateDismissedVersion', 'defaultCwd', 'skillsSettings', 'presetsSeeded'])
+    assert.ok(!ids.includes(id), `${id} fica local`)
+
+  const B = device('B')
+  putSetting(B.conn, 'updateDismissedVersion', '1.0.0')
+  await login(B, email)
+  await settled(B)
+  assert.deepEqual(getSetting(B.conn, 'smartApproveDefaults'), smart)
+  assert.deepEqual(getSetting(B.conn, 'autoTitle'), title)
+  assert.equal(getSetting(B.conn, 'toolOutputSpillChars'), 12000)
+  assert.equal(getSetting(B.conn, 'updateDismissedVersion'), '1.0.0', 'local de B intacto')
+  assert.equal(getSetting(B.conn, 'defaultCwd'), undefined)
+
+  // edição em B (com o sync rodando) → A; a UI recarrega aprovações/settings
+  A.events.length = 0
+  putSetting(B.conn, 'smartApproveDefaults', { ...smart, environment: 'novo ambiente' })
+  putSetting(B.conn, 'autoTitle', { ...title, prompt: null })
+  putSetting(B.conn, 'toolOutputSpillChars', 20000)
+  putSetting(B.conn, 'updateDismissedVersion', '2.0.0')
+  await synced(B, A)
+  await waitFor(
+    () => getSetting(A.conn, 'smartApproveDefaults')?.environment === 'novo ambiente',
+    'A recebe o ambiente novo'
+  )
+  await waitFor(() => getSetting(A.conn, 'toolOutputSpillChars') === 20000, 'A recebe o spill')
+  assert.equal(getSetting(A.conn, 'autoTitle').prompt, null)
+  assert.equal(getSetting(A.conn, 'updateDismissedVersion'), '9.9.9')
+  const scopes = A.events.flatMap((e: any) => (e.type === 'sync-data-changed' ? e.scopes : []))
+  assert.ok(scopes.includes('approvals') && scopes.includes('settings'), String(scopes))
+  // remover (valor null = chave apagada) também propaga — setting nunca é tombstone
+  B.conn.prepare("DELETE FROM settings WHERE key = 'autoTitle'").run()
+  await synced(B, A)
+  await waitFor(() => getSetting(A.conn, 'autoTitle') === undefined, 'A remove o autoTitle')
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('1.4.0: config do chat e da persona (capturedContext, acceptEditsInRoot, ambiente, coleta, prompts, juiz) vão e voltam', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const pid = addProvider(A.conn, { name: 'OR', apiKey: 'k' })
+  const { chatId } = addChat(A.conn, 'Com Smart-Approve')
+  const sa = {
+    providerId: pid,
+    model: 'juiz/m',
+    prompt: 'juiz {{tool}}',
+    template: null,
+    labels: { approve: 'OK', reject: 'NO', ask: 'ASK' },
+    contextMessages: 4,
+    timeoutS: 20,
+    canDeny: true,
+    judgeWhitelisted: true,
+    environment: 'ambiente do chat',
+    capture: { enabled: true, providerId: pid, model: 'resumo/m', maxTokens: null, lookback: 2 },
+    capturePrompts: { prompt: null, template: '{{current}} {{user}}', derivePrompt: 'D' }
+  }
+  const captured = {
+    main: {
+      text: '- só staging',
+      updatedAt: 5,
+      by: 'model',
+      cursor: { id: 'm1', seq: 1, at: 1 },
+      calls: 2,
+      cost: 0.01
+    },
+    sessions: { sub1: { text: '- tarefa', updatedAt: 6, by: 'derived' } }
+  }
+  A.conn.prepare('UPDATE chats SET config_json = ? WHERE id = ?').run(
+    JSON.stringify({
+      model: 'fake/m',
+      providerId: pid,
+      cwd: '/home/a/proj',
+      approvalModes: { commands: 'smart', memory_write: 'lists' },
+      acceptEditsInRoot: false,
+      smartApprove: sa,
+      capturedContext: captured
+    }),
+    chatId
+  )
+  const presetId = randomUUID()
+  A.conn
+    .prepare(
+      'INSERT INTO presets (id, name, description, icon, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    )
+    .run(
+      presetId,
+      'Dev',
+      '',
+      'code',
+      JSON.stringify({ cwd: '/home/a/dev', acceptEditsInRoot: true, smartApprove: sa }),
+      1,
+      1
+    )
+  await login(A, email)
+  await settled(A)
+  const B = device('B')
+  await login(B, email)
+  await settled(B)
+  const cfgB = JSON.parse(
+    (B.conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(chatId) as any).config_json
+  )
+  assert.deepEqual(cfgB.smartApprove, sa)
+  assert.deepEqual(cfgB.capturedContext, captured)
+  assert.equal(cfgB.acceptEditsInRoot, false)
+  assert.deepEqual(cfgB.approvalModes, { commands: 'smart', memory_write: 'lists' })
+  assert.notEqual(cfgB.cwd, '/home/a/proj', 'raiz do chat fica local')
+  const pcfgB = JSON.parse(
+    (B.conn.prepare('SELECT config_json FROM presets WHERE id = ?').get(presetId) as any)
+      .config_json
+  )
+  assert.equal(pcfgB.acceptEditsInRoot, true)
+  assert.deepEqual(pcfgB.smartApprove, sa)
+  assert.notEqual(pcfgB.cwd, '/home/a/dev', 'raiz da persona fica local')
+  // B muda o contexto capturado e o ambiente → A (LWW por chave da config)
+  B.conn.prepare('UPDATE chats SET config_json = ? WHERE id = ?').run(
+    JSON.stringify({
+      ...cfgB,
+      cwd: '/home/b/proj',
+      acceptEditsInRoot: null,
+      smartApprove: { ...sa, environment: '' },
+      capturedContext: {
+        ...captured,
+        main: { ...captured.main, text: '- editado em B', by: 'user' }
+      }
+    }),
+    chatId
+  )
+  await synced(B, A)
+  await waitFor(() => {
+    const c = JSON.parse(
+      (A.conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(chatId) as any).config_json
+    )
+    return c.capturedContext?.main?.text === '- editado em B' && c
+  }, 'A recebe a config de B').then((c: any) => {
+    assert.equal(c.smartApprove.environment, '', "'' = nenhuma (não volta para a global)")
+    assert.equal(c.acceptEditsInRoot, null)
+    assert.equal(c.cwd, '/home/a/proj', 'raiz local de A preservada')
+  })
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('1.4.0: dispositivo que já sincronizava envia as preferências novas uma vez (o que já está online vence)', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  await login(A, email)
+  await settled(A)
+  const B = device('B')
+  await login(B, email)
+  await settled(B)
+  // simula o app < 1.4.0: valores gravados sem rastreamento e sem a passada de backfill
+  const legacy = (d: Dev, spill: number, env: string): void => {
+    d.eng.stop()
+    d.conn.prepare("DELETE FROM sync_flags WHERE k = 'on'").run()
+    putSetting(d.conn, 'toolOutputSpillChars', spill)
+    putSetting(d.conn, 'smartApproveDefaults', { environment: env })
+    d.conn.prepare("DELETE FROM sync_state WHERE key = 'settings_backfill'").run()
+    d.conn.prepare("DELETE FROM sync_dirty WHERE type = 'setting'").run()
+  }
+  legacy(A, 15000, 'de A')
+  legacy(B, 9000, 'de B')
+  assert.ok(!settingIdsOnline(email).includes('toolOutputSpillChars'))
+  A.eng.start()
+  await settled(A)
+  await A.eng.syncNow()
+  await settled(A)
+  assert.ok(settingIdsOnline(email).includes('toolOutputSpillChars'), 'A enviou depois do pull')
+  assert.ok(settingIdsOnline(email).includes('smartApproveDefaults'))
+  // B atualiza depois: o pull traz o de A (registro online existe) e B não sobrescreve
+  B.eng.start()
+  await synced(B, A)
+  assert.equal(getSetting(B.conn, 'toolOutputSpillChars'), 15000)
+  assert.equal(getSetting(B.conn, 'smartApproveDefaults').environment, 'de A')
+  assert.equal(getSetting(A.conn, 'toolOutputSpillChars'), 15000)
+  // a passada é única: valor local depois disso segue o rastreamento normal (triggers)
+  putSetting(B.conn, 'toolOutputSpillChars', 30000)
+  await synced(B, A)
+  await waitFor(() => getSetting(A.conn, 'toolOutputSpillChars') === 30000, 'A recebe o novo')
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('1.4.0: merge do primeiro login remapeia o provedor dentro de autoTitle, smartApproveDefaults e da coleta do chat', async () => {
+  const email = await newAccount()
+  const A = device('A')
+  const pidA = addProvider(A.conn, { name: 'OpenRouter', apiKey: 'k-a' })
+  await login(A, email)
+  await settled(A)
+  const C = device('C')
+  const pidC = addProvider(C.conn, { name: 'openrouter', apiKey: 'k-c' })
+  putSetting(C.conn, 'autoTitle', {
+    providerId: pidC,
+    model: 't/m',
+    useMemory: false,
+    maxTokens: 64,
+    prompt: null
+  })
+  putSetting(C.conn, 'smartApproveDefaults', {
+    environment: '',
+    acceptEditsInRoot: false,
+    capture: { enabled: true, providerId: pidC, model: 'r/m', maxTokens: null, lookback: 2 }
+  })
+  const { chatId } = addChat(C.conn, 'Chat de C')
+  C.conn.prepare('UPDATE chats SET config_json = ? WHERE id = ?').run(
+    JSON.stringify({
+      providerId: pidC,
+      model: 'x',
+      cwd: '/c',
+      smartApprove: {
+        providerId: pidC,
+        model: 'j',
+        capture: { enabled: true, providerId: pidC, model: 'r/m', maxTokens: null, lookback: 2 }
+      }
+    }),
+    chatId
+  )
+  await C.eng.init()
+  await C.eng.requestCode(email)
+  await C.eng.verifyCode(email, srv.lastCode(email)!)
+  await C.eng.unlock(PASSWORD, true)
+  assert.equal(C.eng.phase(), 'merge')
+  await C.eng.resolveMerge('local')
+  await synced(C, A)
+  assert.equal(getSetting(C.conn, 'autoTitle').providerId, pidA)
+  assert.equal(getSetting(C.conn, 'smartApproveDefaults').capture.providerId, pidA)
+  const cfg = JSON.parse(
+    (C.conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(chatId) as any).config_json
+  )
+  assert.equal(cfg.smartApprove.providerId, pidA)
+  assert.equal(cfg.smartApprove.capture.providerId, pidA)
+  // e A recebe as preferências de C já com o id que existe lá
+  await waitFor(() => getSetting(A.conn, 'autoTitle')?.providerId === pidA, 'A recebe autoTitle')
+  assert.equal(getSetting(A.conn, 'smartApproveDefaults').capture.providerId, pidA)
+  A.eng.destroy()
+  C.eng.destroy()
+})

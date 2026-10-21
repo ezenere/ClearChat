@@ -3,24 +3,37 @@
 // global). O "Contexto capturado da conversa" (descrição mantida pelo resumidor, editável) só
 // aparece no painel do chat. Ver SPEC.md → "Smart-Approve → Descrição do ambiente e coleta
 // automática de contexto".
-import { RotateCcw, X } from 'lucide-react'
+import { AlertTriangle, RotateCcw, X } from 'lucide-react'
 import { useState } from 'react'
 import {
+  CAPTURE_PLACEHOLDERS,
   captureActive,
+  capturePromptsSummary,
+  capturePromptsWarning,
   CONTEXT_CAPTURE_LIMITS,
+  DERIVE_PLACEHOLDERS,
   effectiveCapture,
+  effectiveCapturePrompts,
   effectiveEnvironment,
   normalizeCapture,
-  smartInUse
+  normalizeCapturePrompts,
+  smartInUse,
+  validateCapturePrompts,
+  type CapturePromptIssue
 } from '@shared/contextCapture'
-import type { CapturedEntry, ChatConfig, ContextCaptureConfig } from '@shared/types'
+import {
+  DEFAULT_CONTEXT_CAPTURE_PROMPT,
+  DEFAULT_CONTEXT_CAPTURE_TEMPLATE,
+  DEFAULT_CONTEXT_DERIVE_PROMPT
+} from '@shared/defaults'
+import type { CapturePrompts, CapturedEntry, ChatConfig, ContextCaptureConfig } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn, formatCost, relativeTime } from '../../lib/format'
 import { useStore } from '../../store'
 import { AutoTextarea, Button } from '../ui/controls'
 import { ModelPicker } from '../ui/ModelPicker'
-import { Tip } from '../ui/Tooltip'
-import { NumberInput, ToggleRow } from './fields'
+import { C, Tip } from '../ui/Tooltip'
+import { CollapsibleSection, NumberInput, RestoreButton, ToggleRow } from './fields'
 
 export const ENVIRONMENT_PLACEHOLDER =
   'Ex.: 172.16.1.7 é meu servidor de testes; pode reiniciar containers lá. Produção é deploy@prod.exemplo.com — nunca mexer sem perguntar.'
@@ -116,6 +129,185 @@ export function CaptureFields({
   )
 }
 
+// ---------------- prompts do resumidor ----------------
+
+const PROMPT_FIELDS: {
+  key: keyof CapturePrompts
+  title: string
+  role: string
+  def: string
+  aria: string
+}[] = [
+  {
+    key: 'prompt',
+    title: 'Prompt do resumo',
+    role: 'role: "system"',
+    def: DEFAULT_CONTEXT_CAPTURE_PROMPT,
+    aria: 'Prompt do resumidor'
+  },
+  {
+    key: 'template',
+    title: 'Template da mensagem do resumo',
+    role: 'role: "user"',
+    def: DEFAULT_CONTEXT_CAPTURE_TEMPLATE,
+    aria: 'Template do resumidor'
+  },
+  {
+    key: 'derivePrompt',
+    title: 'Prompt da derivação (subagentes)',
+    role: 'role: "system"',
+    def: DEFAULT_CONTEXT_DERIVE_PROMPT,
+    aria: 'Prompt da derivação do resumidor'
+  }
+]
+
+function IssueLine({ issue }: { issue: CapturePromptIssue }): React.JSX.Element {
+  return (
+    <p
+      data-testid={`capture-${issue.field}-${issue.level}`}
+      className={cn(
+        'mt-1 flex items-start gap-1.5 text-[11px] leading-snug',
+        issue.level === 'error' ? 'text-warning' : 'text-warning/80'
+      )}
+    >
+      <AlertTriangle className="mt-px size-3.5 shrink-0" />
+      <span>{issue.message}</span>
+    </p>
+  )
+}
+
+/**
+ * Os três prompts do resumidor (system do resumo, template do resumo, system da derivação), cada um
+ * com "Restaurar padrão", validação e a lista de placeholders. Salva ao sair do campo (igual ao
+ * padrão ou vazio → null = segue o padrão, inclusive quando ele mudar numa versão nova).
+ */
+export function CapturePromptsFields({
+  value,
+  onChange,
+  testId
+}: {
+  value: CapturePrompts | null | undefined
+  onChange: (v: CapturePrompts) => void
+  testId?: string
+}): React.JSX.Element {
+  const saved = normalizeCapturePrompts(value)
+  const [drafts, setDrafts] = useState<Partial<Record<keyof CapturePrompts, string>>>({})
+  // `local` = o último valor gravado por aqui (o store pode demorar: dois campos salvos em
+  // seguida não podem se sobrescrever com um valor velho)
+  const [local, setLocal] = useState(saved)
+  const [prevSaved, setPrevSaved] = useState(saved)
+  const keys = PROMPT_FIELDS.map((f) => f.key)
+  if (keys.some((k) => prevSaved[k] !== saved[k])) {
+    // mudou por fora (outro dispositivo, "usar o global"): descarta só o rascunho dos campos que
+    // mudaram e não são eco do que gravamos aqui
+    const external = keys.filter((k) => prevSaved[k] !== saved[k] && saved[k] !== local[k])
+    setPrevSaved(saved)
+    setLocal(saved)
+    if (external.length)
+      setDrafts((d) => {
+        const next = { ...d }
+        for (const k of external) delete next[k]
+        return next
+      })
+  }
+  const toValue = (f: (typeof PROMPT_FIELDS)[number], text: string): string | null =>
+    !text.trim() || text === f.def ? null : text
+  // validação ao vivo: o rascunho vale como se já estivesse salvo
+  const live: CapturePrompts = { ...local }
+  for (const f of PROMPT_FIELDS)
+    if (drafts[f.key] !== undefined) live[f.key] = toValue(f, drafts[f.key]!)
+  const issues = validateCapturePrompts(live)
+  const commit = (key: keyof CapturePrompts, v: string | null): void => {
+    setDrafts((d) => {
+      const next = { ...d }
+      delete next[key]
+      return next
+    })
+    if ((local[key] ?? null) === v) return
+    const next = { ...local, [key]: v }
+    setLocal(next)
+    onChange(next)
+  }
+  return (
+    <div data-testid={testId} className="animate-fade-in space-y-2.5">
+      {PROMPT_FIELDS.map((f) => {
+        const text = drafts[f.key] ?? local[f.key] ?? f.def
+        const custom = toValue(f, text) != null
+        return (
+          <div key={f.key}>
+            <div className="mb-0.5 flex items-center gap-2">
+              <span className="min-w-0 text-[10.5px] text-faint">
+                {f.title} (<C>{f.role}</C>)
+              </span>
+              {custom && (
+                <span
+                  className="ml-auto shrink-0 whitespace-nowrap"
+                  data-testid={`capture-${f.key}-restore`}
+                >
+                  <RestoreButton onClick={() => commit(f.key, null)} />
+                </span>
+              )}
+            </div>
+            <AutoTextarea
+              value={text}
+              aria-label={f.aria}
+              spellCheck={false}
+              onChange={(e) => {
+                const v = e.target.value
+                setDrafts((d) => ({ ...d, [f.key]: v }))
+              }}
+              onBlur={() =>
+                drafts[f.key] !== undefined && commit(f.key, toValue(f, drafts[f.key]!))
+              }
+              minRows={4}
+              maxRows={16}
+              className="field font-mono text-[11px] leading-relaxed"
+            />
+            {issues
+              .filter((i) => i.field === f.key)
+              .map((i) => (
+                <IssueLine key={i.message} issue={i} />
+              ))}
+          </div>
+        )
+      })}
+      <div className="rounded-lg border border-border bg-bg/40 px-2.5 py-2">
+        <div className="mb-1 text-[10.5px] font-medium text-subtle">
+          Placeholders do resumo (prompt e template)
+        </div>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
+          {CAPTURE_PLACEHOLDERS.map((p) => (
+            <div key={p.key} className="contents">
+              <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
+              <dd className="text-subtle">
+                {p.desc}
+                {p.required && <span className="text-warning/90"> · obrigatório</span>}
+              </dd>
+            </div>
+          ))}
+        </dl>
+        <div className="mt-1.5 mb-1 text-[10.5px] font-medium text-subtle">
+          Placeholders da derivação
+        </div>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-2.5 gap-y-0.5 text-[11px]">
+          {DERIVE_PLACEHOLDERS.map((p) => (
+            <div key={p.key} className="contents">
+              <dt className="font-mono text-accent-strong">{`{{${p.key}}}`}</dt>
+              <dd className="text-subtle">{p.desc}</dd>
+            </div>
+          ))}
+        </dl>
+        <p className="mt-1.5 text-[11px] leading-snug text-faint">
+          Qualquer que seja o prompt, o app descarta linhas novas que copiam o texto do agente sem
+          que você tenha dito ou confirmado (trava “só o que o usuário disse”), e o resumidor nunca
+          recebe resultados de tool. A derivação recebe a descrição do pai e a tarefa numa mensagem
+          fixa.
+        </p>
+      </div>
+    </div>
+  )
+}
+
 /** Aba Tools: descrição do ambiente (chat/persona sobre a global) + coleta (sobre a global). */
 export function SmartContextSection({
   cfg,
@@ -123,7 +315,11 @@ export function SmartContextSection({
   chatId
 }: {
   cfg: ChatConfig
-  set: (p: { environment?: string | null; capture?: ContextCaptureConfig | null }) => void
+  set: (p: {
+    environment?: string | null
+    capture?: ContextCaptureConfig | null
+    capturePrompts?: CapturePrompts | null
+  }) => void
   chatId?: string
 }): React.JSX.Element {
   const defaults = useStore((s) => s.approvalSettings.smart)
@@ -132,7 +328,9 @@ export function SmartContextSection({
   const sa = cfg.smartApprove
   const ownEnv = typeof sa?.environment === 'string'
   const ownCapture = !!sa?.capture
+  const ownPrompts = !!sa?.capturePrompts
   const capture = effectiveCapture(sa, defaults)
+  const prompts = effectiveCapturePrompts(sa, defaults)
   const inUse = smartInUse(cfg, globalModes)
   const active = captureActive(cfg, globalModes, defaults)
   return (
@@ -226,6 +424,53 @@ export function SmartContextSection({
               : 'Inativa.'}
         </p>
       </div>
+
+      <CollapsibleSection
+        id="smart-capture-prompts"
+        level="sub"
+        title="Prompts do resumidor"
+        summary={
+          ownPrompts
+            ? { text: `deste chat · ${capturePromptsSummary(prompts)}`, changed: true }
+            : { text: `global · ${capturePromptsSummary(prompts)}`, changed: false }
+        }
+        warning={capturePromptsWarning(prompts)}
+      >
+        <div data-testid="chat-capture-prompts" className="space-y-2">
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-subtle">
+            <input
+              type="checkbox"
+              data-testid="capture-prompts-use-global"
+              checked={!ownPrompts}
+              onChange={(e) =>
+                set({ capturePrompts: e.target.checked ? null : normalizeCapturePrompts(prompts) })
+              }
+            />
+            usar o global
+          </label>
+          {ownPrompts ? (
+            <CapturePromptsFields
+              value={sa?.capturePrompts}
+              onChange={(v) => set({ capturePrompts: v })}
+              testId="chat-capture-prompts-fields"
+            />
+          ) : (
+            <p className="text-[11.5px] text-muted">
+              Global ({capturePromptsSummary(prompts)}) — edite em{' '}
+              <button
+                type="button"
+                onClick={() => setSettingsOpen(true, 'approvals')}
+                className="text-accent-strong hover:underline"
+              >
+                Configurações → Aprovações
+              </button>{' '}
+              ou desmarque “usar o global” para personalizar só neste chat.
+            </p>
+          )}
+          {!ownPrompts &&
+            validateCapturePrompts(prompts).map((i) => <IssueLine key={i.message} issue={i} />)}
+        </div>
+      </CollapsibleSection>
 
       {chatId && <CapturedContextPanel chatId={chatId} cfg={cfg} />}
     </div>

@@ -5,7 +5,7 @@
 import { DEFAULT_AUTO_TITLE_PROMPT } from './defaults'
 import type { Usage } from './types'
 
-/** Chave em `settings` (local do dispositivo: não está entre as chaves sincronizadas, §4.3.2). */
+/** Chave em `settings` (sincroniza: registro `setting autoTitle`, protocolo 1.4.0, §4.3.2). */
 export const AUTO_TITLE_SETTING = 'autoTitle'
 
 export interface AutoTitleSettings {

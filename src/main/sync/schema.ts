@@ -18,7 +18,11 @@ export const SYNC_SETTING_KEYS: Record<string, string> = {
   approvalLists: 'approvalLists',
   webSearchEngines: 'webSearchEngines',
   webSearchApiKeys: 'webSearchApiKeys',
-  webSearchMinIntervalSec: 'webSearchMinIntervalSec'
+  webSearchMinIntervalSec: 'webSearchMinIntervalSec',
+  // desde o protocolo 1.4.0: preferências que antes ficavam só no dispositivo
+  smartApproveDefaults: 'smartApproveDefaults',
+  autoTitle: 'autoTitle',
+  toolOutputSpillChars: 'toolOutputSpillChars'
 }
 
 const TABLES = `
@@ -122,8 +126,8 @@ CREATE TRIGGER IF NOT EXISTS sync_settings_ad AFTER DELETE ON settings WHEN ${AC
   ${mark('setting', settingId('OLD.key'), 'NULL')}
 END;`
 
-/** Versão dos triggers (recria quando muda). */
-const TRIGGERS_VERSION = '1'
+/** Versão dos triggers (recria quando muda — ex.: chaves novas em SYNC_SETTING_KEYS). */
+const TRIGGERS_VERSION = '2'
 
 function triggerSql(): string {
   return [

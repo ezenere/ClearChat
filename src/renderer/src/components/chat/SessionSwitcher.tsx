@@ -7,6 +7,8 @@ import { api } from '../../lib/api'
 import { Popover } from '../ui/layers'
 import { ModelLabel } from '../ui/ModelLabel'
 import { sessionProviderId } from '@shared/models'
+import { Tip } from '../ui/Tooltip'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 
 const STATUS_LABEL: Record<SessionStatus, string> = {
   idle: 'ociosa',
@@ -61,6 +63,7 @@ export function SessionSwitcher({
   const openSession = useStore((s) => s.openSession)
   const run = useStore((s) => s.run)
   const [open, setOpen] = useState(false)
+  const level = useBarLevel('session-switcher')
   /** Nós recolhidos (sessões com subagentes). */
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
   const anchor = useRef<HTMLButtonElement>(null)
@@ -172,31 +175,42 @@ export function SessionSwitcher({
     )
   }
 
+  const currentLabel = current ? sessionLabel(current) : 'Sessão'
+  const button = (
+    <button
+      ref={anchor}
+      type="button"
+      data-testid="session-switcher"
+      {...barAttrs('session-switcher', level)}
+      aria-label={`Sessões: ${currentLabel} · ${subs.length} ${subs.length === 1 ? 'subagente' : 'subagentes'}`}
+      onClick={() => setOpen((o) => !o)}
+      className={cn(
+        'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-border px-2 text-xs whitespace-nowrap text-muted transition-colors hover:border-border-strong hover:text-fg',
+        open && 'border-border-strong text-fg'
+      )}
+    >
+      {current?.depth ? (
+        <Bot className="size-3.5 shrink-0 text-accent-strong" />
+      ) : (
+        <MessageSquare className="size-3.5 shrink-0" />
+      )}
+      {level === 0 && <span className="max-w-[160px] truncate">{currentLabel}</span>}
+      <span className="rounded bg-white/[0.06] px-1 text-[10px] whitespace-nowrap tabular-nums text-subtle">
+        {subs.length} sub
+      </span>
+      {activeSubs > 0 && <StatusDot status="running" />}
+      <ChevronDown className="size-3 shrink-0 text-subtle" />
+    </button>
+  )
   return (
     <>
-      <button
-        ref={anchor}
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className={cn(
-          'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border border-border px-2 text-xs text-muted transition-colors hover:border-border-strong hover:text-fg',
-          open && 'border-border-strong text-fg'
-        )}
-      >
-        {current?.depth ? (
-          <Bot className="size-3.5 text-accent-strong" />
-        ) : (
-          <MessageSquare className="size-3.5" />
-        )}
-        <span className="max-w-[160px] truncate max-[1179px]:hidden">
-          {current ? sessionLabel(current) : 'Sessão'}
-        </span>
-        <span className="rounded bg-white/[0.06] px-1 text-[10px] whitespace-nowrap tabular-nums text-subtle">
-          {subs.length} sub
-        </span>
-        {activeSubs > 0 && <StatusDot status="running" />}
-        <ChevronDown className="size-3 text-subtle" />
-      </button>
+      {level > 0 ? (
+        <Tip side="bottom" label={`${currentLabel} · trocar de sessão`}>
+          {button}
+        </Tip>
+      ) : (
+        button
+      )}
       <Popover
         open={open}
         onClose={() => setOpen(false)}

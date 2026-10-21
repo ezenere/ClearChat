@@ -844,8 +844,8 @@ export function LimitsSection({ cfg, patch }: CfgProps): React.JSX.Element {
 }
 
 /**
- * Limite para salvar saídas grandes em arquivo — setting GLOBAL deste dispositivo
- * (`toolOutputSpillChars`, não sincronizado), não um campo do ChatConfig.
+ * Limite para salvar saídas grandes em arquivo — setting GLOBAL (`toolOutputSpillChars`, sincroniza
+ * entre os dispositivos desde o protocolo 1.4.0), não um campo do ChatConfig.
  */
 function SpillField({ max }: { max: number }): React.JSX.Element {
   const run = useStore((s) => s.run)
@@ -863,8 +863,8 @@ function SpillField({ max }: { max: number }): React.JSX.Element {
       <div className="min-w-0 flex-1">
         <div className="text-[13px] text-fg/90">Salvar em arquivo acima de</div>
         <p className="mt-0.5 text-[11.5px] text-subtle">
-          caracteres · global (todos os chats deste dispositivo) · acima disso o modelo recebe um
-          trecho e o caminho do arquivo com a saída completa
+          caracteres · global (todos os chats) · acima disso o modelo recebe um trecho e o caminho
+          do arquivo com a saída completa
           {effective < (value ?? LIMITS.spillThresholdChars)
             ? ` · neste chat vale ${effective.toLocaleString('pt-BR')} (saída máx.)`
             : ''}

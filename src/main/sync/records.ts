@@ -50,8 +50,22 @@ export const SETTING_IDS = [
   'approvalLists',
   'webSearchEngines',
   'webSearchApiKeys',
-  'webSearchMinIntervalSec'
+  'webSearchMinIntervalSec',
+  // desde 1.4.0 (preferências; antes locais do dispositivo)
+  'smartApproveDefaults',
+  'autoTitle',
+  'toolOutputSpillChars'
 ] as const
+
+/**
+ * Ids de `setting` que entraram depois do 1.0.0: um dispositivo que já sincronizava não marcou os
+ * valores locais como sujos (os triggers não os viam) — o motor faz uma passada única depois do
+ * primeiro pull (SyncEngine.backfillSettings). Mudou a lista → mudar a versão.
+ */
+export const SETTINGS_BACKFILL = {
+  version: '1.4.0',
+  ids: ['smartApproveDefaults', 'autoTitle', 'toolOutputSpillChars']
+} as const
 
 /** Status transitórios de sessão (exibidos como interrupted sem janela aberta, §4.3.7). */
 export const TRANSIENT_STATUS = new Set([
@@ -647,7 +661,8 @@ export function applyRemote(
         setSetting(conn, 'defaultModel', value ? strOrNull(v.model) : null)
       } else if ((SETTING_IDS as readonly string[]).includes(id)) setSetting(conn, id, value)
       res.scopes.add('settings')
-      if (id === 'approvalModes' || id === 'approvalLists') res.scopes.add('approvals')
+      if (id === 'approvalModes' || id === 'approvalLists' || id === 'smartApproveDefaults')
+        res.scopes.add('approvals')
       if (id.startsWith('webSearch')) res.scopes.add('webSearch')
       break
     }

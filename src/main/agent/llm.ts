@@ -20,6 +20,10 @@ export interface StreamAccumulator {
   model?: string
   /** true quando o stream terminou normalmente ([DONE] ou fim do body). */
   completed: boolean
+  /** 1º delta de raciocínio (epoch ms) — ver markReasoning. */
+  reasoningStartedAt?: number
+  /** 1º delta de conteúdo/tool call depois do raciocínio. */
+  reasoningEndedAt?: number
 }
 
 export const newAccumulator = (): StreamAccumulator => ({
@@ -32,8 +36,34 @@ export const newAccumulator = (): StreamAccumulator => ({
 export const accToDraft = (a: StreamAccumulator): StreamDraft => ({
   content: a.content,
   reasoning: a.reasoning,
-  toolCalls: a.toolCalls.map((t) => ({ ...t }))
+  toolCalls: a.toolCalls.map((t) => ({ ...t })),
+  ...(a.reasoningStartedAt != null ? { reasoningStartedAt: a.reasoningStartedAt } : {}),
+  ...(a.reasoningEndedAt != null ? { reasoningEndedAt: a.reasoningEndedAt } : {})
 })
+
+/**
+ * Relógio do raciocínio, chamado a cada atualização do stream: marca o 1º delta de raciocínio e o
+ * 1º delta de conteúdo/tool call que vem depois dele (o fim do "Pensando…").
+ */
+export function markReasoning(acc: StreamAccumulator, now: number): void {
+  if (acc.reasoningStartedAt == null) {
+    if (acc.reasoning) acc.reasoningStartedAt = now
+    else return
+  }
+  if (acc.reasoningEndedAt == null && (acc.content || acc.toolCalls.length))
+    acc.reasoningEndedAt = now
+}
+
+/**
+ * Duração do raciocínio (ms) para `meta.reasoningMs`: início → fim marcado (ou `now`, se o stream
+ * acabou/foi cortado ainda pensando). undefined sem raciocínio ou quando tudo chegou de uma vez
+ * (resposta não-stream: duração 0 não diz nada).
+ */
+export function reasoningDuration(acc: StreamAccumulator, now: number): number | undefined {
+  if (acc.reasoningStartedAt == null) return undefined
+  const ms = (acc.reasoningEndedAt ?? now) - acc.reasoningStartedAt
+  return ms > 0 ? ms : undefined
+}
 
 export class LlmHttpError extends Error {
   status: number

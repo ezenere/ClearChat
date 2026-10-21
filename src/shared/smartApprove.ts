@@ -8,7 +8,7 @@
 // vira perguntar (mapJudgeDecision). Qualquer erro, tempo esgotado ou resposta ambígua do juiz →
 // pergunta ao usuário (nunca libera nem nega). Contexto extra: smartApproveContext.ts.
 import { contentText } from './attachments'
-import { normalizeCapture } from './smartDefaults'
+import { normalizeCapture, normalizeCapturePrompts } from './smartDefaults'
 import { describeShell } from './shellParse'
 import { activeHistory, isDisplayOnly } from './context'
 import {
@@ -170,7 +170,10 @@ export function normalizeSmartApprove(
     judgeWhitelisted: s.judgeWhitelisted === true,
     // 0.8.5: ajustes do chat/persona sobre os padrões globais (ausente/null = o global)
     ...(typeof s.environment === 'string' ? { environment: s.environment } : {}),
-    ...(s.capture && typeof s.capture === 'object' ? { capture: normalizeCapture(s.capture) } : {})
+    ...(s.capture && typeof s.capture === 'object' ? { capture: normalizeCapture(s.capture) } : {}),
+    ...(s.capturePrompts && typeof s.capturePrompts === 'object'
+      ? { capturePrompts: normalizeCapturePrompts(s.capturePrompts) }
+      : {})
   }
 }
 

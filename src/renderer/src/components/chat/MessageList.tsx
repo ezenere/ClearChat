@@ -86,6 +86,7 @@ import {
 } from '../../lib/branchView'
 import { useHostInfo } from '../sync/hooks'
 import { BranchSwitcher } from './BranchSwitcher'
+import { reasoningHeader } from '../../lib/reasoning'
 
 // ---------- Bits ----------
 
@@ -98,16 +99,48 @@ const reasoningViews = new Map<string, ReasoningView>()
  * "expandir tudo" (texto inteiro na altura natural, sem rolagem interna). Enquanto o modelo
  * pensa, a caixa aparece sozinha; no modo expandido ela só cresce.
  */
+/** Agora (ms), atualizado a cada segundo enquanto `active`. */
+function useSecondTick(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    const tick = (): void => setNow(Date.now())
+    const first = setTimeout(tick, 0)
+    const t = setInterval(tick, 1000)
+    return () => {
+      clearTimeout(first)
+      clearInterval(t)
+    }
+  }, [active])
+  return now
+}
+
 function Reasoning({
   text,
   live,
-  id
+  id,
+  startedAt,
+  durationMs,
+  tokens
 }: {
   text: string
   live?: boolean
   /** id da mensagem, para lembrar o estado; rascunhos não têm. */
   id?: string
+  /** Pensando: início do raciocínio (relógio do store) → "Pensando… N s". */
+  startedAt?: number
+  /** Concluído: tempo de raciocínio (meta.reasoningMs ou o relógio do rascunho). */
+  durationMs?: number
+  /** Concluído: usage.reasoningTokens (quando o provedor informa). */
+  tokens?: number
 }): React.JSX.Element {
+  const now = useSecondTick(!!live && startedAt != null)
+  const header = reasoningHeader({
+    live,
+    elapsedMs: live && startedAt != null ? Math.max(0, now - startedAt) : undefined,
+    durationMs,
+    tokens
+  })
   const [view, setViewState] = useState<ReasoningView>(
     () => (id && reasoningViews.get(id)) || 'closed'
   )
@@ -140,7 +173,15 @@ function Reasoning({
           className="inline-flex items-center gap-1.5 rounded-md px-1 py-0.5 text-[12px] text-subtle hover:text-fg"
         >
           <Brain className={cn('size-3.5', live && 'animate-pulse-soft text-accent-strong')} />
-          {live ? 'Pensando…' : 'Raciocínio'}
+          <span data-testid="reasoning-header">
+            {header.label}
+            {header.details.map((d) => (
+              <span key={d} className="tabular-nums text-faint">
+                {' · '}
+                {d}
+              </span>
+            ))}
+          </span>
           <ChevronRight
             className={cn('size-3 transition-transform', shown !== 'closed' && 'rotate-90')}
           />
@@ -1134,7 +1175,14 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
   const canRegen = canEdit && ctx.depth === 0 && ctx.regenTargets.has(msg.id)
   return (
     <div className="group/msg animate-slide-up py-2">
-      {m.reasoning && <Reasoning text={m.reasoning} id={msg.id} />}
+      {m.reasoning && (
+        <Reasoning
+          text={m.reasoning}
+          id={msg.id}
+          durationMs={msg.meta.reasoningMs}
+          tokens={msg.meta.usage?.reasoningTokens}
+        />
+      )}
       {editing ? (
         <InlineEditor
           initial={content}
@@ -1236,10 +1284,17 @@ const DraftView = memo(function DraftView({
   draft: StreamDraft
   ctx: Ctx
 }): React.JSX.Element {
+  const clock = useStore((s) => s.reasoningClocks[ctx.sessionId])
+  const live = !draft.content && !draft.toolCalls.length
   return (
     <div className="py-2">
       {draft.reasoning && (
-        <Reasoning text={draft.reasoning} live={!draft.content && !draft.toolCalls.length} />
+        <Reasoning
+          text={draft.reasoning}
+          live={live}
+          startedAt={clock?.start}
+          durationMs={clock?.end != null ? clock.end - clock.start : undefined}
+        />
       )}
       {(draft.content || (!draft.reasoning && !draft.toolCalls.length)) && (
         <Markdown text={draft.content} streaming={!draft.toolCalls.length} />

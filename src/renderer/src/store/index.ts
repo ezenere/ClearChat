@@ -31,6 +31,7 @@ import { trackFailure, type SubFailure } from '../lib/subFailures'
 import type { UpdateStatus } from '@shared/updates'
 import { buildTree, selectionToReach, selEquals } from '@shared/branches'
 import { canAutoOpen } from '../lib/fileSources'
+import { nextReasoningClock, type ReasoningClock } from '../lib/reasoning'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -43,7 +44,7 @@ export interface AppSettings {
   defaultPresetId: string | null
   /** Versão cujo aviso de atualização foi dispensado (local; não sincroniza). */
   updateDismissedVersion: string | null
-  /** Título automático (valor cru; ler com normalizeAutoTitleSettings). Local; não sincroniza. */
+  /** Título automático (valor cru; ler com normalizeAutoTitleSettings). Sincroniza (protocolo 1.4.0). */
   autoTitle: unknown
 }
 
@@ -171,6 +172,8 @@ interface State {
   /** Mensagens por sessão (só sessões já carregadas). */
   messages: Record<string, StoredMessage[]>
   drafts: Record<string, StreamDraft | null>
+  /** Relógio do "Pensando… N s" do rascunho de cada sessão (lib/reasoning.ts). */
+  reasoningClocks: Record<string, ReasoningClock | undefined>
   toolRuns: Record<string, Record<string, ToolRun>>
   queues: Record<string, QueuedMessage[]>
   approvals: ApprovalRequest[]
@@ -405,6 +408,7 @@ export const useStore = create<Store>()((set, get) => ({
   sessions: {},
   messages: {},
   drafts: {},
+  reasoningClocks: {},
   toolRuns: {},
   queues: {},
   approvals: [],
@@ -1191,6 +1195,7 @@ function applyEvent(e: AgentEvent): void {
           sessions: drop(s.sessions),
           messages: drop(s.messages),
           drafts: drop(s.drafts),
+          reasoningClocks: drop(s.reasoningClocks),
           toolRuns: drop(s.toolRuns),
           queues: drop(s.queues),
           errors: drop(s.errors),
@@ -1285,7 +1290,16 @@ function applyEvent(e: AgentEvent): void {
       })
       break
     case 'draft':
-      set((s) => ({ drafts: { ...s.drafts, [e.sessionId]: e.draft } }))
+      set((s) => {
+        const prev = s.reasoningClocks[e.sessionId]
+        const clock = nextReasoningClock(prev, e.draft, Date.now())
+        return {
+          drafts: { ...s.drafts, [e.sessionId]: e.draft },
+          ...(clock !== prev
+            ? { reasoningClocks: { ...s.reasoningClocks, [e.sessionId]: clock } }
+            : {})
+        }
+      })
       break
     case 'tool-running':
       set((s) => {

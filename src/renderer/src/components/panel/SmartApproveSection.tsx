@@ -45,6 +45,7 @@ function environmentSummary(cfg: CfgProps['cfg']): { text: string; changed: bool
   if (typeof sa?.environment === 'string')
     parts.push(sa.environment.trim() ? 'ambiente do chat' : 'sem ambiente')
   if (sa?.capture) parts.push(sa.capture.enabled ? 'coleta ligada' : 'coleta desligada')
+  if (sa?.capturePrompts) parts.push('prompts do resumidor')
   if (cfg.capturedContext?.main?.text) parts.push('contexto capturado')
   return parts.length
     ? { text: parts.join(' · '), changed: true }

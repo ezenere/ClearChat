@@ -10,6 +10,7 @@ import { api, errorMessage } from '../../lib/api'
 import { selectProcesses, useStore } from '../../store'
 import { Popover } from '../ui/layers'
 import { Tip } from '../ui/Tooltip'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 import { CopyButton } from './Markdown'
 import { processesChip, processState } from './processFormat'
 
@@ -157,6 +158,7 @@ export function ProcessesBadge({ chatId }: { chatId: string }): React.JSX.Elemen
   const anchor = useRef<HTMLButtonElement>(null)
   const chip = processesChip(list)
   const now = useNow(open)
+  const level = useBarLevel('processes')
   // lista esvaziou (último removido/parado): fecha o popover junto com o chip (ajuste durante o
   // render — não reabre sozinho quando surgir outro processo)
   if (!chip && open) setOpen(false)
@@ -175,12 +177,13 @@ export function ProcessesBadge({ chatId }: { chatId: string }): React.JSX.Elemen
           ref={anchor}
           type="button"
           data-testid="processes-badge"
+          {...barAttrs('processes', level)}
           data-state={finished ? (failed ? 'failed' : 'finished') : 'running'}
           onClick={() => setOpen((o) => !o)}
           aria-expanded={open}
-          aria-label={finished ? tip : undefined}
+          aria-label={finished ? tip : `${n} processo${s} em segundo plano`}
           className={cn(
-            'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
+            'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs whitespace-nowrap transition-colors',
             finished
               ? 'border-border text-muted hover:border-border-strong hover:text-fg'
               : 'border-success/25 bg-success/[0.06] text-success/90 hover:bg-success/[0.12]'
@@ -195,10 +198,9 @@ export function ProcessesBadge({ chatId }: { chatId: string }): React.JSX.Elemen
               />
             )}
           </span>
-          <span className="max-[1179px]:hidden">
-            {n} {finished ? `encerrado${s}` : `processo${s}`}
+          <span className="tabular-nums">
+            {level === 0 ? `${n} ${finished ? `encerrado${s}` : `processo${s}`}` : n}
           </span>
-          <span className="min-[1180px]:hidden">{n}</span>
         </button>
       </Tip>
       <Popover

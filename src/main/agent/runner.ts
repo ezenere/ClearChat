@@ -113,7 +113,16 @@ import {
 import { listModels } from '../providers'
 import { contentText, isAppPart } from '@shared/attachments'
 import { providerKind } from '@shared/providerKinds'
-import { accToDraft, finalizeToolCalls, newAccumulator, streamChat, throttle } from './llm'
+import {
+  accToDraft,
+  finalizeToolCalls,
+  markReasoning,
+  newAccumulator,
+  reasoningDuration,
+  streamChat,
+  throttle,
+  type StreamAccumulator
+} from './llm'
 import {
   availableTools,
   buildRequest,
@@ -891,6 +900,12 @@ async function runLoop(st: RunState): Promise<LoopOutcome> {
   }
 }
 
+/** `{ reasoningMs }` da resposta (vazio sem raciocínio medido). */
+function withReasoningMs(acc: StreamAccumulator): Pick<MessageMeta, 'reasoningMs'> {
+  const ms = reasoningDuration(acc, Date.now())
+  return ms != null ? { reasoningMs: ms } : {}
+}
+
 async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   const session = sessionsRepo.get(st.sessionId)
   if (!session) return { kind: 'error', error: 'Sessão não encontrada (chat apagado?).' }
@@ -929,7 +944,11 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
         t0 = Date.now()
       }
       first = false
-      await streamChat(req, signal, acc, draft.call)
+      // relógio do raciocínio (meta.reasoningMs e o "Pensando… N s" do rascunho)
+      await streamChat(req, signal, acc, () => {
+        markReasoning(acc, Date.now())
+        draft.call()
+      })
     },
     isNetwork: isConnectionFailure,
     onDiscard: () => {
@@ -955,7 +974,12 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
             content: acc.content,
             ...(acc.reasoning.trim() ? { reasoning: acc.reasoning } : {})
           },
-          { interrupted: true, model: acc.model ?? session.model, durationMs: Date.now() - t0 }
+          {
+            interrupted: true,
+            model: acc.model ?? session.model,
+            durationMs: Date.now() - t0,
+            ...withReasoningMs(acc)
+          }
         )
       }
       return { kind: 'aborted', partial: acc.content }
@@ -985,7 +1009,11 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     ...(calls.length ? { tool_calls: calls } : {}),
     ...(acc.reasoning.trim() ? { reasoning: acc.reasoning } : {})
   }
-  const meta: MessageMeta = { model: acc.model ?? session.model, durationMs: Date.now() - t0 }
+  const meta: MessageMeta = {
+    model: acc.model ?? session.model,
+    durationMs: Date.now() - t0,
+    ...withReasoningMs(acc)
+  }
   if (acc.usage) meta.usage = acc.usage
   append(session.id, assistant, meta)
 

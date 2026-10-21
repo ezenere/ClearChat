@@ -710,6 +710,99 @@ async function main(): Promise<void> {
     assert(existsSync(join(B.dir, 'attachments', info.file)), 'gravado no store de B')
   })
 
+  await step(
+    'preferências (protocolo 1.4.0): padrões do Smart-Approve, título automático e spill de A chegam em B; aviso dispensado fica local',
+    async () => {
+      const cur = await api<any>(A, 'approvals.getSettings')
+      await api(A, 'approvals.updateSettings', {
+        smart: {
+          ...cur.smart,
+          environment: 'Ambiente vindo do PC: 10.0.0.5 é teste',
+          acceptEditsInRoot: true,
+          capture: {
+            enabled: true,
+            providerId,
+            model: 'fake/resumo',
+            maxTokens: null,
+            lookback: 3
+          },
+          capturePrompts: {
+            prompt: 'PROMPT DO PC KEEP APPEND REWRITE',
+            template: null,
+            derivePrompt: null
+          }
+        }
+      })
+      await api(A, 'settings.set', 'autoTitle', {
+        providerId,
+        model: 'fake/titulo',
+        useMemory: true,
+        maxTokens: 48,
+        prompt: 'Título do PC.'
+      })
+      await api(A, 'settings.set', 'toolOutputSpillChars', 25_000)
+      await api(A, 'settings.set', 'updateDismissedVersion', '99.0.0')
+      await settled(A)
+      const smartB = await waitFor(
+        async () => {
+          const st = await api<any>(B, 'approvals.getSettings')
+          return st.smart.environment.startsWith('Ambiente vindo do PC') && st.smart
+        },
+        15_000,
+        'B recebeu os padrões globais'
+      )
+      assert(smartB.acceptEditsInRoot === true, 'aceitar edições')
+      assert(smartB.capture.providerId === providerId && smartB.capture.lookback === 3, 'coleta')
+      assert(
+        smartB.capturePrompts.prompt === 'PROMPT DO PC KEEP APPEND REWRITE',
+        'prompts do resumidor'
+      )
+      const titleB = await waitFor(
+        async () =>
+          (await api<any>(B, 'settings.get', 'autoTitle'))?.model === 'fake/titulo' &&
+          api<any>(B, 'settings.get', 'autoTitle'),
+        15_000,
+        'B recebeu o título automático'
+      )
+      assert(
+        titleB.providerId === providerId && titleB.prompt === 'Título do PC.',
+        'autoTitle inteiro'
+      )
+      await waitFor(
+        async () => (await api<any>(B, 'settings.get', 'toolOutputSpillChars')) === 25_000,
+        15_000,
+        'B recebeu o spill'
+      )
+      assert(
+        (await api<any>(B, 'settings.get', 'updateDismissedVersion')) !== '99.0.0',
+        'aviso dispensado é local'
+      )
+      // a UI de B recarregou (Configurações → Aprovações mostra o ambiente novo)
+      await B.page.keyboard.press('Control+,')
+      await B.page
+        .getByRole('dialog')
+        .getByRole('button', { name: 'Aprovações', exact: true })
+        .click()
+      const env = B.page.getByRole('textbox', { name: 'Descrição do ambiente global' })
+      await waitFor(
+        async () => (await env.inputValue()).startsWith('Ambiente vindo do PC'),
+        10_000,
+        'UI de B atualizada'
+      )
+      await B.page.keyboard.press('Escape')
+      // e de volta: B muda o ambiente → A
+      await api(B, 'approvals.updateSettings', {
+        smart: { ...smartB, environment: 'editado no notebook' }
+      })
+      await waitFor(
+        async () =>
+          (await api<any>(A, 'approvals.getSettings')).smart.environment === 'editado no notebook',
+        15_000,
+        'A recebeu a edição de B'
+      )
+    }
+  )
+
   await step('Configurações → Conta (screenshot) e dispositivos', async () => {
     await B.page.keyboard.press('Control+,')
     await B.page.getByRole('button', { name: 'Conta' }).click()

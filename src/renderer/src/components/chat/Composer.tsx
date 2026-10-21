@@ -31,6 +31,56 @@ import {
   RemoteHint
 } from '../sync/ChatHost'
 import { useHostInfo } from '../sync/hooks'
+import { sessionProviderId } from '@shared/models'
+import { ModelPill } from './ModelPill'
+import { SpendButton } from './SpendButton'
+import { BarLevelsContext, barAttrs, useBarCollapse, useBarLevel } from '../../lib/useBarCollapse'
+
+/** Estado do agente na barra do composer; recolhido, só o ponto (o texto vai no tooltip). */
+function ComposerStatus({ text }: { text: string }): React.JSX.Element {
+  const level = useBarLevel('composer-status')
+  const dot = (
+    <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent-strong" />
+  )
+  if (level > 0)
+    return (
+      <Tip label={text}>
+        <span
+          {...barAttrs('composer-status', level)}
+          data-testid="composer-status"
+          aria-label={text}
+          className="flex h-4 items-center px-1"
+        >
+          {dot}
+        </span>
+      </Tip>
+    )
+  return (
+    <span
+      {...barAttrs('composer-status', level)}
+      data-testid="composer-status"
+      className="flex items-center gap-1.5 text-subtle"
+    >
+      {dot}
+      {text}
+    </span>
+  )
+}
+
+/** "Enter envia · Shift+Enter quebra linha" — o primeiro a sair quando falta espaço. */
+function ComposerHint(): React.JSX.Element {
+  const level = useBarLevel('composer-hint')
+  return (
+    <span {...barAttrs('composer-hint', level)} data-testid="composer-hint">
+      {level === 0 && (
+        <>
+          <span className="text-subtle">Enter</span> envia ·{' '}
+          <span className="text-subtle">Shift+Enter</span> quebra linha
+        </>
+      )}
+    </span>
+  )
+}
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
 function pastedName(file: File, i: number): File {
@@ -141,6 +191,7 @@ export function Composer({
   const hostOffline = host?.mode === 'host-offline'
   const [text, setText] = useState('')
   const ref = useRef<HTMLTextAreaElement>(null)
+  const [barRef, barLevels] = useBarCollapse<HTMLDivElement>()
   const pending = useStore(selectPendingAttachments(session.id))
   const addFiles = useStore((s) => s.addFiles)
   const pickFiles = useStore((s) => s.pickFiles)
@@ -330,83 +381,99 @@ export function Composer({
                   className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
                 />
               )}
-              <div className="flex items-center gap-2 px-2.5 pb-2.5">
-                {!blocked && (
-                  <Tip label={attachTip}>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        void pickFiles(session.id)
-                      }}
-                      className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
-                      aria-label="Anexar arquivos"
-                    >
-                      <Paperclip className="size-4" />
-                    </button>
-                  </Tip>
-                )}
-                {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
-                <span className="flex items-center gap-1.5 text-[11px] text-faint">
-                  <ComposerInfo running={busy} />
-                  {chat && <RemoteHint chat={chat} />}
-                  {busy ? (
-                    <span className="flex items-center gap-1.5 text-subtle">
-                      <span className="size-1.5 animate-pulse-soft rounded-full bg-accent-strong" />
-                      {question || session.status === 'awaiting_input'
-                        ? 'Aguardando sua resposta'
-                        : retry || session.status === 'awaiting_retry'
-                          ? 'Aguardando sua decisão (falha de conexão)'
-                          : session.status === 'awaiting_approval'
-                            ? 'Aguardando aprovação'
-                            : session.status === 'waiting'
-                              ? 'Aguardando subagentes'
-                              : compaction?.state === 'running'
-                                ? 'Compactando conversa…'
-                                : 'Trabalhando…'}
-                    </span>
-                  ) : (
-                    <span>
-                      <span className="text-subtle">Enter</span> envia ·{' '}
-                      <span className="text-subtle">Shift+Enter</span> quebra linha
-                    </span>
-                  )}
-                </span>
-                <div className="ml-auto flex items-center gap-1.5">
-                  {chat && <ContextMeter chat={chat} session={session} className="mr-0.5" />}
-                  {busy && (
-                    <Tip label="Parar">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          void run(() => api.agent.stop(session.id), 'Falha ao parar')
-                        }}
-                        className="flex size-8 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
-                        aria-label="Parar"
-                      >
-                        <Square className="size-3" fill="currentColor" />
-                      </button>
-                    </Tip>
-                  )}
+              <BarLevelsContext.Provider value={barLevels}>
+                <div
+                  ref={barRef}
+                  data-testid="composer-toolbar"
+                  data-bar-clip
+                  className="flex items-center gap-2 overflow-x-clip px-2.5 pb-2.5"
+                >
                   {!blocked && (
-                    <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
+                    <Tip label={attachTip}>
                       <button
                         type="button"
-                        disabled={!canSend}
                         onClick={(e) => {
                           e.stopPropagation()
-                          void submit()
+                          void pickFiles(session.id)
                         }}
-                        className="flex size-8 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
-                        aria-label="Enviar"
+                        className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
+                        aria-label="Anexar arquivos"
                       >
-                        <ArrowUp className="size-4" strokeWidth={2.25} />
+                        <Paperclip className="size-4" />
                       </button>
                     </Tip>
                   )}
+                  {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
+                  <span className="flex shrink-0 items-center gap-1.5 text-[11px] whitespace-nowrap text-faint">
+                    <ComposerInfo running={busy} />
+                    {chat && <RemoteHint chat={chat} />}
+                    {busy ? (
+                      <ComposerStatus
+                        text={
+                          question || session.status === 'awaiting_input'
+                            ? 'Aguardando sua resposta'
+                            : retry || session.status === 'awaiting_retry'
+                              ? 'Aguardando sua decisão (falha de conexão)'
+                              : session.status === 'awaiting_approval'
+                                ? 'Aguardando aprovação'
+                                : session.status === 'waiting'
+                                  ? 'Aguardando subagentes'
+                                  : compaction?.state === 'running'
+                                    ? 'Compactando conversa…'
+                                    : 'Trabalhando…'
+                        }
+                      />
+                    ) : (
+                      <ComposerHint />
+                    )}
+                  </span>
+                  <div data-bar-spacer className="min-w-0 flex-1" />
+                  <div className="flex shrink-0 items-center gap-1">
+                    {chat && (
+                      <ModelPill
+                        providerId={sessionProviderId(
+                          chat.config,
+                          session.depth > 0 ? session : null
+                        )}
+                        model={session.depth > 0 ? session.model : chat.config.model}
+                      />
+                    )}
+                    {chat && <ContextMeter chat={chat} session={session} />}
+                    {chat && <SpendButton chat={chat} />}
+                    {busy && (
+                      <Tip label="Parar">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void run(() => api.agent.stop(session.id), 'Falha ao parar')
+                          }}
+                          className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
+                          aria-label="Parar"
+                        >
+                          <Square className="size-3" fill="currentColor" />
+                        </button>
+                      </Tip>
+                    )}
+                    {!blocked && (
+                      <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
+                        <button
+                          type="button"
+                          disabled={!canSend}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            void submit()
+                          }}
+                          className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
+                          aria-label="Enviar"
+                        >
+                          <ArrowUp className="size-4" strokeWidth={2.25} />
+                        </button>
+                      </Tip>
+                    )}
+                  </div>
                 </div>
-              </div>
+              </BarLevelsContext.Provider>
             </div>
           )}
         </div>

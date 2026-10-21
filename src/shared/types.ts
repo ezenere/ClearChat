@@ -148,8 +148,8 @@ export interface ApprovalSettings {
   /** Listas globais (settings `approvalLists`) — nunca por chat. */
   lists: Record<ApprovalListItem, ApprovalList>
   /**
-   * Padrões globais do Smart-Approve (setting local `smartApproveDefaults`): descrição do ambiente,
-   * "Aceitar edições dentro da raiz" e coleta automática de contexto.
+   * Padrões globais do Smart-Approve (setting `smartApproveDefaults`, sincronizado): descrição do
+   * ambiente, "Aceitar edições dentro da raiz", coleta automática de contexto e prompts do resumidor.
    */
   smart: SmartApproveDefaults
 }
@@ -290,6 +290,11 @@ export interface SmartApproveConfig {
    */
   capture?: ContextCaptureConfig | null
   /**
+   * Prompts do resumidor (coleta de contexto) deste chat/persona: ausente/null = os globais
+   * (Configurações → Aprovações → Padrões globais). Ver contextCapture.ts.
+   */
+  capturePrompts?: CapturePrompts | null
+  /**
    * @deprecated (≤ 0.4.0) liga/desliga. Só alias de leitura: migrateSmartApproveConfig converte
    * (ver approvalPolicy.ts) e remove. Hoje o juiz age nos itens em modo `smart` quando há modelo.
    */
@@ -327,6 +332,19 @@ export interface ContextCaptureConfig {
   lookback: number
 }
 
+/**
+ * Prompts editáveis do resumidor (cada um null = o padrão de defaults.ts). O template precisa de
+ * {{current}} e {{user}} — sem eles o app usa o template padrão (validateCapturePrompts).
+ */
+export interface CapturePrompts {
+  /** System da chamada de resumo; null = DEFAULT_CONTEXT_CAPTURE_PROMPT. */
+  prompt: string | null
+  /** Mensagem user da chamada de resumo; null = DEFAULT_CONTEXT_CAPTURE_TEMPLATE. */
+  template: string | null
+  /** System da derivação da descrição de um subagente; null = DEFAULT_CONTEXT_DERIVE_PROMPT. */
+  derivePrompt: string | null
+}
+
 /** Uma descrição capturada (do chat ou de um subagente). */
 export interface CapturedEntry {
   text: string
@@ -361,13 +379,15 @@ export interface CapturedContextState {
 }
 
 /**
- * Padrões GLOBAIS do Smart-Approve/aprovações (setting local `smartApproveDefaults`, Configurações
- * → Aprovações; não sincroniza — ver SPEC).
+ * Padrões GLOBAIS do Smart-Approve/aprovações (setting `smartApproveDefaults`, Configurações →
+ * Aprovações; sincroniza desde o protocolo 1.4.0 — ver SPEC → Sync).
  */
 export interface SmartApproveDefaults {
   environment: string
   acceptEditsInRoot: boolean
   capture: ContextCaptureConfig
+  /** Prompts do resumidor (cada um null = o padrão). */
+  capturePrompts: CapturePrompts
 }
 
 /** Uma avaliação do juiz (meta da mensagem tool e da ApprovalRequest). Nunca entra no histórico enviado. */
@@ -567,6 +587,11 @@ export interface MessageMeta {
   usage?: Usage
   model?: string
   durationMs?: number
+  /**
+   * Resposta do assistente: tempo de raciocínio (ms) — do 1º delta de raciocínio ao 1º delta de
+   * conteúdo/tool call (ou ao fim do stream). Ausente = sem raciocínio ou mensagem antiga.
+   */
+  reasoningMs?: number
   error?: string
   /** Em mensagens tool de delegate_task. */
   subSessionId?: string
@@ -855,6 +880,13 @@ export interface StreamDraft {
   content: string
   reasoning: string
   toolCalls: { id: string; name: string; arguments: string }[]
+  /**
+   * Relógio do raciocínio (epoch ms do processo que roda o stream): 1º delta de raciocínio e 1º
+   * delta de conteúdo/tool call depois dele. Só local — o sync (draft.delta) não leva; o renderer
+   * cai para a hora em que viu o raciocínio pela primeira vez.
+   */
+  reasoningStartedAt?: number
+  reasoningEndedAt?: number
 }
 
 export interface DirEntry {

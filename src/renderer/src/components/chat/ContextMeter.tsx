@@ -6,6 +6,7 @@ import { useContextInfo } from '../../lib/useContextInfo'
 import { isBusy, useStore } from '../../store'
 import { Button } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 
 const fmtInt = (n: number): string => n.toLocaleString('pt-BR')
 
@@ -60,6 +61,7 @@ export function ContextMeter({
 }): React.JSX.Element | null {
   const info = useContextInfo(chat, session)
   const focusConfig = useStore((s) => s.focusConfig)
+  const level = useBarLevel('context-meter')
   const { usage, window, pct, threshold } = info
   if (!usage) return null
   const u = usage.usage
@@ -97,6 +99,7 @@ export function ContextMeter({
       <button
         type="button"
         data-testid="context-meter"
+        {...barAttrs('context-meter', level)}
         aria-label="Contexto em uso"
         onClick={(e) => {
           e.stopPropagation()
@@ -104,13 +107,16 @@ export function ContextMeter({
           focusConfig(window ? 'contexto' : 'contexto-janela')
         }}
         className={cn(
-          'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[11px] tabular-nums transition-colors hover:bg-hover',
+          'no-drag flex h-7 shrink-0 items-center gap-1.5 rounded-lg px-1.5 text-[11px] whitespace-nowrap tabular-nums transition-colors hover:bg-hover',
           levelClass(pct, threshold),
           className
         )}
       >
         <Ring pct={pct} />
-        <span>
+        {level === 1 && (
+          <span>{window ? `${Math.round((pct ?? 0) * 100)}%` : formatTokens(usage.used)}</span>
+        )}
+        <span className={cn(level > 0 && 'hidden')}>
           {usage.estimated ? '~' : ''}
           {formatTokens(usage.used)}
           {window ? (

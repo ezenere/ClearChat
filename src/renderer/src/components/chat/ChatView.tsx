@@ -26,7 +26,6 @@ import {
   modeLabel
 } from '@shared/approvalPolicy'
 import { sessionProviderId } from '@shared/models'
-import { providerKind } from '@shared/providerKinds'
 import { cn, compactPath, sessionLabel } from '../../lib/format'
 import { isBusy, useStore } from '../../store'
 import { api } from '../../lib/api'
@@ -37,6 +36,7 @@ import { IconButton } from '../ui/controls'
 import { Popover } from '../ui/layers'
 import { ModelLabel } from '../ui/ModelLabel'
 import { Tip } from '../ui/Tooltip'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 import { Composer } from './Composer'
 import { useAttachmentSupport } from './attachmentSupport'
 import { ContextMeter } from './ContextMeter'
@@ -46,60 +46,6 @@ import { ProcessesBadge } from './ProcessesBadge'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
 import { DivergencePanel, HostBadge } from '../sync/ChatHost'
 import { useHostInfo } from '../sync/hooks'
-
-function ModelPill({
-  providerId,
-  model
-}: {
-  providerId: string
-  model: string
-}): React.JSX.Element {
-  const setPanel = useStore((s) => s.setPanel)
-  const provider = useStore((s) => s.providers.find((p) => p.id === providerId))
-  const [vendor, name] = model.includes('/')
-    ? [model.split('/')[0], model.split('/').slice(1).join('/')]
-    : ['', model]
-  return (
-    <Tip
-      label={
-        <span className="max-w-[360px]">
-          <span className="text-muted">{provider?.name ?? 'Provedor removido'}</span>
-          <span className="text-faint"> · </span>
-          <span className="font-mono">{model || 'sem modelo'}</span>
-          <span className="block text-[11px] text-subtle">
-            Enviado como <code className="font-mono">model</code> para{' '}
-            {provider
-              ? `${provider.baseUrl}/${providerKind(provider) === 'anthropic' ? 'messages' : 'chat/completions'}`
-              : 'o endpoint do provedor'}{' '}
-            · clique para trocar
-          </span>
-        </span>
-      }
-      side="bottom"
-    >
-      <button
-        type="button"
-        data-testid="model-pill"
-        onClick={() => setPanel(true, 'model')}
-        className="no-drag flex h-7 max-w-[340px] min-w-0 shrink items-center gap-1.5 rounded-lg border border-border bg-surface px-2.5 text-xs transition-colors hover:border-border-strong hover:bg-hover max-[1179px]:max-w-[220px]"
-      >
-        <Sparkles className="size-3 shrink-0 text-accent-strong" />
-        <span
-          data-testid="model-pill-provider"
-          className={cn(
-            'max-w-[120px] shrink-0 truncate max-[1179px]:max-w-[80px]',
-            provider ? 'text-subtle' : 'text-warning/85'
-          )}
-        >
-          {provider?.name ?? 'provedor removido'}
-        </span>
-        <span className="shrink-0 text-faint">·</span>
-        {vendor && <span className="shrink-0 text-subtle max-[1179px]:hidden">{vendor}/</span>}
-        <span className="truncate font-medium text-fg/90">{name || 'sem modelo'}</span>
-      </button>
-    </Tip>
-  )
-}
 
 function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
   const homeDir = useStore((s) => s.homeDir)
@@ -142,6 +88,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
   const patchConfig = useStore((s) => s.patchConfig)
   const flushConfig = useStore((s) => s.flushConfig)
   const global = useStore((s) => s.approvalSettings.modes)
+  const level = useBarLevel('auto-approve')
   const [open, setOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const sa = normalizeSmartApprove(chat.config.smartApprove)
@@ -185,6 +132,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
         side="bottom"
         label={
           <span>
+            {level > 0 && <span className="block font-medium">{label}</span>}
             {always.length
               ? `Rodam sem pedir confirmação: ${always.map((m) => ITEM_LABEL[m.item]).join(', ')}`
               : 'Smart-Approve decide as confirmações'}
@@ -197,11 +145,13 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           ref={anchor}
           type="button"
           data-testid="auto-approve-badge"
+          {...barAttrs('auto-approve', level)}
           onClick={() => setOpen((o) => !o)}
           aria-label="Aprovações"
           aria-expanded={open}
           className={cn(
-            'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs transition-colors',
+            'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border text-xs whitespace-nowrap transition-colors',
+            level === 0 ? 'px-2' : 'w-7 justify-center',
             always.length
               ? 'border-warning/25 bg-warning/[0.06] text-warning/90 hover:bg-warning/[0.12]'
               : 'border-accent/25 bg-accent-soft/50 text-accent-strong hover:bg-accent-soft'
@@ -212,7 +162,7 @@ function AutoApproveBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           ) : (
             <ShieldCheck className="size-3.5 shrink-0" />
           )}
-          <span className="truncate max-[1179px]:hidden">{label}</span>
+          {level === 0 && <span className="truncate">{label}</span>}
         </button>
       </Tip>
       <Popover
@@ -372,11 +322,12 @@ function ChatTitle({ chat }: { chat: Chat }): React.JSX.Element {
         <button
           type="button"
           data-testid="chat-title"
+          data-bar-title
           onClick={() => {
             setText(chat.title)
             setEditing(true)
           }}
-          className="no-drag -mx-1.5 min-w-0 truncate rounded-md px-1.5 py-0.5 text-[13px] font-medium hover:bg-hover"
+          className="no-drag -mx-1.5 min-w-[64px] truncate rounded-md px-1.5 py-0.5 text-left text-[13px] font-medium whitespace-nowrap hover:bg-hover"
         >
           {chat.title || 'Novo chat'}
         </button>
@@ -411,27 +362,28 @@ export function ChatHeader({
         </IconButton>
       }
     >
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 shrink items-center gap-1.5">
         {isSub ? (
           <>
             <button
               type="button"
               onClick={() => void openSession(chat.mainSessionId)}
-              className="no-drag max-w-[220px] truncate text-[13px] text-subtle hover:text-fg"
+              className="no-drag max-w-[220px] min-w-[48px] shrink truncate text-[13px] whitespace-nowrap text-subtle hover:text-fg"
             >
               {chat.title || 'Novo chat'}
             </button>
             <ChevronRight className="size-3.5 shrink-0 text-faint" />
-            <span className="truncate text-[13px] font-medium">{sessionLabel(session)}</span>
+            <span
+              data-bar-title
+              className="min-w-[64px] truncate text-[13px] font-medium whitespace-nowrap"
+            >
+              {sessionLabel(session)}
+            </span>
           </>
         ) : (
           <ChatTitle key={chat.id} chat={chat} />
         )}
       </div>
-      <ModelPill
-        providerId={sessionProviderId(chat.config, isSub ? session : null)}
-        model={isSub ? session.model : chat.config.model}
-      />
       <SessionSwitcher chatId={chat.id} currentId={session?.id ?? chat.mainSessionId} />
       <ProcessesBadge chatId={chat.id} />
       <AutoApproveBadge chat={chat} />

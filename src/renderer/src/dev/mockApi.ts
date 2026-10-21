@@ -813,6 +813,159 @@ export function createMockApi(scenario: string): ClearApi {
       }
     ]
   }
+  // ?scenario=spend → chat c2 com gasto conhecido (respostas com cache/raciocínio, uma sem custo,
+  // juiz, subagente, coleta de contexto e título automático) — valores conferidos no E2E
+  if (scenario === 'spend') {
+    const c2 = chats.find((c) => c.id === 'c2')!
+    c2.config = {
+      ...c2.config,
+      capturedContext: {
+        main: {
+          text: 'Projeto de app de chat minimalista.',
+          updatedAt: now,
+          by: 'model',
+          calls: 3,
+          cost: 0.0015,
+          lastRun: {
+            at: now,
+            providerId: 'p1',
+            model: 'openai/gpt-5-mini',
+            usage: { promptTokens: 500, completionTokens: 40, cost: 0.0005 },
+            durationMs: 900
+          }
+        }
+      }
+    }
+    sessions.push({
+      id: 's2a',
+      chatId: 'c2',
+      parentSessionId: 's2',
+      parentToolCallId: 'tcs2',
+      depth: 1,
+      model: 'anthropic/claude-haiku-4.5',
+      title: 'Pesquisar nomes',
+      task: 'Liste nomes curtos disponíveis.',
+      status: 'done',
+      createdAt: now - 60_000
+    })
+    messages.push(
+      msg(
+        's2',
+        { role: 'user', content: 'Me ajuda a escolher um nome para o app?' },
+        {
+          autoTitle: {
+            title: 'Ideias de nomes para o app',
+            applied: true,
+            trigger: 'auto',
+            providerId: 'p1',
+            model: 'openai/gpt-5-mini',
+            usage: { promptTokens: 120, completionTokens: 8, cost: 0.00004 },
+            durationMs: 600,
+            at: now
+          }
+        }
+      ),
+      msg(
+        's2',
+        {
+          role: 'assistant',
+          content: 'Vou verificar o ambiente e pedir ajuda a um subagente.',
+          reasoning: 'Preciso entender o projeto antes de sugerir nomes.',
+          tool_calls: [
+            {
+              id: 'tcs1',
+              type: 'function',
+              function: { name: 'shell', arguments: '{"command":"ls"}' }
+            }
+          ]
+        },
+        {
+          model: 'openai/gpt-5',
+          durationMs: 6100,
+          reasoningMs: 4200,
+          usage: {
+            promptTokens: 10_000,
+            completionTokens: 500,
+            cachedTokens: 6000,
+            cacheWriteTokens: 1000,
+            reasoningTokens: 200,
+            cost: 0.12
+          }
+        }
+      ),
+      msg(
+        's2',
+        { role: 'tool', tool_call_id: 'tcs1', content: 'README.md\nsrc' },
+        {
+          toolStatus: 'ok',
+          smartApprove: {
+            decision: 'approve',
+            reason: 'Listar arquivos é seguro.',
+            providerId: 'p1',
+            model: 'openai/gpt-5-mini',
+            usage: { promptTokens: 900, completionTokens: 20, cost: 0.002 },
+            durationMs: 800
+          }
+        }
+      ),
+      msg(
+        's2',
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [
+            {
+              id: 'tcs2',
+              type: 'function',
+              function: {
+                name: 'delegate_task',
+                arguments: '{"task":"Liste nomes curtos disponíveis."}'
+              }
+            }
+          ]
+        },
+        {
+          model: 'openai/gpt-5',
+          durationMs: 2100,
+          usage: { promptTokens: 12_000, completionTokens: 300, cachedTokens: 10_000, cost: 0.03 }
+        }
+      ),
+      msg(
+        's2',
+        { role: 'tool', tool_call_id: 'tcs2', content: 'Lumen, Quill, Hush' },
+        { toolStatus: 'ok', subSessionId: 's2a' }
+      ),
+      msg(
+        's2',
+        { role: 'assistant', content: 'Sugestões: **Lumen**, **Quill** e **Hush**.' },
+        // provedor sem custo na usage → "custo desconhecido"
+        {
+          model: 'openai/gpt-5',
+          durationMs: 1500,
+          usage: { promptTokens: 5000, completionTokens: 100 }
+        }
+      ),
+      msg('s2a', { role: 'user', content: 'Liste nomes curtos disponíveis.' }),
+      msg(
+        's2a',
+        { role: 'assistant', content: 'Procurando…' },
+        {
+          model: 'anthropic/claude-haiku-4.5',
+          durationMs: 900,
+          usage: { promptTokens: 3000, completionTokens: 400, cachedTokens: 1000, cost: 0.01 }
+        }
+      ),
+      msg(
+        's2a',
+        { role: 'assistant', content: 'Lumen, Quill, Hush' },
+        {
+          model: 'anthropic/claude-haiku-4.5',
+          durationMs: 700,
+          usage: { promptTokens: 3500, completionTokens: 200, cost: 0.008 }
+        }
+      )
+    )
+  }
   const questions: QuestionRequest[] = []
   if (scenario === 'question') {
     const s2 = sessions.find((s) => s.id === 's2')
@@ -2065,7 +2218,8 @@ export function createMockApi(scenario: string): ClearApi {
               cost: 0.0042
             },
             model: 'openai/gpt-5',
-            durationMs: 18_400
+            durationMs: 18_400,
+            reasoningMs: 12_400
           }
         )
         const u2 = msg('s2', {

@@ -11,6 +11,8 @@
 //   próxima mensagem do usuário. Cancelado = descrição e cursor intactos.
 // - Subagente criado (`deriveForSubagent`): descrição do pai + a tarefa (concatenada na hora; com o
 //   modelo, refeita em segundo plano).
+// - Prompts: os personalizados do chat/persona ou os globais (`capturePrompts`); template sem
+//   {{current}}/{{user}} → o padrão. A trava "só o que o usuário disse" (applyCapture) vale sempre.
 // Sem Electron (testável): as dependências entram por `CaptureDeps`.
 import {
   applyCapture,
@@ -22,8 +24,10 @@ import {
   CONTEXT_CAPTURE_LIMITS,
   deriveConcat,
   effectiveCapture,
+  effectiveCapturePrompts,
   entryFor,
   nextEntry,
+  resolveCapturePrompts,
   selectionTexts,
   selectPending,
   undoEntry,
@@ -227,6 +231,17 @@ export class ContextCaptureService {
     this.runs.set(sessionId, { ctrl, done })
   }
 
+  /**
+   * Prompts personalizados do chat (ou os globais). Template sem placeholder obrigatório → o
+   * builder usa o padrão; aqui só fica o registro no log.
+   */
+  private prompts(chat: Chat): ReturnType<typeof effectiveCapturePrompts> {
+    const p = effectiveCapturePrompts(chat.config.smartApprove, this.d.defaults())
+    if (resolveCapturePrompts(p).templateFallback)
+      this.log('template personalizado sem {{current}}/{{user}} — usando o padrão', chat.id)
+    return p
+  }
+
   /** Ids dos subagentes acima (o mais próximo primeiro), até a principal. */
   private chain(s: Session): string[] {
     const out: string[] = []
@@ -301,7 +316,11 @@ export class ContextCaptureService {
     if (!sel) return
     const texts = selectionTexts(sel)
     const current = entry ? entry.text : sub ? capturedTextFor(st, s.id, this.chain(s)) : ''
-    const r = await this.callModel(chat, buildCaptureMessages(current, texts, sub), signal)
+    const r = await this.callModel(
+      chat,
+      buildCaptureMessages(current, texts, sub, this.prompts(chat)),
+      signal
+    )
     if (!r || signal.aborted) return // cancelado: nada muda (nem o cursor)
     const now = this.now()
     if (!r.ok) {
@@ -363,7 +382,11 @@ export class ContextCaptureService {
   ): Promise<void> {
     const chat = this.d.getChat(child.chatId)
     if (!chat) return
-    const r = await this.callModel(chat, buildDeriveMessages(parentText, task), signal)
+    const r = await this.callModel(
+      chat,
+      buildDeriveMessages(parentText, task, this.prompts(chat)),
+      signal
+    )
     if (!r || signal.aborted) return
     const now = this.now()
     this.d.save(chat.id, (cur) => {

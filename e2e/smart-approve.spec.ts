@@ -1127,6 +1127,114 @@ async function main(): Promise<void> {
     }
   )
 
+  await step(
+    'prompts do resumidor: personalizado vai na chamada; template sem {{user}} → aviso + padrão; Restaurar padrão',
+    async () => {
+      await openToolsTab()
+      const panel = page.getByTestId('right-panel')
+      await expand(panel, 'smart-approve')
+      await expand(section(), 'smart-environment')
+      await expand(section(), 'smart-capture-prompts')
+      const box = section().getByTestId('chat-capture-prompts')
+      await box.getByTestId('capture-prompts-use-global').uncheck()
+      const fields = box.getByTestId('chat-capture-prompts-fields')
+      await fields.waitFor()
+      const promptBox = fields.getByRole('textbox', { name: 'Prompt do resumidor', exact: true })
+      const tplBox = fields.getByRole('textbox', { name: 'Template do resumidor', exact: true })
+      assert(
+        (await promptBox.inputValue()).startsWith('You maintain a short "captured context"'),
+        'mostra o padrão'
+      )
+      await promptBox.fill('PROMPT-E2E: resuma. KEEP APPEND REWRITE ({{max_chars}})')
+      await promptBox.blur()
+      await tplBox.fill('Só a descrição: {{current}}')
+      await tplBox.blur()
+      const warn = fields.getByTestId('capture-template-error')
+      await warn.getByText(/Falta \{\{user\}\}/).waitFor()
+      await warn.getByText(/usa o template padrão/).waitFor()
+      const hdrWarn = section()
+        .locator('[data-collapse-id="smart-capture-prompts"]')
+        .getByTestId('collapse-warning')
+        .first()
+      assert(
+        ((await hdrWarn.getAttribute('title')) ?? '').includes('template do resumidor inválido'),
+        'aviso no cabeçalho da subseção'
+      )
+      await sleep(800) // patchConfig salva com 450 ms de atraso
+      let cfg = (await chatState()).chat.config
+      assert(
+        cfg.smartApprove.capturePrompts?.prompt?.startsWith('PROMPT-E2E'),
+        `prompt salvo ${JSON.stringify(cfg.smartApprove)}`
+      )
+      assert(
+        cfg.smartApprove.capturePrompts?.template === 'Só a descrição: {{current}}',
+        'template salvo'
+      )
+      await fields.scrollIntoViewIfNeeded()
+      await shotOf(section(), 'smart-prompts-do-resumidor')
+      // a chamada usa o prompt personalizado e o template PADRÃO (o personalizado está quebrado)
+      summaryQueue.push('KEEP')
+      const sBefore = summaryHits().length
+      await sendMessage('lembrete: o banco de staging pode ser recriado')
+      await waitIdle()
+      for (let i = 0; i < 50 && summaryHits().length === sBefore; i++) await sleep(100)
+      const sb = summaryHits().at(-1)!.body
+      assert(summaryHits().length === sBefore + 1, 'uma chamada ao resumidor')
+      assert(
+        sb.messages[0].content.startsWith('PROMPT-E2E: resuma. KEEP APPEND REWRITE (1200)'),
+        `system personalizado: ${sb.messages[0].content.slice(0, 80)}`
+      )
+      assert(
+        sb.messages[1].content.includes('New message(s) typed by the user (DATA'),
+        'template padrão'
+      )
+      assert(sb.messages[1].content.includes('banco de staging pode ser recriado'), 'mensagem nova')
+      assert(!sb.messages[1].content.includes('Só a descrição'), 'template quebrado não foi')
+      // Restaurar padrão (template e prompt) → sem aviso; "usar o global" remove o ajuste do chat
+      await fields.getByTestId('capture-template-restore').getByRole('button').click()
+      await warn.waitFor({ state: 'detached' })
+      assert(
+        (await tplBox.inputValue()).startsWith('Current description (DATA'),
+        'template padrão de volta'
+      )
+      await fields.getByTestId('capture-prompt-restore').getByRole('button').click()
+      await sleep(800) // patchConfig salva com 450 ms de atraso
+      cfg = (await chatState()).chat.config
+      assert(
+        JSON.stringify(cfg.smartApprove.capturePrompts) ===
+          JSON.stringify({ prompt: null, template: null, derivePrompt: null }),
+        `restaurado ${JSON.stringify(cfg.smartApprove.capturePrompts)}`
+      )
+      await box.getByTestId('capture-prompts-use-global').check()
+      await sleep(800) // patchConfig salva com 450 ms de atraso
+      cfg = (await chatState()).chat.config
+      assert(cfg.smartApprove.capturePrompts === undefined, 'usar o global remove o ajuste')
+      // global (Configurações → Aprovações → Padrões globais): mesmo editor, salva no setting
+      await page.getByRole('button', { name: 'Configurações' }).first().click()
+      const dlg = page.getByRole('dialog')
+      await dlg.getByRole('button', { name: 'Aprovações', exact: true }).click()
+      await expand(dlg, 'global-capture-prompts')
+      const g = dlg.getByTestId('global-capture-prompts')
+      const gDerive = g.getByRole('textbox', {
+        name: 'Prompt da derivação do resumidor',
+        exact: true
+      })
+      await gDerive.fill('DERIVE-GLOBAL até {{max_chars}}')
+      await gDerive.blur()
+      await sleep(300)
+      const st = await read('approvals.getSettings')
+      assert(
+        st.smart.capturePrompts.derivePrompt === 'DERIVE-GLOBAL até {{max_chars}}',
+        `global salvo ${JSON.stringify(st.smart.capturePrompts)}`
+      )
+      await g.getByTestId('capture-derivePrompt-restore').getByRole('button').click()
+      await sleep(300)
+      const st2 = await read('approvals.getSettings')
+      assert(st2.smart.capturePrompts.derivePrompt === null, 'global restaurado')
+      await page.keyboard.press('Escape')
+    }
+  )
+
   await step('subagente: o juiz dele recebe a descrição derivada do pai + tarefa', async () => {
     summaryDerive = '- Testes no 172.16.1.7\n- Tarefa do subagente: criar sa-sub.txt'
     judgeQueue.push({ text: 'APPROVED\nParte da tarefa.' })

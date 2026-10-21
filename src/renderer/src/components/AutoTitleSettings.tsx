@@ -1,5 +1,6 @@
 // Configurações → Novos chats → "Título automático": modelo do título (padrão Nenhum), memórias,
-// limite de tokens e prompt editável. Config global em `settings.autoTitle` (local do dispositivo).
+// limite de tokens e prompt editável. Config global em `settings.autoTitle` (sincroniza entre os
+// dispositivos desde o protocolo 1.4.0).
 // Ver SPEC.md → "Título automático".
 import { X } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
@@ -72,6 +73,12 @@ export function AutoTitleSettings(): React.JSX.Element {
   const [prompt, setPrompt] = useState(cfg.prompt ?? DEFAULT_AUTO_TITLE_PROMPT)
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingPrompt = useRef<string | null>(null)
+  // prompt mudou por fora (sync de outro dispositivo): acompanha, se não houver edição pendente
+  const [prevSaved, setPrevSaved] = useState(cfg.prompt)
+  if (prevSaved !== cfg.prompt) {
+    setPrevSaved(cfg.prompt)
+    if (pendingPrompt.current === null) setPrompt(cfg.prompt ?? DEFAULT_AUTO_TITLE_PROMPT)
+  }
 
   const save = (patch: Partial<AutoTitleSettings>): void =>
     void setSetting('autoTitle', { ...current(), ...patch })

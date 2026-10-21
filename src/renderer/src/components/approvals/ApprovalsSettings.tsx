@@ -19,8 +19,13 @@ import { analyzeShell, groupHeadings } from '@shared/shellParse'
 import type { ApprovalItem, ApprovalListItem, ApprovalMode } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
-import { CaptureFields, ENVIRONMENT_PLACEHOLDER } from '../panel/SmartContextFields'
-import { ToggleRow } from '../panel/fields'
+import { capturePromptsSummary, capturePromptsWarning } from '@shared/contextCapture'
+import {
+  CaptureFields,
+  CapturePromptsFields,
+  ENVIRONMENT_PLACEHOLDER
+} from '../panel/SmartContextFields'
+import { CollapsibleSection, ToggleRow } from '../panel/fields'
 import { AutoTextarea } from '../ui/controls'
 import { useStore } from '../../store'
 import { C } from '../ui/Tooltip'
@@ -437,8 +442,9 @@ function Tester({ item }: { item: ApprovalListItem }): React.JSX.Element {
 }
 
 /**
- * Padrões globais do Smart-Approve (setting local, não sincroniza): descrição do ambiente,
- * "Aceitar edições dentro da raiz" e a coleta automática de contexto. Cada chat/persona pode ajustar.
+ * Padrões globais do Smart-Approve (setting `smartApproveDefaults`, sincronizado): descrição do
+ * ambiente, "Aceitar edições dentro da raiz", a coleta automática de contexto e os prompts do
+ * resumidor. Cada chat/persona pode ajustar.
  */
 function SmartDefaults(): React.JSX.Element {
   const smart = useStore((s) => s.approvalSettings.smart)
@@ -476,7 +482,8 @@ function SmartDefaults(): React.JSX.Element {
           className="field text-[12px] leading-relaxed"
         />
         <p className="mt-1 text-[11px] leading-snug text-faint">
-          Vai para o juiz de todos os chats (salvo ajuste no chat). Fica só neste computador.
+          Vai para o juiz de todos os chats (salvo ajuste no chat). Sincroniza entre os seus
+          dispositivos (com o sync ligado).
         </p>
       </div>
       <CaptureFields
@@ -484,6 +491,22 @@ function SmartDefaults(): React.JSX.Element {
         onChange={(capture) => set({ capture })}
         testId="global-capture-fields"
       />
+      <CollapsibleSection
+        id="global-capture-prompts"
+        level="sub"
+        title="Prompts do resumidor"
+        summary={{
+          text: capturePromptsSummary(smart.capturePrompts),
+          changed: capturePromptsSummary(smart.capturePrompts) !== 'padrão'
+        }}
+        warning={capturePromptsWarning(smart.capturePrompts)}
+      >
+        <CapturePromptsFields
+          value={smart.capturePrompts}
+          onChange={(capturePrompts) => set({ capturePrompts })}
+          testId="global-capture-prompts"
+        />
+      </CollapsibleSection>
     </div>
   )
 }

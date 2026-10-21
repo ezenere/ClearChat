@@ -91,6 +91,7 @@ import {
   sameJson,
   sameRecordPlain,
   sessionFromPlain,
+  SETTINGS_BACKFILL,
   type ApplyResult,
   type LocalRecord,
   type Plain,
@@ -1056,6 +1057,22 @@ export class SyncEngine {
       )
   }
 
+  /**
+   * Ids de `setting` novos (SETTINGS_BACKFILL, protocolo 1.4.0) num dispositivo que já
+   * sincronizava: depois do 1º pull, o valor local que ainda não tem registro online é marcado para
+   * envio (uma vez por versão). Se outro dispositivo já enviou o seu, o pull acabou de aplicá-lo
+   * (registro existe → nada a enviar: vale o que chegou primeiro ao servidor, como no LWW).
+   */
+  private backfillSettings(): void {
+    if (!this.started || this.kv('settings_backfill') === SETTINGS_BACKFILL.version) return
+    for (const id of SETTINGS_BACKFILL.ids) {
+      if (this.record('setting', id)) continue
+      const l = buildLocal(this.conn, 'setting', id)
+      if (l && l.plain.value != null) this.markDirty('setting', id)
+    }
+    this.setKv('settings_backfill', SETTINGS_BACKFILL.version)
+  }
+
   markDirty(type: string, id: string, scope: string | null = null): void {
     this.conn
       .prepare(
@@ -1203,6 +1220,7 @@ export class SyncEngine {
     if (!this.started || !this.sk || this.protocolError) return
     try {
       await this.pullAll()
+      this.backfillSettings()
       await this.pushAll()
       await this.refetchPending()
       this.error = null
@@ -2907,8 +2925,13 @@ export class SyncEngine {
       }
       set(cfg, 'providerId', 'provider')
       set(cfg, 'presetId', 'preset')
-      if (cfg.smartApprove && typeof cfg.smartApprove === 'object')
-        set(cfg.smartApprove as Plain, 'providerId', 'provider')
+      if (cfg.smartApprove && typeof cfg.smartApprove === 'object') {
+        const sa = cfg.smartApprove as Plain
+        set(sa, 'providerId', 'provider')
+        // modelo do resumo (coleta de contexto, desde 0.8.5)
+        if (sa.capture && typeof sa.capture === 'object')
+          set(sa.capture as Plain, 'providerId', 'provider')
+      }
       const mem = cfg.memory as Plain | undefined
       if (mem && typeof mem === 'object') {
         if (mem.extraction && typeof mem.extraction === 'object')
@@ -2942,6 +2965,27 @@ export class SyncEngine {
             JSON.stringify(cfg),
             r.id
           )
+      }
+    }
+    // settings com provedor dentro do objeto (1.4.0): smartApproveDefaults.capture e autoTitle
+    for (const [sk, path] of [
+      ['smartApproveDefaults', ['capture']],
+      ['autoTitle', []]
+    ] as [string, string[]][]) {
+      const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(sk) as
+        { value: string } | undefined
+      if (!r) continue
+      try {
+        const v = JSON.parse(r.value) as Plain
+        let obj: unknown = v
+        for (const k of path) obj = (obj as Plain | undefined)?.[k]
+        if (!obj || typeof obj !== 'object') continue
+        const n = get('provider', (obj as Plain).providerId)
+        if (!n) continue
+        ;(obj as Plain).providerId = n
+        db.prepare('UPDATE settings SET value = ? WHERE key = ?').run(JSON.stringify(v), sk)
+      } catch {
+        /* */
       }
     }
     for (const [sk, type] of [

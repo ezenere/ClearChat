@@ -124,7 +124,7 @@ export const LIMITS = {
 /** Aproximação usada na UI: ~4 caracteres por token. */
 export const approxTokens = (chars: number): number => Math.ceil(chars / 4)
 
-/** Setting global (deste dispositivo, não sincronizado): limite para salvar saídas em arquivo. */
+/** Setting global (sincroniza desde o protocolo 1.4.0): limite para salvar saídas em arquivo. */
 export const TOOL_SPILL_SETTING = 'toolOutputSpillChars'
 
 /** Normaliza o limite de spill configurado (fallback no padrão). */
