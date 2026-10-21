@@ -283,7 +283,7 @@ function ImageView({
     >
       <div
         className={cn(
-          'flex min-h-full min-w-full p-4',
+          'flex min-h-full min-w-full',
           zoom == null ? 'h-full items-center justify-center' : 'w-max items-start'
         )}
       >
