@@ -31,6 +31,7 @@ import {
   type InterjectionObservation
 } from '@shared/voicePolicy'
 import { VoiceCallManager, type VoiceCallUtterance } from '../src/main/voice/call.ts'
+import type { VoiceEvalEvent } from '../src/main/voice/evalLog.ts'
 import {
   UtteranceQueue,
   type UtterancePlayer
@@ -84,6 +85,8 @@ interface Harness {
   clips: { cls: string; n: number }[]
   /** Eventos da timeline emitidos pelo manager. */
   timeline: VoiceCallTimelineEvent[]
+  /** Decisões registradas no log de avaliação (`logEval`). */
+  evals: VoiceEvalEvent[]
   emit(e: AgentEvent): void
   advance(ms: number): void
   openClip(): void
@@ -96,6 +99,7 @@ function harness(opts: HarnessOpts = {}): Harness {
   const cancelled: string[] = []
   const clips: { cls: string; n: number }[] = []
   const timeline: VoiceCallTimelineEvent[] = []
+  const evals: VoiceEvalEvent[] = []
   let clock = 1_000_000
   let clipGate: { open: () => void } | null = null
   const defaults = {
@@ -114,6 +118,7 @@ function harness(opts: HarnessOpts = {}): Harness {
     emitUtterance: (u) => emitted.push(u),
     emitUtteranceCancel: (id) => cancelled.push(id),
     emitTimeline: (e) => timeline.push({ ...e }),
+    logEval: (e) => evals.push({ ...e }),
     clip: async (cls, n) => {
       clips.push({ cls, n })
       if (opts.gateClips) await new Promise<void>((r) => (clipGate = { open: r }))
@@ -144,6 +149,7 @@ function harness(opts: HarnessOpts = {}): Harness {
     cancelled,
     clips,
     timeline,
+    evals,
     emit: (e) => listeners.forEach((l) => l(e)),
     advance: (ms) => {
       clock += ms
@@ -322,6 +328,10 @@ test('filler: fillers desligados não tocam; modo sombra decide mas não toca', 
   await sleep(80)
   assert.equal(shadow.emitted.length, 0, 'sombra: não toca')
   assert.equal(shadow.clips.length, 1, 'sombra: decide (carrega o clipe que tocaria)')
+  assert.equal(shadow.evals.length, 1, 'sombra: a decisão vai para o log de avaliação')
+  assert.equal(shadow.evals[0].kind, 'filler')
+  assert.equal(shadow.evals[0].played, false)
+  assert.equal(shadow.evals[0].shadow, true)
   shadow.m.stop()
 })
 
@@ -663,6 +673,13 @@ test('interjeição: modo sombra decide mas não toca; expirada é descartada na
   const d = sh.timeline.find((e) => e.kind === 'decision')
   assert.equal(d?.played, false)
   assert.equal(d?.reason, 'shadow')
+  assert.equal(sh.evals.length, 1, 'sombra: decisão registrada no log de avaliação')
+  assert.equal(sh.evals[0].class, 'ACK')
+  assert.equal(sh.evals[0].tail, 'uhum')
+  assert.equal(sh.evals[0].speechMs, 1200)
+  assert.equal(sh.evals[0].pauseMs, 600)
+  assert.equal(sh.evals[0].shadow, true)
+  assert.equal(sh.evals[0].played, false)
   sh.m.stop()
 
   // decisão válida, mas o clipe só resolve tarde demais (> 600 ms) → descartada

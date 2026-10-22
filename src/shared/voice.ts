@@ -539,9 +539,9 @@ export interface ResolvedVoiceCall {
   tools: VoiceCallToolsConfig | null
   /** Acréscimo ao system prompt no modo voz; null = sem acréscimo. */
   voicePrompt: string | null
-  /** Falas preenchidoras efetivas (fillers são de fatia futura — só o valor resolvido). */
+  /** Falas preenchidoras efetivas (consumidas pela chamada — ver SPEC → "Fillers"). */
   fillers: VoiceFillers
-  /** Interjeições efetivas (interjeições são de fatia futura — só o valor resolvido). */
+  /** Interjeições efetivas (consumidas pela chamada — ver SPEC → "Interjeições (regras)"). */
   interjections: InterjectionPolicy
 }
 

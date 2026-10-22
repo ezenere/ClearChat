@@ -125,6 +125,7 @@ import {
   loadClips,
   type ClipsManifest
 } from './voice/clips'
+import { createEvalLogger } from './voice/evalLog'
 import { findCatalogEntry } from './voice/catalog'
 import {
   downloadLocalModel,
@@ -283,6 +284,10 @@ export function registerIpc(): void {
   presetsRepo.seed()
   // ---- chamada de voz meia-duplex: o dono do turno no main + os overrides de request ----
   // (o renderer é o "sensor": captura/silêncio/reprodução — SPEC → "Chamada de voz (meia-duplex)")
+  // decisões de filler/interjeição também viram linhas no log de avaliação (modo sombra/calibração)
+  const evalLogger = createEvalLogger(app.getPath('userData'), (e) =>
+    console.log('[clearchat] voice-eval:', e)
+  )
   const voiceCalls = new VoiceCallManager({
     sendTurn: (sessionId, text) => {
       // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas)
@@ -299,6 +304,7 @@ export function registerIpc(): void {
     emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
     emitUtteranceCancel: (id) => sendToWindows(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, { id }),
     emitTimeline: (event) => sendToWindows(VOICE_CALL_TIMELINE_CHANNEL, event),
+    logEval: (event) => evalLogger.log(event),
     clip: (cls, n) =>
       loadClipAudio(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts), cls, n),
     sessionInfo: (sessionId) => {

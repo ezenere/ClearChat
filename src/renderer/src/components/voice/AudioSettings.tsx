@@ -14,9 +14,17 @@ import type {
   SttMode,
   SttSettings,
   TtsLocalEngine,
-  TtsSettings
+  TtsSettings,
+  VoiceCallDefaults,
+  InterjectionClass
 } from '@shared/voice'
-import { DEFAULT_AUDIO_INPUT, DEFAULT_STT_SETTINGS, DEFAULT_TTS_SETTINGS } from '@shared/voice'
+import {
+  DEFAULT_AUDIO_INPUT,
+  DEFAULT_STT_SETTINGS,
+  DEFAULT_TTS_SETTINGS,
+  DEFAULT_VOICE_CALL_DEFAULTS,
+  INTERJECTION_CLASSES
+} from '@shared/voice'
 import type { AudioInputSettings } from '@shared/voice'
 import { api, errorMessage } from '../../lib/api'
 import { formatHotkeyLabel, hotkeyFromEvent } from '../../lib/voice/hotkeyLabel'
@@ -78,6 +86,8 @@ export function AudioSettings(): React.JSX.Element | null {
   const [input, setInput] = useState<AudioInputSettings>(DEFAULT_AUDIO_INPUT)
   const [stt, setStt] = useState<SttSettings>(DEFAULT_STT_SETTINGS)
   const [tts, setTts] = useState<TtsSettings>(DEFAULT_TTS_SETTINGS)
+  /** Padrões globais da chamada de voz (interjeições/fillers — SPEC → "Chamada de voz"). */
+  const [callDefaults, setCallDefaults] = useState<VoiceCallDefaults>(DEFAULT_VOICE_CALL_DEFAULTS)
   const [keyDraft, setKeyDraft] = useState('')
   const [ttsKeyDraft, setTtsKeyDraft] = useState('')
   /** Rascunho do idioma livre ("Outro…") enquanto digita; null = lista comum. */
@@ -116,6 +126,7 @@ export function AudioSettings(): React.JSX.Element | null {
         setInput(all.audioInput)
         setStt(all.sttSettings)
         setTts(all.ttsSettings)
+        setCallDefaults(all.voiceCallDefaults)
         setKeyDraft(all.sttSettings.api.apiKey)
         setTtsKeyDraft(all.ttsSettings.api.apiKey)
       })
@@ -176,6 +187,18 @@ export function AudioSettings(): React.JSX.Element | null {
     void voice.settings
       .set('audioInput', next)
       .then(setInput)
+      .catch(() => {
+        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
+      })
+  }
+
+  /** Grava `voiceCallDefaults` (padrões globais da chamada de voz — herdados por persona/chat). */
+  const saveCallDefaults = (patch: Partial<VoiceCallDefaults>): void => {
+    const next = { ...callDefaults, ...patch }
+    setCallDefaults(next)
+    void voice.settings
+      .set('voiceCallDefaults', next)
+      .then(setCallDefaults)
       .catch(() => {
         // erro de gravação: o valor da tela fica; o próximo save tenta de novo
       })
@@ -824,6 +847,215 @@ export function AudioSettings(): React.JSX.Element | null {
           />
         </div>
       </section>
+
+      {/* ---- chamada de voz: atos de fala curta (interjeições/fillers) ---- */}
+      <section className="border-t border-border pt-4" data-testid="voice-acts-settings">
+        <div className="mb-3 flex items-baseline gap-2">
+          <span className="text-[13px] font-medium text-fg/90">
+            Chamada de voz — interjeições e fillers
+          </span>
+          <HelpTip label="Interjeições e fillers da chamada de voz">
+            <p>
+              Atos de fala curta da chamada de voz (SPEC → &quot;Fillers&quot; e &quot;Interjeições
+              (regras)&quot;): regras v1, sem classificador treinado. Estes são os padrões GLOBAIS —
+              persona/chat podem sobrescrever (★ do painel da chamada).
+            </p>
+            <p className="mt-2">
+              Interjeições entram nas pausas da sua fala (clipe curto tipo &quot;uhum&quot;); o
+              filler toca quando a resposta demora a começar. Em modo sombra nada toca: as decisões
+              só são registradas em <code className="font-mono">voice-eval/</code> para calibração.
+            </p>
+          </HelpTip>
+        </div>
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+            <div className="flex items-center gap-2">
+              <Label
+                className="mb-0"
+                help="Interjeições durante a sua fala (só em pausas, com cooldown; nunca sobre a fala do assistente)."
+              >
+                Interjeições
+              </Label>
+              <Switch
+                checked={callDefaults.interjections.enabled}
+                label="Interjeições"
+                onChange={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, enabled: v }
+                  })
+                }
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label
+                className="mb-0"
+                help="Modo sombra: o motor decide mas NÃO toca — as decisões ficam no log de avaliação (voice-eval) para calibração. Vale para interjeições E fillers."
+              >
+                Modo sombra
+              </Label>
+              <Switch
+                checked={callDefaults.interjections.shadow}
+                label="Modo sombra"
+                onChange={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, shadow: v }
+                  })
+                }
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Label
+                className="mb-0"
+                help={
+                  'Falas preenchidoras ("Só um minutinho…") quando a resposta demora a começar (~1,2 s) ou com tools em execução. No máximo 1 por turno.'
+                }
+              >
+                Fillers
+              </Label>
+              <Switch
+                checked={callDefaults.fillers.enabled}
+                label="Fillers"
+                onChange={(v) =>
+                  saveCallDefaults({ fillers: { ...callDefaults.fillers, enabled: v } })
+                }
+              />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:max-w-[560px]">
+            <div>
+              <Label help="Intervalo mínimo entre interjeições (ms).">
+                Cooldown entre interjeições (ms)
+              </Label>
+              <NumberField
+                value={callDefaults.interjections.cooldownMs}
+                min={0}
+                step={100}
+                label="Cooldown entre interjeições (ms)"
+                testId="voice-interjection-cooldown"
+                onCommit={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, cooldownMs: v }
+                  })
+                }
+              />
+            </div>
+            <div>
+              <Label help="Probabilidade de a interjeição sair quando as regras deixam (0–1; 0 = nunca, 1 = sempre).">
+                Probabilidade de disparo (0–1)
+              </Label>
+              <NumberField
+                value={callDefaults.interjections.fireProbability}
+                min={0}
+                max={1}
+                step={0.05}
+                label="Probabilidade de disparo (0 a 1)"
+                testId="voice-interjection-probability"
+                onCommit={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, fireProbability: v }
+                  })
+                }
+              />
+            </div>
+            <div>
+              <Label help="Sua fala acumulada (ms) antes de uma interjeição poder sair.">
+                Fala mínima (ms)
+              </Label>
+              <NumberField
+                value={callDefaults.interjections.minSpeechMs}
+                min={0}
+                step={100}
+                label="Fala mínima para interjeição (ms)"
+                testId="voice-interjection-min-speech"
+                onCommit={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, minSpeechMs: v }
+                  })
+                }
+              />
+            </div>
+            <div>
+              <Label help="Sua pausa contínua (ms) em que a interjeição pode entrar.">
+                Pausa mínima (ms)
+              </Label>
+              <NumberField
+                value={callDefaults.interjections.minPauseMs}
+                min={0}
+                step={50}
+                label="Pausa mínima para interjeição (ms)"
+                testId="voice-interjection-min-pause"
+                onCommit={(v) =>
+                  saveCallDefaults({
+                    interjections: { ...callDefaults.interjections, minPauseMs: v }
+                  })
+                }
+              />
+            </div>
+          </div>
+
+          <div>
+            <Label help="Classes de clipe que podem sair como interjeição (os clipes vêm de 'Gerar clipes de voz' acima). Vazio = todas.">
+              Classes permitidas
+            </Label>
+            <div
+              className="flex flex-wrap items-center gap-3"
+              data-testid="voice-interjection-classes"
+            >
+              {INTERJECTION_CLASSES.map((cls) => {
+                const checked = callDefaults.interjections.classes.includes(cls)
+                return (
+                  <label key={cls} className="flex cursor-pointer items-center gap-1.5 text-[12px]">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      aria-label={`Classe ${cls}`}
+                      onChange={() => {
+                        const classes = checked
+                          ? callDefaults.interjections.classes.filter((c) => c !== cls)
+                          : [...callDefaults.interjections.classes, cls]
+                        saveCallDefaults({
+                          interjections: {
+                            ...callDefaults.interjections,
+                            classes: INTERJECTION_CLASSES.filter((c) =>
+                              classes.includes(c as InterjectionClass)
+                            ) as InterjectionClass[]
+                          }
+                        })
+                      }}
+                      className="size-3.5 accent-accent-strong"
+                    />
+                    {cls}
+                  </label>
+                )
+              })}
+            </div>
+            <p className="mt-1.5 text-xs leading-relaxed text-subtle">
+              Classe vem da cauda da transcrição parcial: pergunta evita THINKING; negação/incerteza
+              não interjeita; sem confiança sai ACK neutro.
+            </p>
+          </div>
+
+          <div>
+            <Label help="Texto livre para orientar as falas preenchidoras no futuro. v1 decide por REGRA — este prompt ainda NÃO é consumido (classificador é fatia futura).">
+              Prompt dos fillers (v1: não consumido)
+            </Label>
+            <textarea
+              value={callDefaults.fillers.prompt ?? ''}
+              aria-label="Prompt dos fillers"
+              data-testid="voice-filler-prompt"
+              rows={2}
+              placeholder="ex.: fale curto e informal enquanto pensa"
+              onChange={(e) =>
+                saveCallDefaults({
+                  fillers: { ...callDefaults.fillers, prompt: e.target.value }
+                })
+              }
+              className="field w-full max-w-[560px] px-2 py-1.5 text-[12px]"
+            />
+          </div>
+        </div>
+      </section>
     </div>
   )
 }
@@ -941,6 +1173,50 @@ function SilenceMsField({
       onBlur={commit}
       onKeyDown={(e) => e.key === 'Enter' && commit()}
       className="field h-8 w-[110px] px-2 py-0 text-right font-mono text-[12.5px] tabular-nums disabled:opacity-50"
+    />
+  )
+}
+
+/** Campo numérico genérico com commit no blur/Enter (mesmo padrão do `SilenceMsField`). */
+function NumberField({
+  value,
+  min,
+  max,
+  step,
+  label,
+  testId,
+  onCommit
+}: {
+  value: number
+  min: number
+  max?: number
+  step: number
+  label: string
+  testId: string
+  onCommit: (v: number) => void
+}): React.JSX.Element {
+  const [draft, setDraft] = useState<string | null>(null)
+  const text = draft ?? String(value)
+  const commit = (): void => {
+    const n = Number(text)
+    let v = Number.isFinite(n) && text.trim() ? n : value
+    v = Math.max(min, max != null ? Math.min(max, v) : v)
+    setDraft(null)
+    if (v !== value) onCommit(v)
+  }
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      step={step}
+      value={text}
+      aria-label={label}
+      data-testid={testId}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => e.key === 'Enter' && commit()}
+      className="field h-8 w-[110px] px-2 py-0 text-right font-mono text-[12.5px] tabular-nums"
     />
   )
 }

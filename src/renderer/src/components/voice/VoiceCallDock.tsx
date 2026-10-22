@@ -1,17 +1,22 @@
 // Chamada de voz ativa — dock fixo (canto inferior central, acima do composer, visível em qualquer
 // chat): indicador de estado ("Ouvindo…/Transcrevendo…/Pensando…/Falando…"), waveform do microfone,
-// mudo (captura pausada), volume da reprodução, "Encerrar" e o card de erro. A captura/reprodução
-// vive em `lib/voice/useVoiceCall` (o controller roda AQUI, uma única vez por app); o chat continua
+// mudo (captura pausada), volume da reprodução, painel de timeline/toggles ("Atos de fala curta"),
+// indicador de modo sombra, "Encerrar" e o card de erro. A captura/reprodução vive em
+// `lib/voice/useVoiceCall` (o controller roda AQUI, uma única vez por app); o chat continua
 // normal por baixo (as mensagens do turno de voz aparecem como quaisquer outras).
 // Testids: `voice-call-dock`, `voice-call-status`, `voice-call-waveform`, `voice-call-mute`,
-// `voice-call-volume`, `voice-call-end`, `voice-call-error`, `voice-call-pending`.
-import { Mic, MicOff, PhoneOff, TriangleAlert, Volume2, X } from 'lucide-react'
+// `voice-call-volume`, `voice-call-end`, `voice-call-error`, `voice-call-pending`,
+// `voice-call-panel-toggle`, `voice-call-shadow` (painel: `voice-call-panel`).
+import { useState } from 'react'
+import { Activity, Mic, MicOff, PhoneOff, TriangleAlert, Volume2, X } from 'lucide-react'
 import type { VoiceCallPhase } from '@shared/voice'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { useVoiceCall } from '../../lib/voice/useVoiceCall'
 import { Tip } from '../ui/Tooltip'
 import { Waveform } from './Waveform'
+import { VoiceCallPanel } from './VoiceCallPanel'
+import { useVoiceCallConfig } from '../../lib/voice/useVoiceCallConfig'
 
 const MOCK = import.meta.env.VITE_CLEAR_MOCK === '1'
 
@@ -33,9 +38,15 @@ function phaseLabel(phase: VoiceCallPhase): string {
 export function VoiceCallDock(): React.JSX.Element | null {
   const call = useStore((s) => s.voiceCall)
   const stopVoiceCall = useStore((s) => s.stopVoiceCall)
+  const timeline = useStore((s) => s.voiceCallTimeline)
   const controls = useVoiceCall()
+  const [panelOpen, setPanelOpen] = useState(false)
+  const { resolved } = useVoiceCallConfig()
   if (!call.active) return null
   const error = call.error ?? controls.error
+  const shadowCount = timeline.filter(
+    (e) => e.kind === 'decision' && !e.played && (e.reason ?? '').includes('shadow')
+  ).length
   return (
     <>
       <div
@@ -67,6 +78,30 @@ export function VoiceCallDock(): React.JSX.Element | null {
           </span>
         )}
         <div className="mx-1 h-5 w-px bg-border" />
+        {resolved.interjections.shadow && (
+          <span
+            data-testid="voice-call-shadow"
+            className="rounded-full border border-warning/40 bg-warning/10 px-1.5 py-px text-[10px] text-warning"
+            title="Modo sombra: os atos de fala curta decidem mas não tocam (decisões no log de avaliação)"
+          >
+            modo sombra · {shadowCount}
+          </span>
+        )}
+        <Tip label={panelOpen ? 'Fechar timeline' : 'Timeline e atos de fala curta'}>
+          <button
+            type="button"
+            data-testid="voice-call-panel-toggle"
+            aria-label="Timeline e atos de fala curta"
+            aria-pressed={panelOpen}
+            onClick={() => setPanelOpen((v) => !v)}
+            className={cn(
+              'flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
+              panelOpen && 'bg-active text-fg'
+            )}
+          >
+            <Activity className="size-4" />
+          </button>
+        </Tip>
         <Tip label={call.muted ? 'Ativar microfone' : 'Silenciar microfone'}>
           <button
             type="button"
@@ -109,6 +144,7 @@ export function VoiceCallDock(): React.JSX.Element | null {
           </button>
         </Tip>
       </div>
+      <VoiceCallPanel open={panelOpen} />
       {error && (
         <div
           role="alert"

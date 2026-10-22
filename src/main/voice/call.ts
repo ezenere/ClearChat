@@ -37,6 +37,7 @@ import {
   type InterjectionObservation
 } from '@shared/voicePolicy'
 import type { ClipClass } from './clips'
+import type { VoiceEvalEvent } from './evalLog'
 import { splitSentences } from './sentences'
 import { VoiceTurnMachine, isBusyStatus } from './turnMachine'
 
@@ -75,6 +76,8 @@ export interface VoiceCallDeps {
   emitUtteranceCancel(id: string): void
   /** Evento da timeline da chamada (canal `voice:call:timeline` — UI/métricas/calibração). */
   emitTimeline(event: VoiceCallTimelineEvent): void
+  /** Registra uma decisão no log de avaliação (`<userData>/voice-eval/*.jsonl` — calibração). */
+  logEval(event: VoiceEvalEvent): void
   /**
    * Bytes de um clipe pré-gerado (`resolveClip` — SPEC → "Serviço de TTS (clipes)");
    * null = clipe ausente (filler/interjeição não tocam — nada é sintetizado no lugar).
@@ -599,6 +602,19 @@ export class VoiceCallManager {
       latencyMs: Math.max(0, this.#now() - decidedAt),
       reason
     })
+    this.#deps.logEval({
+      ts: this.#now(),
+      kind: 'filler',
+      class: 'FILLER',
+      variant: n,
+      played,
+      shadow,
+      speechMs: null,
+      pauseMs: null,
+      tail: null,
+      latencyMs: Math.max(0, this.#now() - decidedAt),
+      reason
+    })
     if (!played || !clip) return
     this.#uttSeq++
     const id = `u${this.#uttSeq}`
@@ -648,6 +664,19 @@ export class VoiceCallManager {
       speechMs: obs.speechMs,
       pauseMs: obs.pauseMs,
       text: obs.tail,
+      reason
+    })
+    this.#deps.logEval({
+      ts: now,
+      kind: 'interjection',
+      class: cls,
+      variant,
+      played,
+      shadow,
+      speechMs: obs.speechMs,
+      pauseMs: obs.pauseMs,
+      tail: obs.tail,
+      latencyMs,
       reason
     })
     if (!played || !clip) return
