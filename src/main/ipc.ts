@@ -4,6 +4,8 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import {
   ALL_CHANNELS,
   IPC,
+  VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
@@ -35,7 +37,7 @@ import {
   syncEngine,
   syncHandlers
 } from './sync'
-import { emit, sendToWindows } from './events'
+import { emit, onAgentEvent, sendToWindows } from './events'
 import { isBranchEditable, pruneSel, selectionToReach } from '@shared/branches'
 import {
   chatsRepo,
@@ -68,6 +70,7 @@ import {
 } from './fileRun'
 import { safeFileName } from '@shared/remoteFs'
 import * as runner from './agent/runner'
+import { setVoiceCallSource } from './agent/request'
 import * as memory from './memory'
 import { generateTitleNow } from './autoTitle'
 import { answerQuestion } from './agent/questions'
@@ -129,6 +132,8 @@ import {
 } from './voice/session'
 import { synthesize, TTS_TEST_PHRASE } from './voice/tts'
 import { createKokoroEngine, type KokoroEngine } from './voice/ttsLocal'
+import { VoiceCallManager } from './voice/call'
+import { isBusyStatus } from './voice/turnMachine'
 
 type Handler = (...args: never[]) => unknown
 
@@ -268,6 +273,34 @@ function runDeps(): RunDeps {
 
 export function registerIpc(): void {
   presetsRepo.seed()
+  // ---- chamada de voz meia-duplex: o dono do turno no main + os overrides de request ----
+  // (o renderer é o "sensor": captura/silêncio/reprodução — SPEC → "Chamada de voz (meia-duplex)")
+  const voiceCalls = new VoiceCallManager({
+    sendTurn: (sessionId, text) => {
+      // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas)
+      void gatedSend(sessionId, text, undefined, undefined).catch((e) =>
+        voiceCalls.reportError(e instanceof Error ? e.message : String(e))
+      )
+    },
+    synth: (text, signal) =>
+      synthesize(
+        { text, settings: getVoiceSettings().tts, format: 'wav' },
+        { local: ttsLocalEngine(), signal }
+      ),
+    emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
+    emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
+    sessionInfo: (sessionId) => {
+      const s = sessionsRepo.get(sessionId)
+      return s ? { chatId: s.chatId, depth: s.depth, busy: isBusyStatus(s.status) } : null
+    },
+    chatConfig: (chatId) => chatsRepo.get(chatId)?.config ?? null,
+    settings: () => {
+      const v = getVoiceSettings()
+      return { defaults: v.voiceCallDefaults, audioInput: v.audioInput, stt: v.stt, tts: v.tts }
+    },
+    onEvent: (cb) => onAgentEvent(cb)
+  })
+  setVoiceCallSource((chat, session) => voiceCalls.callContextFor(chat, session))
   const handlers: Record<string, Handler> = {
     // ---- providers ----
     [IPC.providers.list]: () => providersRepo.list(),
@@ -826,6 +859,21 @@ export function registerIpc(): void {
         api: TTS_API_VOICES
       }
     },
+
+    // ---- chamada de voz (meia-duplex) — SPEC → "Áudio → Chamada de voz (meia-duplex)" ----
+    [IPC.voice.callStart]: (input: { sessionId: string }) => {
+      const sessionId = input && typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
+      if (!sessionId) throw new Error('Sessão não informada (esperado { sessionId }).')
+      return voiceCalls.start(sessionId)
+    },
+    [IPC.voice.callStop]: () => voiceCalls.stop(),
+    [IPC.voice.callMute]: (input: { muted: boolean }) => voiceCalls.mute(!!input?.muted),
+    [IPC.voice.callSpeechBegin]: () => voiceCalls.speechBegin(),
+    [IPC.voice.callSpeechEnd]: () => voiceCalls.speechEnd(),
+    [IPC.voice.callTurn]: (input: { text: string }) =>
+      voiceCalls.turn(input && typeof input.text === 'string' ? input.text : ''),
+    [IPC.voice.callPlaybackIdle]: () => voiceCalls.playbackIdle(),
+    [IPC.voice.callBargeIn]: () => voiceCalls.bargeIn(),
 
     // ---- sync ----
     ...syncHandlers()

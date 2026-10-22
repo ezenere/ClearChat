@@ -52,6 +52,7 @@ import type { ModelInfo, Provider } from '@shared/types'
 import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
 import { clampToolOutput, LIMITS, TOOL_SPILL_SETTING } from '@shared/limits'
+import { applyVoiceCallChat } from '@shared/voice'
 import {
   interChatHeader,
   interChatText,
@@ -128,7 +129,8 @@ import {
   buildRequest,
   maskRequest,
   setProviderNamesSource,
-  setSiblingsSource
+  setSiblingsSource,
+  voiceCallContextFor
 } from './request'
 import type { BuiltRequest } from './request'
 import { connectionErrorText, isConnectionFailure, retryAppClosedText } from '@shared/network'
@@ -326,6 +328,15 @@ function clearPendingBranch(sessionId: string): void {
 }
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+/**
+ * Teto de caracteres do resultado de uma tool no turno: override da chamada de voz
+ * (`voice.tools.maxToolOutputChars`, SPEC → "Chamada de voz (meia-duplex)") ou o do chat.
+ */
+function toolOutputLimit(chat: Chat, session: Pick<Session, 'id' | 'depth'>): number {
+  const call = voiceCallContextFor(chat, session)
+  return clampToolOutput(call?.tools?.maxToolOutputChars ?? chat.config.maxToolOutputChars)
+}
 
 /**
  * Persiste um erro HTTP/do modelo como mensagem só de exibição (sobrevive ao reinício).
@@ -911,21 +922,37 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!session) return { kind: 'error', error: 'Sessão não encontrada (chat apagado?).' }
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return { kind: 'error', error: 'Chat não encontrado.' }
-  const provider = providerFor(chat, session)
+  // Chamada de voz ativa: os overrides do turno (modelo/params, tools, voicePrompt) valem só nas
+  // requests/tools deste turno — o chat salvo e o histórico não mudam (SPEC → "Chamada de voz").
+  const call = voiceCallContextFor(chat, session)
+  const reqChat = call ? applyVoiceCallChat(chat, call) : chat
+  const reqSession = call?.model ? { ...session, model: call.model.model } : session
+  let provider: Provider | null
+  if (call?.model) {
+    provider = providersRepo.get(call.model.providerId)
+    if (!provider)
+      return {
+        kind: 'error',
+        error: `Provider "${call.model.providerId}" da chamada de voz não está configurado.`
+      }
+  } else {
+    provider = providerFor(chat, session)
+  }
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
-  if (!session.model) return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
+  if (!reqSession.model)
+    return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
 
   const history = messagesRepo.path(session.id)
   // memória: o índice vai congelado por sessão (snapshot no 1º request; ver memory/service.ts)
   if (session.depth === 0) ensureSnapshot(chat, session)
   let req: BuiltRequest
   try {
-    req = buildRequest(chat, session, history, provider)
+    req = buildRequest(reqChat, reqSession, history, provider)
   } catch (e) {
     return { kind: 'error', error: errMsg(e) }
   }
 
-  dbg('step', session.id.slice(0, 8), 'model', session.model, 'msgs', history.length)
+  dbg('step', session.id.slice(0, 8), 'model', reqSession.model, 'msgs', history.length)
   let acc = newAccumulator()
   const draft = throttle(
     () => emit({ type: 'draft', sessionId: session.id, draft: accToDraft(acc) }),
@@ -939,7 +966,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     signal,
     attempt: async () => {
       if (!first) {
-        req = buildRequest(chat, session, messagesRepo.path(session.id), provider)
+        req = buildRequest(reqChat, reqSession, messagesRepo.path(session.id), provider)
         acc = newAccumulator()
         t0 = Date.now()
       }
@@ -976,7 +1003,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
           },
           {
             interrupted: true,
-            model: acc.model ?? session.model,
+            model: acc.model ?? reqSession.model,
             durationMs: Date.now() - t0,
             ...withReasoningMs(acc)
           }
@@ -1010,7 +1037,7 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     ...(acc.reasoning.trim() ? { reasoning: acc.reasoning } : {})
   }
   const meta: MessageMeta = {
-    model: acc.model ?? session.model,
+    model: acc.model ?? reqSession.model,
     durationMs: Date.now() - t0,
     ...withReasoningMs(acc)
   }
@@ -1056,8 +1083,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   }
 
   // ---- modo texto (sem tools nativas) ----
-  if (!chat.config.nativeTools && availableTools(chat, session, history).length && acc.content) {
-    const parsed = parseTextToolCalls(acc.content, availableTools(chat, session, history))
+  if (!reqChat.config.nativeTools && availableTools(reqChat, session, history).length && acc.content) {
+    const parsed = parseTextToolCalls(acc.content, availableTools(reqChat, session, history))
     if (parsed.length) {
       const parts: string[] = []
       // read_file de imagem/PDF no modo texto: os parts vão na própria mensagem user sintética
@@ -1642,7 +1669,7 @@ async function executeTool(
     const r = await runLocalTool(name, args, {
       cwd: root,
       confine: chat.config.confineToRoot !== false,
-      maxOutput: clampToolOutput(chat.config.maxToolOutputChars),
+      maxOutput: toolOutputLimit(chat, session),
       // saída grande → userData/tool-outputs/<chat>/<toolCallId>.txt (setting global do dispositivo)
       spillChars: settingsRepo.get<number>(TOOL_SPILL_SETTING) ?? undefined,
       toolCallId,
@@ -1792,7 +1819,7 @@ async function runDelegate(
 
   const cst = startLoop(child, signal)
   const outcome = await cst.done
-  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  const max = toolOutputLimit(chat, session)
   if (outcome.kind === 'final') {
     return {
       content: note + truncateHeadTail(outcome.text.trim() || delegateEmptyText(model), max, 0.5),
@@ -1883,7 +1910,7 @@ async function runAskUser(
       askUser: rec({ outcome: 'cancelled' })
     }
   setStatus(session.id, 'running')
-  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  const max = toolOutputLimit(chat, session)
   return {
     content: truncateHeadTail(formatAskUserResult(questions, outcome.answers, notes), max, 0.5),
     status: 'ok',
@@ -2157,7 +2184,7 @@ async function runSendToChat(
         )
       throw e
     }
-    const max = clampToolOutput(chat.config.maxToolOutputChars)
+    const max = toolOutputLimit(chat, session)
     switch (r.kind) {
       case 'final':
         return done(
@@ -2263,7 +2290,7 @@ function onReportDone(r: Report, o: LoopOutcome): void {
       const parent = sessionsRepo.get(r.parentSessionId)
       const chat = parent && chatsRepo.get(parent.chatId)
       if (parent && chat) {
-        const text = callbackText(r, o, clampToolOutput(chat.config.maxToolOutputChars))
+        const text = callbackText(r, o, toolOutputLimit(chat, parent))
         const d = deliverToSession(parent, text, callbackMeta(r), !r.silent)
         reports.sent(r, d.queuedId)
       }
@@ -2375,7 +2402,7 @@ function runCheckSubagents(
     content += `\n\n${formatSiblingList(sibs.map((s) => ({ id: s.id, title: s.title, status: s.status })))}`
   }
   return {
-    content: truncateHeadTail(content, clampToolOutput(chat.config.maxToolOutputChars), 0.5),
+    content: truncateHeadTail(content, toolOutputLimit(chat, session), 0.5),
     status: 'ok'
   }
 }
@@ -2446,7 +2473,7 @@ function runSiblingExchanges(
     content: formatSiblingExchanges(
       items,
       chat.id,
-      clampToolOutput(chat.config.maxToolOutputChars)
+      toolOutputLimit(chat, session)
     ),
     status: 'ok'
   }
@@ -2501,7 +2528,7 @@ async function runWaitSubagents(
       : []
   const mode = args.mode === 'any' ? 'any' : 'all'
   const timeoutS = clampWaitS(args.timeout_s)
-  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  const max = toolOutputLimit(chat, session)
   let targets: Report[]
   if (rawIds.length) {
     targets = []
@@ -2656,7 +2683,7 @@ async function runMessageSubagent(
   // a resposta volta aqui: o callback dessa execução não é injetado de novo (se vinha para esta sessão)
   const rep = r.run?.report
   if (rep && rep.parentSessionId === session.id && r.kind !== 'timeout') claimReport(rep)
-  const max = clampToolOutput(chat.config.maxToolOutputChars)
+  const max = toolOutputLimit(chat, session)
   switch (r.kind) {
     case 'final':
       return out(

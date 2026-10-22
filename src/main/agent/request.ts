@@ -241,6 +241,28 @@ export function setMemorySources(src: {
   memoryToolsSource = src.tools
 }
 
+// ---------------- chamada de voz (SPEC → "Áudio → Chamada de voz (meia-duplex)") ----------------
+
+/**
+ * Overrides do modo voz no turno em andamento (`ResolvedVoiceCall` de `@shared/voice`); null =
+ * turno de texto normal. O main registra a fonte (`src/main/ipc.ts` liga ao `VoiceCallManager`);
+ * sem registro (testes puros) = nunca há chamada. O runner aplica com `applyVoiceCallChat`.
+ */
+export type VoiceCallContextSource = (
+  chat: Pick<Chat, 'id' | 'config'>,
+  session: Pick<Session, 'id' | 'depth'>
+) => import('@shared/voice').ResolvedVoiceCall | null
+let voiceCallContextSource: VoiceCallContextSource = () => null
+export function setVoiceCallSource(fn: VoiceCallContextSource): void {
+  voiceCallContextSource = fn
+}
+export function voiceCallContextFor(
+  chat: Pick<Chat, 'id' | 'config'>,
+  session: Pick<Session, 'id' | 'depth'>
+): import('@shared/voice').ResolvedVoiceCall | null {
+  return voiceCallContextSource(chat, session)
+}
+
 /** Nomes dos provedores configurados (o runner registra; sem registro = nenhum → sem `provider`). */
 let providerNamesSource: () => string[] = () => []
 export function setProviderNamesSource(fn: () => string[]): void {

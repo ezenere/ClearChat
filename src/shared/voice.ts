@@ -4,7 +4,7 @@
 // `undefined` nos writers) e pronto para sincronizar — o sync dessas configurações entra no
 // protocolo 1.5.0 (fatia futura). A UI, a captura de áudio e os backends STT/TTS entram em fatias
 // futuras. Ver SPEC.md → "Áudio".
-import { normalizeToolList, type ChatParams, type ToolName } from './types'
+import { normalizeToolList, type Chat, type ChatConfig, type ChatParams, type ToolName } from './types'
 
 // ---------------- settings keys (tabela `settings`, JSON; ver SPEC → Banco) ----------------
 
@@ -258,12 +258,32 @@ export interface VoiceCallDefaults {
   interjections: InterjectionPolicy
   /** Falas preenchidoras padrão. */
   fillers: VoiceFillers
+  /** Turnos da chamada (silêncio que encerra a fala do usuário). */
+  turn: VoiceCallTurnConfig
 }
+
+/**
+ * Turnos da chamada de voz (setting `voiceCallDefaults.turn`). `silenceStopMs: 0` é tratado como
+ * `null` (na chamada o turno SEMPRE tem limite de silêncio — sem limite não há turnos).
+ */
+export interface VoiceCallTurnConfig {
+  /**
+   * Ms de silêncio contínuo que ENCERRAM a fala do usuário (turno). `null` = segue `audioInput`
+   * (`silenceStopMs`, quando `silenceStopEnabled` e > 0; senão `DEFAULT_TURN_SILENCE_MS`).
+   */
+  silenceStopMs: number | null
+}
+
+/** Fallback do silêncio de turno quando `audioInput` está com auto-stop desligado/zerado. */
+export const DEFAULT_TURN_SILENCE_MS = 2000
+
+export const DEFAULT_VOICE_CALL_TURN: VoiceCallTurnConfig = { silenceStopMs: null }
 
 export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
   enabled: true,
   interjections: { ...DEFAULT_INTERJECTION_POLICY, classes: [...INTERJECTION_CLASSES] },
-  fillers: { enabled: true, prompt: null }
+  fillers: { enabled: true, prompt: null },
+  turn: { ...DEFAULT_VOICE_CALL_TURN }
 }
 
 /** Config "vazia": tudo null = herda os padrões globais (`voiceCallDefaults`) e o próprio chat. */
@@ -467,12 +487,125 @@ export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
 export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
   const src = asObject(v)
   const fillers = asObject(src?.fillers)
+  const turn = asObject(src?.turn)
+  const turnMs = intOrNull(turn?.silenceStopMs)
   return {
     enabled: boolOr(src?.enabled, DEFAULT_VOICE_CALL_DEFAULTS.enabled),
     interjections: normalizeInterjectionPolicy(src?.interjections),
     fillers: {
       enabled: boolOr(fillers?.enabled, DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled),
       prompt: promptOrNull(fillers?.prompt)
-    }
+    },
+    // null = segue `audioInput`; 0 não faz sentido aqui (sem limite = sem turnos) e vira null
+    turn: { silenceStopMs: turnMs && turnMs > 0 ? turnMs : null }
   }
+}
+
+// ---------------- resolução da chamada de voz (herança persona→chat→global) ----------------
+
+/**
+ * Silêncio que encerra a fala do usuário na chamada (ms): `turn.silenceStopMs` quando definido;
+ * senão `audioInput` (`silenceStopMs` com auto-stop ligado e > 0); senão `DEFAULT_TURN_SILENCE_MS`
+ * (na chamada o turno SEMPRE tem limite — sem limite não há turnos).
+ */
+export function resolveTurnSilenceMs(
+  turn: VoiceCallTurnConfig | null | undefined,
+  audioInput: Pick<AudioInputSettings, 'silenceStopEnabled' | 'silenceStopMs'>
+): number {
+  const explicit = turn?.silenceStopMs
+  if (typeof explicit === 'number' && explicit > 0) return Math.round(explicit)
+  if (audioInput.silenceStopEnabled && audioInput.silenceStopMs > 0)
+    return Math.round(audioInput.silenceStopMs)
+  return DEFAULT_TURN_SILENCE_MS
+}
+
+/**
+ * `VoiceCallConfig` resolvido: campos null herdam o padrão (como `memory`/`skills` — a herança
+ * persona→chat é snapshot na criação do chat; aqui resolve-se chat→global). `model`/`tools`
+ * continuam `null` quando não há override (o chamador usa o modelo/tools do próprio chat).
+ */
+export interface ResolvedVoiceCall {
+  /** Chamada de voz liberada (para UI/envio). */
+  enabled: boolean
+  /** Modelo próprio da chamada (provider/model/params); null = o modelo do chat. */
+  model: VoiceCallModelConfig | null
+  /** Tools próprias (campos null = os do chat); null = igual ao chat. */
+  tools: VoiceCallToolsConfig | null
+  /** Acréscimo ao system prompt no modo voz; null = sem acréscimo. */
+  voicePrompt: string | null
+  /** Falas preenchidoras efetivas (fillers são de fatia futura — só o valor resolvido). */
+  fillers: VoiceFillers
+  /** Interjeições efetivas (interjeições são de fatia futura — só o valor resolvido). */
+  interjections: InterjectionPolicy
+}
+
+/** Resolução completa (aceita lixo/null; `enabled: null` herda o global — null ≠ false). */
+export function resolveVoiceCallConfig(
+  config: VoiceCallConfig | null | undefined,
+  defaults: VoiceCallDefaults | null | undefined
+): ResolvedVoiceCall {
+  const c = normalizeVoiceCallConfig(config ?? null)
+  const d = normalizeVoiceCallDefaults(defaults ?? null)
+  return {
+    enabled: c.enabled ?? d.enabled,
+    model: c.model,
+    tools: c.tools,
+    voicePrompt: c.voicePrompt,
+    fillers: c.fillers ?? d.fillers,
+    interjections: c.interjections ?? d.interjections
+  }
+}
+
+/**
+ * Chat efetivo de um turno de voz (cópia): a config do chat com os overrides da chamada aplicados
+ * (`voice.model` → params; `voice.tools` → enabledTools/maxToolOutputChars; `voicePrompt` →
+ * acréscimo ao system prompt). Função pura — o runner usa a cópia só nas requests/tools do turno;
+ * o chat salvo nunca muda (o histórico de um turno de voz é idêntico ao de um turno de texto).
+ */
+export function applyVoiceCallChat(chat: Chat, call: ResolvedVoiceCall): Chat {
+  const cfg = chat.config
+  const out: ChatConfig = { ...cfg }
+  if (call.model) out.params = { ...call.model.params }
+  if (call.tools?.enabledTools != null) out.enabledTools = [...call.tools.enabledTools]
+  if (call.tools?.maxToolOutputChars != null) out.maxToolOutputChars = call.tools.maxToolOutputChars
+  if (call.voicePrompt) {
+    out.systemPrompt = cfg.systemPrompt
+      ? `${cfg.systemPrompt}\n\n${call.voicePrompt}`
+      : call.voicePrompt
+  }
+  return { ...chat, config: out }
+}
+
+// ---------------- estado da chamada de voz (main → store/UI; canais `voice:call:*`) ----------------
+
+/** Fase do turno de voz mostrada na UI ("Ouvindo…/Transcrevendo…/Pensando…/Falando…"). */
+export type VoiceCallPhase = 'listening' | 'transcribing' | 'thinking' | 'speaking'
+
+/**
+ * Estado da chamada de voz ativa (evento `voice:call:state`; retorno dos canais `voice:call:*`).
+ * `error` é a última falha legível (ex.: TTS); limpa na próxima transição bem-sucedida.
+ */
+export interface VoiceCallState {
+  active: boolean
+  chatId: string | null
+  sessionId: string | null
+  phase: VoiceCallPhase
+  muted: boolean
+  /** Silêncio que encerra o turno, em ms (resolvido em `voice:call:start`). */
+  turnSilenceMs: number
+  /** Fala já transcrita aguardando o próximo turno (máx. 1; '' = nenhuma). */
+  pendingText: string
+  error: string | null
+}
+
+/** Estado "desligado" (retorno de `voice:call:stop` / inicial do store). */
+export const VOICE_CALL_INACTIVE: VoiceCallState = {
+  active: false,
+  chatId: null,
+  sessionId: null,
+  phase: 'listening',
+  muted: false,
+  turnSilenceMs: DEFAULT_TURN_SILENCE_MS,
+  pendingText: '',
+  error: null
 }

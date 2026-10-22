@@ -2,14 +2,18 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
   EVENT_CHANNEL,
   IPC,
+  VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
   type FullClearApi,
   type TtsClipProgressEvent,
+  type VoiceCallUtteranceEvent,
   type VoiceModelProgressEvent,
   type VoicePartialEvent
 } from '@shared/ipc'
+import type { VoiceCallState } from '@shared/voice'
 import type { AgentEvent } from '@shared/types'
 
 const invoke = ipcRenderer.invoke.bind(ipcRenderer)
@@ -176,6 +180,16 @@ const api: FullClearApi = {
         list: () => invoke(IPC.voice.ttsClipsList)
       },
       voices: () => invoke(IPC.voice.ttsVoices)
+    },
+    call: {
+      start: (input) => invoke(IPC.voice.callStart, input),
+      stop: () => invoke(IPC.voice.callStop),
+      mute: (input) => invoke(IPC.voice.callMute, input),
+      speechBegin: () => invoke(IPC.voice.callSpeechBegin),
+      speechEnd: () => invoke(IPC.voice.callSpeechEnd),
+      turn: (input) => invoke(IPC.voice.callTurn, input),
+      playbackIdle: () => invoke(IPC.voice.callPlaybackIdle),
+      bargeIn: () => invoke(IPC.voice.callBargeIn)
     }
   },
   sync: {
@@ -245,6 +259,20 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, listener)
+    }
+  },
+  onVoiceCallState: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceCallState): void => cb(event)
+    ipcRenderer.on(VOICE_CALL_STATE_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_CALL_STATE_CHANNEL, listener)
+    }
+  },
+  onVoiceCallUtterance: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceCallUtteranceEvent): void => cb(event)
+    ipcRenderer.on(VOICE_CALL_UTTERANCE_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CHANNEL, listener)
     }
   }
 }

@@ -7,7 +7,8 @@ import type {
   SttSettings,
   TtsLocalEngine,
   TtsSettings,
-  VoiceCallDefaults
+  VoiceCallDefaults,
+  VoiceCallState
 } from './voice'
 import type {
   ChatHostInfo,
@@ -243,7 +244,15 @@ export const IPC = {
     ttsTest: 'voice:tts:test',
     ttsClipsGenerate: 'voice:tts:clips:generate',
     ttsClipsList: 'voice:tts:clips:list',
-    ttsVoices: 'voice:tts:voices'
+    ttsVoices: 'voice:tts:voices',
+    callStart: 'voice:call:start',
+    callStop: 'voice:call:stop',
+    callMute: 'voice:call:mute',
+    callSpeechBegin: 'voice:call:speech-begin',
+    callSpeechEnd: 'voice:call:speech-end',
+    callTurn: 'voice:call:turn',
+    callPlaybackIdle: 'voice:call:playback-idle',
+    callBargeIn: 'voice:call:barge-in'
   }
 } as const
 
@@ -255,6 +264,10 @@ export const VOICE_PARTIAL_CHANNEL = 'voice:partial'
 export const VOICE_MODELS_PROGRESS_CHANNEL = 'voice:models:progress'
 /** Canal main → renderer com o progresso da geração de clipes de voz (`TtsClipProgressEvent`). */
 export const VOICE_TTS_CLIPS_PROGRESS_CHANNEL = 'voice:tts:clips:progress'
+/** Canal main → renderer com o estado da chamada de voz (`VoiceCallState`). */
+export const VOICE_CALL_STATE_CHANNEL = 'voice:call:state'
+/** Canal main → renderer com uma utterance falada da chamada (`VoiceCallUtteranceEvent`). */
+export const VOICE_CALL_UTTERANCE_CHANNEL = 'voice:call:utterance'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -532,6 +545,33 @@ export interface VoiceApi {
     /** Vozes do motor local atual (com estado de instalação) + sugestões livres para a API. */
     voices(): Promise<TtsVoicesView>
   }
+  /**
+   * Chamada de voz meia-duplex (SPEC → "Áudio → Chamada de voz (meia-duplex)"): entrar/sair,
+   * mudo e os eventos do turno (fala do usuário → transcrição → envio; resposta falada por
+   * sentença em `voice:call:utterance`). O renderer é o "sensor" (captura, silêncio, reprodução);
+   * o main é o dono do estado do turno e do envio pelo caminho normal do composer.
+   */
+  call: {
+    /** Entra na chamada da sessão (depth 0). Já em chamada/fora do padrão → erro legível. */
+    start(input: { sessionId: string }): Promise<VoiceCallState>
+    /** Sai da chamada (descarta fala pendente e para a fala do assistente). */
+    stop(): Promise<VoiceCallState>
+    /** Mudo do microfone (a captura é pausada pelo renderer; aqui só reflete no estado). */
+    mute(input: { muted: boolean }): Promise<VoiceCallState>
+    /** O usuário começou a falar (a UI mostra "Ouvindo…"; durante a reprodução = barge-in). */
+    speechBegin(): Promise<VoiceCallState>
+    /** Silêncio encerrou a fala: a transcrição final está em andamento ("Transcrevendo…"). */
+    speechEnd(): Promise<VoiceCallState>
+    /**
+     * Transcrição final da fala do usuário. Sem resposta em andamento envia já (mesmo caminho do
+     * composer — fila/⚡ respeitadas); com resposta em voo fica como PRÓXIMO turno (máx. 1).
+     */
+    turn(input: { text: string }): Promise<VoiceCallState>
+    /** A fila de reprodução do renderer esvaziou (tudo que foi emitido já tocou). */
+    playbackIdle(): Promise<VoiceCallState>
+    /** Barge-in: o usuário falou durante a reprodução (a fala do assistente é cancelada). */
+    bargeIn(): Promise<VoiceCallState>
+  }
 }
 
 /** Estado do modelo local no disco (espelho de `LocalModelState` em `src/main/voice/models.ts`). */
@@ -626,6 +666,16 @@ export interface TtsClipsView {
   model: string
   generatedAt: string
   clips: TtsClipInfo[]
+}
+
+/** Uma utterance falada da chamada de voz (canal `voice:call:utterance`) — bytes completos por sentença. */
+export interface VoiceCallUtteranceEvent {
+  /** Id estável da utterance (ordem de emissão). */
+  id: string
+  /** Bytes do áudio (wav/mp3) — tocar na ordem, sem sobreposição (fila `UtteranceQueue`). */
+  audio: Uint8Array
+  /** MIME do áudio ('audio/wav' | 'audio/mpeg'). */
+  mime: string
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -899,6 +949,10 @@ export interface ClearApi {
   onVoiceModelProgress?(cb: (e: VoiceModelProgressEvent) => void): () => void
   /** Progresso da geração de clipes de voz (canal `voice:tts:clips:progress`); unsubscribe como em `onEvent`. */
   onVoiceTtsClipsProgress?(cb: (e: TtsClipProgressEvent) => void): () => void
+  /** Estado da chamada de voz (canal `voice:call:state`); unsubscribe como em `onEvent`. */
+  onVoiceCallState?(cb: (e: VoiceCallState) => void): () => void
+  /** Utterances faladas da chamada (canal `voice:call:utterance`); unsubscribe como em `onEvent`. */
+  onVoiceCallUtterance?(cb: (e: VoiceCallUtteranceEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -969,5 +1023,13 @@ export interface ClearApi {
 /** `ClearApi` com os membros de voz obrigatórios — o que o preload real expõe em `window.api`. */
 export type FullClearApi = ClearApi &
   Required<
-    Pick<ClearApi, 'voice' | 'onVoicePartial' | 'onVoiceModelProgress' | 'onVoiceTtsClipsProgress'>
+    Pick<
+      ClearApi,
+      | 'voice'
+      | 'onVoicePartial'
+      | 'onVoiceModelProgress'
+      | 'onVoiceTtsClipsProgress'
+      | 'onVoiceCallState'
+      | 'onVoiceCallUtterance'
+    >
   >
