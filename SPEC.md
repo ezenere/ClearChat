@@ -267,10 +267,17 @@ interface ClearApi {
   skills: { getSettings(): SkillsSettings; updateSettings(patch): SkillsSettings; discover(opts?: { cwd?; counts?; rescan? }): SkillsDiscovery
             read(file /* só SKILL.md */): string; pickFolder(): string | null; openFolder(path): void }   // ver "Skills"
   approvals: { getSettings(): ApprovalSettings; updateSettings(patch: Partial<ApprovalSettings>): ApprovalSettings }  // modos globais + listas (substitui inteiros; entrada inválida → erro)
+  voice:    { settings: { get(): VoiceSettingsView        // os 4 grupos (audioInput, sttSettings, ttsSettings, voiceCallDefaults) completos/normalizados; api.apiKey vem MASCARADA ('gsk-…abcd'; '' = sem chave)
+                          set(kind, value): grupo gravado }  // normaliza+grava e devolve o gravado (mascarado em stt/tts). api.apiKey: ausente/lixo/igual à máscara ou à chave = PRESERVA a chave real; ''/null = remove; outra string = nova
+              transcribe: { start(language?): sessionId   // sessão global única de transcrição (PCM16 mono 16 kHz); language ausente → audioInput.language; já há sessão → erro legível
+                            push(sessionId, pcm16: Uint8Array, sampleRate?): void   // acumula; sampleRate informado precisa ser 16000
+                            stop(sessionId): { text, model, baseUrl, ms, backend, fellBack, fallbackReason? }   // final do buffer inteiro (erro legível propaga)
+                            cancel(sessionId): void } }   // descarta sem transcrever (id desconhecido = sem efeito)
+  onVoicePartial(cb: (e: VoicePartialEvent) => void): () => void   // parciais ao vivo (canal voice:partial); unsubscribe como onEvent
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
-Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`. Constantes em `src/shared/ipc.ts`.
+Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event` e parciais de voz em `voice:partial` (os canais de voz são `voice:settings:get|set` e `voice:transcribe:start|push|stop|cancel` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
 
 ## Construção da request (`src/main/agent/request.ts` — função pura `buildRequest(chat, session, history, provider)`, usada pelo runner E pelo preview)
 
@@ -1024,7 +1031,7 @@ interface SkillsConfig {
 
 ## Áudio — configuração global (contrato — `src/shared/voice.ts`, settings)
 
-Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global, os modelos locais e o TTS entram em fatias futuras; o serviço de transcrição já existe — ver "Serviço de transcrição (STT)" abaixo): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` (`src/main/voice.ts`).
+Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global, os modelos locais e o TTS entram em fatias futuras; o serviço de transcrição e a fiação main+preload já existem — ver "Serviço de transcrição (STT)" e "Configuração e sessão de transcrição por IPC" abaixo): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` e gravadas por `setVoiceSetting()` (`src/main/voice.ts`).
 
 ### Ditado — entrada de áudio (setting `audioInput`)
 
@@ -1062,7 +1069,7 @@ interface TtsSettings {
   local: TtsLocalConfig | null   // padrão: DEFAULT_TTS_LOCAL = { engine: 'kokoro', voice: 'pf_dora', installed: false }; null = o usuário limpou explicitamente
 }
 ```
-- `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting (a UI mostra mascarada; proteção/máscara do `settings:get` genérico é decidida na fatia de UI).
+- `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting, mas **nunca sai do main**: `sttSettings`/`ttsSettings` são settings **protegidas** (`PROTECTED_SETTINGS`, como `webSearchApiKeys` — `settings:get/set` genérico responde "Setting protegido.") e o acesso é pelos canais `voice:settings:*`, que devolvem a chave **mascarada** e preservam a chave real quando a UI grava por cima do valor mascarado (ver "Configuração e sessão de transcrição por IPC" abaixo).
 - `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, strings aparadas (`apiKey` inclusive). **TTS `local`**: objeto parcial é completado com `DEFAULT_TTS_LOCAL` (Kokoro; `installed: false` → a UI mostra "não instalado — baixar"; voz vazia → `'pf_dora'`); `local: null` salvo é **preservado** (= o usuário limpou explicitamente); ausente/lixo → o padrão. A voz `'pf_dora'` é **provisória** — o id real do voice pack pt-BR do Kokoro é confirmado na fatia de TTS. **STT `local`** continua `null` = nenhum instalado (ausente/lixo/null → `null`; engine padrão ao normalizar objeto: `'whisper.cpp'`).
 
 ### Serviço de transcrição (STT — `src/main/voice/stt.ts`)
@@ -1086,6 +1093,22 @@ transcribeWithFallback(input, opts & { local?: SttLocalBackend }):
 - **Fallback** (`transcribeWithFallback`): tenta o backend primário e cai no secundário **só no modo `hybrid`** e **só em erro de disponibilidade** (`isSttFallbackable`: rede, timeout, cota/429 e 5xx). Autenticação/configuração/demais 4xx nunca caem (config errada falha visível); os modos `api`/`local` nunca trocam de backend; abort sai sem fallback. Os dois falhando → erro do secundário com a falha do primário anotada ("após falha em …", como em `runWebSearch`).
 - **Parciais ao vivo** (`TranscribePartial { text, isFinal, ms }`, pronto para a fatia de integração): via API são **melhor-esforço** — a cada `STT_PARTIAL_INTERVAL_MS` (1 s) transcreve o buffer com sobreposição de `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro e o texto pode ser reescrito no seguinte). Parciais de verdade vêm do motor local em streaming: a integração pede o backend com `chooseSttBackend(settings, { hasLocalReady, purpose: 'partial' })`.
 - **Testes**: `e2e/stt.test.ts` (em `npm run test:unit`) — multipart correto (file/model/language/response_format, filename por mime) com fetch mockado e round-trip real contra servidor local (multipart serializado pelo FormData/Blob/fetch nativos), texto extraído do JSON, 401/429/500/400 com mensagens legíveis, rede/config/resposta sem `text`, timeout e abort, `chooseSttBackend` (api/local/hybrid) e fallback (só hybrid; nunca em 401; "após falha em …" quando os dois falham).
+
+### Configuração e sessão de transcrição por IPC (`src/main/voice.ts`, `src/main/voice/session.ts`, `voice:*`)
+
+Fiação main+preload para a UI do renderer (SPEC → "API do preload"): settings tipadas e uma sessão de transcrição por vez. A chave de API de stt/tts continua trancada no main (a chave real é só para `transcribeAudio`; o renderer só vê a máscara `maskKey`, ex. 'gsk-…abcd').
+
+**Settings (`voice:settings:get` / `voice:settings:set`)** — os 4 grupos pelas chaves de setting (`audioInput`, `sttSettings`, `ttsSettings`, `voiceCallDefaults`):
+- `get` devolve os grupos completos e normalizados (`normalizeX`) como `VoiceSettingsView`, com `api.apiKey` **mascarada** (`''` = sem chave). `set(kind, value)` normaliza, grava e devolve o valor gravado (mesma visão mascarada). Grupo desconhecido → erro legível.
+- Escrita da `api.apiKey` (o resto do grupo segue o normalizador): **ausente**, lixo (não-string), a própria chave ou o **valor mascarado** → preserva a chave salva (gravar por cima da máscara nunca apaga a chave real — espelho de `webSearchApiKeys`/`PROTECTED_SETTINGS`); `null` ou `''` → remove a chave (ação explícita de limpar, como `webSearch.setKey`); qualquer outra string (aparada) → nova chave. Grupo inteiro lixo → volta aos padrões, mas a chave sobrevive.
+- `audioInput`/`voiceCallDefaults` não têm segredo e continuam acessíveis no `settings:get/set` genérico (o canal tipado é a forma canônica).
+
+**Sessão de transcrição (`voice:transcribe:*`, `src/main/voice/session.ts` — sem Electron)** — buffer PCM16 mono **16 kHz** (`VOICE_SAMPLE_RATE`); o áudio vai para a API como **wav** (`encodeWav`, PCM 16-bit mono, cabeçalho RIFF de 44 bytes) nas parciais e no final:
+- `start(language?)` cria a sessão e devolve o id (canal `voice:transcribe:start`; `language` ausente → `audioInput.language`). **Sessão global única** por janela: iniciar com outra ativa → erro legível; `stop`/`cancel` liberam a vaga (o `stop` libera ao terminar).
+- `push(sessionId, pcm16, sampleRate?)` acumula (sampleRate informado, se vier, precisa ser 16000; tamanho ímpar/bytes inválidos → erro legível).
+- **Parciais melhor-esforço** (evento `voice:partial`, assinado por `onVoicePartial`, payload `VoicePartialEvent = { sessionId, text, isFinal: false, ms }`): a cada `STT_PARTIAL_INTERVAL_MS` (1 s, disparado no `push` seguinte) transcreve-se o pedaço do acumulado desde o fim da parcial aceita anterior menos `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro — palavras na fronteira podem sair reescritas/duplicadas; a final reescreve tudo). Só quando `settings.livePartials` e `chooseSttBackend(settings, { purpose: 'partial', hasLocalReady: false })` = 'api' (no modo `local` a parcial **nunca** vai para a API; parciais de verdade vêm do motor local em streaming, outra fatia). Regra de latência: a request em voo é **abortada** quando a seguinte dispara, resultados velhos expiram (geração anterior) e nunca há fila; falha de parcial é engolida (melhor-esforço — a sessão segue).
+- `stop(sessionId)` cancela o loop e transcreve o buffer **inteiro** como final (`purpose: 'final'`, via `transcribeWithFallback` com o motor local injetado quando houver) → `{ text, model, baseUrl, ms, backend, fellBack, fallbackReason? }`. Erro de API propaga legível (`SttError` pt-BR). Sem áudio capturado → `{ text: '' }` sem ir à rede.
+- `cancel(sessionId)` descarta tudo sem transcrever (aborta o que estiver em voo; id desconhecido = sem efeito; idempotente). Depois de `stop`/`cancel`, `push`/`stop` na sessão → erro legível.
 
 ### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
 
@@ -1115,6 +1138,10 @@ interface VoiceCallConfig {
 
 ### Testes
 `e2e/voice.test.ts` (em `npm run test:unit`): defaults quando null/ausente/lixo (4 settings + config) e round-trip JSON, defaults de produto (chamada de voz/interjeições/fillers ligados; TTS local = Kokoro não instalado, `local: null` preservado como limpeza explícita), `silenceStopMs: 0` preservado, `enabled: null` ≠ false (e null ≠ objeto em fillers/interjections), campos desconhecidos descartados com `params` preservados, interjeições (classes vazias → padrão, limites aparados, 0 preservado), `voiceCallDefaults` parcial e a ligação com personas (`PRESET_FIELDS` contém `voice`; `sanitizePresetConfig` copia normalizado; `memory`/`skills` inalterados).
+
+`e2e/voiceSession.test.ts`: `encodeWav` (cabeçalho RIFF/PCM16 mono, round-trip de amostras, pcm vazio, inválidos) e a sessão de transcrição com fetch mockado e relógio injetado — parciais no intervalo com sobreposição (pedaço conferido byte a byte) e evento `{ sessionId, text, isFinal: false, ms }`, abort da request em voo quando a seguinte dispara, expiração de resultado velho, `livePartials: false`/modo `local` sem chamadas, `stop` final (buffer inteiro; `backend`/`fellBack` com motor local injetado no modo hybrid; modo `local` nunca vaza para a API; vazio sem rede), `cancel` nunca transcreve, sessão única e erros legíveis (parcial engole 500, final propaga).
+
+`e2e/voiceSettings.test.ts` (repositório real com stub do `electron`, padrão de `branches.test.ts`): `PROTECTED_SETTINGS` cobre `sttSettings`/`ttsSettings`, round-trip normalizado (inclui `silenceStopMs: 0` e `voiceCallDefaults` parcial), chave real gravada no banco e mascarada no get/set, escrita por cima do valor mascarado preserva a chave (idem para `ttsSettings`), `''`/`null` removem, ausente/lixo preserva, string nova substitui, `local: null` preservado.
 
 ## Atualizações (aviso de versão nova — `src/shared/updates.ts`, `src/main/updates.ts`, `components/UpdateNotice.tsx`)
 

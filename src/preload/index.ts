@@ -1,10 +1,16 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
-import { EVENT_CHANNEL, IPC, type ClearApi } from '@shared/ipc'
+import {
+  EVENT_CHANNEL,
+  IPC,
+  VOICE_PARTIAL_CHANNEL,
+  type FullClearApi,
+  type VoicePartialEvent
+} from '@shared/ipc'
 import type { AgentEvent } from '@shared/types'
 
 const invoke = ipcRenderer.invoke.bind(ipcRenderer)
 
-const api: ClearApi = {
+const api: FullClearApi = {
   providers: {
     list: () => invoke(IPC.providers.list),
     create: (p) => invoke(IPC.providers.create, p),
@@ -140,6 +146,19 @@ const api: ClearApi = {
     revealKey: (engine) => invoke(IPC.webSearch.revealKey, engine),
     test: (engine) => invoke(IPC.webSearch.test, engine)
   },
+  voice: {
+    settings: {
+      get: () => invoke(IPC.voice.settingsGet),
+      set: (kind, value) => invoke(IPC.voice.settingsSet, kind, value)
+    },
+    transcribe: {
+      start: (language) => invoke(IPC.voice.transcribeStart, language),
+      push: (sessionId, pcm16, sampleRate) =>
+        invoke(IPC.voice.transcribePush, sessionId, pcm16, sampleRate),
+      stop: (sessionId) => invoke(IPC.voice.transcribeStop, sessionId),
+      cancel: (sessionId) => invoke(IPC.voice.transcribeCancel, sessionId)
+    }
+  },
   sync: {
     status: () => invoke(IPC.sync.status),
     probeServer: (url) => invoke(IPC.sync.probeServer, url),
@@ -186,6 +205,13 @@ const api: ClearApi = {
     ipcRenderer.on(EVENT_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(EVENT_CHANNEL, listener)
+    }
+  },
+  onVoicePartial: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoicePartialEvent): void => cb(event)
+    ipcRenderer.on(VOICE_PARTIAL_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_PARTIAL_CHANNEL, listener)
     }
   }
 }

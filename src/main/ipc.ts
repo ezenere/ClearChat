@@ -4,6 +4,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import {
   ALL_CHANNELS,
   IPC,
+  VOICE_PARTIAL_CHANNEL,
   type AppCapabilities,
   type ApprovalDecision,
   type AttachmentAddInput,
@@ -16,7 +17,8 @@ import {
   type ProviderInput,
   type ProviderPatch,
   type ProviderTestInput,
-  type SmartApproveTestInput
+  type SmartApproveTestInput,
+  type VoiceSettingKind
 } from '@shared/ipc'
 import type { ApiMessage, AttachmentInfo, Chat, QuestionAnswer } from '@shared/types'
 import {
@@ -28,7 +30,7 @@ import {
   syncEngine,
   syncHandlers
 } from './sync'
-import { emit } from './events'
+import { emit, sendToWindows } from './events'
 import { isBranchEditable, pruneSel, selectionToReach } from '@shared/branches'
 import {
   chatsRepo,
@@ -100,6 +102,12 @@ import type {
   MemoryListQuery,
   MemoryPatch
 } from '@shared/memory'
+import { getVoiceSettings, getVoiceSettingsView, setVoiceSetting } from './voice'
+import {
+  activeTranscribeSession,
+  startTranscribeSession,
+  type TranscribeSession
+} from './voice/session'
 
 type Handler = (...args: never[]) => unknown
 
@@ -117,6 +125,14 @@ function remoteProcessGuard(chatId: string): void {
   const e = syncEngine()
   if (e?.active && e.host.mode(chatId) === 'remote')
     throw new Error(`Os processos rodam no host (${e.host.hostName(chatId)}) — gerencie-os por lá.`)
+}
+
+/** Sessão de transcrição ativa (global, uma por vez) — erro legível para id desconhecido/encerrado. */
+function requireTranscribeSession(sessionId: string): TranscribeSession {
+  const s = activeTranscribeSession()
+  if (!s || s.id !== sessionId)
+    throw new Error('Sessão de transcrição não encontrada (encerrada, cancelada ou substituída).')
+  return s
 }
 
 /** Banco + sync para o visualizador de arquivos (fileViewer.ts é sem Electron). */
@@ -607,6 +623,31 @@ export function registerIpc(): void {
           })
         }
       ),
+    // ---- voz: settings de áudio + sessão de transcrição (SPEC → "Áudio") ----
+    // (as chaves de API de stt/tts não passam por aqui nem pelo settings genérico:
+    //  PROTECTED_SETTINGS; saem mascaradas e só o main usa a chave real)
+    [IPC.voice.settingsGet]: () => getVoiceSettingsView(),
+    [IPC.voice.settingsSet]: (kind: VoiceSettingKind, value: unknown) =>
+      setVoiceSetting(kind, value),
+    [IPC.voice.transcribeStart]: (language?: string) => {
+      const v = getVoiceSettings()
+      const lang =
+        typeof language === 'string' && language.trim() ? language : v.audioInput.language
+      return startTranscribeSession(
+        { settings: v.stt, language: lang },
+        { onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e) }
+      ).id
+    },
+    [IPC.voice.transcribePush]: (sessionId: string, pcm16: Uint8Array, sampleRate?: number) => {
+      requireTranscribeSession(sessionId).push(pcm16, sampleRate)
+    },
+    [IPC.voice.transcribeStop]: (sessionId: string) => requireTranscribeSession(sessionId).stop(),
+    // cancel é tolerante: encerrar uma sessão que já saiu (corrida com o fim natural) não é erro
+    [IPC.voice.transcribeCancel]: (sessionId: string) => {
+      const s = activeTranscribeSession()
+      if (s && s.id === sessionId) s.cancel()
+    },
+
     // ---- sync ----
     ...syncHandlers()
   }

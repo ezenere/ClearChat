@@ -1,6 +1,7 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
-// Ver SPEC.md → "API do preload". Todo método (exceto onEvent) é ipcRenderer.invoke → ipcMain.handle.
+// Ver SPEC.md → "API do preload". Todo método (exceto onEvent/onVoicePartial) é ipcRenderer.invoke → ipcMain.handle.
 import type { EngineConfig } from './webSearchSettings'
+import type { AudioInputSettings, SttSettings, TtsSettings, VoiceCallDefaults } from './voice'
 import type {
   ChatHostInfo,
   CloudSkill,
@@ -219,11 +220,21 @@ export const IPC = {
     setKey: 'webSearch:setKey',
     revealKey: 'webSearch:revealKey',
     test: 'webSearch:test'
+  },
+  voice: {
+    settingsGet: 'voice:settings:get',
+    settingsSet: 'voice:settings:set',
+    transcribeStart: 'voice:transcribe:start',
+    transcribePush: 'voice:transcribe:push',
+    transcribeStop: 'voice:transcribe:stop',
+    transcribeCancel: 'voice:transcribe:cancel'
   }
 } as const
 
 /** Canal main → renderer (webContents.send) para todos os AgentEvent. */
 export const EVENT_CHANNEL = 'agent:event'
+/** Canal main → renderer com as parciais ao vivo de uma sessão de transcrição (`VoicePartialEvent`). */
+export const VOICE_PARTIAL_CHANNEL = 'voice:partial'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -395,6 +406,77 @@ export interface WebSearchTestResult {
   ms?: number
   /** Recusado pelo freio do botão (teste em andamento / muito seguido) — sem ir à rede. */
   throttled?: boolean
+}
+
+// ---- áudio/voz: settings globais + sessão de transcrição (SPEC → "Áudio") ----
+
+/**
+ * As 4 settings de áudio pelas CHAVES de setting (o discriminador de `voice:settings:set`).
+ * `sttSettings.api.apiKey` e `ttsSettings.api.apiKey` saem do main SEMPRE mascarados
+ * (`maskKey`, ex. 'gsk-…abcd'); a chave real nunca chega ao renderer.
+ */
+export interface VoiceSettingsMap {
+  audioInput: AudioInputSettings
+  sttSettings: SttSettings
+  ttsSettings: TtsSettings
+  voiceCallDefaults: VoiceCallDefaults
+}
+export type VoiceSettingKind = keyof VoiceSettingsMap
+/** O que `voice:settings:get` devolve (= `VoiceSettingsMap`, com as chaves de API mascaradas). */
+export type VoiceSettingsView = VoiceSettingsMap
+
+/** Parcial ao vivo de uma sessão de transcrição (canal `voice:partial`, assinada por `onVoicePartial`). */
+export interface VoicePartialEvent {
+  /** Sessão que emitiu (a UI descarta eventos de sessões antigas). */
+  sessionId: string
+  /** Texto parcial acumulado (melhor-esforço; a transcrição final o reescreve). */
+  text: string
+  /** Sempre false aqui — a transcrição definitiva volta como retorno de `voice:transcribe:stop`. */
+  isFinal: boolean
+  /** Duração da chamada que gerou a parcial, em ms. */
+  ms: number
+}
+
+/** Resultado final de uma sessão de transcrição (`TranscribeResult` + backend/fellBack de `voice/stt.ts`). */
+export interface VoiceTranscribeResult {
+  /** Texto transcrito (pode ser vazio quando não há fala). */
+  text: string
+  /** Modelo usado (`sttSettings.api.model`; no motor local, o modelo/motor dele). */
+  model: string
+  /** Base da API usada (no motor local: 'local'). */
+  baseUrl: string
+  /** Duração da chamada em ms. */
+  ms: number
+  /** Backend que serviu a transcrição. */
+  backend: 'api' | 'local'
+  /** true quando o primário falhou (disponibilidade) e o secundário atendeu. */
+  fellBack: boolean
+  /** Motivo curto (pt-BR) da falha do primário quando `fellBack`. */
+  fallbackReason?: string
+}
+
+/** Uma sessão de transcrição por vez; `start` devolve o id usado em push/stop/cancel. */
+export interface VoiceApi {
+  settings: {
+    /** Os 4 grupos completos e normalizados (chaves de API mascaradas). */
+    get(): Promise<VoiceSettingsView>
+    /**
+     * Normaliza, grava um grupo e devolve o valor gravado (chave de API mascarada).
+     * `api.apiKey`: ausente/igual à máscara ou à chave atual = preserva a chave salva;
+     * `null`/`''` = remove; outra string = nova chave.
+     */
+    set<K extends VoiceSettingKind>(kind: K, value: unknown): Promise<VoiceSettingsMap[K]>
+  }
+  transcribe: {
+    /** Cria a sessão global (PCM16 mono 16 kHz). `language` ausente = `audioInput.language`. */
+    start(language?: string): Promise<string>
+    /** Acumula PCM16 mono little-endian (16 kHz; `sampleRate`, se vier, precisa casar). */
+    push(sessionId: string, pcm16: Uint8Array, sampleRate?: number): Promise<void>
+    /** Para o loop de parciais e transcreve o buffer inteiro (final, com fallback se houver motor local). */
+    stop(sessionId: string): Promise<VoiceTranscribeResult>
+    /** Descarta a sessão sem transcrever (id desconhecido = sem efeito). */
+    cancel(sessionId: string): Promise<void>
+  }
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -656,6 +738,14 @@ export interface ClearApi {
     revealKey(engine: import('./webSearchSettings').SearchEngineId): Promise<string | null>
     test(engine: import('./webSearchSettings').SearchEngineId): Promise<WebSearchTestResult>
   }
+  /**
+   * Áudio/voz (SPEC → "Áudio"): settings globais tipadas + sessão de transcrição. Opcional no tipo
+   * só porque o mock de dev (`src/renderer/src/dev/mockApi.ts`) ainda não o implementa — o preload
+   * real SEMPRE expõe (use `FullClearApi` / `window.api`, onde ele é obrigatório).
+   */
+  voice?: VoiceApi
+  /** Parciais ao vivo da sessão de transcrição (canal `voice:partial`); unsubscribe como em `onEvent`. */
+  onVoicePartial?(cb: (e: VoicePartialEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -722,3 +812,6 @@ export interface ClearApi {
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
+
+/** `ClearApi` com os membros de voz obrigatórios — o que o preload real expõe em `window.api`. */
+export type FullClearApi = ClearApi & Required<Pick<ClearApi, 'voice' | 'onVoicePartial'>>

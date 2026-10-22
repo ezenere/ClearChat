@@ -21,16 +21,21 @@ export function onAgentEvent(fn: Listener): () => void {
 }
 
 export function emit(event: AgentEvent): void {
-  for (const win of windows) {
-    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
-      win.webContents.send(EVENT_CHANNEL, event)
-    }
-  }
+  sendToWindows(EVENT_CHANNEL, event)
   for (const fn of listeners) {
     try {
       fn(event)
     } catch {
       /* ignora */
+    }
+  }
+}
+
+/** Envia um payload cru para as janelas registradas (canais fora de `agent:event`; ex. `voice:partial`). */
+export function sendToWindows(channel: string, payload: unknown): void {
+  for (const win of windows) {
+    if (!win.isDestroyed() && !win.webContents.isDestroyed()) {
+      win.webContents.send(channel, payload)
     }
   }
 }
