@@ -268,6 +268,7 @@ async function main(): Promise<void> {
   await step('userData isolado + onboarding + novo chat', async () => {
     assert(userData === USER_DATA, `userData ${userData}`)
     await page.getByText('Bem-vindo ao ClearChat').waitFor({ timeout: 30_000 })
+    await page.getByTestId('onboarding-provider').click()
     await page.locator('input.field').nth(0).fill('Local')
     await page.locator('input.field').nth(1).fill(llmBase)
     await page.locator('input[type="password"]').fill('fake-key')

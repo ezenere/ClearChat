@@ -246,6 +246,7 @@ async function main(): Promise<void> {
 
   await step('onboarding + chat com delegate_task', async () => {
     await page.getByText('Bem-vindo ao ClearChat').waitFor({ timeout: 30_000 })
+    await page.getByTestId('onboarding-provider').click()
     await page.locator('input.field').nth(0).fill('Local')
     await page.locator('input.field').nth(1).fill(fakeBase)
     await page.locator('input[type="password"]').fill('fake-key')

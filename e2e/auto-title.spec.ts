@@ -278,6 +278,7 @@ async function main(): Promise<void> {
 
   await step('onboarding com o provedor falso', async () => {
     await page.getByText('Bem-vindo ao ClearChat').waitFor({ timeout: 30_000 })
+    await page.getByTestId('onboarding-provider').click()
     await page.locator('input.field').nth(0).fill('Local')
     await page.locator('input.field').nth(1).fill(fakeBase)
     await page.locator('input[type="password"]').fill(FAKE_KEY)

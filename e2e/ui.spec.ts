@@ -387,6 +387,7 @@ async function main(): Promise<void> {
 
   await step('onboarding (Testar → Continuar)', async () => {
     await page.getByText('Bem-vindo ao ClearChat').waitFor({ timeout: 30_000 })
+    await page.getByTestId('onboarding-provider').click()
     await shot('onboarding')
     await page.locator('input[type="password"]').fill(KEY)
     await page.getByRole('button', { name: 'Testar conexão' }).click()
