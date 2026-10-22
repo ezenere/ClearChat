@@ -31,6 +31,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { elementShot, pickModel as pickModelIn } from './uiHelpers.ts'
 
 const FAKE_KEY = 'fake-key-smart-approve'
 const AGENT = 'fake/agent-1'
@@ -293,7 +294,8 @@ async function shot(name: string): Promise<void> {
 }
 
 async function shotOf(loc: Locator, name: string): Promise<void> {
-  await loc.screenshot({ path: join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`) })
+  // nunca loc.screenshot(): elemento maior que a janela redimensiona a viewport (ver uiHelpers)
+  await elementShot(page, loc, join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`))
 }
 
 async function read<T = any>(path: string, ...args: unknown[]): Promise<T> {
@@ -369,14 +371,8 @@ async function toolResultFor(cmd: string): Promise<any> {
   return msgs.find((m) => m.message.role === 'tool' && m.message.tool_call_id === call.id)
 }
 
-async function pickModel(combobox: Locator, id: string): Promise<void> {
-  await combobox.click()
-  await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(id)
-  const listbox = page.getByRole('listbox', { name: 'Modelos' })
-  const opt = listbox.locator(`[role=option][data-model="${id}"]`)
-  await opt.first().waitFor({ timeout: 15_000 })
-  await opt.first().click()
-  await listbox.waitFor({ state: 'detached', timeout: 5000 })
+async function pickModel(combobox: Locator, id: string, provider?: string): Promise<void> {
+  await pickModelIn(page, combobox, id, { provider })
 }
 
 async function openToolsTab(): Promise<void> {
@@ -958,13 +954,11 @@ async function main(): Promise<void> {
       await expand(panel, 'smart-approve')
       const sec = section()
       await sec.scrollIntoViewIfNeeded()
-      await sec.getByTestId('smart-approve-model').getByRole('combobox').click()
-      await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(CACHE_JUDGE)
-      await page
-        .getByRole('listbox', { name: 'Modelos' })
-        .locator(`[role=option][data-provider="Local OR"][data-model="${CACHE_JUDGE}"]`)
-        .first()
-        .click()
+      await pickModel(
+        sec.getByTestId('smart-approve-model').getByRole('combobox'),
+        CACHE_JUDGE,
+        'Local OR'
+      )
       await sleep(700)
       let cfg = (await chatState()).chat.config
       assert(cfg.smartApprove?.model === CACHE_JUDGE, `juiz ${cfg.smartApprove?.model}`)
@@ -1016,13 +1010,7 @@ async function main(): Promise<void> {
       await sleep(700)
       cfg = (await chatState()).chat.config
       assert(!('cache' in cfg.smartApprove), 'ligado = chave ausente')
-      await sec.getByTestId('smart-approve-model').getByRole('combobox').click()
-      await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(JUDGE)
-      await page
-        .getByRole('listbox', { name: 'Modelos' })
-        .locator(`[role=option][data-provider="Local"][data-model="${JUDGE}"]`)
-        .first()
-        .click()
+      await pickModel(sec.getByTestId('smart-approve-model').getByRole('combobox'), JUDGE, 'Local')
       await sleep(700)
       assert((await chatState()).chat.config.smartApprove?.model === JUDGE, 'juiz restaurado')
     }

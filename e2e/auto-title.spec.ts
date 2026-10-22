@@ -25,6 +25,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { elementShot, pickModel as pickModelIn } from './uiHelpers.ts'
 
 const FAKE_KEY = 'fake-key-auto-title'
 const AGENT = 'fake/agent-1'
@@ -157,7 +158,7 @@ async function shot(name: string): Promise<string> {
 
 async function shotOf(loc: Locator, name: string): Promise<string> {
   const p = join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`)
-  await loc.screenshot({ path: p })
+  await elementShot(page, loc, p) // nunca loc.screenshot() (ver uiHelpers)
   return p
 }
 
@@ -236,13 +237,7 @@ async function currentChat(): Promise<any> {
 }
 
 async function pickModel(combobox: Locator, id: string): Promise<void> {
-  await combobox.click()
-  await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(id)
-  const listbox = page.getByRole('listbox', { name: 'Modelos' })
-  const opt = listbox.locator(`[role=option][data-model="${id}"]`)
-  await opt.first().waitFor({ timeout: 15_000 })
-  await opt.first().click()
-  await listbox.waitFor({ state: 'detached', timeout: 5000 })
+  await pickModelIn(page, combobox, id)
 }
 
 async function openDefaults(): Promise<void> {

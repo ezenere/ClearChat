@@ -21,6 +21,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { elementShot } from './uiHelpers.ts'
 
 const AGENT = 'fake/agent'
 const ROOT = resolve(import.meta.dirname, '..')
@@ -235,7 +236,8 @@ function assert(cond: unknown, msg: string): asserts cond {
 async function shot(name: string, el?: ReturnType<Page['locator']>): Promise<void> {
   await page.waitForTimeout(300)
   const path = join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`)
-  if (el) await el.screenshot({ path })
+  // nunca el.screenshot(): elemento maior que a janela redimensiona a viewport (ver uiHelpers)
+  if (el) await elementShot(page, el, path)
   else await page.screenshot({ path })
 }
 

@@ -26,6 +26,7 @@ import { createServer, type IncomingMessage, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
+import { elementShot, pickModel as pickModelIn } from './uiHelpers.ts'
 
 const FAKE_KEY = 'fake-key-approvals'
 const AGENT = 'fake/agent-1'
@@ -187,7 +188,8 @@ async function shot(name: string): Promise<void> {
 }
 
 async function shotOf(loc: Locator, name: string): Promise<void> {
-  await loc.screenshot({ path: join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`) })
+  // nunca loc.screenshot(): elemento maior que a janela redimensiona a viewport (ver uiHelpers)
+  await elementShot(page, loc, join(SHOTS, `${String(++shotN).padStart(2, '0')}-${name}.png`))
 }
 
 async function read<T = any>(path: string, ...args: unknown[]): Promise<T> {
@@ -251,13 +253,7 @@ async function chatState(): Promise<{ chat: any; msgs: any[] }> {
 }
 
 async function pickModel(combobox: Locator, id: string): Promise<void> {
-  await combobox.click()
-  await page.getByRole('textbox', { name: 'Buscar modelo' }).fill(id)
-  const listbox = page.getByRole('listbox', { name: 'Modelos' })
-  const opt = listbox.locator(`[role=option][data-model="${id}"]`)
-  await opt.first().waitFor({ timeout: 15_000 })
-  await opt.first().click()
-  await listbox.waitFor({ state: 'detached', timeout: 5000 })
+  await pickModelIn(page, combobox, id)
 }
 
 const approvalCard = (): Locator => page.getByTestId('approval-card').last()
