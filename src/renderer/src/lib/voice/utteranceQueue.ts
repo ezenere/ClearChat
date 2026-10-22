@@ -84,6 +84,7 @@ export class UtteranceQueue {
   #onState: ((state: UtteranceState) => void) | undefined
   #queue: VoiceCallUtteranceEvent[] = []
   #current: UtterancePlayer | null = null
+  #currentItem: VoiceCallUtteranceEvent | null = null
   #state: UtteranceState = 'idle'
   #volume = 1
 
@@ -122,6 +123,7 @@ export class UtteranceQueue {
     this.#queue = []
     const cur = this.#current
     this.#current = null
+    this.#currentItem = null
     if (cur) {
       try {
         cur.pause()
@@ -131,6 +133,28 @@ export class UtteranceQueue {
       cur.dispose?.()
     }
     this.#setState('idle')
+  }
+
+  /**
+   * Cancela UMA utterance pelo id (ex.: filler interrompido pela 1ª sentença da resposta): na
+   * fila → só descarta; tocando → pausa/limpa e avança para a seguinte. Id desconhecido = sem efeito.
+   */
+  drop(id: string): void {
+    this.#queue = this.#queue.filter((u) => u.id !== id)
+    if (this.#currentItem?.id !== id) return
+    const cur = this.#current
+    this.#current = null
+    this.#currentItem = null
+    if (cur) {
+      try {
+        cur.pause()
+      } catch {
+        /* player já parado */
+      }
+      cur.dispose?.()
+    }
+    if (!this.#queue.length) this.#setState('idle')
+    else void this.#pump()
   }
 
   async #pump(): Promise<void> {
@@ -143,10 +167,11 @@ export class UtteranceQueue {
     const done = (): void => {
       if (settled) return
       settled = true
-      // só age se este player ainda for o atual (cancel() + enqueue novo tornam o done velho:
-      // o play() interrompido rejeita depois e não pode derrubar quem está tocando agora)
+      // só age se este player ainda for o atual (cancel()/drop() + enqueue novo tornam o done
+      // velho: o play() interrompido rejeita depois e não pode derrubar quem está tocando agora)
       if (this.#current !== player) return
       this.#current = null
+      this.#currentItem = null
       player?.dispose?.()
       if (!this.#queue.length) this.#setState('idle')
       void this.#pump()
@@ -159,6 +184,7 @@ export class UtteranceQueue {
       return
     }
     this.#current = player
+    this.#currentItem = next
     player.volume = this.#volume
     player.onended = done
     player.onerror = done

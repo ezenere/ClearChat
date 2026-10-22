@@ -146,8 +146,11 @@ export function useVoiceCall(): VoiceCallControls {
     queueRef.current = queue
     queue.setVolume(volumeRef.current)
     const off = api.onVoiceCallUtterance?.((e) => queue.enqueue(e))
+    // filler interrompido pela 1ª sentença (ou reset/stop): cancela SÓ essa utterance
+    const offCancel = api.onVoiceCallUtteranceCancel?.((e) => queue.drop(e.id))
     return () => {
       off?.()
+      offCancel?.()
       queue.cancel()
       queueRef.current = null
     }

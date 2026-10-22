@@ -5,6 +5,7 @@ import {
   ALL_CHANNELS,
   IPC,
   VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
@@ -116,7 +117,13 @@ import {
   setVoiceSetting,
   syncLocalModelInstalled
 } from './voice'
-import { clipVoiceId, generateClips, loadClips, type ClipsManifest } from './voice/clips'
+import {
+  clipVoiceId,
+  generateClips,
+  loadClipAudio,
+  loadClips,
+  type ClipsManifest
+} from './voice/clips'
 import { findCatalogEntry } from './voice/catalog'
 import {
   downloadLocalModel,
@@ -289,6 +296,9 @@ export function registerIpc(): void {
       ),
     emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
     emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
+    emitUtteranceCancel: (id) => sendToWindows(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, { id }),
+    clip: (cls, n) =>
+      loadClipAudio(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts), cls, n),
     sessionInfo: (sessionId) => {
       const s = sessionsRepo.get(sessionId)
       return s ? { chatId: s.chatId, depth: s.depth, busy: isBusyStatus(s.status) } : null

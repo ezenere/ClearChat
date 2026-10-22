@@ -268,6 +268,8 @@ export const VOICE_TTS_CLIPS_PROGRESS_CHANNEL = 'voice:tts:clips:progress'
 export const VOICE_CALL_STATE_CHANNEL = 'voice:call:state'
 /** Canal main → renderer com uma utterance falada da chamada (`VoiceCallUtteranceEvent`). */
 export const VOICE_CALL_UTTERANCE_CHANNEL = 'voice:call:utterance'
+/** Canal main → renderer com o cancelamento de uma utterance (`VoiceCallUtteranceCancelEvent`). */
+export const VOICE_CALL_UTTERANCE_CANCEL_CHANNEL = 'voice:call:utterance-cancel'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -676,6 +678,17 @@ export interface VoiceCallUtteranceEvent {
   audio: Uint8Array
   /** MIME do áudio ('audio/wav' | 'audio/mpeg'). */
   mime: string
+  /**
+   * Origem do áudio (timeline/UI; ausente = 'sentence'): sentença da resposta, filler pós-turno
+   * ou interjeição na fala do usuário (clipes `resolveClip` — SPEC → "Chamada de voz").
+   */
+  kind?: 'sentence' | 'filler' | 'interjection'
+}
+
+/** Cancela uma utterance (canal `voice:call:utterance-cancel`) — filler interrompido pela 1ª sentença. */
+export interface VoiceCallUtteranceCancelEvent {
+  /** Id da utterance a cancelar (tocando → pausa e descarta; na fila → só descarta). */
+  id: string
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -953,6 +966,8 @@ export interface ClearApi {
   onVoiceCallState?(cb: (e: VoiceCallState) => void): () => void
   /** Utterances faladas da chamada (canal `voice:call:utterance`); unsubscribe como em `onEvent`. */
   onVoiceCallUtterance?(cb: (e: VoiceCallUtteranceEvent) => void): () => void
+  /** Cancelamento de utterance da chamada (canal `voice:call:utterance-cancel`); unsubscribe como em `onEvent`. */
+  onVoiceCallUtteranceCancel?(cb: (e: VoiceCallUtteranceCancelEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -1031,5 +1046,6 @@ export type FullClearApi = ClearApi &
       | 'onVoiceTtsClipsProgress'
       | 'onVoiceCallState'
       | 'onVoiceCallUtterance'
+      | 'onVoiceCallUtteranceCancel'
     >
   >

@@ -16,6 +16,7 @@ import type {
   TtsSynthResult,
   TtsVoicesView,
   VoiceApi,
+  VoiceCallUtteranceCancelEvent,
   VoiceCallUtteranceEvent,
   VoiceModelInfo,
   VoiceModelProgressEvent,
@@ -2696,7 +2697,12 @@ export function createMockApi(scenario: string): ClearApi {
               timers.push(
                 setTimeout(() => {
                   voiceCallUtteranceListeners.forEach((l) =>
-                    l({ id: `u-mock-${++seq}`, audio: beep(freq, 600), mime: 'audio/wav' })
+                    l({
+                      id: `u-mock-${++seq}`,
+                      audio: beep(freq, 600),
+                      mime: 'audio/wav',
+                      kind: 'sentence'
+                    })
                   )
                 }, at)
               )
@@ -2761,6 +2767,11 @@ export function createMockApi(scenario: string): ClearApi {
     onVoiceCallUtterance: (cb: (e: VoiceCallUtteranceEvent) => void) => {
       voiceCallUtteranceListeners.add(cb)
       return () => voiceCallUtteranceListeners.delete(cb)
+    },
+    onVoiceCallUtteranceCancel: (cb: (e: VoiceCallUtteranceCancelEvent) => void) => {
+      // mock sem fillers/interjeições: o cancelamento nunca dispara, mas o canal existe
+      void cb
+      return () => void 0
     },
     onEvent: (cb) => {
       listeners.add(cb)

@@ -218,6 +218,25 @@ export async function resolveClip(
   return existsSync(path) ? path : null
 }
 
+/**
+ * Bytes prontos de um clipe da voz atual (null = não gerado/ilegível) — consumo da chamada de voz
+ * (fillers/interjeições tocam os `.wav` cacheados; nada é sintetizado no lugar).
+ */
+export async function loadClipAudio(
+  baseDir: string,
+  voiceId: string,
+  cls: string,
+  n: number
+): Promise<{ audio: Uint8Array; mime: string } | null> {
+  const path = await resolveClip(baseDir, voiceId, cls, n)
+  if (!path) return null
+  try {
+    return { audio: await readFile(path), mime: 'audio/wav' }
+  } catch {
+    return null
+  }
+}
+
 // ---------------- geração ----------------
 
 /**

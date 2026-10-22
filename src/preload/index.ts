@@ -3,12 +3,14 @@ import {
   EVENT_CHANNEL,
   IPC,
   VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
   type FullClearApi,
   type TtsClipProgressEvent,
+  type VoiceCallUtteranceCancelEvent,
   type VoiceCallUtteranceEvent,
   type VoiceModelProgressEvent,
   type VoicePartialEvent
@@ -273,6 +275,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_CALL_UTTERANCE_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CHANNEL, listener)
+    }
+  },
+  onVoiceCallUtteranceCancel: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceCallUtteranceCancelEvent): void => cb(event)
+    ipcRenderer.on(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
     }
   }
 }

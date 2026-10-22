@@ -264,6 +264,10 @@ async function boot(): Promise<{ manager: Manager }> {
       emitted.push(new TextDecoder().decode(u.audio))
       queue?.enqueue(u)
     },
+    // fillers/interjeições ficam fora destes testes (clip ausente = nada toca; ver
+    // `e2e/voiceCallActs.test.ts` para os atos de fala curta)
+    emitUtteranceCancel: (id) => queue?.drop(id),
+    clip: async () => null,
     sessionInfo: (sid) => {
       const s = repo.sessionsRepo.get(sid)
       return s ? { chatId: s.chatId, depth: s.depth, busy: machine.isBusyStatus(s.status) } : null
