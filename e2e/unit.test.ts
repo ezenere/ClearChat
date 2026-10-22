@@ -1572,6 +1572,7 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
     acceptEditsInRoot: true,
     memory: { enabled: true, collections: ['c1'], chatMemory: true },
     skills: { enabled: true, disabled: ['pdf'] },
+    voice: { enabled: true, fillers: { enabled: true, prompt: 'F' } },
     // estado do chat (não vai para a persona)
     capturedContext: { main: { text: '- x', updatedAt: 1, by: 'model' } },
     presetId: 'old'
@@ -1592,6 +1593,8 @@ test('persona: snapshot copia os campos de chat, sem cwd por padrão (opcional),
   assert.equal(snap.sandboxBash, true)
   assert.deepEqual(snap.memory?.collections, ['c1'])
   assert.ok(!('chatMemory' in snap.memory!), 'chatMemory legado descartado')
+  assert.equal(snap.voice?.enabled, true)
+  assert.deepEqual(snap.voice?.fillers, { enabled: true, prompt: 'F' })
   assert.ok(!('cwd' in snap) && !('presetId' in snap))
   // cópia profunda: mexer no snapshot não altera o chat
   ;(snap.enabledTools as string[]).push('write_file')

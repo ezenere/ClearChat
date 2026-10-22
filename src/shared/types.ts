@@ -1,5 +1,6 @@
 import type { MemoryConfig, MemoryExtractionResult } from './memory'
 import type { SkillPartMeta, SkillsConfig } from './skills'
+import type { VoiceCallConfig } from './voice'
 import type { AutoTitleRecord } from './autoTitle'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
@@ -226,6 +227,11 @@ export interface ChatConfig {
   memory?: MemoryConfig
   /** Skills (SPEC → Skills). Ausente = desligadas. */
   skills?: SkillsConfig
+  /**
+   * Chamada de voz (SPEC → Áudio → Chamada de voz). Ausente = segue os padrões (campos null herdam
+   * `voiceCallDefaults` global / o próprio chat). Persona via `PRESET_FIELDS`.
+   */
+  voice?: VoiceCallConfig
   /**
    * Smart-Approve: o modelo "juiz" que decide as chamadas dos itens em modo `smart` (aprovar /
    * rejeitar / perguntar ao usuário). Ausente/sem modelo = esses itens perguntam. Ver smartApprove.ts.

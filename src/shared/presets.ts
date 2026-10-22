@@ -5,6 +5,7 @@ import { migrateConfigTools } from './toolRename'
 import { migrateLegacyApprovals, normalizeChatModes } from './approvalPolicy'
 import { normalizeMemoryConfig } from './memory'
 import { normalizeSkillsConfig } from './skills'
+import { normalizeVoiceCallConfig } from './voice'
 
 export type PresetConfig = Partial<ChatConfig>
 
@@ -18,7 +19,8 @@ export const PRESETS_SEEDED_SETTING = 'presetsSeeded'
 
 /**
  * Campos de ChatConfig que uma persona guarda. Ficam de fora: `cwd` (opcional — "incluir
- * diretório raiz") e `presetId` (informativo, do chat). `memory` e `skills` são gravadas normalizadas.
+ * diretório raiz") e `presetId` (informativo, do chat). `memory`, `skills` e `voice` são gravadas
+ * normalizadas.
  */
 export const PRESET_FIELDS = [
   'providerId',
@@ -45,7 +47,8 @@ export const PRESET_FIELDS = [
   'confineToRoot',
   'sandboxBash',
   'memory',
-  'skills'
+  'skills',
+  'voice'
 ] as const satisfies readonly (keyof ChatConfig)[]
 
 export type PresetField = (typeof PRESET_FIELDS)[number]
@@ -84,7 +87,9 @@ export function sanitizePresetConfig(cfg: unknown): PresetConfig {
             ? normalizeMemoryConfig(src[k])
             : k === 'skills'
               ? normalizeSkillsConfig(src[k])
-              : clone(src[k])
+              : k === 'voice'
+                ? normalizeVoiceCallConfig(src[k])
+                : clone(src[k])
   }
   if (out.approvalModes && !Object.keys(out.approvalModes as object).length)
     delete out.approvalModes

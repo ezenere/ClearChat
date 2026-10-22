@@ -21,7 +21,7 @@ Segurança Electron: `contextIsolation: true`, `nodeIntegration: false`, `sandbo
 
 ```sql
 providers(id TEXT PK, name TEXT, base_url TEXT, api_key TEXT, headers_json TEXT DEFAULT '{}', created_at INTEGER)
-settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS), skillsSettings (locais de skills — ver "Skills"), updateDismissedVersion (aviso de versão dispensado — ver "Atualizações"), autoTitle (título automático — ver "Título automático"; sincroniza desde o protocolo 1.4.0), smartApproveDefaults (padrões globais do Smart-Approve: descrição do ambiente, "Aceitar edições dentro da raiz", coleta de contexto, prompts do resumidor — ver "Smart-Approve → Descrição do ambiente e coleta automática de contexto"; sincroniza desde 1.4.0), toolOutputSpillChars (limite de spill — ver "Tools"; sincroniza desde 1.4.0), migration.messageTree (preenchimento único de messages.parent_id — ver "Árvore de mensagens")
+settings(key TEXT PK, value TEXT)                 -- JSON values. keys: defaultProviderId + defaultModel (o par "Modelo padrão"), defaultSystemPrompt, defaultCwd, defaultPresetId, presetsSeeded, migration.toolShellRename, approvalModes, approvalLists, migration.approvalModes, migration.smartApproveItems (ver "Aprovações"), migration.searchIndex (versão das regras do índice FTS), skillsSettings (locais de skills — ver "Skills"), updateDismissedVersion (aviso de versão dispensado — ver "Atualizações"), autoTitle (título automático — ver "Título automático"; sincroniza desde o protocolo 1.4.0), smartApproveDefaults (padrões globais do Smart-Approve: descrição do ambiente, "Aceitar edições dentro da raiz", coleta de contexto, prompts do resumidor — ver "Smart-Approve → Descrição do ambiente e coleta automática de contexto"; sincroniza desde 1.4.0), toolOutputSpillChars (limite de spill — ver "Tools"; sincroniza desde 1.4.0), audioInput, sttSettings, ttsSettings (ditado: microfone/PTT/silêncio/idioma, transcrição e fala — ver "Áudio"), voiceCallDefaults (padrões globais da chamada de voz, herdados por persona/chat — ver "Áudio → Chamada de voz"; os 4 entram no sync no protocolo 1.5.0), migration.messageTree (preenchimento único de messages.parent_id — ver "Árvore de mensagens")
 chats(id TEXT PK, title TEXT, config_json TEXT, main_session_id TEXT, created_at INTEGER, updated_at INTEGER)
 sessions(id TEXT PK, chat_id TEXT, parent_session_id TEXT NULL, parent_tool_call_id TEXT NULL, depth INTEGER,
          model TEXT, title TEXT, task TEXT NULL, status TEXT, created_at INTEGER,
@@ -102,6 +102,7 @@ export interface ChatConfig {
   capturedContext?: CapturedContextState // 0.8.5 estado do chat: { main?, sessions?: { [subsessionId] } } — descrição capturada pelo resumidor (editável); NÃO vai para as personas; sincroniza com a config do chat
   memory?: MemoryConfig         // memória modular (ver "Memória")
   skills?: SkillsConfig         // skills (ver "Skills"); ausente = desligadas
+  voice?: VoiceCallConfig       // chamada de voz (ver "Áudio → Chamada de voz"); ausente = segue os padrões (campos null herdam o global/o chat)
   presetId?: string             // persona de onde o chat veio — só informativo
 }
 export interface SmartApproveConfig { providerId: string | null; model: string | null   // par do juiz (qualquer provedor); sem liga/desliga
@@ -309,7 +310,7 @@ Por chat, o usuário escolhe quais headers de atribuição (`HTTP-Referer` / `X-
 ### Personas (presets de chat) — `src/shared/presets.ts`
 
 Registro de configurações de chat reutilizáveis (tabela `presets`, `presetsRepo` em `repo.ts`, canais `presets:*`).
-- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `approvalModes` (o override por chat; as listas são globais e nunca entram), `acceptEditsInRoot`, `smartApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash`, `smartApprove`, `memory`, `skills` (os dois gravados normalizados) — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
+- `config` é um **snapshot parcial** de `ChatConfig` com só os campos de `PRESET_FIELDS`: `providerId`, `model`, `systemPrompt`, `params`, `enabledTools`, `nativeTools`, `toolsInPrompt`, `toolsPromptText`, `envInPrompt`, `cacheEnabled`, `subagentSystemPrompt`, `approvalModes` (o override por chat; as listas são globais e nunca entram), `acceptEditsInRoot`, `smartApprove`, `appSignature`, `appSignatureCustom`, `contextWindow`, `compactThreshold`, `autoCompact`, `compactPrompt`, `maxToolOutputChars`, `confineToRoot`, `sandboxBash`, `memory`, `skills`, `voice` (os três gravados normalizados) — e `cwd` só se o usuário marcar "Incluir diretório raiz" (desligado por padrão). `presetId`, título e chaves desconhecidas nunca entram (`sanitizePresetConfig`, aplicado no main ao salvar e ao ler).
 - **Campos ausentes seguem os padrões** de "Novos chats" (modelo/system prompt/pasta padrão + `DEFAULT_CHAT_CONFIG`): `applyPreset(base, config)` = base ← persona (params mesclados). `providerId` + `model` são **um par** (`resolvePresetModel` em `src/shared/models.ts`): persona sem modelo → o par padrão (o `providerId` sozinho é ignorado); com modelo e sem `providerId` (antigas) → o modelo no provedor padrão; provedor apagado → o par padrão + aviso no Novo chat e no editor ("O provedor … não existe mais"). Sem `cacheEnabled` na persona → segue o provedor (OpenRouter liga).
 - `snapshotPreset(chatConfig, { includeCwd })` = persona a partir de um chat (snapshot completo dos campos acima). `patchPresetConfig` mescla edições num rascunho (params nulos removem).
 - **Primeira execução** (`presetsRepo.seed()`, chamado em `registerIpc`): cria "Padrão" com config **vazia** (= segue "Novos chats", então mudar o modelo/system prompt padrão continua valendo) e a define em `defaultPresetId`; a flag `presetsSeeded` impede recriá-la depois de apagada. Sem nenhuma persona o app funciona igual (só os padrões).
@@ -1020,6 +1021,77 @@ interface SkillsConfig {
 
 ### Testes
 `e2e/skills.test.ts` (em `npm run test:unit`, só pastas temporárias com home injetada): parse (válido, sem frontmatter, não fechado, YAML ruim, sem name/description, campos extras, CRLF/BOM, blocos), descoberta (precedência, sobrescrita, inválidas, projeto, local desligado, local que é a própria skill, link de pasta, cache por mtime), settings/config/herança, ativas (subconjunto), `list_skills`/`skill_load`/`skill_read` (saídas, limites, corte, confinação com `..`/absoluto/symlink), sandbox (`--ro-bind`), request (desligadas → nada; prompt + tools; subagentes; modo texto), invocação manual (part exato, `_skill` removido em openai/anthropic, edição, compactação, corte, erros). `e2e/skills.spec.ts` (`npm run test:e2e:skills`): app real com provedor falso, userData isolado e **HOME temporária** (o `~/.claude/skills` padrão resolve dentro dela) — Configurações → Skills, list_skills → skill_load → skill_read pelo agente, desligadas → nada, seção da aba Tools, lâmpada → picker → chip → part `<skill>` + card, fila, erro legível, subagentes com/sem, editor de personas; screenshots.
+
+## Áudio — configuração global (contrato — `src/shared/voice.ts`, settings)
+
+Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global e os backends STT/TTS entram em fatias futuras): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` (`src/main/voice.ts`).
+
+### Ditado — entrada de áudio (setting `audioInput`)
+
+```ts
+interface AudioInputSettings {
+  deviceId: string | null        // microfone (deviceId do sistema); null = padrão do sistema
+  pttEnabled: boolean            // push-to-talk: captura só enquanto a tecla/botão estiver pressionada (padrão true)
+  pttKey: string | null          // tecla do PTT (ex.: 'Ctrl+Shift+Space'); null = sem tecla (só clique/segurar no botão)
+  silenceStopEnabled: boolean    // auto-stop por silêncio (padrão true)
+  silenceStopMs: number          // ms de silêncio que encerram a captura (padrão 5000; 0 = ignora o limite)
+  language: string               // idioma do ditado — seletor multilingue (padrão 'pt-BR')
+}
+```
+- `DEFAULT_AUDIO_INPUT` + `normalizeAudioInput` (null/ausente/lixo → padrões): `silenceStopMs: 0` é válido e **preservado** (não vira default; negativo/inválido → 5000, arredondado); booleanos explícitos valem (false não vira default); strings aparadas, vazias/não-string → `null` (ids/teclas) ou `'pt-BR'` (idioma).
+
+### Transcrição (setting `sttSettings`) e fala (setting `ttsSettings`)
+
+```ts
+type SttMode = 'api' | 'local' | 'hybrid'      // padrão 'api'
+type SttLocalEngine = 'whisper.cpp' | 'vosk' | 'nemotron'
+interface SttEndpointConfig { providerId: string | null; baseUrl: string; apiKey: string; model: string }
+interface SttLocalConfig { engine: SttLocalEngine; model: string; installed: boolean }
+interface SttSettings {
+  mode: SttMode                  // padrão 'api'
+  api: SttEndpointConfig         // padrão Groq: baseUrl 'https://api.groq.com/openai/v1', model 'whisper-large-v3-turbo'
+  local: SttLocalConfig | null   // null = nenhum instalado (engine padrão ao instalar: 'whisper.cpp')
+  livePartials: boolean          // transcrição ao vivo melhor-esforço enquanto o usuário fala (padrão true)
+}
+type TtsLocalEngine = 'kokoro' | 'chatterbox'
+interface TtsEndpointConfig { providerId: string | null; baseUrl: string; apiKey: string; model: string; voice: string | null }
+interface TtsSettings {
+  backend: 'api' | 'local'       // padrão 'local' (Kokoro)
+  api: TtsEndpointConfig         // padrão: não configurado (baseUrl/model vazios; voice null = voz padrão da API)
+  local: TtsLocalConfig | null   // null = nenhum instalado (engine padrão ao instalar: 'kokoro'; voice vazia = voz padrão do motor)
+}
+```
+- `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting (a UI mostra mascarada; proteção/máscara do `settings:get` genérico é decidida na fatia de UI).
+- `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, `local` que não é objeto → `null` (e `local: null` salvo é preservado = nenhum instalado), strings aparadas (`apiKey` inclusive).
+
+### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
+
+```ts
+type InterjectionClass = 'ACK' | 'AGREEMENT' | 'ENCOURAGEMENT' | 'THINKING'
+interface InterjectionPolicy {
+  enabled: boolean               // padrão false
+  shadow: boolean                // modo sombra: decide mas não toca (padrão false) — calibra sem interromper
+  cooldownMs: number             // intervalo mínimo entre interjeições (padrão 2500)
+  fireProbability: number        // 0–1, aparado fora da faixa (padrão 0.8)
+  minSpeechMs: number            // fala do usuário antes de poder sair (padrão 700)
+  minPauseMs: number             // pausa do usuário em que pode entrar (padrão 450)
+  classes: InterjectionClass[]   // classes permitidas (padrão: todas; vazia/desconhecidas → todas)
+}
+interface VoiceCallConfig {
+  enabled: boolean | null        // null = segue voiceCallDefaults.enabled (null ≠ false)
+  model: { providerId: string; model: string; params: ChatParams } | null  // null = herda o modelo do chat
+  tools: { enabledTools: ToolName[] | null; maxToolOutputChars: number | null } | null // null (em cada campo) = igual ao chat
+  voicePrompt: string | null     // acréscimo ao system prompt no modo voz; null = sem acréscimo
+  fillers: { enabled: boolean; prompt: string | null } | null  // falas preenchidoras; null = segue o padrão global
+  interjections: InterjectionPolicy | null                      // null = segue o padrão global
+}
+```
+- **Herança persona→chat como `memory`/`skills`**: `voice` entra em `PRESET_FIELDS` (gravado **normalizado** por `sanitizePresetConfig`; chaves desconhecidas descartadas) e `applyPreset` o aplica como os demais campos; o chat herda da persona por snapshot na criação. `voice` ausente = `DEFAULT_VOICE_CALL_CONFIG` = **tudo null** = herda: `enabled`/`fillers`/`interjections` do global, `model`/`tools` do próprio chat (modelo/tools da conversa).
+- Setting global `voiceCallDefaults` = `{ enabled: boolean; interjections: InterjectionPolicy; fillers: { enabled: boolean; prompt: string | null } }` — `DEFAULT_VOICE_CALL_DEFAULTS` = tudo desligado (`DEFAULT_INTERJECTION_POLICY` com todas as classes). É o que os nulls de `ChatConfig.voice` herdam; `normalizeVoiceCallDefaults` completa parciais.
+- `normalizeVoiceCallConfig` (tolerante a null/ausente/lixo; **null preservado** — `enabled: null` ≠ `false`): campos desconhecidos descartados (como os demais normalizadores), mas `model.params` preserva as chaves que não conhece (mesma semântica de `cleanParams` em presets.ts) e zera o que for null/NaN; `model` sem `providerId` **e** `model` não vale (→ null = herda o do chat); `tools.enabledTools` passa por `normalizeToolList` (alias antigos mapeados, sem duplicatas); `maxToolOutputChars` inválido → null (0 válido); prompts sem CR, vazios → null.
+
+### Testes
+`e2e/voice.test.ts` (em `npm run test:unit`): defaults quando null/ausente/lixo (4 settings + config) e round-trip JSON, `silenceStopMs: 0` preservado, `enabled: null` ≠ false (e null ≠ objeto em fillers/interjections), campos desconhecidos descartados com `params` preservados, interjeições (classes vazias → padrão, limites aparados, 0 preservado), `voiceCallDefaults` parcial e a ligação com personas (`PRESET_FIELDS` contém `voice`; `sanitizePresetConfig` copia normalizado; `memory`/`skills` inalterados).
 
 ## Atualizações (aviso de versão nova — `src/shared/updates.ts`, `src/main/updates.ts`, `components/UpdateNotice.tsx`)
 
