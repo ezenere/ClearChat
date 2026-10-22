@@ -32,6 +32,7 @@ import type { UpdateStatus } from '@shared/updates'
 import { createBranchSelects } from '../lib/branchSelects'
 import { canAutoOpen } from '../lib/fileSources'
 import { nextReasoningClock, type ReasoningClock } from '../lib/reasoning'
+import { VOICE_CALL_INACTIVE, type VoiceCallState } from '@shared/voice'
 
 export type View = { kind: 'new' } | { kind: 'chat'; chatId: string; sessionId: string }
 
@@ -244,6 +245,8 @@ interface State {
   update: UpdateStatus | null
   /** Aviso "Atualize <dispositivo> para usar versões de mensagens" dispensado (só nesta execução). */
   outdatedHostsDismissed: boolean
+  /** Chamada de voz (meia-duplex) — espelho do estado do main (`voice:call:state`). */
+  voiceCall: VoiceCallState
 }
 
 interface Actions {
@@ -280,6 +283,14 @@ interface Actions {
     attachments?: AttachmentInfo[],
     skills?: string[]
   ): Promise<boolean>
+  /** Entra na chamada de voz do chat (só sessão principal; erros legíveis viram toast). */
+  startVoiceCall(sessionId: string): Promise<boolean>
+  /** Sai da chamada de voz (idempotente). */
+  stopVoiceCall(): Promise<void>
+  /** Mudo do microfone na chamada (captura pausada). */
+  setVoiceCallMuted(muted: boolean): Promise<void>
+  /** Espelho do estado da chamada (evento `voice:call:state` / retorno dos canais `voice:call:*`). */
+  applyVoiceCallState(state: VoiceCallState): void
   /** Chips "Carregar skill" do composer. */
   setPendingSkills(sessionId: string, names: string[]): void
   /** Abre Configurações → Skills (opcionalmente destacando uma skill). */
@@ -461,6 +472,7 @@ export const useStore = create<Store>()((set, get) => ({
   chatNotices: {},
   update: null,
   outdatedHostsDismissed: false,
+  voiceCall: { ...VOICE_CALL_INACTIVE },
 
   async refreshSync() {
     try {
@@ -594,7 +606,14 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   async boot() {
-    if (!unsubscribe) unsubscribe = api.onEvent((e) => applyEvent(e))
+    if (!unsubscribe) {
+      const offs: (() => void)[] = [api.onEvent((e) => applyEvent(e))]
+      const onVoiceCallState = api.onVoiceCallState
+      if (onVoiceCallState) offs.push(onVoiceCallState((e) => get().applyVoiceCallState(e)))
+      unsubscribe = () => {
+        for (const off of offs) off()
+      }
+    }
     const safe = async <T>(p: () => Promise<T>, fallback: T): Promise<T> => {
       try {
         return await p()
@@ -890,6 +909,45 @@ export const useStore = create<Store>()((set, get) => ({
         if (remote) set((s) => ({ remoteSending: { ...s.remoteSending, [sessionId]: undefined } }))
       })
     return res !== undefined
+  },
+
+  async startVoiceCall(sessionId) {
+    const voice = api.voice
+    if (!voice) return false
+    const session = get().sessions[sessionId]
+    if (session) await get().flushConfig(session.chatId)
+    try {
+      const state = await voice.call.start({ sessionId })
+      set({ voiceCall: state })
+      return true
+    } catch (err) {
+      get().toast(errorMessage(err), 'error')
+      return false
+    }
+  },
+
+  async stopVoiceCall() {
+    const voice = api.voice
+    if (!voice) return
+    try {
+      set({ voiceCall: await voice.call.stop() })
+    } catch (err) {
+      get().toast(errorMessage(err), 'error')
+    }
+  },
+
+  async setVoiceCallMuted(muted) {
+    const voice = api.voice
+    if (!voice) return
+    try {
+      set({ voiceCall: await voice.call.mute({ muted }) })
+    } catch (err) {
+      get().toast(errorMessage(err), 'error')
+    }
+  },
+
+  applyVoiceCallState(state) {
+    set({ voiceCall: state })
   },
 
   setPendingSkills(sessionId, names) {

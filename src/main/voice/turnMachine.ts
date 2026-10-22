@@ -125,6 +125,15 @@ export class VoiceTurnMachine {
     this.#flushPending()
   }
 
+  /**
+   * Uma mensagem do usuário entrou na sessão (turno falado, digitado ou drenado da fila): o
+   * agente vai responder — vale para a UI ("Pensando…") e para a fila de turnos de voz.
+   */
+  responseBegan(): void {
+    if (!this.#active) return
+    this.#responseInFlight = true
+  }
+
   /** O envio da mensagem falhou (fila/recusa externa): o turno volta ao repouso, sem pendente. */
   sendFailed(): void {
     this.#responseInFlight = false

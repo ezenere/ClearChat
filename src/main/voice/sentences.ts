@@ -9,7 +9,7 @@
 //   (flush do fim da resposta; em streaming o fim do buffer pode continuar "Dr. Silva");
 // - `.` NÃO corta: entre dígitos (decimal "3.14"), quando o trecho desde a última fronteira é só
 //   um número ("1." de lista) ou quando a última palavra é uma abreviação pt-BR comum ("ex.",
-//   "etc.", "Dr.", "p.ex."…);
+//   "etc.", "Dr.", "p.ex."…) — exceto no fim do buffer com `final: true` (é o fim da resposta);
 // - sem fronteira há muito tempo: corte forçado no último espaço antes de `maxChars` (padrão 240)
 //   — resposta sem pontuação nunca espera o fim inteiro para começar a falar.
 export interface SentenceSplit {
@@ -86,9 +86,20 @@ function trailingToken(seg: string): string {
   return m ? m[0].toLowerCase() : ''
 }
 
-/** `.` na posição `i` é fronteira? (decimais, marcadores de lista e abreviações não cortam). */
-function dotCuts(buffer: string, i: number, segStart: number): boolean {
-  if (i > 0 && isDigit(buffer[i - 1]) && i + 1 < buffer.length && isDigit(buffer[i + 1])) return false
+/**
+ * `.` na posição `i` é fronteira? (decimais, marcadores de lista e abreviações não cortam).
+ * `atEnd` (fim do buffer com `final: true`) corta SEMPRE — no fim da resposta "Etc." é o fim.
+ */
+function dotCuts(
+  buffer: string,
+  i: number,
+  segStart: number,
+  atEnd: boolean,
+  final: boolean
+): boolean {
+  if (atEnd && final) return true
+  if (i > 0 && isDigit(buffer[i - 1]) && i + 1 < buffer.length && isDigit(buffer[i + 1]))
+    return false
   const seg = buffer.slice(segStart, i)
   if (/^\d+$/.test(seg.trim())) return false // "1." / "2." de lista numerada
   const token = trailingToken(seg)
@@ -98,6 +109,7 @@ function dotCuts(buffer: string, i: number, segStart: number): boolean {
 /**
  * Corta as sentenças completas de `buffer`. `final: true` trata o fim do buffer como fronteira
  * (flush do fim da resposta); `maxChars` limita o `rest` acumulado (corte forçado em espaço).
+ * `rest` volta sem espaço à esquerda (o que vem depois de um corte é início de sentença).
  */
 export function splitSentences(
   buffer: string,
@@ -115,16 +127,17 @@ export function splitSentences(
       i++
       continue
     }
-    if (buffer[i] === '.' && !dotCuts(buffer, i, segStart)) {
-      i++
-      continue
-    }
-    // marca (+ marcas repetidas) + fechos
+    // marca (+ marcas repetidas) + fechos; fronteira = espaço depois (ou o fim, com `final`)
     let j = i
     while (j < buffer.length && isMark(buffer[j])) j++
     while (j < buffer.length && isCloser(buffer[j])) j++
-    const boundary = j >= buffer.length ? !!opts.final : /\s/.test(buffer[j])
+    const atEnd = j >= buffer.length
+    const boundary = atEnd ? !!opts.final : /\s/.test(buffer[j])
     if (!boundary) {
+      i++
+      continue
+    }
+    if (buffer[i] === '.' && !dotCuts(buffer, i, segStart, atEnd, !!opts.final)) {
       i++
       continue
     }
@@ -148,5 +161,5 @@ export function splitSentences(
     if (forced) sentences.push(forced)
     rest = rest.slice(cut)
   }
-  return { sentences, rest }
+  return { sentences, rest: rest.trimStart() }
 }

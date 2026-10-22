@@ -16,6 +16,7 @@ import type {
   TtsSynthResult,
   TtsVoicesView,
   VoiceApi,
+  VoiceCallUtteranceEvent,
   VoiceModelInfo,
   VoiceModelProgressEvent,
   VoicePartialEvent,
@@ -28,14 +29,17 @@ import {
   DEFAULT_STT_SETTINGS,
   DEFAULT_TTS_SETTINGS,
   DEFAULT_VOICE_CALL_DEFAULTS,
+  VOICE_CALL_INACTIVE,
   normalizeAudioInput,
   normalizeSttSettings,
   normalizeTtsSettings,
   normalizeVoiceCallDefaults,
+  resolveTurnSilenceMs,
   type SttLocalEngine,
   type SttSettings,
   type TtsLocalEngine,
-  type TtsSettings
+  type TtsSettings,
+  type VoiceCallState
 } from '@shared/voice'
 import type { UpdateStatus } from '@shared/updates'
 import { OFFICIAL_SYNC_URL, type SyncStatus } from '@shared/sync'
@@ -157,6 +161,9 @@ export function createMockApi(scenario: string): ClearApi {
   const voiceModelListeners = new Set<(e: VoiceModelProgressEvent) => void>()
   // progresso da geração de clipes de voz (canal `voice:tts:clips:progress`)
   const voiceTtsClipListeners = new Set<(e: TtsClipProgressEvent) => void>()
+  // estado da chamada de voz (canal `voice:call:state`) + utterances faladas (`voice:call:utterance`)
+  const voiceCallStateListeners = new Set<(e: VoiceCallState) => void>()
+  const voiceCallUtteranceListeners = new Set<(e: VoiceCallUtteranceEvent) => void>()
   // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
   ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
 
@@ -2635,6 +2642,103 @@ export function createMockApi(scenario: string): ClearApi {
               }))
             })
           }
+        })(),
+        // Chamada de voz (mock): máquina de turnos simulada — `turn(text)` "responde" com 2
+        // utterances (wav curto gerado aqui) emitidas em ordem; barge-in descarta a fala pendente
+        // e `playbackIdle` (do `UtteranceQueue` real, tocando os beeps) devolve ao "Ouvindo…".
+        call: ((): VoiceApi['call'] => {
+          let state: VoiceCallState = { ...VOICE_CALL_INACTIVE }
+          let seq = 0
+          let timers: ReturnType<typeof setTimeout>[] = []
+          const setState = (patch: Partial<VoiceCallState>): VoiceCallState => {
+            state = { ...state, ...patch }
+            voiceCallStateListeners.forEach((l) => l({ ...state }))
+            return { ...state }
+          }
+          const clearTimers = (): void => {
+            timers.forEach(clearTimeout)
+            timers = []
+          }
+          /** wav PCM16 mono 16 kHz curto (senoide) — o `UtteranceQueue` toca de verdade. */
+          const beep = (freq: number, ms: number): Uint8Array => {
+            const rate = 16000
+            const n = Math.round((rate * ms) / 1000)
+            const buf = new ArrayBuffer(44 + n * 2)
+            const v = new DataView(buf)
+            const ascii = (o: number, s: string): void => {
+              for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i))
+            }
+            ascii(0, 'RIFF')
+            v.setUint32(4, 36 + n * 2, true)
+            ascii(8, 'WAVE')
+            ascii(12, 'fmt ')
+            v.setUint32(16, 16, true)
+            v.setUint16(20, 1, true)
+            v.setUint16(22, 1, true)
+            v.setUint32(24, rate, true)
+            v.setUint32(28, rate * 2, true)
+            v.setUint16(32, 2, true)
+            v.setUint16(34, 16, true)
+            ascii(36, 'data')
+            v.setUint32(40, n * 2, true)
+            for (let i = 0; i < n; i++)
+              v.setInt16(
+                44 + i * 2,
+                Math.round(Math.sin((2 * Math.PI * freq * i) / rate) * 6000),
+                true
+              )
+            return new Uint8Array(buf)
+          }
+          const speak = (sentences: number[]): void => {
+            setState({ phase: 'speaking' })
+            let at = 150
+            for (const freq of sentences) {
+              timers.push(
+                setTimeout(() => {
+                  voiceCallUtteranceListeners.forEach((l) =>
+                    l({ id: `u-mock-${++seq}`, audio: beep(freq, 600), mime: 'audio/wav' })
+                  )
+                }, at)
+              )
+              at += 1000
+            }
+          }
+          return {
+            start: async ({ sessionId }: { sessionId: string }) => {
+              if (state.active) throw new Error('Já existe uma chamada de voz ativa.')
+              state = {
+                ...VOICE_CALL_INACTIVE,
+                active: true,
+                chatId: 'c1',
+                sessionId,
+                turnSilenceMs: resolveTurnSilenceMs(null, audioInput)
+              }
+              voiceCallStateListeners.forEach((l) => l({ ...state }))
+              return { ...state }
+            },
+            stop: async () => {
+              clearTimers()
+              state = { ...VOICE_CALL_INACTIVE }
+              voiceCallStateListeners.forEach((l) => l({ ...state }))
+              return { ...state }
+            },
+            mute: async ({ muted }: { muted: boolean }) => setState({ muted }),
+            speechBegin: async () => setState({ phase: 'listening' }),
+            speechEnd: async () => setState({ phase: 'transcribing' }),
+            turn: async ({ text }: { text: string }) => {
+              clearTimers()
+              if (!text.trim()) return setState({ phase: 'listening' })
+              const s = setState({ phase: 'thinking' })
+              timers.push(setTimeout(() => speak([440, 330]), 700))
+              return s
+            },
+            playbackIdle: async () =>
+              state.phase === 'speaking' ? setState({ phase: 'listening' }) : { ...state },
+            bargeIn: async () => {
+              clearTimers()
+              return setState({ phase: 'listening' })
+            }
+          }
         })()
       }
     })(),
@@ -2649,6 +2753,14 @@ export function createMockApi(scenario: string): ClearApi {
     onVoiceTtsClipsProgress: (cb: (e: TtsClipProgressEvent) => void) => {
       voiceTtsClipListeners.add(cb)
       return () => voiceTtsClipListeners.delete(cb)
+    },
+    onVoiceCallState: (cb: (e: VoiceCallState) => void) => {
+      voiceCallStateListeners.add(cb)
+      return () => voiceCallStateListeners.delete(cb)
+    },
+    onVoiceCallUtterance: (cb: (e: VoiceCallUtteranceEvent) => void) => {
+      voiceCallUtteranceListeners.add(cb)
+      return () => voiceCallUtteranceListeners.delete(cb)
     },
     onEvent: (cb) => {
       listeners.add(cb)

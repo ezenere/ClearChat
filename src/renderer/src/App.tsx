@@ -10,6 +10,7 @@ import { CHAT_MIN_WIDTH, useWidth } from './components/viewer/viewerLayout'
 import { SettingsModal } from './components/SettingsModal'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
+import { VoiceCallDock } from './components/voice/VoiceCallDock'
 import { SyncPrompts } from './components/sync/ChatHost'
 import { Spinner } from './components/ui/controls'
 import { TooltipProvider } from './components/ui/Tooltip'
@@ -157,6 +158,7 @@ function App(): React.JSX.Element {
         </div>
       )}
       <Toasts />
+      <VoiceCallDock />
     </TooltipProvider>
   )
 }

@@ -43,6 +43,7 @@ import {
   splitDictationEdit
 } from '../../lib/voice/dictation'
 import { MicButton } from '../voice/MicControls'
+import { VoiceCallButton } from '../voice/VoiceCallButton'
 import { Waveform } from '../voice/Waveform'
 
 /** Estado do agente na barra do composer; recolhido, só o ponto (o texto vai no tooltip). */
@@ -222,6 +223,8 @@ export function Composer({
     onFinal: (spoken) => setText((t) => mergeDictationDraft(t, spoken))
   })
   const dictating = dictation.state !== 'idle'
+  /** Chamada de voz ativa nesta sessão: o microfone do ditado some (um de cada vez). */
+  const callActive = useStore((s) => s.voiceCall.active && s.voiceCall.sessionId === session.id)
 
   useEffect(() => {
     if (autoFocus) ref.current?.focus()
@@ -464,7 +467,8 @@ export function Composer({
                     </Tip>
                   )}
                   {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
-                  {!blocked && <MicButton dictation={dictation} />}
+                  {!blocked && !callActive && <MicButton dictation={dictation} />}
+                  {!blocked && <VoiceCallButton session={session} />}
                   {dictating && (
                     <Waveform
                       level={dictation.level}

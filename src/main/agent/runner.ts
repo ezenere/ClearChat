@@ -1083,7 +1083,11 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   }
 
   // ---- modo texto (sem tools nativas) ----
-  if (!reqChat.config.nativeTools && availableTools(reqChat, session, history).length && acc.content) {
+  if (
+    !reqChat.config.nativeTools &&
+    availableTools(reqChat, session, history).length &&
+    acc.content
+  ) {
     const parsed = parseTextToolCalls(acc.content, availableTools(reqChat, session, history))
     if (parsed.length) {
       const parts: string[] = []
@@ -2470,11 +2474,7 @@ function runSiblingExchanges(
   let items = [...direct, ...broadcasts.values()]
   if (only) items = items.filter((it) => it.from.id === only || it.to.some((t) => t.id === only))
   return {
-    content: formatSiblingExchanges(
-      items,
-      chat.id,
-      toolOutputLimit(chat, session)
-    ),
+    content: formatSiblingExchanges(items, chat.id, toolOutputLimit(chat, session)),
     status: 'ok'
   }
 }

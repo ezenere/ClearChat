@@ -4,7 +4,13 @@
 // `undefined` nos writers) e pronto para sincronizar — o sync dessas configurações entra no
 // protocolo 1.5.0 (fatia futura). A UI, a captura de áudio e os backends STT/TTS entram em fatias
 // futuras. Ver SPEC.md → "Áudio".
-import { normalizeToolList, type Chat, type ChatConfig, type ChatParams, type ToolName } from './types'
+import {
+  normalizeToolList,
+  type Chat,
+  type ChatConfig,
+  type ChatParams,
+  type ToolName
+} from './types'
 
 // ---------------- settings keys (tabela `settings`, JSON; ver SPEC → Banco) ----------------
 

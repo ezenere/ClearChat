@@ -1,0 +1,499 @@
+// Chamada de voz (meia-duplex) — unidades puras: resolução do `VoiceCallConfig` com herança
+// (persona→chat→global), silêncio que encerra o turno, chat efetivo do turno (`applyVoiceCallChat`),
+// corte de sentença do TTS (`splitSentences`), máquina de estados do turno (`VoiceTurnMachine`),
+// fila de utterances (`UtteranceQueue`, com player fake) e porta de fala (`UtteranceGate`).
+// Rodar: node --import ./e2e/ts-hooks.mjs --test e2e/voiceCall.test.ts
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import {
+  DEFAULT_TURN_SILENCE_MS,
+  DEFAULT_VOICE_CALL_DEFAULTS,
+  applyVoiceCallChat,
+  normalizeVoiceCallDefaults,
+  resolveTurnSilenceMs,
+  resolveVoiceCallConfig,
+  type VoiceCallConfig
+} from '@shared/voice'
+import type { Chat, ChatConfig } from '@shared/types'
+import { splitSentences, DEFAULT_SENTENCE_MAX_CHARS } from '../src/main/voice/sentences.ts'
+import { VoiceTurnMachine } from '../src/main/voice/turnMachine.ts'
+import {
+  UtteranceQueue,
+  type UtterancePlayer
+} from '../src/renderer/src/lib/voice/utteranceQueue.ts'
+import { UtteranceGate } from '../src/renderer/src/lib/voice/utteranceGate.ts'
+
+// ---------------- resolução do VoiceCallConfig (herança persona→chat→global) ----------------
+
+test('resolveVoiceCallConfig: null/ausente herda tudo (enabled/fillers/interjections do global; model/tools do chat)', () => {
+  const r = resolveVoiceCallConfig(null, DEFAULT_VOICE_CALL_DEFAULTS)
+  assert.equal(r.enabled, true)
+  assert.equal(r.model, null, 'model null = herda o modelo do chat')
+  assert.equal(r.tools, null, 'tools null = as do chat')
+  assert.equal(r.voicePrompt, null)
+  assert.deepEqual(r.fillers, DEFAULT_VOICE_CALL_DEFAULTS.fillers)
+  assert.deepEqual(r.interjections, DEFAULT_VOICE_CALL_DEFAULTS.interjections)
+})
+
+test('resolveVoiceCallConfig: enabled null herda o global; false explícito vence (null ≠ false)', () => {
+  const off = { ...DEFAULT_VOICE_CALL_DEFAULTS, enabled: false }
+  assert.equal(resolveVoiceCallConfig({ ...emptyConfig(), enabled: null }, off).enabled, false)
+  assert.equal(resolveVoiceCallConfig({ ...emptyConfig(), enabled: true }, off).enabled, true)
+  assert.equal(
+    resolveVoiceCallConfig({ ...emptyConfig(), enabled: false }, DEFAULT_VOICE_CALL_DEFAULTS)
+      .enabled,
+    false
+  )
+})
+
+test('resolveVoiceCallConfig: fillers/interjections presentes são override (parciais completam com os padrões); null herda o global', () => {
+  const custom = {
+    ...DEFAULT_VOICE_CALL_DEFAULTS,
+    fillers: { enabled: false, prompt: 'fale curto' },
+    interjections: { ...DEFAULT_VOICE_CALL_DEFAULTS.interjections, cooldownMs: 9999 }
+  }
+  const r = resolveVoiceCallConfig(
+    { ...emptyConfig(), fillers: { enabled: true, prompt: null } },
+    custom
+  )
+  assert.deepEqual(r.fillers, { enabled: true, prompt: null }, 'override vence o global')
+  const r2 = resolveVoiceCallConfig(emptyConfig(), custom)
+  assert.equal(r2.fillers.prompt, 'fale curto')
+  assert.equal(r2.interjections.cooldownMs, 9999)
+  const r3 = resolveVoiceCallConfig(
+    asConfig({ ...emptyConfig(), interjections: { cooldownMs: 100 } }),
+    custom
+  )
+  assert.equal(r3.interjections.cooldownMs, 100, 'parcial completado')
+  assert.equal(r3.interjections.enabled, true, 'campos ausentes completam com o padrão')
+})
+
+test('resolveVoiceCallConfig: model/tools passam pelo normalizador (model sem providerId+model → null)', () => {
+  const ok = resolveVoiceCallConfig(
+    asConfig({
+      ...emptyConfig(),
+      model: { providerId: 'p2', model: 'm-voz', params: { temperature: 0.2 } },
+      tools: { enabledTools: ['shell'], maxToolOutputChars: 500 }
+    }),
+    DEFAULT_VOICE_CALL_DEFAULTS
+  )
+  assert.deepEqual(ok.model, { providerId: 'p2', model: 'm-voz', params: { temperature: 0.2 } })
+  assert.deepEqual(ok.tools, { enabledTools: ['shell'], maxToolOutputChars: 500 })
+  const broken = resolveVoiceCallConfig(
+    asConfig({ ...emptyConfig(), model: { providerId: '', model: 'm', params: {} } }),
+    DEFAULT_VOICE_CALL_DEFAULTS
+  )
+  assert.equal(broken.model, null, 'model incompleto não vale (herda o do chat)')
+})
+
+// ---------------- silêncio que encerra o turno ----------------
+
+test('resolveTurnSilenceMs: explícito vale; null segue audioInput; 0/desligado cai no fallback', () => {
+  assert.equal(
+    resolveTurnSilenceMs(
+      { silenceStopMs: 1500 },
+      { silenceStopEnabled: true, silenceStopMs: 5000 }
+    ),
+    1500
+  )
+  assert.equal(
+    resolveTurnSilenceMs(
+      { silenceStopMs: null },
+      { silenceStopEnabled: true, silenceStopMs: 5000 }
+    ),
+    5000
+  )
+  assert.equal(
+    resolveTurnSilenceMs(
+      { silenceStopMs: null },
+      { silenceStopEnabled: false, silenceStopMs: 5000 }
+    ),
+    DEFAULT_TURN_SILENCE_MS,
+    'auto-stop desligado → fallback (na chamada SEMPRE há limite)'
+  )
+  assert.equal(
+    resolveTurnSilenceMs({ silenceStopMs: null }, { silenceStopEnabled: true, silenceStopMs: 0 }),
+    DEFAULT_TURN_SILENCE_MS
+  )
+})
+
+test('normalizeVoiceCallDefaults: turn.silenceStopMs é preservado (> 0) e 0/lixeira vira null', () => {
+  assert.equal(
+    normalizeVoiceCallDefaults({ turn: { silenceStopMs: 3000 } }).turn.silenceStopMs,
+    3000
+  )
+  assert.equal(
+    normalizeVoiceCallDefaults({ turn: { silenceStopMs: 0 } }).turn.silenceStopMs,
+    null,
+    '0 = sem limite não faz sentido no turno → segue audioInput'
+  )
+  assert.equal(normalizeVoiceCallDefaults({ turn: { silenceStopMs: -5 } }).turn.silenceStopMs, null)
+  assert.equal(normalizeVoiceCallDefaults(null).turn.silenceStopMs, null)
+  assert.equal(normalizeVoiceCallDefaults({ turn: {} }).turn.silenceStopMs, null)
+})
+
+// ---------------- chat efetivo do turno (overrides de request) ----------------
+
+const chatWith = (patch: Partial<ChatConfig>): Chat =>
+  ({
+    id: 'c1',
+    title: 't',
+    config: {
+      providerId: 'p1',
+      model: 'm-base',
+      systemPrompt: 'persona',
+      params: { temperature: 0.7 },
+      enabledTools: ['shell', 'read_file'],
+      maxToolOutputChars: 30000,
+      ...patch
+    } as ChatConfig
+  }) as Chat
+
+test('applyVoiceCallChat: voicePrompt/params/tools aplicados na CÓPIA; sem override nada muda', () => {
+  const base = chatWith({})
+  const r = resolveVoiceCallConfig(
+    {
+      ...emptyConfig(),
+      voicePrompt: 'fale em frases curtas',
+      model: { providerId: 'p2', model: 'm-voz', params: { temperature: 0.1 } },
+      tools: { enabledTools: [], maxToolOutputChars: 1000 }
+    },
+    DEFAULT_VOICE_CALL_DEFAULTS
+  )
+  const eff = applyVoiceCallChat(base, r)
+  assert.equal(eff.config.systemPrompt, 'persona\n\nfale em frases curtas')
+  assert.deepEqual(
+    eff.config.params,
+    { temperature: 0.1 },
+    'params do modelo da chamada substituem'
+  )
+  assert.deepEqual(eff.config.enabledTools, [], 'lista vazia = nenhuma tool na chamada')
+  assert.equal(eff.config.maxToolOutputChars, 1000)
+  assert.equal(base.config.systemPrompt, 'persona', 'o chat salvo não é mutado')
+  assert.deepEqual(base.config.params, { temperature: 0.7 })
+
+  const plain = applyVoiceCallChat(
+    base,
+    resolveVoiceCallConfig(emptyConfig(), DEFAULT_VOICE_CALL_DEFAULTS)
+  )
+  assert.deepEqual(plain.config, base.config, 'sem overrides a config é a do chat')
+})
+
+// ---------------- corte de sentença (TTS por sentença) ----------------
+
+test('splitSentences: sentenças completas por marcas; resto fica para o próximo delta', () => {
+  assert.deepEqual(splitSentences('Frase um. Frase dois. Frase três.', { final: true }), {
+    sentences: ['Frase um.', 'Frase dois.', 'Frase três.'],
+    rest: ''
+  })
+  assert.deepEqual(splitSentences('Frase um. Frase'), {
+    sentences: ['Frase um.'],
+    rest: 'Frase'
+  })
+  // sem espaço depois da marca (streaming): espera o próximo delta
+  assert.deepEqual(splitSentences('Frase um.'), { sentences: [], rest: 'Frase um.' })
+  assert.deepEqual(splitSentences('Frase um.', { final: true }), {
+    sentences: ['Frase um.'],
+    rest: ''
+  })
+})
+
+test('splitSentences: marcas repetidas, fechos e interrogações/exclamações', () => {
+  assert.deepEqual(splitSentences('Tá?? Tá! Ok… Segue.', { final: true }).sentences, [
+    'Tá??',
+    'Tá!',
+    'Ok…',
+    'Segue.'
+  ])
+  assert.deepEqual(splitSentences('Ele disse "tá bom." E saiu.', { final: true }).sentences, [
+    'Ele disse "tá bom."',
+    'E saiu.'
+  ])
+})
+
+test('splitSentences: decimais, listas numeradas e abreviações não cortam', () => {
+  assert.deepEqual(splitSentences('O pi é 3.14 mais ou menos.', { final: true }).sentences, [
+    'O pi é 3.14 mais ou menos.'
+  ])
+  assert.deepEqual(
+    splitSentences('1. Primeiro item. 2. Segundo item.', { final: true }).sentences,
+    ['1. Primeiro item.', '2. Segundo item.']
+  )
+  assert.deepEqual(splitSentences('Veja o Dr. Silva amanhã.', { final: true }).sentences, [
+    'Veja o Dr. Silva amanhã.'
+  ])
+  assert.deepEqual(splitSentences('Ex.: isto. Etc.', { final: true }).sentences, [
+    'Ex.: isto.',
+    'Etc.'
+  ])
+})
+
+test('splitSentences: corte forçado por maxChars sem pontuação (latência)', () => {
+  const long = 'palavra '.repeat(80).trim() // ~630 chars sem nenhuma marca
+  const { sentences, rest } = splitSentences(long)
+  assert.equal(sentences.length, 1)
+  assert.ok(sentences[0].length <= DEFAULT_SENTENCE_MAX_CHARS)
+  assert.ok(rest.length > 0, 'o resto fica para os deltas seguintes')
+  // streaming: cada chamada vai serrando o resto
+  let buf = long
+  let out: string[] = []
+  for (let i = 0; i < 10 && buf; i++) {
+    const r = splitSentences(buf)
+    out = out.concat(r.sentences)
+    if (!r.sentences.length) break
+    buf = r.rest
+  }
+  assert.ok(out.join(' ').startsWith('palavra'))
+})
+
+// ---------------- máquina de estados do turno ----------------
+
+test('VoiceTurnMachine: fluxo por silêncio — listening → transcribing → thinking → listening', () => {
+  const sent: string[] = []
+  const m = new VoiceTurnMachine((t) => sent.push(t))
+  m.start(false)
+  assert.equal(m.phase, 'listening')
+  m.speechBegan()
+  assert.equal(m.phase, 'listening', 'usuário falando = "Ouvindo…"')
+  m.speechEnded()
+  assert.equal(m.phase, 'transcribing')
+  m.turnArrived('olá, tudo bem?')
+  assert.deepEqual(sent, ['olá, tudo bem?'])
+  assert.equal(m.phase, 'thinking')
+  m.responseDone()
+  assert.equal(m.phase, 'listening')
+})
+
+test('VoiceTurnMachine: fala durante a resposta vira o PRÓXIMO turno (máx. 1 pendente, falas acumulam)', () => {
+  const sent: string[] = []
+  const m = new VoiceTurnMachine((t) => sent.push(t))
+  m.start(false)
+  m.turnArrived('pergunta')
+  m.speechBegan()
+  m.speechEnded()
+  m.turnArrived('primeira fala') // durante a resposta → pendente
+  m.speechBegan()
+  m.speechEnded()
+  m.turnArrived('segunda fala') // acumula no mesmo pendente
+  assert.equal(m.pendingText, 'primeira fala segunda fala')
+  assert.deepEqual(sent, ['pergunta'], 'nada sai antes do fim da resposta')
+  assert.equal(m.phase, 'thinking')
+  m.responseDone()
+  assert.deepEqual(sent, ['pergunta', 'primeira fala segunda fala'])
+  assert.equal(m.pendingText, '')
+  assert.equal(m.phase, 'thinking', 'o turno pendente já disparou a próxima resposta')
+  m.responseDone()
+  assert.equal(m.phase, 'listening')
+})
+
+test('VoiceTurnMachine: transcrição vazia não vira turno; turnArrived ocioso envia já', () => {
+  const sent: string[] = []
+  const m = new VoiceTurnMachine((t) => sent.push(t))
+  m.start(false)
+  m.speechBegan()
+  m.speechEnded()
+  m.turnArrived('   ')
+  assert.deepEqual(sent, [])
+  assert.equal(m.phase, 'listening')
+  m.turnArrived('direto')
+  assert.deepEqual(sent, ['direto'])
+})
+
+test('VoiceTurnMachine: "Falando…" com utterances; playback-idle devolve ao repouso; barge-in cancela', () => {
+  const m = new VoiceTurnMachine(() => {})
+  m.start(false)
+  m.turnArrived('pergunta')
+  m.synthEnqueued()
+  m.synthEnqueued()
+  assert.equal(m.phase, 'speaking', 'sentenças na síntese já contam como "Falando…"')
+  m.utteranceEmitted()
+  assert.equal(m.phase, 'speaking')
+  m.playbackIdle()
+  assert.equal(m.phase, 'speaking', 'ainda há sentença para emitir')
+  m.utteranceEmitted()
+  m.playbackIdle()
+  assert.equal(m.phase, 'thinking', 'áudio acabou mas a resposta continua')
+  m.synthEnqueued()
+  m.utteranceEmitted()
+  assert.equal(m.phase, 'speaking')
+  m.bargeIn()
+  assert.equal(m.phase, 'listening', 'usuário falou por cima — volta a ouvir')
+  m.responseDone()
+  assert.equal(m.phase, 'listening')
+})
+
+test('VoiceTurnMachine: start com agente ocupado; stop zera tudo', () => {
+  const m = new VoiceTurnMachine(() => {})
+  m.start(true)
+  assert.equal(m.phase, 'thinking')
+  m.stop()
+  assert.equal(m.active, false)
+  assert.equal(m.phase, 'listening')
+  m.turnArrived('ignorado')
+  assert.equal(m.pendingText, '', 'fora da chamada nada é guardado')
+})
+
+// ---------------- fila de utterances (reprodução) ----------------
+
+type FakePlayer = UtterancePlayer & { played: boolean; paused: boolean; id: string }
+
+function fakeFactory(log: string[]): (audio: Uint8Array, mime: string) => UtterancePlayer {
+  let n = 0
+  return (audio, mime) => {
+    const id = `p${++n}:${mime}:${audio.length}`
+    const p: FakePlayer = {
+      id,
+      played: false,
+      paused: false,
+      play() {
+        p.played = true
+        log.push(`play:${id}`)
+      },
+      pause() {
+        p.paused = true
+        log.push(`pause:${id}`)
+      },
+      onended: null,
+      onerror: null,
+      volume: 1
+    }
+    return p
+  }
+}
+
+const utt = (id: string): Parameters<UtteranceQueue['enqueue']>[0] => ({
+  id,
+  audio: new Uint8Array([1, 2, 3]),
+  mime: 'audio/wav'
+})
+
+test('UtteranceQueue: toca na ordem, sem sobreposição; estados idle/playing', () => {
+  const log: string[] = []
+  const states: string[] = []
+  const players: FakePlayer[] = []
+  const q = new UtteranceQueue({
+    playerFactory: (a, m) => {
+      const p = fakeFactory(log)(a, m) as FakePlayer
+      players.push(p)
+      return p
+    },
+    onState: (s) => states.push(s)
+  })
+  q.enqueue(utt('u1'))
+  q.enqueue(utt('u2'))
+  assert.equal(q.state, 'playing')
+  assert.equal(players.length, 1, 'uma utterance por vez')
+  assert.equal(players[0].id.startsWith('p1'), true)
+  assert.equal(q.pending, 1)
+  players[0].onended!()
+  assert.equal(players.length, 2, 'a segunda começa só quando a primeira termina')
+  assert.equal(players[0].paused, false)
+  players[1].onended!()
+  assert.equal(q.state, 'idle')
+  assert.deepEqual(states, ['playing', 'idle'])
+  assert.deepEqual(
+    log.map((l) => l.split(':')[0]),
+    ['play', 'play']
+  )
+})
+
+test('UtteranceQueue: cancel (barge-in) pausa o atual e descarta a fila', () => {
+  const log: string[] = []
+  const players: FakePlayer[] = []
+  const q = new UtteranceQueue({
+    playerFactory: (a, m) => {
+      const p = fakeFactory(log)(a, m) as FakePlayer
+      players.push(p)
+      return p
+    }
+  })
+  q.enqueue(utt('u1'))
+  q.enqueue(utt('u2'))
+  q.enqueue(utt('u3'))
+  q.cancel()
+  assert.equal(players[0].paused, true, 'o atual é pausado')
+  assert.equal(q.state, 'idle')
+  assert.equal(q.pending, 0)
+  assert.equal(players.length, 1, 'a fila foi descartada — nada mais toca')
+})
+
+test('UtteranceQueue: volume propaga ao player atual e aos seguintes', () => {
+  const players: FakePlayer[] = []
+  const q = new UtteranceQueue({
+    playerFactory: (a, m) => {
+      const p = fakeFactory([])(a, m) as FakePlayer
+      players.push(p)
+      return p
+    }
+  })
+  q.setVolume(0.4)
+  q.enqueue(utt('u1'))
+  assert.equal(players[0].volume, 0.4)
+  q.setVolume(2) // fora da faixa é aparado
+  assert.equal(q.volume, 1)
+  players[0].onended!()
+  q.enqueue(utt('u2'))
+  assert.equal(players[1].volume, 1)
+})
+
+test('UtteranceQueue: player que falha pula para a próxima', () => {
+  const players: FakePlayer[] = []
+  let fail = true
+  const q = new UtteranceQueue({
+    playerFactory: (a, m) => {
+      const p = fakeFactory([])(a, m) as FakePlayer
+      players.push(p)
+      if (fail) {
+        fail = false
+        queueMicrotask(() => p.onerror?.())
+      }
+      return p
+    }
+  })
+  q.enqueue(utt('u1'))
+  q.enqueue(utt('u2'))
+  return Promise.resolve().then(async () => {
+    await new Promise((r) => setTimeout(r, 5))
+    assert.equal(players.length, 2, 'a segunda toca apesar da falha da primeira')
+  })
+})
+
+// ---------------- porta de fala (fronteiras do turno) ----------------
+
+test('UtteranceGate: fala começa no quadro acima do limiar e termina após o silêncio contínuo', () => {
+  const g = new UtteranceGate({ threshold: 0.01, silenceMs: 500 })
+  assert.equal(g.push(0.001, 33), null, 'silêncio antes da fala não dispara')
+  assert.equal(g.push(0.05, 33), 'start')
+  assert.equal(g.speaking, true)
+  assert.equal(g.push(0.001, 33), null)
+  assert.equal(g.push(0.02, 33), null, 'um quadro audível zera o silêncio')
+  assert.equal(g.push(0.001, 33), null)
+  assert.equal(g.push(0.001, 400), null, '433 ms ainda não encerram')
+  assert.equal(g.push(0.001, 100), 'end', '533 ms contínuos encerram a fala')
+  assert.equal(g.speaking, false)
+  assert.equal(g.push(0.05, 33), 'start', 'nova fala')
+})
+
+test('UtteranceGate: reset descarta a fala em curso sem disparar end', () => {
+  const g = new UtteranceGate({ threshold: 0.01, silenceMs: 500 })
+  assert.equal(g.push(0.5, 33), 'start')
+  g.reset()
+  assert.equal(g.speaking, false)
+  assert.equal(g.push(0.001, 5000), null, 'sem fala aberta o silêncio não dispara end')
+})
+
+function emptyConfig(): VoiceCallConfig {
+  return {
+    enabled: null,
+    model: null,
+    tools: null,
+    voicePrompt: null,
+    fillers: null,
+    interjections: null
+  }
+}
+
+/** Config "parcial/lixo" para testar a tolerância do normalizador (o resolver aceita unknown). */
+function asConfig(v: unknown): VoiceCallConfig {
+  return v as VoiceCallConfig
+}

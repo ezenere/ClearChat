@@ -213,7 +213,10 @@ export class VoiceCallManager {
    * Overrides de request do turno em andamento (fonte registrada por `setVoiceCallSource`; o
    * runner aplica com `applyVoiceCallConfig`). Null = fora da chamada (turno de texto normal).
    */
-  callContextFor(chat: Pick<Chat, 'id' | 'config'>, session: Pick<Session, 'id' | 'depth'>): ResolvedVoiceCall | null {
+  callContextFor(
+    chat: Pick<Chat, 'id' | 'config'>,
+    session: Pick<Session, 'id' | 'depth'>
+  ): ResolvedVoiceCall | null {
     if (!this.#sessionId || session.id !== this.#sessionId) return null
     if (chat.id !== this.#chatId) return null
     return this.#resolved()
@@ -239,6 +242,7 @@ export class VoiceCallManager {
       if (m.message.role === 'user') {
         // novo turno (falado, digitado ou drenado da fila): a próxima resposta volta a ser falada
         this.#resetResponse()
+        this.#machine.responseBegan()
         return
       }
       if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) {
@@ -314,14 +318,14 @@ export class VoiceCallManager {
     this.#synthQueue = []
     this.#synthAbort?.abort()
     this.#synthAbort = null
-    this.#synthRunning = false
   }
 
   async #pumpSynth(): Promise<void> {
     if (this.#synthRunning) return
     this.#synthRunning = true
+    const runGen = this.#synthGen
     try {
-      while (this.#synthQueue.length) {
+      while (this.#synthQueue.length && runGen === this.#synthGen) {
         const item = this.#synthQueue.shift()!
         const abort = new AbortController()
         this.#synthAbort = abort
@@ -346,7 +350,8 @@ export class VoiceCallManager {
       }
     } finally {
       this.#synthRunning = false
-      this.#synthAbort = null
+      // itens chegaram enquanto a fila foi descartada (ou pump cancelado): retoma
+      if (this.#synthQueue.length) void this.#pumpSynth()
     }
   }
 

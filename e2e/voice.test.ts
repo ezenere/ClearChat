@@ -261,7 +261,8 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
       cooldownMs: 1000,
       classes: ['ACK']
     },
-    fillers: { enabled: true, prompt: 'fale "ãh"' }
+    fillers: { enabled: true, prompt: 'fale "ãh"' },
+    turn: { silenceStopMs: null }
   })
   assert.deepEqual(normalizeVoiceCallDefaults({ fillers: null }), DEFAULT_VOICE_CALL_DEFAULTS)
   // false explícito no fillers global vale (não vira o padrão ligado)
