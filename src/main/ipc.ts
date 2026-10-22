@@ -6,6 +6,7 @@ import {
   IPC,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
+  VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
   type AppCapabilities,
   type ApprovalDecision,
   type AttachmentAddInput,
@@ -19,6 +20,8 @@ import {
   type ProviderPatch,
   type ProviderTestInput,
   type SmartApproveTestInput,
+  type TtsClipsView,
+  type TtsVoicesView,
   type VoiceModelInfo,
   type VoiceSettingKind
 } from '@shared/ipc'
@@ -110,11 +113,11 @@ import {
   setVoiceSetting,
   syncLocalModelInstalled
 } from './voice'
+import { clipVoiceId, generateClips, loadClips, type ClipsManifest } from './voice/clips'
 import { findCatalogEntry } from './voice/catalog'
 import {
   downloadLocalModel,
   listLocalModels,
-  modelsDir,
   removeLocalModel,
   type LocalModelInfo
 } from './voice/models'
@@ -124,6 +127,8 @@ import {
   startTranscribeSession,
   type TranscribeSession
 } from './voice/session'
+import { synthesize, TTS_TEST_PHRASE } from './voice/tts'
+import { createKokoroEngine, type KokoroEngine } from './voice/ttsLocal'
 
 type Handler = (...args: never[]) => unknown
 
@@ -153,8 +158,11 @@ function requireTranscribeSession(sessionId: string): TranscribeSession {
 
 // ---- modelos locais de áudio (SPEC → "Áudio → Componentes locais") ----
 
-/** `<userData>/models` — onde o gerenciador instala os modelos locais de áudio. */
-const localModelsDir = (): string => modelsDir(app.getPath('userData'))
+/**
+ * userData do app — a API de modelos locais recebe o `baseDir` e instala em `<userData>/models`
+ * (o `modelsDir` do gerenciador faz a junção; passar o caminho já montado dobraria o `models`).
+ */
+const localModelsBaseDir = (): string => app.getPath('userData')
 
 /** Downloads de modelos locais em voo por id (cancelamento via `voice:models:cancel`). */
 const localDownloads = new Map<string, AbortController>()
@@ -184,6 +192,37 @@ function requireModelId(input: { id: string } | undefined): string {
   if (!id) throw new Error('Modelo não informado (esperado { id }).')
   return id
 }
+
+// ---- TTS: síntese de fala e clipes (`voice:tts:*` — SPEC → "Áudio → Serviço de TTS") ----
+
+/** Motor local Kokoro (memoizado — mantém a sessão ONNX aquecida entre chamadas). */
+let kokoro: KokoroEngine | null = null
+const ttsLocalEngine = (): KokoroEngine =>
+  (kokoro ??= createKokoroEngine({ baseDir: app.getPath('userData') }))
+
+/** Sugestões livres de vozes para endpoints OpenAI-compatíveis (o campo aceita qualquer id). */
+const TTS_API_VOICES: TtsVoicesView['api'] = [
+  'alloy',
+  'ash',
+  'ballad',
+  'coral',
+  'echo',
+  'fable',
+  'nova',
+  'onyx',
+  'sage',
+  'shimmer'
+].map((id) => ({ id, label: id, engine: null }))
+
+/** Manifest de clipes → visão do renderer (sem o hash da definição, que é interno). */
+const toClipsView = (m: ClipsManifest): TtsClipsView => ({
+  voiceId: m.voiceId,
+  backend: m.backend,
+  engine: m.engine,
+  model: m.model,
+  generatedAt: m.generatedAt,
+  clips: m.clips.map((c) => ({ id: c.id, class: c.class, n: c.n, text: c.text }))
+})
 
 /** Banco + sync para o visualizador de arquivos (fileViewer.ts é sem Electron). */
 const viewerDeps: ViewerDeps = {
@@ -683,7 +722,7 @@ export function registerIpc(): void {
       const v = getVoiceSettings()
       const lang =
         typeof language === 'string' && language.trim() ? language : v.audioInput.language
-      const models = await listLocalModels(localModelsDir())
+      const models = await listLocalModels(localModelsBaseDir())
       return startTranscribeSession(
         { settings: v.stt, language: lang },
         {
@@ -704,7 +743,7 @@ export function registerIpc(): void {
     },
     // ---- modelos locais (catálogo + download/estado em disco) ----
     [IPC.voice.modelsList]: async (): Promise<VoiceModelInfo[]> =>
-      (await listLocalModels(localModelsDir())).map(toModelView),
+      (await listLocalModels(localModelsBaseDir())).map(toModelView),
     [IPC.voice.modelsDownload]: async (input: { id: string }): Promise<VoiceModelInfo | null> => {
       const id = requireModelId(input)
       if (localDownloads.has(id)) throw new Error(`download já em andamento para ${id}`)
@@ -718,7 +757,7 @@ export function registerIpc(): void {
         sendToWindows(VOICE_MODELS_PROGRESS_CHANNEL, { id, bytes, total })
       }
       try {
-        const info = await downloadLocalModel(localModelsDir(), id, {
+        const info = await downloadLocalModel(localModelsBaseDir(), id, {
           signal: controller.signal,
           onProgress: emitProgress
         })
@@ -740,9 +779,52 @@ export function registerIpc(): void {
     },
     [IPC.voice.modelsRemove]: async (input: { id: string }): Promise<void> => {
       const id = requireModelId(input)
-      await removeLocalModel(localModelsDir(), id)
+      await removeLocalModel(localModelsBaseDir(), id)
       const entry = findCatalogEntry(id)
       if (entry) syncLocalModelInstalled(entry, false)
+    },
+
+    // ---- TTS: síntese de fala + clipes de interjeição/filler ----
+    // (a `apiKey` do endpoint de síntese fica no main — os handlers usam `getVoiceSettings()`)
+    [IPC.voice.ttsSynth]: (input: { text: string; format?: 'wav' | 'mp3' }) => {
+      const text = input && typeof input.text === 'string' ? input.text : ''
+      if (!text.trim()) throw new Error('Texto para a síntese de fala está vazio.')
+      return synthesize(
+        {
+          text,
+          settings: getVoiceSettings().tts,
+          format: input.format === 'mp3' ? 'mp3' : 'wav'
+        },
+        { local: ttsLocalEngine() }
+      )
+    },
+    [IPC.voice.ttsTest]: () =>
+      synthesize(
+        { text: TTS_TEST_PHRASE, settings: getVoiceSettings().tts, format: 'wav' },
+        { local: ttsLocalEngine() }
+      ),
+    [IPC.voice.ttsClipsGenerate]: async (): Promise<TtsClipsView> => {
+      const manifest = await generateClips({
+        baseDir: app.getPath('userData'),
+        settings: getVoiceSettings().tts,
+        local: ttsLocalEngine(),
+        onProgress: (e) => sendToWindows(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, e)
+      })
+      return toClipsView(manifest)
+    },
+    [IPC.voice.ttsClipsList]: async (): Promise<TtsClipsView | null> => {
+      const m = await loadClips(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts))
+      return m ? toClipsView(m) : null
+    },
+    [IPC.voice.ttsVoices]: async (): Promise<TtsVoicesView> => {
+      const v = getVoiceSettings().tts
+      // chatterbox: motor ainda sem runtime nesta versão (a lista fica vazia na UI)
+      if (v.local?.engine === 'chatterbox') return { local: [], api: TTS_API_VOICES }
+      const local = await ttsLocalEngine().voices()
+      return {
+        local: local.map((x) => ({ ...x, engine: 'kokoro' as const })),
+        api: TTS_API_VOICES
+      }
     },
 
     // ---- sync ----

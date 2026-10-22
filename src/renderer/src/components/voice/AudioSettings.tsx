@@ -1,14 +1,21 @@
 // Configurações → Áudio: ditado por voz (microfone padrão, push-to-talk com captura de tecla,
-// auto-stop por silêncio, idioma) e transcrição (STT — modo, endpoint de API com chave mascarada,
-// motor local com download real dos modelos, parciais ao vivo). TTS: o heading + a lista de modelos
-// com ações desabilitadas (o download entra na fatia de TTS). Espelha o padrão de "Pesquisa na web"
-// (`WebSearchSettings.tsx`): cada controle grava na hora via `voice:settings:set`; a chave de API é
-// ECOADA mascarada no campo — escrever por cima da máscara preserva a chave real (contrato do main,
-// testado em `e2e/voiceSettings.test.ts`).
-import { Check, Download, KeyRound, TriangleAlert, X } from 'lucide-react'
+// auto-stop por silêncio, idioma), transcrição (STT — modo, endpoint de API com chave mascarada,
+// motor local com download real dos modelos, parciais ao vivo) e fala (TTS — backend API/local,
+// endpoint com chave mascarada, vozes do Kokoro, "Testar voz" e geração dos clipes de
+// interjeição/filler; os pesos do motor baixam pela mesma lista de modelos locais). Espelha o
+// padrão de "Pesquisa na web" (`WebSearchSettings.tsx`): cada controle grava na hora via
+// `voice:settings:set`; as chaves de API são ECOADAS mascaradas nos campos — escrever por cima da
+// máscara preserva a chave real (contrato do main, testado em `e2e/voiceSettings.test.ts`).
+import { Check, Download, KeyRound, Play, TriangleAlert, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import type { VoiceModelInfo } from '@shared/ipc'
-import type { SttLocalConfig, SttMode, SttSettings, TtsSettings } from '@shared/voice'
+import type { TtsSynthResult, TtsVoicesView, VoiceModelInfo } from '@shared/ipc'
+import type {
+  SttLocalConfig,
+  SttMode,
+  SttSettings,
+  TtsLocalEngine,
+  TtsSettings
+} from '@shared/voice'
 import { DEFAULT_AUDIO_INPUT, DEFAULT_STT_SETTINGS, DEFAULT_TTS_SETTINGS } from '@shared/voice'
 import type { AudioInputSettings } from '@shared/voice'
 import { api, errorMessage } from '../../lib/api'
@@ -50,14 +57,46 @@ const STT_MODE_LABELS: Record<SttMode, { label: string; description: string }> =
   hybrid: { label: 'Híbrido', description: 'API com fallback local em falhas de disponibilidade' }
 }
 
+const TTS_BACKEND_LABELS: Record<TtsSettings['backend'], { label: string; description: string }> = {
+  api: {
+    label: 'API',
+    description: 'Endpoint remoto OpenAI-compatível (POST /audio/speech → bytes de áudio)'
+  },
+  local: {
+    label: 'Local',
+    description: 'Motor Kokoro no dispositivo — o texto nunca sai do computador'
+  }
+}
+
+const TTS_ENGINE_LABELS: Record<TtsLocalEngine, string> = {
+  kokoro: 'kokoro (Kokoro-82M, ONNX)',
+  chatterbox: 'chatterbox (runtime em outra fatia)'
+}
+
 export function AudioSettings(): React.JSX.Element | null {
   const voice = api.voice
   const [input, setInput] = useState<AudioInputSettings>(DEFAULT_AUDIO_INPUT)
   const [stt, setStt] = useState<SttSettings>(DEFAULT_STT_SETTINGS)
   const [tts, setTts] = useState<TtsSettings>(DEFAULT_TTS_SETTINGS)
   const [keyDraft, setKeyDraft] = useState('')
+  const [ttsKeyDraft, setTtsKeyDraft] = useState('')
   /** Rascunho do idioma livre ("Outro…") enquanto digita; null = lista comum. */
   const [langDraft, setLangDraft] = useState<string | null>(null)
+  /** Vozs de fala (`voice:tts:voices`): engine local + sugestões livres para a API. */
+  const [ttsVoices, setTtsVoices] = useState<TtsVoicesView>({ local: [], api: [] })
+  /** Estado do "Testar voz" (sintetiza a frase de demonstração e reproduz). */
+  const [ttsTest, setTtsTest] = useState<{
+    state: 'idle' | 'busy' | 'playing'
+    error: string | null
+  }>({ state: 'idle', error: null })
+  /** Estado da geração dos clipes de interjeição/filler. */
+  const [ttsClips, setTtsClips] = useState<{
+    busy: boolean
+    done: number
+    total: number
+    error: string | null
+    count: number | null
+  }>({ busy: false, done: 0, total: 0, error: null, count: null })
   /** Modelos locais (catálogo + estado em disco, `voice:models:list`). */
   const [models, setModels] = useState<VoiceModelInfo[]>([])
   /** Progresso de download por modelo id (evento `voice:models:progress`). */
@@ -78,12 +117,25 @@ export function AudioSettings(): React.JSX.Element | null {
         setStt(all.sttSettings)
         setTts(all.ttsSettings)
         setKeyDraft(all.sttSettings.api.apiKey)
+        setTtsKeyDraft(all.ttsSettings.api.apiKey)
       })
       .catch(() => void 0)
     void voice?.models
       .list()
       .then((list) => {
         if (alive) setModels(list)
+      })
+      .catch(() => void 0)
+    void voice?.tts
+      .voices()
+      .then((view) => {
+        if (alive) setTtsVoices(view)
+      })
+      .catch(() => void 0)
+    void voice?.tts.clips
+      .list()
+      .then((m) => {
+        if (alive) setTtsClips((c) => ({ ...c, count: m ? m.clips.length : 0 }))
       })
       .catch(() => void 0)
     return () => {
@@ -97,6 +149,15 @@ export function AudioSettings(): React.JSX.Element | null {
       api.onVoiceModelProgress?.((e) => {
         setModelProgress((p) => ({ ...p, [e.id]: { bytes: e.bytes, total: e.total } }))
         setModels((ms) => ms.map((m) => (m.id === e.id ? { ...m, state: 'downloading' } : m)))
+      }),
+    []
+  )
+
+  // progresso da geração de clipes (`voice:tts:clips:progress`)
+  useEffect(
+    () =>
+      api.onVoiceTtsClipsProgress?.((e) => {
+        setTtsClips((c) => ({ ...c, busy: true, done: e.done, total: e.total }))
       }),
     []
   )
@@ -140,6 +201,69 @@ export function AudioSettings(): React.JSX.Element | null {
   }
   const saveSttApi = (patch: Partial<SttSettings['api']>): void => {
     commitStt({ ...stt, api: { ...stt.api, ...patch } }, patch.apiKey ?? stt.api.apiKey)
+  }
+
+  // ---- TTS (síntese de fala + clipes) ----
+
+  /** Grava `ttsSettings`; `sentKey` é o que foi de fato enviado no campo da chave (para a máscara). */
+  const commitTts = (next: TtsSettings, sentKey: string): void => {
+    setTts(next)
+    void voice.settings
+      .set('ttsSettings', next)
+      .then((saved) => {
+        setTts(saved)
+        setTtsKeyDraft((d) => (d === sentKey ? saved.api.apiKey : d))
+      })
+      .catch(() => {
+        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
+      })
+  }
+  const saveTts = (patch: Partial<Omit<TtsSettings, 'api'>>): void => {
+    commitTts({ ...tts, ...patch }, tts.api.apiKey)
+  }
+  const saveTtsApi = (patch: Partial<TtsSettings['api']>): void => {
+    commitTts({ ...tts, api: { ...tts.api, ...patch } }, patch.apiKey ?? tts.api.apiKey)
+  }
+
+  /** Recarrega as vozes (`voice:tts:voices`) — a lista local muda com o engine escolhido. */
+  const refreshTtsVoices = (): void => {
+    void voice.tts
+      .voices()
+      .then(setTtsVoices)
+      .catch(() => void 0)
+  }
+
+  /** "Testar voz": sintetiza a frase de demonstração e reproduz (bytes → blob → `<audio>`). */
+  const runTtsTest = (): void => {
+    setTtsTest({ state: 'busy', error: null })
+    void voice.tts
+      .test()
+      .then((r) => {
+        setTtsTest({ state: 'playing', error: null })
+        playTtsAudio(
+          r,
+          () => setTtsTest((s) => ({ ...s, state: 'idle' })),
+          (error) => setTtsTest({ state: 'idle', error })
+        )
+      })
+      .catch((e) => setTtsTest({ state: 'idle', error: errorMessage(e) }))
+  }
+
+  /** "Gerar clipes de voz": pré-gera as falas curtas (interjeições/fillers) da voz atual. */
+  const runTtsClips = (): void => {
+    setTtsClips((c) => ({ ...c, busy: true, done: 0, total: 0, error: null }))
+    void voice.tts.clips
+      .generate()
+      .then((m) =>
+        setTtsClips({
+          busy: false,
+          done: m.clips.length,
+          total: m.clips.length,
+          error: null,
+          count: m.clips.length
+        })
+      )
+      .catch((e) => setTtsClips((c) => ({ ...c, busy: false, error: errorMessage(e) })))
   }
 
   // ---- modelos locais (download/remoção com progresso) ----
@@ -443,31 +567,289 @@ export function AudioSettings(): React.JSX.Element | null {
         </div>
       </section>
 
-      {/* ---- TTS (configuração na fatia de TTS; a lista de modelos já aparece) ---- */}
+      {/* ---- TTS (síntese de fala: API ou motor local Kokoro + clipes) ---- */}
       <section className="border-t border-border pt-4" data-testid="tts-section">
-        <div className="mb-1 flex items-baseline gap-2">
+        <div className="mb-3 flex items-baseline gap-2">
           <span className="text-[13px] font-medium text-fg/90">Fala (TTS)</span>
           <HelpTip label="Fala (TTS)">
             <p>
-              Síntese de fala para a chamada de voz (Feature B). Os contratos de configuração já
-              existem (<code className="font-mono">ttsSettings</code>: backend API/local, Kokoro
-              local por padrão) — o download dos modelos e o falante entram na fatia de TTS.
+              Síntese de fala para a chamada de voz: um endpoint OpenAI-compatível{' '}
+              <code className="font-mono">POST /audio/speech</code> ou o motor local Kokoro (pesos
+              ONNX baixados aqui embaixo). A chave de API fica no banco local e nunca chega à tela —
+              o campo mostra só a máscara.
             </p>
           </HelpTip>
         </div>
-        <p className="text-xs leading-relaxed text-subtle">
-          Configuração completa na próxima fatia. Padrão provisório: motor local Kokoro (não
-          instalado) {tts.backend === 'api' ? '· backend atual: API' : ''}.
-        </p>
-        <LocalModelList
-          kind="tts"
-          models={models}
-          progress={modelProgress}
-          onAction={runModelAction}
-        />
+        <div className="space-y-4">
+          <div>
+            <Label>Backend</Label>
+            <Select
+              value={tts.backend}
+              label="Backend de fala"
+              className="h-8 w-full max-w-[360px]"
+              menuMinWidth={360}
+              onChange={(backend) => saveTts({ backend })}
+              options={(['local', 'api'] as TtsSettings['backend'][]).map((b) => ({
+                value: b,
+                label: TTS_BACKEND_LABELS[b].label,
+                description: TTS_BACKEND_LABELS[b].description
+              }))}
+            />
+          </div>
+          {tts.backend === 'api' ? (
+            <div className="grid grid-cols-2 gap-x-4 gap-y-3">
+              <div>
+                <Label>Endpoint (baseUrl)</Label>
+                <input
+                  type="text"
+                  value={tts.api.baseUrl}
+                  spellCheck={false}
+                  aria-label="Endpoint de síntese de fala (baseUrl)"
+                  data-testid="tts-base-url"
+                  placeholder="https://api.openai.com/v1"
+                  onChange={(e) => setTts({ ...tts, api: { ...tts.api, baseUrl: e.target.value } })}
+                  onBlur={() => saveTtsApi({})}
+                  className="field h-8 px-2 py-0 font-mono text-[12px]"
+                />
+              </div>
+              <div>
+                <Label>Modelo</Label>
+                <input
+                  type="text"
+                  value={tts.api.model}
+                  spellCheck={false}
+                  aria-label="Modelo de síntese de fala"
+                  data-testid="tts-model"
+                  placeholder="gpt-4o-mini-tts"
+                  onChange={(e) => setTts({ ...tts, api: { ...tts.api, model: e.target.value } })}
+                  onBlur={() => saveTtsApi({})}
+                  className="field h-8 px-2 py-0 font-mono text-[12px]"
+                />
+              </div>
+              <div>
+                <Label help="Voz pedida à API (campo livre; as sugestões abaixo são as vozes comuns dos endpoints OpenAI-compatíveis). Vazio = a voz padrão da API.">
+                  Voz
+                </Label>
+                <input
+                  type="text"
+                  list="tts-api-voices"
+                  value={tts.api.voice ?? ''}
+                  spellCheck={false}
+                  aria-label="Voz da síntese de fala"
+                  data-testid="tts-voice"
+                  placeholder="alloy"
+                  onChange={(e) => setTts({ ...tts, api: { ...tts.api, voice: e.target.value } })}
+                  onBlur={() => saveTtsApi({ voice: tts.api.voice?.trim() ? tts.api.voice : null })}
+                  className="field h-8 px-2 py-0 font-mono text-[12px]"
+                />
+                <datalist id="tts-api-voices">
+                  {ttsVoices.api.map((v) => (
+                    <option key={v.id} value={v.id} />
+                  ))}
+                </datalist>
+              </div>
+              <div>
+                <Label help="Chave do endpoint (header Authorization: Bearer). O campo mostra a máscara da chave salva; digitar uma chave nova substitui, limpar o campo remove.">
+                  Chave de API
+                </Label>
+                <ApiKeyField
+                  mask={tts.api.apiKey}
+                  draft={ttsKeyDraft}
+                  onDraft={setTtsKeyDraft}
+                  onCommit={() => saveTtsApi({ apiKey: ttsKeyDraft.trim() })}
+                  what="fala"
+                  testId="tts-api-key"
+                />
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Label className="mb-0">Motor local</Label>
+                <Select
+                  value={tts.local?.engine ?? 'kokoro'}
+                  label="Motor local de fala"
+                  className="h-8 w-[300px]"
+                  menuMinWidth={320}
+                  onChange={(engine) => {
+                    saveTts({
+                      local: {
+                        engine: engine as TtsLocalEngine,
+                        voice: tts.local?.voice ?? '',
+                        installed: tts.local?.installed ?? false
+                      }
+                    })
+                    refreshTtsVoices()
+                  }}
+                  options={(['kokoro', 'chatterbox'] as TtsLocalEngine[]).map((e) => ({
+                    value: e,
+                    label: TTS_ENGINE_LABELS[e]
+                  }))}
+                />
+                <span
+                  className={`rounded-full border px-1.5 py-px text-[10px] leading-4 ${
+                    tts.local?.installed
+                      ? 'border-success/30 text-success'
+                      : 'border-warning/30 text-warning'
+                  }`}
+                >
+                  {tts.local?.installed ? 'instalado' : 'não instalado'}
+                </span>
+              </div>
+              <div>
+                <Label help="Voz do motor local. As vozes pt-BR do Kokoro vêm dos voice packs baixados aqui embaixo (sem o pack instalado, a síntese avisa).">
+                  Voz
+                </Label>
+                <Select
+                  value={tts.local?.voice ?? 'pf_dora'}
+                  label="Voz do motor local"
+                  className="h-8 w-full max-w-[360px]"
+                  menuMinWidth={360}
+                  disabled={(tts.local?.engine ?? 'kokoro') !== 'kokoro'}
+                  onChange={(voice) =>
+                    saveTts({
+                      local: {
+                        engine: tts.local?.engine ?? 'kokoro',
+                        voice,
+                        installed: tts.local?.installed ?? false
+                      }
+                    })
+                  }
+                  options={
+                    ttsVoices.local.length
+                      ? ttsVoices.local.map((v) => ({
+                          value: v.id,
+                          label: v.installed
+                            ? `${v.label} — instalada`
+                            : `${v.label} — baixar abaixo`
+                        }))
+                      : [{ value: 'pf_dora', label: 'pf_dora (padrão)' }]
+                  }
+                />
+                {(tts.local?.engine ?? 'kokoro') !== 'kokoro' && (
+                  <p className="mt-1.5 text-xs leading-relaxed text-subtle">
+                    O runtime do Chatterbox entra numa fatia futura — até lá, use o motor{' '}
+                    <strong>kokoro</strong> ou o backend de API.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ---- testar voz + clipes ---- */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="tts-test"
+              disabled={ttsTest.state !== 'idle'}
+              icon={<Play className="size-3.5" />}
+              onClick={runTtsTest}
+            >
+              {ttsTest.state === 'busy'
+                ? 'Sintetizando…'
+                : ttsTest.state === 'playing'
+                  ? 'Reproduzindo…'
+                  : 'Testar voz'}
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="tts-clips-generate"
+              disabled={ttsClips.busy}
+              onClick={runTtsClips}
+            >
+              Gerar clipes de voz
+            </Button>
+            {ttsClips.busy && (
+              <span
+                className="text-[11px] text-subtle tabular-nums"
+                data-testid="tts-clips-progress"
+              >
+                gerando clipes… {ttsClips.done}/{ttsClips.total || 15}
+              </span>
+            )}
+            {!ttsClips.busy && ttsClips.count !== null && ttsClips.count > 0 && (
+              <span className="text-[11px] text-subtle" data-testid="tts-clips-count">
+                {ttsClips.count} clipes gerados para a voz atual
+              </span>
+            )}
+          </div>
+          <p className="text-xs leading-relaxed text-subtle">
+            Os clipes (interjeições e falas de espera da chamada de voz) são gerados pela voz
+            escolhida e ficam em cache em <code className="font-mono">userData/voice-clips</code> —
+            regenerados sozinhos quando a voz muda.
+          </p>
+          {ttsTest.error && (
+            <div
+              role="alert"
+              data-testid="tts-error"
+              className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+            >
+              <TriangleAlert className="size-3.5 shrink-0" />
+              <span className="min-w-0 flex-1">{ttsTest.error}</span>
+              <button
+                type="button"
+                aria-label="Dispensar erro de síntese de fala"
+                onClick={() => setTtsTest((s) => ({ ...s, error: null }))}
+                className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          )}
+          {ttsClips.error && (
+            <div
+              role="alert"
+              data-testid="tts-clips-error"
+              className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+            >
+              <TriangleAlert className="size-3.5 shrink-0" />
+              <span className="min-w-0 flex-1">{ttsClips.error}</span>
+              <button
+                type="button"
+                aria-label="Dispensar erro de clipes"
+                onClick={() => setTtsClips((c) => ({ ...c, error: null }))}
+                className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+              >
+                <X className="size-3.5" />
+              </button>
+            </div>
+          )}
+          <LocalModelList
+            kind="tts"
+            models={models}
+            progress={modelProgress}
+            onAction={runModelAction}
+          />
+        </div>
       </section>
     </div>
   )
+}
+
+/** Reproduz o áudio sintetizado (bytes → blob → `<audio>`); falhas viram mensagem legível. */
+function playTtsAudio(r: TtsSynthResult, onEnd: () => void, onError: (msg: string) => void): void {
+  try {
+    // cópia: `Uint8Array<ArrayBuffer>` satisfaz `BlobPart` em qualquer origem do buffer
+    const blob = new Blob([new Uint8Array(r.audio)], { type: r.mime })
+    const url = URL.createObjectURL(blob)
+    const el = new Audio(url)
+    el.onended = (): void => {
+      URL.revokeObjectURL(url)
+      onEnd()
+    }
+    el.onerror = (): void => {
+      URL.revokeObjectURL(url)
+      onError('não foi possível reproduzir o áudio sintetizado')
+    }
+    void el.play().catch((e: unknown) => {
+      URL.revokeObjectURL(url)
+      onError(errorMessage(e))
+    })
+  } catch (e) {
+    onError(errorMessage(e))
+  }
 }
 
 /** Campo da chave com máscara ecoada: `type=password`, sem botão "mostrar" (a chave real não sai do main). */
@@ -475,12 +857,18 @@ function ApiKeyField({
   mask,
   draft,
   onDraft,
-  onCommit
+  onCommit,
+  what = 'transcrição',
+  testId = 'stt-api-key'
 }: {
   mask: string
   draft: string
   onDraft: (v: string) => void
   onCommit: () => void
+  /** Rótulo do domínio (transcrição/fala) nos textos de aria/placeholder. */
+  what?: string
+  /** `data-testid` do campo (STT usa o padrão; TTS usa 'tts-api-key'). */
+  testId?: string
 }): React.JSX.Element {
   const [focused, setFocused] = useState(false)
   return (
@@ -491,9 +879,9 @@ function ApiKeyField({
         value={draft}
         spellCheck={false}
         autoComplete="off"
-        aria-label="Chave de API (transcrição)"
-        data-testid="stt-api-key"
-        placeholder={mask ? `${mask} — digite para trocar` : 'Cole a chave da API de transcrição'}
+        aria-label={`Chave de API (${what})`}
+        data-testid={testId}
+        placeholder={mask ? `${mask} — digite para trocar` : `Cole a chave da API de ${what}`}
         onFocus={() => setFocused(true)}
         onChange={(e) => onDraft(e.target.value)}
         onBlur={() => {

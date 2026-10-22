@@ -238,7 +238,12 @@ export const IPC = {
     modelsList: 'voice:models:list',
     modelsDownload: 'voice:models:download',
     modelsCancel: 'voice:models:cancel',
-    modelsRemove: 'voice:models:remove'
+    modelsRemove: 'voice:models:remove',
+    ttsSynth: 'voice:tts:synth',
+    ttsTest: 'voice:tts:test',
+    ttsClipsGenerate: 'voice:tts:clips:generate',
+    ttsClipsList: 'voice:tts:clips:list',
+    ttsVoices: 'voice:tts:voices'
   }
 } as const
 
@@ -248,6 +253,8 @@ export const EVENT_CHANNEL = 'agent:event'
 export const VOICE_PARTIAL_CHANNEL = 'voice:partial'
 /** Canal main → renderer com o progresso de downloads de modelos locais (`VoiceModelProgressEvent`). */
 export const VOICE_MODELS_PROGRESS_CHANNEL = 'voice:models:progress'
+/** Canal main → renderer com o progresso da geração de clipes de voz (`TtsClipProgressEvent`). */
+export const VOICE_TTS_CLIPS_PROGRESS_CHANNEL = 'voice:tts:clips:progress'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -504,6 +511,27 @@ export interface VoiceApi {
     /** Remove o modelo instalado (idempotente). Download em voo para o id → erro legível. */
     remove(input: { id: string }): Promise<void>
   }
+  tts: {
+    /**
+     * Sintetiza `text` com as settings TTS atuais (API OpenAI-compatível `/audio/speech` ou motor
+     * local). Devolve os bytes do áudio + modelo/backend/ms; a chave de API nunca sai do main.
+     */
+    synth(input: { text: string; format?: 'wav' | 'mp3' }): Promise<TtsSynthResult>
+    /** Frase curta de demonstração ("Testar voz" — Configurações → Áudio). */
+    test(): Promise<TtsSynthResult>
+    clips: {
+      /**
+       * Gera os clipes de interjeição/filler da voz atual (cache em `userData/voice-clips`),
+       * emitindo `voice:tts:clips:progress` a cada clipe. Cache válido (mesma voz/definição) é
+       * reutilizado; voz muda → gera no diretório da voz nova.
+       */
+      generate(): Promise<TtsClipsView>
+      /** Cache de clipes da voz atual (null = ainda não gerados). */
+      list(): Promise<TtsClipsView | null>
+    }
+    /** Vozes do motor local atual (com estado de instalação) + sugestões livres para a API. */
+    voices(): Promise<TtsVoicesView>
+  }
 }
 
 /** Estado do modelo local no disco (espelho de `LocalModelState` em `src/main/voice/models.ts`). */
@@ -537,6 +565,67 @@ export interface VoiceModelProgressEvent {
   bytes: number
   /** Total esperado em bytes (0 = desconhecido). */
   total: number
+}
+
+// ---- TTS: síntese de fala e clipes de interjeição/filler (`voice:tts:*`) ----
+
+/** Resultado de uma síntese de fala (`voice:tts:synth`/`voice:tts:test`) — bytes completos. */
+export interface TtsSynthResult {
+  /** Bytes do áudio (wav/mp3). */
+  audio: Uint8Array
+  /** MIME do áudio ('audio/wav' | 'audio/mpeg'). */
+  mime: string
+  /** Modelo usado (endpoint de API ou artefato do motor local). */
+  model: string
+  /** Backend que serviu a síntese. */
+  backend: 'api' | 'local'
+  /** Duração da chamada em ms. */
+  ms: number
+}
+
+/** Voz de fala (`voice:tts:voices`). */
+export interface TtsVoiceInfo {
+  /** Id da voz (`ttsSettings.local.voice` ou `ttsSettings.api.voice`). */
+  id: string
+  label: string
+  /** Motor local da voz; null = sugestão livre para endpoints OpenAI-compatíveis. */
+  engine: TtsLocalEngine | null
+  /** Voz instalada em disco (só vozes locais). */
+  installed?: boolean
+}
+
+/** Vozes para a UI de Fala (TTS): as do motor local atual + sugestões livres para a API. */
+export interface TtsVoicesView {
+  local: TtsVoiceInfo[]
+  api: TtsVoiceInfo[]
+}
+
+/** Progresso da geração de clipes de voz (canal `voice:tts:clips:progress`). */
+export interface TtsClipProgressEvent {
+  /** Clipe pronto (`<CLASSE>_<n>`, ex.: `ACK_2`). */
+  id: string
+  done: number
+  total: number
+}
+
+/** Um clipe gerado (visão serializável de `VoiceClip` em `src/main/voice/clips.ts`). */
+export interface TtsClipInfo {
+  id: string
+  class: string
+  n: number
+  text: string
+}
+
+/** Cache de clipes de uma voz (`voice:tts:clips:list|generate`). */
+export interface TtsClipsView {
+  /** Voz dona do cache (diretório em `userData/voice-clips`). */
+  voiceId: string
+  backend: 'api' | 'local'
+  /** Motor local ('kokoro'); null no backend de API. */
+  engine: string | null
+  model: string
+  generatedAt: string
+  clips: TtsClipInfo[]
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -808,6 +897,8 @@ export interface ClearApi {
   onVoicePartial?(cb: (e: VoicePartialEvent) => void): () => void
   /** Progresso de downloads de modelos locais (canal `voice:models:progress`); unsubscribe como em `onEvent`. */
   onVoiceModelProgress?(cb: (e: VoiceModelProgressEvent) => void): () => void
+  /** Progresso da geração de clipes de voz (canal `voice:tts:clips:progress`); unsubscribe como em `onEvent`. */
+  onVoiceTtsClipsProgress?(cb: (e: TtsClipProgressEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -877,4 +968,6 @@ export interface ClearApi {
 
 /** `ClearApi` com os membros de voz obrigatórios — o que o preload real expõe em `window.api`. */
 export type FullClearApi = ClearApi &
-  Required<Pick<ClearApi, 'voice' | 'onVoicePartial' | 'onVoiceModelProgress'>>
+  Required<
+    Pick<ClearApi, 'voice' | 'onVoicePartial' | 'onVoiceModelProgress' | 'onVoiceTtsClipsProgress'>
+  >

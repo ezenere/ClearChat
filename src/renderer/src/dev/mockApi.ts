@@ -11,6 +11,10 @@ import {
 } from '@shared/skills'
 import type {
   ClearApi,
+  TtsClipsView,
+  TtsClipProgressEvent,
+  TtsSynthResult,
+  TtsVoicesView,
   VoiceApi,
   VoiceModelInfo,
   VoiceModelProgressEvent,
@@ -151,6 +155,8 @@ export function createMockApi(scenario: string): ClearApi {
   const voiceListeners = new Set<(e: VoicePartialEvent) => void>()
   // progresso de download de modelos locais (canal `voice:models:progress`)
   const voiceModelListeners = new Set<(e: VoiceModelProgressEvent) => void>()
+  // progresso da geração de clipes de voz (canal `voice:tts:clips:progress`)
+  const voiceTtsClipListeners = new Set<(e: TtsClipProgressEvent) => void>()
   // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
   ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
 
@@ -2417,11 +2423,12 @@ export function createMockApi(scenario: string): ClearApi {
               kind: 'tts',
               engine: 'kokoro',
               name: 'Kokoro (mock)',
-              description: 'Placeholder de TTS — o download entra na fatia de TTS.',
-              languages: [],
+              description:
+                'Modelo falso de TTS para validar a UI de Fala (download, vozes e clipes).',
+              languages: ['pt-BR'],
               version: '1',
-              sizeBytes: 0,
-              hasDownload: false,
+              sizeBytes: 92_361_116,
+              hasDownload: true,
               state: 'notInstalled',
               installedBytes: null
             }
@@ -2524,6 +2531,110 @@ export function createMockApi(scenario: string): ClearApi {
               syncMockModelSetting(m, false)
             }
           }
+        })(),
+        // TTS (mock): síntese falsa (wav curto), clipes simulados com progresso e vozes
+        tts: ((): VoiceApi['tts'] => {
+          /** wav falso (seno 440 Hz, 0,6 s a 24 kHz) para o "Testar voz" do mock. */
+          const fakeWav = (): Uint8Array => {
+            const samples = 14_400
+            const buf = new Uint8Array(44 + samples * 2)
+            const view = new DataView(buf.buffer)
+            view.setUint32(0, 0x46464952, true) // 'RIFF'
+            view.setUint32(4, 36 + samples * 2, true)
+            view.setUint32(8, 0x45564157, true) // 'WAVE'
+            view.setUint32(12, 0x20746d66, true) // 'fmt '
+            view.setUint32(16, 16, true)
+            view.setUint16(20, 1, true)
+            view.setUint16(22, 1, true)
+            view.setUint32(24, 24_000, true)
+            view.setUint32(28, 48_000, true)
+            view.setUint16(32, 2, true)
+            view.setUint16(34, 16, true)
+            view.setUint32(36, 0x61746164, true) // 'data'
+            view.setUint32(40, samples * 2, true)
+            for (let i = 0; i < samples; i++)
+              view.setInt16(
+                44 + i * 2,
+                Math.round(Math.sin((2 * Math.PI * 440 * i) / 24_000) * 8192),
+                true
+              )
+            return buf
+          }
+          const fakeSynth = async (format?: 'wav' | 'mp3'): Promise<TtsSynthResult> => {
+            await delay(undefined, 350)
+            return {
+              audio: fakeWav(),
+              mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav',
+              model: tts.backend === 'api' ? tts.api.model || 'mock-tts' : 'kokoro (mock)',
+              backend: tts.backend,
+              ms: 350
+            }
+          }
+          let clips: TtsClipsView | null = null
+          return {
+            synth: ({ format }) => fakeSynth(format),
+            test: () => fakeSynth('wav'),
+            clips: {
+              generate: async () => {
+                const voiceId =
+                  tts.backend === 'local'
+                    ? `local-kokoro-${tts.local?.voice || 'pf_dora'}`
+                    : `api-${tts.api.voice || 'padrao'}`
+                clips = {
+                  voiceId,
+                  backend: tts.backend,
+                  engine: tts.backend === 'local' ? 'kokoro' : null,
+                  model: tts.backend === 'api' ? tts.api.model : (tts.local?.voice ?? ''),
+                  generatedAt: new Date().toISOString(),
+                  clips: []
+                }
+                const view = clips
+                const classes = ['ACK', 'AGREEMENT', 'ENCOURAGEMENT', 'THINKING', 'FILLER']
+                const total = classes.length * 3
+                let done = 0
+                for (const cls of classes) {
+                  for (let n = 1; n <= 3; n++) {
+                    await delay(undefined, 60)
+                    view.clips.push({ id: `${cls}_${n}`, class: cls, n, text: `frase ${cls} ${n}` })
+                    done++
+                    voiceTtsClipListeners.forEach((l) => l({ id: `${cls}_${n}`, done, total }))
+                  }
+                }
+                return view
+              },
+              list: async () => clips
+            },
+            voices: async (): Promise<TtsVoicesView> => ({
+              local:
+                tts.local?.engine === 'chatterbox'
+                  ? []
+                  : [
+                      {
+                        id: 'pf_dora',
+                        label: 'Dora (pt-BR, feminina)',
+                        engine: 'kokoro',
+                        installed: true
+                      },
+                      {
+                        id: 'pm_alex',
+                        label: 'Alex (pt-BR, masculina)',
+                        engine: 'kokoro',
+                        installed: false
+                      },
+                      {
+                        id: 'pm_santa',
+                        label: 'Santa (pt-BR, masculina)',
+                        engine: 'kokoro',
+                        installed: false
+                      }
+                    ],
+              api: ['alloy', 'echo', 'nova', 'onyx', 'shimmer'].map((id) => ({
+                id,
+                label: id,
+                engine: null
+              }))
+            })
+          }
         })()
       }
     })(),
@@ -2534,6 +2645,10 @@ export function createMockApi(scenario: string): ClearApi {
     onVoiceModelProgress: (cb: (e: VoiceModelProgressEvent) => void) => {
       voiceModelListeners.add(cb)
       return () => voiceModelListeners.delete(cb)
+    },
+    onVoiceTtsClipsProgress: (cb: (e: TtsClipProgressEvent) => void) => {
+      voiceTtsClipListeners.add(cb)
+      return () => voiceTtsClipListeners.delete(cb)
     },
     onEvent: (cb) => {
       listeners.add(cb)

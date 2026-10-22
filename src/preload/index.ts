@@ -4,7 +4,9 @@ import {
   IPC,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
+  VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
   type FullClearApi,
+  type TtsClipProgressEvent,
   type VoiceModelProgressEvent,
   type VoicePartialEvent
 } from '@shared/ipc'
@@ -165,6 +167,15 @@ const api: FullClearApi = {
       download: (input) => invoke(IPC.voice.modelsDownload, input),
       cancel: (input) => invoke(IPC.voice.modelsCancel, input),
       remove: (input) => invoke(IPC.voice.modelsRemove, input)
+    },
+    tts: {
+      synth: (input) => invoke(IPC.voice.ttsSynth, input),
+      test: () => invoke(IPC.voice.ttsTest),
+      clips: {
+        generate: () => invoke(IPC.voice.ttsClipsGenerate),
+        list: () => invoke(IPC.voice.ttsClipsList)
+      },
+      voices: () => invoke(IPC.voice.ttsVoices)
     }
   },
   sync: {
@@ -227,6 +238,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_MODELS_PROGRESS_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_MODELS_PROGRESS_CHANNEL, listener)
+    }
+  },
+  onVoiceTtsClipsProgress: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: TtsClipProgressEvent): void => cb(event)
+    ipcRenderer.on(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, listener)
     }
   }
 }

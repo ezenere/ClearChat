@@ -276,13 +276,19 @@ interface ClearApi {
               models: { list(): VoiceModelInfo[]          // catálogo de modelos locais + estado em disco (ver "Áudio → Modelos locais por IPC")
                         download(input: { id }): VoiceModelInfo | null   // baixa/verifica/instala (evento voice:models:progress); null = cancelado por cancel; mesmo id em voo → erro legível
                         cancel(input: { id }): void      // aborta e limpa o `.part` (id desconhecido = sem efeito)
-                        remove(input: { id }): void } }  // idempotente; download em voo → erro legível (cancele antes)
+                        remove(input: { id }): void }    // idempotente; download em voo → erro legível (cancele antes)
+              tts:    { synth(input: { text, format? }): TtsSynthResult   // { audio: Uint8Array, mime, model, backend, ms } — ver "Áudio → Serviço de TTS"
+                        test(): TtsSynthResult           // frase curta de demonstração (TTS_TEST_PHRASE) para o "Testar voz"
+                        clips: { generate(): TtsClipsView   // gera os clipes da voz atual (evento voice:tts:clips:progress { id, done, total }); cache idempotente
+                                 list(): TtsClipsView | null }   // cache da voz atual (null = não gerados)
+                        voices(): { local: TtsVoiceInfo[]; api: TtsVoiceInfo[] } } }  // vozes do motor local (installed) + sugestões livres da API
   onVoicePartial(cb: (e: VoicePartialEvent) => void): () => void   // parciais ao vivo (canal voice:partial); unsubscribe como onEvent
   onVoiceModelProgress(cb: (e: VoiceModelProgressEvent) => void): () => void   // progresso de downloads (canal voice:models:progress)
+  onVoiceTtsClipsProgress(cb: (e: TtsClipProgressEvent) => void): () => void   // progresso de clipes (canal voice:tts:clips:progress)
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
-Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`, parciais de voz em `voice:partial` e progresso de modelos locais em `voice:models:progress` (os canais de voz são `voice:settings:get|set`, `voice:transcribe:start|push|stop|cancel` e `voice:models:list|download|cancel|remove` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
+Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`, parciais de voz em `voice:partial`, progresso de modelos locais em `voice:models:progress` e de clipes em `voice:tts:clips:progress` (os canais de voz são `voice:settings:get|set`, `voice:transcribe:start|push|stop|cancel`, `voice:models:list|download|cancel|remove` e `voice:tts:synth|test|clips:generate|clips:list|voices` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
 
 ## Construção da request (`src/main/agent/request.ts` — função pura `buildRequest(chat, session, history, provider)`, usada pelo runner E pelo preview)
 
@@ -1036,7 +1042,7 @@ interface SkillsConfig {
 
 ## Áudio — configuração global (contrato — `src/shared/voice.ts`, settings)
 
-Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global, a inferência local e o TTS entram em fatias futuras; o serviço de transcrição, o gerenciador de componentes locais — ver "Componentes locais (download)" — e a fiação main+preload já existem — ver "Serviço de transcrição (STT)" e "Configuração e sessão de transcrição por IPC" abaixo): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` e gravadas por `setVoiceSetting()` (`src/main/voice.ts`).
+Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global e a inferência local do STT entram em fatias futuras; o serviço de transcrição, o serviço de TTS com os clipes — ver "Serviço de TTS (clipes)" —, o gerenciador de componentes locais — ver "Componentes locais (download)" — e a fiação main+preload já existem — ver "Serviço de transcrição (STT)", "Serviço de TTS (clipes)" e "Configuração e sessão de transcrição por IPC" abaixo): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` e gravadas por `setVoiceSetting()` (`src/main/voice.ts`).
 
 ### Ditado — entrada de áudio (setting `audioInput`)
 
@@ -1075,7 +1081,7 @@ interface TtsSettings {
 }
 ```
 - `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting, mas **nunca sai do main**: `sttSettings`/`ttsSettings` são settings **protegidas** (`PROTECTED_SETTINGS`, como `webSearchApiKeys` — `settings:get/set` genérico responde "Setting protegido.") e o acesso é pelos canais `voice:settings:*`, que devolvem a chave **mascarada** e preservam a chave real quando a UI grava por cima do valor mascarado (ver "Configuração e sessão de transcrição por IPC" abaixo).
-- `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, strings aparadas (`apiKey` inclusive). **TTS `local`**: objeto parcial é completado com `DEFAULT_TTS_LOCAL` (Kokoro; `installed: false` → a UI mostra "não instalado — baixar"; voz vazia → `'pf_dora'`); `local: null` salvo é **preservado** (= o usuário limpou explicitamente); ausente/lixo → o padrão. A voz `'pf_dora'` é **provisória** — o id real do voice pack pt-BR do Kokoro é confirmado na fatia de TTS. **STT `local`** continua `null` = nenhum instalado (ausente/lixo/null → `null`; engine padrão ao normalizar objeto: `'whisper.cpp'`).
+- `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, strings aparadas (`apiKey` inclusive). **TTS `local`**: objeto parcial é completado com `DEFAULT_TTS_LOCAL` (Kokoro; `installed: false` → a UI mostra "não instalado — baixar"; voz vazia → `'pf_dora'`); `local: null` salvo é **preservado** (= o usuário limpou explicitamente); ausente/lixo → o padrão. A voz `'pf_dora'` está **confirmada** (voz pt-BR feminina do Kokoro v1.0, id conferido em `hexgrad/Kokoro-82M` VOICES.md; as outras pt-BR são `pm_alex`/`pm_santa`). **STT `local`** continua `null` = nenhum instalado (ausente/lixo/null → `null`; engine padrão ao normalizar objeto: `'whisper.cpp'`).
 
 ### Serviço de transcrição (STT — `src/main/voice/stt.ts`)
 
@@ -1107,8 +1113,9 @@ Gerenciador dos arquivos dos modelos locais de áudio: catálogo versionado, dow
   - whisper.cpp: `ggml-tiny` (77.691.713 B), `ggml-base` (147.951.465 B), `ggml-small` (487.601.967 B), `ggml-large-v3-turbo` (1.624.555.275 B) — arquivos `.bin` em formato **ggml** (NÃO `.gguf`) em `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/` (fonte usada pelo script oficial `models/download-ggml-model.sh` do whisper.cpp; o `https://huggingface.co/ggml-org/whisper.cpp` citado no `models/README.md` responde 401/404). Licença MIT; sha256 = `lfs.oid` da API `…/api/models/ggerganov/whisper.cpp/tree/main` (confere com o header `x-linked-etag` do download). Linha quantizada (`-q5_1`/`-q8_0`) e `.en` não entram por enquanto.
   - Vosk `vosk-model-small-pt-0.3` (32.453.112 B = Content-Length conferido em 2026-10-22, Apache-2.0) em `https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip` — a fonte **não publica sha256** (`sha256Oficial: null` → verificação por tamanho + magic bytes). O `vosk-model-pt-fb` (GPL-3.0) fica de fora por licença.
   - Nemotron 3.5 ASR Streaming 0.6B (NVIDIA, OpenMDW-1.1): o download é um **GGUF único** Q8_0 (`nemotron-3.5-asr-streaming-0.6b.q8_0.gguf`, 742.090.464 B, sha256 = `lfs.oid` do HF) em `https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b/resolve/main/` → incluído; o checkpoint `.nemo` (2,37 GB) e os demais arquivos do repositório **não são suportados** (o runtime carrega um GGUF por modelo).
-  - TTS `kokoro` (Apache-2.0) e `chatterbox` (MIT): placeholders com `url: null` + nota "preenchido na fatia de TTS" (URL, tamanho, sha256 e idiomas entram com a fatia de TTS; `sizeBytes: 0` = desconhecido).
-- **Verificação** (regra declarada): tamanho **exato** (`sizeBytes`) + magic bytes sempre (`.bin` → `6c 6d 67 67` = magic ggml 0x67676d6c LE; `.gguf` → `GGUF`; `.zip` → `PK\x03\x04`), e sha256 contra `sha256Oficial` quando o catálogo tem um (os únicos sem hash oficial são o Vosk e os placeholders). Falhou → o `.part` é apagado e nada é instalado nem registrado.
+  - TTS **Kokoro** (Apache-2.0) — artefatos da conversão ONNX oficial (`onnx-community/Kokoro-82M-v1.0-ONNX`, Apache-2.0; pesos originais `hexgrad/Kokoro-82M`): `kokoro-onnx` (`onnx/model.onnx`, 325.532.232 B) e `kokoro-onnx-q8` (`onnx/model_quantized.onnx`, 92.361.116 B) + os voice packs pt-BR `kokoro-voice-pf-dora`/`kokoro-voice-pm-alex`/`kokoro-voice-pm-santa` (`voices/<voz>.bin`, 522.240 B cada, tensores de estilos 510×256 fp32). sha256 = `lfs.oid` da API tree do HF (2026-10-22), conferidos também num download real.
+  - TTS **Chatterbox** (MIT) — o fine-tune pt-BR do `ResembleAI/Chatterbox-Multilingual-pt-br` (pack single-language do Chatterbox Multilingual v3): `chatterbox-pt-br-t3` (`t3_pt_br.safetensors`, 2.143.990.296 B) e `chatterbox-pt-br-s3gen` (`s3gen_v3.safetensors`, 1.056.381.804 B); o runtime (e o `grapheme_mtl_merged_expanded_v1.json`) entram numa fatia futura — aqui só os arquivos.
+- **Verificação** (regra declarada): tamanho **exato** (`sizeBytes`) + magic bytes sempre (`.bin` → `6c 6d 67 67` = magic ggml 0x67676d6c LE; `.gguf` → `GGUF`; `.zip` → `PK\x03\x04`), e sha256 contra `sha256Oficial` quando o catálogo tem um (o único sem hash oficial é o Vosk). Artefatos de **TTS não têm magic** (`.onnx`, `.safetensors` e os `voices/*.bin` do Kokoro são tensores crus — o `.bin` de voz NÃO é ggml) e são verificados por tamanho exato + sha256. Falhou → o `.part` é apagado e nada é instalado nem registrado.
 - **Layout/manifest**: `<userData>/models/<arquivo>` (nome = basename da URL); o download corre para `<arquivo>.part` com rename atômico no fim; `manifest.json` = `{ [id]: { version, file, sha256 (calculado do arquivo instalado), size, installedAt } }` (conferível depois contra o arquivo). `readManifest`/`writeManifest` são idempotentes: manifest ausente/ilegível/JSON inválido → renomeado para `manifest.json.bak` e tratado como vazio (a instalação regrava por cima); entradas com campos inválidos (inclusive `file` com separadores) são descartadas; a escrita é atômica (`.tmp` + rename, chaves ordenadas).
 - **API** (`src/main/voice/models.ts`): `listLocalModels(baseDir)` → catálogo + estado (`notInstalled` | `downloading` | `installed` | `corrupt`) + caminho e tamanho do instalado; `downloadLocalModel(baseDir, id, { onProgress(bytes, total), signal, fetch? })`; `removeLocalModel` (idempotente — também limpa `.part` órfão e ids fora do catálogo que o manifest registra); `resolveLocalModelPath`; `readManifest`/`writeManifest`; `verifyModelFile` (checagem profunda, devolve o sha256 calculado). Estados: `installed` = registrado no manifest + arquivo com o tamanho do registro + magic ok (a checagem de lista é **barata** — sha256 profundo é `verifyModelFile`); `corrupt` = arquivo sem registro, registro sem arquivo ou divergência de tamanho/magic; `downloading` = download em voo nesta sessão; `.part` órfão (de crash) não muda o estado (limpo no próximo download/remoção). `downloadLocalModel` é idempotente (instalado → devolve sem baixar; corrompido → baixa por cima), aborta via `signal` limpando o `.part` (propaga `AbortError`), falha no meio limpa o `.part`, e dois downloads do mesmo id em paralelo → erro legível. O `.zip` do Vosk fica como está — a extração é da fatia de runtime.
 
@@ -1134,6 +1141,90 @@ Fiação main+preload para a UI do renderer (SPEC → "API do preload"): setting
 - `voice:models:cancel` `{ id }` aborta o download em voo (o gerenciador limpa o `.part`; id desconhecido/já encerrado = sem efeito). `voice:models:remove` `{ id }` remove arquivo+registro (idempotente); com download em voo → erro legível (cancele antes).
 - **Semântica `installed`/`hasLocalReady` (escolha desta fatia)**: o flag `installed` de `sttSettings.local`/`ttsSettings.local` é um **espelho** mantido em sincronia pelo main ao instalar/remover via `voice:models:*` (a escrita passa por `setVoiceSetting`, a `apiKey` nunca é tocada): **instalar escolhe o modelo como atual** (`local = { engine, model: id, installed: true }`) e **remover o atual derruba o flag** para `false` (a seleção engine/modelo fica — a UI oferece "Baixar novamente"); remover um modelo que não é o atual não mexe nas settings. Já o `hasLocalReady` da sessão de transcrição é derivado da **presença real de modelo instalado** para o engine escolhido (`deriveHasLocalReady`, em `src/main/voice/session.ts`, puro: estado `'installed'` em disco para `sttSettings.local.engine`; `local: null`/corrupt/downloading → false). A **verdade é sempre o disco** — o flag da setting nunca decide.
 - **Pronto = instalado + runtime**: o backend local só está "pronto" (`hasLocalReady` de `chooseSttBackend`) quando o modelo está instalado **e** o motor de inferência (`SttLocalBackend.ready`, outra fatia) existe. Sem runtime (esta versão): as parciais em `hybrid` seguem melhor-esforço pela API e as transcrições que exigem o motor local falham com erro **`SttError` `config` honesto e legível**: modo `local` → "modelo local instalado, mas o motor de inferência local ainda não está disponível nesta versão — use o modo API" (ou "motor local de transcrição não está pronto — nenhum modelo local instalado (baixe em Configurações → Áudio) ou use o modo API" quando nada está instalado); `hybrid` cujo fallback local ficou bloqueado → o erro da API ganha a anotação "— sem fallback local: modelo instalado, mas o motor de inferência local ainda não está disponível nesta versão".
+
+### Serviço de TTS (clipes — `src/main/voice/tts.ts`, `ttsLocal.ts`, `clips.ts`)
+
+Síntese de fala do main: cliente OpenAI-compatível `/audio/speech` + motor local Kokoro (ONNX), com clipes de interjeição/filler pré-gerados em cache para a chamada de voz. Sem Electron/UI/IPC (a fiação está em "Fala (TTS) por IPC" abaixo), dependências injetáveis (motor local, runner do espeak-ng, sessão ONNX) e **sem streaming de áudio** nesta fatia (bytes completos — o streaming é da Feature B).
+
+**`synthesize({ text, settings, format? }, opts)` → `{ audio, mime, model, backend, ms }`** (`format` `'wav' | 'mp3'`, padrão `'wav'`):
+- **API** (`settings.backend === 'api'`): POST **JSON** em `{baseUrl}/audio/speech` com `{ model, voice?, input, response_format }` (`voice` omitida quando null = voz padrão da API; `response_format` = `wav`/`mp3`) e resposta = **bytes de áudio** (`audio/wav`/`audio/mpeg`). Chave no header `Authorization: Bearer …` **só quando há chave** (endpoints locais compatíveis — ex. Kokoro-FastAPI — não exigem chave); a chave nunca sai do serviço. Erros → `TtsError` com a mesma taxonomia/legibilidade do `SttError` (`auth` 401/403, `quota` 429/402, `http` demais 4xx/5xx e 2xx sem áudio — corpo resumido a 160 chars, `network` via `connectionErrorText`, `timeout` 60 s padrão, `config` sem baseUrl/modelo ou texto vazio); abort do `signal` propaga `AbortError` (nunca `TtsError`).
+- **Local** (`settings.backend === 'local'`): motor injetado (`TtsLocalBackend`; o Kokoro real está em `ttsLocal.ts`); sem motor ou com `local: null` nas settings → `TtsError` `config` legível.
+
+**Motor local Kokoro (`ttsLocal.ts`)** — o pipeline do `hexgrad/kokoro` (`model.py`): fonemas → ids por caractere (chars fora do vocabulário caem) → `[0, *ids, 0]` → estilo `voice[min(nº de tokens, 509)]` → `waveform` 24 kHz → wav PCM16:
+- **Pesos do catálogo** (`<userData>/models`, baixados pelo gerenciador de componentes): modelo `kokoro-onnx` (fp32 — **preferida**, a mais rápida em CPU) ou `kokoro-onnx-q8` + voice pack `kokoro-voice-<voz>` (`pf_dora`/`pm_alex`/`pm_santa`; banco de estilos 510×256 fp32). Modelo/voz não instalados → `TtsError` `config` ("baixe os arquivos do Kokoro em Configurações → Áudio"). A sessão ONNX (`onnxruntime-node`, CPU) fica memoizada por modelo.
+- **Fonemização pt-BR**: `espeak-ng` do **SISTEMA** (CLI `--ipa=3`: estresse + ties) + o pós-processamento do misaki (`EspeakG2P`, `version=None` — `ESPEAK_E2M` colapsa os dífonos: 't^ʃ'→'ʧ', 'e^ɪ'→'A'…; ties/hífens removidos; saída em NFD). A pontuação é preservada (o texto é partido nas marcas e elas voltam entre os fragmentos — o CLI a perde). Validado byte a byte contra o `phonemizer` python que o misaki usa. Sem `espeak-ng` no sistema → `TtsError` `config` com o pacote a instalar (o app **não** embute o espeak-ng, que é GPL — é chamado como ferramenta externa, como o `git`).
+- **`mp3` no motor local** → `TtsError` `config` (só a API devolve mp3; o local gera wav 24 kHz mono).
+- **Spike real (2026-10-22, máquina de dev, CPU — pesos do catálogo baixados pelas URLs acima, sha256 = `lfs.oid` conferido)**: "Olá, isto é um teste." → áudio de 1,68 s. **fp32** (`model.onnx`): síntese **172–183 ms** (RTF ~0,11) + carregamento da sessão ~260 ms; **q8** (`model_quantized.onnx`): 836–903 ms (RTF ~0,5) — a fp32 é ~4,5× mais rápida em CPU (a q8 é download/disco ~3,5× menores). As 3 vozes pt-BR sintetizam com picos ~0,5/rms ~0,07; frases curtas dos clipes (0,75–2,7 s de áudio) saem em 83–271 ms cada. Download único dos pesos: 325,5 MB (fp32) ou 92,4 MB (q8).
+
+**Clipes de interjeição/filler (`clips.ts`)** — falas curtas pré-geradas **pela voz configurada** e cacheadas para a Feature B (latência zero depois de prontos):
+- **Catálogo de frases** (`CLIP_PHRASES`, pt-BR, 3 variantes por classe): `ACK` ("Uhum.", "Aham.", "Entendi."), `AGREEMENT` ("Sim.", "Certo.", "É isso aí."), `ENCOURAGEMENT` ("Isso!", "Boa!", "Pode seguir."), `THINKING` ("Hum...", "Deixa eu pensar...", "Hmm, deixa eu ver...") e `FILLER` pós-turno ("Só um minutinho que eu tô vendo isso.", "Deixa eu ver isso com calma.", "Um instante.").
+- **Cache**: `<userData>/voice-clips/<voiceId>/<CLASSE>_<n>.wav` + `manifest.json` por voz = `{ voiceId, backend, engine, model, hash, generatedAt, clips }` — o `hash` (sha256) cobre a definição (frases + voz + modelo) e **nunca** guarda chave de API. `voiceId` = `local-<engine>-<voz>` / `api-<voz>`, sanitizado para um segmento seguro (a voz livre da API nunca vira caminho). Escrita `.part` + rename; manifest só no fim.
+- **API**: `generateClips({ baseDir, settings, local?, onProgress, signal })` sintetiza cada variante (`synthesize` wav) e devolve o manifest — cache com o mesmo hash é **reutilizado** (idempotente), voz/definição mudam → regenera (voiceId/hash novos = regeneração natural ao trocar de voz). `loadClips(baseDir, voiceId)` valida manifest + arquivos (`null` = regenerar) e `resolveClip(baseDir, voiceId, classe, n)` devolve o caminho do `.wav` para a Feature B; classe/variante fora da whitelist nunca vira arquivo (`clipFileName`).
+
+**Fala (TTS) por IPC (`voice:tts:*` — canais em `src/main/ipc.ts`, tipos em `src/shared/ipc.ts`)** — a `apiKey` continua trancada no main (máscara igual ao resto):
+- `voice:tts:synth` `{ text, format? }` → `TtsSynthResult` (`{ audio: Uint8Array, mime, model, backend, ms }`).
+- `voice:tts:test` (sem argumentos) → sintetiza `TTS_TEST_PHRASE` ("Olá, isto é um teste.") — o **"Testar voz"** da UI reproduz o resultado (bytes → blob → `new Audio(blobUrl)`).
+- `voice:tts:clips:generate` → `TtsClipsView` da voz atual, emitindo `voice:tts:clips:progress` `{ id, done, total }` a cada clipe (no estilo `voice:models:progress`).
+- `voice:tts:clips:list` → `TtsClipsView | null` do cache da voz atual (null = não gerados).
+- `voice:tts:voices` → `{ local, api }`: vozes do motor local atual com `installed` (kokoro: `pf_dora`/`pm_alex`/`pm_santa`; chatterbox: lista vazia — runtime em outra fatia) + sugestões livres da API (`alloy`…`shimmer`; o campo aceita qualquer id).
+
+**Configurações → Áudio (seção *Fala (TTS)*)** — backend (API/Local), endpoint (`baseUrl`, modelo, voz com sugestões via datalist) e **chave de API com máscara ecoada** (`tts-api-key`; escrever por cima da máscara preserva a chave — mesmo contrato do STT), motor local (engine kokoro/chatterbox + seletor de voz com estado de instalação + a lista de downloads dos pesos, com ações reais por `voice:models:*`), botão **"Testar voz"** (`tts-test`; falhas viram aviso `role="alert"` `tts-error` com o texto legível) e botão **"Gerar clipes de voz"** (`tts-clips-generate`, progresso `tts-clips-progress` e contagem `tts-clips-count`).
+
+**O que falta (outras fatias)**: streaming de áudio na resposta (Feature B), runtime do Chatterbox (o catálogo já guarda os arquivos) e o **consumo** dos clipes na chamada de voz (a Feature B chama `resolveClip` — ver "Chamada de voz").
+
+### Runtime local de STT (motor de inferência — `src/main/voice/sttLocal.ts`, `src/main/voice/zip.ts`)
+
+Motor que faz os modos `local`/`híbrido` transcreverem de verdade (`SttLocalBackend` de
+`voice/stt.ts`, injetado na sessão). Sem Electron/UI/IPC: `baseDir` (= userData) e o loader do
+engine são injetáveis (`resolveSttModelsBaseDir` tenta `setSttLocalBaseDir` → `CLEARCHAT_USER_DATA`
+→ `app.getPath('userData')`). **Pronto = modelo instalado + runtime carregável**:
+`deriveHasLocalReady` passou a exigir também `isSttEngineRuntimeAvailable(engine)`; `ready` do
+backend = engine com runtime + arquivo do modelo em disco (checagem barata). `transcribe` decodifica
+o wav PCM16 (`decodeWavToMonoFloat32`, mixdown de canais), resolve o modelo por
+`resolveLocalModelPath` (lazy, cacheado por caminho — carrega **uma vez** por processo) e devolve
+`{ text, model: <id do catálogo>, baseUrl: 'local', ms }`; `language` 'pt-BR' → 'pt';
+`onPartial` existe para engines de streaming. Erros `SttError` `config` legíveis (sem modelo,
+desconhecido, engine divergente, arquivo ausente, wav ruim, motor ausente) — todos com a frase
+"motor local de transcrição não está pronto — …" (as mensagens de "motor indisponível" desta fatia
+**substituem** as citadas em "Modelos locais por IPC" acima; o caso "modelo instalado + engine sem
+runtime" agora cita o engine).
+
+**Engines (decisão do spike; áudios sintéticos pt-BR do espeak-ng, 16 kHz, `ggml-tiny` do catálogo
+com sha256 conferido, nesta máquina 32 threads)**:
+
+| opção | roda sem toolchain | latência medida (3,3 s / 5,5 s de áudio) | veredito |
+|---|---|---|---|
+| `@napi-rs/whisper` 0.0.4 (Node-API pré-compilado, MIT) | sim | **173/235 ms** (threads escalam: 894 ms @1 → 152 ms @16) | **escolhido** para whisper.cpp |
+| `@fugood/whisper.node` (N-API pré-built) | sim | 9 335/10 333 ms (1 core; build sem SIMD) | rejeitado — latência |
+| `@fugood/node-whisper-wasm` | com shim de `fetch`/`Worker` | 7 462/8 119 ms | rejeitado — latência + fricção |
+| `@timur00kh/whisper.wasm` | não (Worker browser; timeout em Node) | — | rejeitado — browser-only |
+| `@echogarden/whisper.cpp-binding` | exige `libwhisper` própria não publicada | — | rejeitado |
+| `nodejs-whisper`/`whisper-node` (gyp) | não (compila no install; processo por transcrição) | — | rejeitado — fricção + reload do modelo |
+| whisper.cpp upstream buildada (referência) | build local | 137/251 ms | baseline do que é possível |
+| ONNX/transformers.js | — | — | não lê `.bin` ggml (mudaria o catálogo — fora do escopo) |
+| Vosk oficial (`vosk` npm) | **instalação falha** (ffi-napi não compila em Node 26) | — | rejeitado |
+| `vosk-koffi` (koffi + libvosk pré-built, MIT) | sim | carga 120 ms; streaming RTF ≈ 0,23; parciais ~150 ms/200 ms de áudio | **aprovado no spike, fora desta fatia** (cap de 1 dependência nova); recomendação para parciais de verdade em pt-BR |
+| `vosk-browser` (WASM) | não (Worker browser; espera `model.tar.gz`) | — | rejeitado |
+
+- **whisper.cpp** (`ggml-*.bin`, 4 modelos): final + **parciais por janelas** (a sessão dispara a
+  cada `STT_PARTIAL_INTERVAL_MS` — melhor-esforço como as parciais de API; `onNewSegment` do
+  binding não dispara na 0.0.4). Medido com o runtime real: final de 3,3 s → **~220 ms**, 5,5 s →
+  **~250 ms**; janelas < ~1 s voltam em ~1–3 ms (whisper encurta; texto muitas vezes vazio/alucinado
+  — parcial de whisper é melhor-esforço mesmo), janela de 2 s → ~180 ms. **Limitação**: `Whisper.full`
+  é síncrono (bloqueia o main thread durante a inferência — irrelevante para tiny/base, sensível
+  para large-v3-turbo; mitigação futura: worker thread). **Pré-builds só para linux-x64-gnu e
+  darwin** (win32/arm64 não existem no pacote): sem `.node` na plataforma, `ready`/transcribe falham
+  com erro legível ("motor whisper.cpp não pôde ser carregado nesta instalação").
+- **vosk** (`vosk-model-small-pt-0.3`): o `.zip` é **extraído pelo próprio runtime** em
+  `<userData>/models/<id>/` (parser zip em TS puro, `voice/zip.ts`: store+deflate via
+  `zlib.inflateRaw`, CRC-32 por entry, sem zip-slip, `expectedRoot`; 32 MB em ~270 ms) e verificado
+  (arquivos Kaldi: `final.mdl`, `Gr.fst`, `HCLr.fst`, `mfcc.conf`, `ivector/final.ie`) — mas o motor
+  de inferência (libvosk) ainda não está plugado: `transcribe` extrai/verifica e falha com o erro
+  honesto do engine. Plugar `vosk-koffi` (linha aprovada no spike) é uma dependência nova à parte.
+- **nemotron** (GGUF): sem motor nesta versão (exigiria runtime llama.cpp) — erro honesto por engine.
+- **Custo de latência**: parciais locais custam uma transcrição de janela por disparo (a sessão
+  aborta/reusa como nas parciais de API); final = 1 transcrição do buffer inteiro; carga do modelo
+  uma vez (tiny ~30 ms; cresce com o modelo — lazy na primeira transcrição).
 
 ### Ditado por voz — UX (composer + Configurações → Áudio)
 
@@ -1186,9 +1277,10 @@ KB/MB/GB) com ações reais por `voice:models:*`, o mapeamento estado→ação d
 (`notInstalled` → "Baixar" com barra de progresso + "Cancelar" durante o download; `installed` →
 ✓ + tamanho + "Remover"; `corrupt` → "Baixar novamente" com aviso) e erros de download/remoção como
 aviso `role="alert"` dispensável (`voice-model-error`, padrão dos avisos do composer, texto vindo de
-`errorMessage`). *Fala (TTS)*: heading + a **mesma lista** de modelos de TTS com as ações
-**desabilitadas** (catálogo com `url: null` → nota "disponível na fatia de TTS") — a configuração do
-falante entra na fatia de TTS.
+`errorMessage`). *Fala (TTS)*: seção completa (ver "Áudio → Serviço de TTS (clipes)" — backend
+API/Local, endpoint com chave mascarada, vozes do motor local, **Testar voz** e **Gerar clipes de
+voz**) + a **mesma lista** de modelos locais com download real dos pesos do Kokoro/Chatterbox
+(`LocalModelList kind="tts"`, ações por `voice:models:*`).
 
 **Mock de UI** (`VITE_CLEAR_MOCK=1`, `dev/mockApi.ts`): binding `voice` completo — settings fake com
 a mesma semântica da chave mascarada, `transcribe` que emite parciais em timers e devolve texto
@@ -1247,7 +1339,11 @@ interface VoiceCallConfig {
 
 `e2e/voiceSettings.test.ts` (repositório real com stub do `electron`, padrão de `branches.test.ts`): `PROTECTED_SETTINGS` cobre `sttSettings`/`ttsSettings`, round-trip normalizado (inclui `silenceStopMs: 0` e `voiceCallDefaults` parcial), chave real gravada no banco e mascarada no get/set, escrita por cima do valor mascarado preserva a chave (idem para `ttsSettings`), `''`/`null` removem, ausente/lixo preserva, string nova substitui, `local: null` preservado.
 
-`e2e/voiceModels.test.ts` (em `npm run test:unit`, só pastas temporárias e fetch mockado — nunca download real): validação do catálogo (campos obrigatórios, URLs https, sha256 de 64 hex ou null, sem GPL, URLs/nomes reais das fontes, placeholders de TTS), manifest (round-trip, escrita atômica sem `.tmp`, ausente/JSON inválido/lixo → `manifest.json.bak` + vazio, entradas inválidas descartadas), download (progresso em chunks, arquivo final byte a byte + manifest com sha256/size/installedAt, estados/caminhos, idempotência e rebaixa de corrompido), falhas limpas (sha256 errado, stream truncado, magic errado, HTTP 500, cancel no meio e abort prévio) e remove/resolve (idempotente, `.part` órfão, ids fora do catálogo).
+`e2e/voiceModels.test.ts` (em `npm run test:unit`, só pastas temporárias e fetch mockado — nunca download real): validação do catálogo (campos obrigatórios, URLs https, sha256 de 64 hex ou null, sem GPL, URLs/nomes reais das fontes — TTS: Kokoro ONNX + vozes pt-BR e o fine-tune pt-BR do Chatterbox, todos baixáveis), manifest (round-trip, escrita atômica sem `.tmp`, ausente/JSON inválido/lixo → `manifest.json.bak` + vazio, entradas inválidas descartadas), download (progresso em chunks, arquivo final byte a byte + manifest com sha256/size/installedAt, estados/caminhos, idempotência e rebaixa de corrompido), falhas limpas (sha256 errado, stream truncado, magic errado, HTTP 500, cancel no meio e abort prévio) e remove/resolve (idempotente, `.part` órfão, ids fora do catálogo).
+
+`e2e/tts.test.ts` (em `npm run test:unit`, fetch mockado + motor local fake — nada de ONNX nem download): payload JSON do `/audio/speech` (model/voice/input/response_format, voz omitida quando null, Authorization só com chave), bytes devolvidos com mime por formato, erros legíveis (401 auth, 429 quota, 500/400 http com corpo resumido, 2xx sem áudio, rede, timeout, abort = `AbortError`), config (sem baseUrl/modelo/texto), despacho para o motor local injetado (voz/formato, `backend: 'local'`) e os helpers puros do Kokoro (`mapEspeakPhonemes` — ties/dífonos do misaki/NFD; `kokoroInputIds` — vocabulário char-level, desconhecidos caem, truncamento 509).
+
+`e2e/voiceClips.test.ts` (idem, só pastas temporárias e motor fake): `clipFileName` (whitelist de classes × 3 variantes; fora → erro legível), `clipVoiceId` (segmento seguro — voz maliciosa nunca vira caminho), `generateClips` (15 arquivos + manifest com voz/engine/modelo/hash, progresso 1..15, `.part` limpo), cache idempotente (mesmo hash não ressintetiza), regeneração por voz (voiceId novo, os dois caches convivem) e por hash (modelo muda → regenera), `loadClips` (manifest inválido/incompleto → null), `resolveClip` (caminho do wav; classe/variante/voz inválidos → null), `removeClips` e abort no meio (sem manifest).
 
 ## Atualizações (aviso de versão nova — `src/shared/updates.ts`, `src/main/updates.ts`, `components/UpdateNotice.tsx`)
 
