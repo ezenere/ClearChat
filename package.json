@@ -34,6 +34,7 @@
     "test:e2e:chat-bars": "node e2e/chat-bars-ui.spec.ts",
     "test:e2e:skills": "electron-vite build && node e2e/skills.spec.ts",
     "test:e2e:websearch": "electron-vite build && node e2e/web-search.spec.ts",
+    "test:e2e:voice": "electron-vite build && node e2e/voice-dictation.spec.ts",
     "test:e2e:branching": "electron-vite build && node e2e/branching.spec.ts",
     "test:e2e:auto-title": "electron-vite build && node e2e/auto-title.spec.ts",
     "test:e2e:sync": "electron-vite build && node e2e/sync.spec.ts",
