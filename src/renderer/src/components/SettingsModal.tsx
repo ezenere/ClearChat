@@ -25,6 +25,7 @@ import { SkillsSettings } from './skills/SkillsSettings'
 import { AccountSettings } from './sync/AccountSettings'
 import { VersionFooter } from './UpdateNotice'
 import { AutoTitleSettings } from './AutoTitleSettings'
+import { AudioSettings } from './voice/AudioSettings'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -326,7 +327,7 @@ export function SettingsModal(): React.JSX.Element {
         (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
       }
     >
-      <div className="mb-5 flex gap-0.5 border-b border-border">
+      <div className="mb-5 flex gap-0.5 overflow-x-auto border-b border-border">
         {(
           [
             ['account', 'Conta'],
@@ -336,7 +337,8 @@ export function SettingsModal(): React.JSX.Element {
             ['approvals', 'Aprovações'],
             ['memory', 'Memórias'],
             ['skills', 'Skills'],
-            ['web', 'Pesquisa na web']
+            ['web', 'Pesquisa na web'],
+            ['audio', 'Áudio']
           ] as const
         ).map(([id, label]) => (
           <button
@@ -344,7 +346,7 @@ export function SettingsModal(): React.JSX.Element {
             type="button"
             onClick={() => setTab(id)}
             className={cn(
-              '-mb-px shrink-0 border-b-2 px-2 pb-2 text-[13px] whitespace-nowrap transition-colors',
+              '-mb-px shrink-0 border-b-2 px-1.5 pb-2 text-[13px] whitespace-nowrap transition-colors',
               tab === id ? 'border-accent text-fg' : 'border-transparent text-subtle hover:text-fg'
             )}
           >
@@ -398,6 +400,8 @@ export function SettingsModal(): React.JSX.Element {
         <SkillsSettings />
       ) : tab === 'web' ? (
         <WebSearchSettings />
+      ) : tab === 'audio' ? (
+        <AudioSettings />
       ) : (
         <DefaultsSection />
       )}

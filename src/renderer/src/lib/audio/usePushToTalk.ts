@@ -32,8 +32,9 @@ export interface PushToTalkControls {
   level: number
   /** Último erro legível (permissão negada etc.); null sem erro. */
   error: string | null
-  /** Inicia a captura (clique). Ignorado se já estiver gravando/parando. */
-  start: () => Promise<void>
+  /** Inicia a captura (clique). Ignorado se já estiver gravando/parando. `settingsOverride`
+   *  usa um valor fresco de `AudioInputSettings` nesta captura (sem esperar o re-render). */
+  start: (settingsOverride?: AudioInputSettings) => Promise<void>
   /** Para a captura (motivo 'manual'). Idempotente. */
   stop: () => Promise<void>
   /** Clique: inicia se parado, para se gravando. */
@@ -65,7 +66,7 @@ export function usePushToTalk(
   const pttHeldRef = useRef(false)
   const pttOwnsRef = useRef(false)
   const optionsRef = useRef(options)
-  const startRef = useRef<() => Promise<void>>(async () => {})
+  const startRef = useRef<(o?: AudioInputSettings) => Promise<void>>(async () => {})
   const stopRef = useRef<(reason: StopReason) => Promise<void>>(async () => {})
 
   const stopCapture = useCallback(async (reason: StopReason) => {
@@ -83,47 +84,52 @@ export function usePushToTalk(
     optionsRef.current.onStopped?.(reason)
   }, [])
 
-  const startCapture = useCallback(async () => {
-    if (busyRef.current || captureRef.current) return
-    busyRef.current = true
-    setError(null)
-    const capture = new AudioCapture({
-      constraints: optionsRef.current.constraints,
-      silence:
-        settings.silenceStopEnabled && settings.silenceStopMs > 0
-          ? { silenceMs: settings.silenceStopMs, threshold: optionsRef.current.silenceThreshold }
-          : false
-    })
-    capture.on('level', (rms) => setLevel(rms))
-    capture.on('pcm', (chunk) => optionsRef.current.onPcmChunk?.(chunk))
-    capture.on('silence', () => void stopRef.current('silence'))
-    capture.on('error', (e) => setError(e.message))
-    capture.on('ended', () => {
-      if (captureRef.current !== capture) return
-      captureRef.current = null
-      setLevel(0)
-      setState('idle')
-      optionsRef.current.onStopped?.('device-lost')
-    })
-    captureRef.current = capture
-    try {
-      await capture.start(settings.deviceId)
-      if (captureRef.current === capture) {
-        setLevel(0)
-        setState('recording')
-      }
-    } catch (cause) {
-      if (captureRef.current === capture) {
+  const startCapture = useCallback(
+    async (override?: AudioInputSettings) => {
+      if (busyRef.current || captureRef.current) return
+      busyRef.current = true
+      setError(null)
+      // settings desta captura: override do chamador (valor fresco) ou as props (hook)
+      const s = override ?? settings
+      const capture = new AudioCapture({
+        constraints: optionsRef.current.constraints,
+        silence:
+          s.silenceStopEnabled && s.silenceStopMs > 0
+            ? { silenceMs: s.silenceStopMs, threshold: optionsRef.current.silenceThreshold }
+            : false
+      })
+      capture.on('level', (rms) => setLevel(rms))
+      capture.on('pcm', (chunk) => optionsRef.current.onPcmChunk?.(chunk))
+      capture.on('silence', () => void stopRef.current('silence'))
+      capture.on('error', (e) => setError(e.message))
+      capture.on('ended', () => {
+        if (captureRef.current !== capture) return
         captureRef.current = null
         setLevel(0)
         setState('idle')
-        setError(cause instanceof Error ? cause.message : String(cause))
+        optionsRef.current.onStopped?.('device-lost')
+      })
+      captureRef.current = capture
+      try {
+        await capture.start(s.deviceId)
+        if (captureRef.current === capture) {
+          setLevel(0)
+          setState('recording')
+        }
+      } catch (cause) {
+        if (captureRef.current === capture) {
+          captureRef.current = null
+          setLevel(0)
+          setState('idle')
+          setError(cause instanceof Error ? cause.message : String(cause))
+        }
+        // se o captureRef mudou, o stop() já cuidou do estado (start interrompido de propósito)
+      } finally {
+        busyRef.current = false
       }
-      // se o captureRef mudou, o stop() já cuidou do estado (start interrompido de propósito)
-    } finally {
-      busyRef.current = false
-    }
-  }, [settings.deviceId, settings.silenceStopEnabled, settings.silenceStopMs])
+    },
+    [settings]
+  )
 
   const toggle = useCallback(async () => {
     if (state === 'recording') await stopCapture('manual')

@@ -36,6 +36,14 @@ import { sessionProviderId } from '@shared/models'
 import { ModelPill } from './ModelPill'
 import { SpendButton } from './SpendButton'
 import { BarLevelsContext, barAttrs, useBarCollapse, useBarLevel } from '../../lib/useBarCollapse'
+import { useDictation } from '../../lib/voice/useDictation'
+import {
+  composeDictationDraft,
+  mergeDictationDraft,
+  splitDictationEdit
+} from '../../lib/voice/dictation'
+import { MicButton } from '../voice/MicControls'
+import { Waveform } from '../voice/Waveform'
 
 /** Estado do agente na barra do composer; recolhido, só o ponto (o texto vai no tooltip). */
 function ComposerStatus({ text }: { text: string }): React.JSX.Element {
@@ -209,6 +217,12 @@ export function Composer({
   /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
+  /** Ditado por voz: parciais viram rascunho diferenciado (`▌`); o final entra no rascunho normal. */
+  const dictation = useDictation({
+    onFinal: (spoken) => setText((t) => mergeDictationDraft(t, spoken))
+  })
+  const dictating = dictation.state !== 'idle'
+
   useEffect(() => {
     if (autoFocus) ref.current?.focus()
   }, [autoFocus, session.id])
@@ -226,11 +240,12 @@ export function Composer({
   }, [ready, supportOf, historyWarning])
   const warnKey = warnings.join('|')
   const confirming = !!warnKey && confirmKey === warnKey
-  const canSend = !loading && (!!text.trim() || ready.length > 0 || pendingSkills.length > 0)
+  const canSend =
+    !dictating && !loading && (!!text.trim() || ready.length > 0 || pendingSkills.length > 0)
 
   const submit = async (force = false): Promise<void> => {
     const t = text.trim()
-    if (!canSend) return
+    if (!canSend || dictating) return
     if (warnings.length && !force) {
       setConfirmKey(warnKey)
       return
@@ -296,6 +311,13 @@ export function Composer({
                 'focus-within:border-border-strong focus-within:shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7),0_0_0_3px_rgb(139_92_246/0.08)]'
               )}
               onClick={() => ref.current?.focus()}
+              onKeyDown={(e) => {
+                // Esc com o foco no composer cancela a gravação em andamento (descarta)
+                if (dictating && e.key === 'Escape') {
+                  e.preventDefault()
+                  void dictation.cancel()
+                }
+              }}
             >
               {question && <QuestionForm key={question.id} request={question} />}
               {!question && retry && <RetryForm key={retry.id} request={retry} />}
@@ -356,20 +378,52 @@ export function Composer({
                   </button>
                 </div>
               )}
+              {!blocked && dictation.error && (
+                <div
+                  role="alert"
+                  data-testid="voice-error"
+                  onClick={(e) => e.stopPropagation()}
+                  className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+                >
+                  <TriangleAlert className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1">{dictation.error}</span>
+                  <button
+                    type="button"
+                    aria-label="Dispensar erro de voz"
+                    onClick={dictation.clearError}
+                    className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              )}
               {!blocked && (
                 <AutoTextarea
                   ref={ref}
-                  value={text}
+                  value={dictating ? composeDictationDraft(text, dictation.partial) : text}
                   minRows={1}
                   maxRows={14}
                   placeholder={
-                    busy
-                      ? 'Enviar para a fila…'
-                      : session.depth > 0
-                        ? 'Mensagem ao subagente…'
-                        : 'Mensagem…'
+                    dictating
+                      ? dictation.state === 'recording'
+                        ? 'Gravando… (Esc cancela)'
+                        : 'Transcrevendo…'
+                      : busy
+                        ? 'Enviar para a fila…'
+                        : session.depth > 0
+                          ? 'Mensagem ao subagente…'
+                          : 'Mensagem…'
                   }
-                  onChange={(e) => setText(e.target.value)}
+                  onChange={(e) => {
+                    if (!dictating) {
+                      setText(e.target.value)
+                      return
+                    }
+                    // edição durante a gravação: separa o texto do usuário do rascunho falado
+                    const r = splitDictationEdit(e.target.value, dictation.partial, text)
+                    setText(r.text)
+                    if (r.partial !== dictation.partial) dictation.clearPartial()
+                  }}
                   onPaste={(e) => {
                     const files = [...e.clipboardData.files]
                     if (!files.length) return
@@ -378,6 +432,8 @@ export function Composer({
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      // enquanto grava, Enter não envia (vira quebra de linha)
+                      if (dictating) return
                       e.preventDefault()
                       void submit()
                     }
@@ -408,6 +464,15 @@ export function Composer({
                     </Tip>
                   )}
                   {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
+                  {!blocked && <MicButton dictation={dictation} />}
+                  {dictating && (
+                    <Waveform
+                      level={dictation.level}
+                      recording={dictation.state === 'recording'}
+                      simulate={import.meta.env.VITE_CLEAR_MOCK === '1'}
+                      className="h-5 w-20 shrink-0"
+                    />
+                  )}
                   {chat && <HostIndicator chat={chat} />}
                   <span className="flex shrink-0 items-center gap-1.5 text-[11px] whitespace-nowrap text-faint">
                     <ComposerInfo running={busy} />
@@ -459,7 +524,44 @@ export function Composer({
                         </button>
                       </Tip>
                     )}
-                    {!blocked && (
+                    {!blocked && dictating && (
+                      <>
+                        <Tip label="Cancelar gravação (Esc)">
+                          <button
+                            type="button"
+                            data-testid="voice-cancel-button"
+                            aria-label="Cancelar gravação"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void dictation.cancel()
+                            }}
+                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl text-subtle transition-colors hover:bg-hover hover:text-fg"
+                          >
+                            <X className="size-4" />
+                          </button>
+                        </Tip>
+                        <Tip
+                          label={
+                            dictation.state === 'stopping' ? 'Transcrevendo…' : 'Parar gravação'
+                          }
+                        >
+                          <button
+                            type="button"
+                            data-testid="voice-stop-button"
+                            aria-label="Parar gravação"
+                            disabled={dictation.state === 'stopping'}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void dictation.stop()
+                            }}
+                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover disabled:opacity-60"
+                          >
+                            <Square className="size-3" fill="currentColor" />
+                          </button>
+                        </Tip>
+                      </>
+                    )}
+                    {!blocked && !dictating && (
                       <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
                         <button
                           type="button"

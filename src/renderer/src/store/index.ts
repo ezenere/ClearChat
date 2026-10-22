@@ -70,7 +70,15 @@ export interface Toast {
 export type { SubFailure }
 
 export type SettingsTab =
-  'account' | 'providers' | 'presets' | 'defaults' | 'approvals' | 'memory' | 'skills' | 'web'
+  | 'account'
+  | 'providers'
+  | 'presets'
+  | 'defaults'
+  | 'approvals'
+  | 'memory'
+  | 'skills'
+  | 'web'
+  | 'audio'
 
 export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'files'
 

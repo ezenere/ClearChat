@@ -9,7 +9,26 @@ import {
   type SkillsDiscovery,
   type SkillsSettings
 } from '@shared/skills'
-import type { ClearApi, WebSearchSettingsState } from '@shared/ipc'
+import type {
+  ClearApi,
+  VoiceApi,
+  VoicePartialEvent,
+  VoiceSettingKind,
+  VoiceSettingsMap,
+  WebSearchSettingsState
+} from '@shared/ipc'
+import {
+  DEFAULT_AUDIO_INPUT,
+  DEFAULT_STT_SETTINGS,
+  DEFAULT_TTS_SETTINGS,
+  DEFAULT_VOICE_CALL_DEFAULTS,
+  normalizeAudioInput,
+  normalizeSttSettings,
+  normalizeTtsSettings,
+  normalizeVoiceCallDefaults,
+  type SttSettings,
+  type TtsSettings
+} from '@shared/voice'
 import type { UpdateStatus } from '@shared/updates'
 import { OFFICIAL_SYNC_URL, type SyncStatus } from '@shared/sync'
 import {
@@ -124,6 +143,8 @@ export function createMockApi(scenario: string): ClearApi {
         )
   }
   const emit = (e: AgentEvent): void => listeners.forEach((l) => l(e))
+  // parciais ao vivo da transcrição (canal `voice:partial`) — só o mock de áudio emite
+  const voiceListeners = new Set<(e: VoicePartialEvent) => void>()
   // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
   ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
 
@@ -2250,6 +2271,129 @@ export function createMockApi(scenario: string): ClearApi {
           )
       }
     })(),
+    // Áudio/voz (mock): settings com a chave ECOADA mascarada (escrever por cima da máscara
+    // preserva a chave real — mesmo contrato do main) e transcrição falsa com parciais ao vivo.
+    voice: ((): VoiceApi => {
+      let audioInput = { ...DEFAULT_AUDIO_INPUT }
+      let stt: SttSettings = { ...DEFAULT_STT_SETTINGS }
+      let tts: TtsSettings = { ...DEFAULT_TTS_SETTINGS }
+      let voiceCallDefaults = { ...DEFAULT_VOICE_CALL_DEFAULTS }
+      const asObj = (v: unknown): Record<string, unknown> | null =>
+        v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
+      /** Chave: `null`/`''` remove; igual à máscara / ausente / lixo preserva; outra string = nova. */
+      const nextKey = (current: string, raw: unknown): string => {
+        if (raw === null || raw === '') return ''
+        const t = typeof raw === 'string' ? raw.trim() : null
+        if (t === null) return current
+        if (!t) return ''
+        return t === (maskKey(current) ?? '') ? current : t
+      }
+      const masked = <T extends SttSettings | TtsSettings>(s: T): T => ({
+        ...s,
+        api: { ...s.api, apiKey: maskKey(s.api.apiKey) ?? '' }
+      })
+      const view = (): VoiceSettingsMap => ({
+        audioInput: normalizeAudioInput(audioInput),
+        sttSettings: masked(stt),
+        ttsSettings: masked(tts),
+        voiceCallDefaults: normalizeVoiceCallDefaults(voiceCallDefaults)
+      })
+      const apply = (kind: string, value: unknown): unknown => {
+        const raw = asObj(value)
+        if (kind === 'audioInput') return (audioInput = normalizeAudioInput(value))
+        if (kind === 'voiceCallDefaults')
+          return (voiceCallDefaults = normalizeVoiceCallDefaults(value))
+        if (kind === 'sttSettings') {
+          const api = asObj(raw?.api)
+          stt = normalizeSttSettings({
+            ...(raw ?? {}),
+            api: {
+              ...(api ?? {}),
+              apiKey: nextKey(stt.api.apiKey, api && 'apiKey' in api ? api.apiKey : undefined)
+            }
+          })
+          return masked(stt)
+        }
+        if (kind === 'ttsSettings') {
+          const api = asObj(raw?.api)
+          tts = normalizeTtsSettings({
+            ...(raw ?? {}),
+            api: {
+              ...(api ?? {}),
+              apiKey: nextKey(tts.api.apiKey, api && 'apiKey' in api ? api.apiKey : undefined)
+            }
+          })
+          return masked(tts)
+        }
+        throw new Error(`Grupo de settings desconhecido: ${kind}`)
+      }
+      // transcrição falsa: parciais ao vivo em timers + texto final fixo (sem áudio de verdade)
+      const MOCK_PARTIALS = ['Olá', 'Olá mundo', 'Olá mundo, isto é um ditado']
+      const MOCK_FINAL = 'Olá mundo, isto é um ditado simulado pelo mock de voz.'
+      let sessionSeq = 0
+      let active: { id: string; timers: ReturnType<typeof setTimeout>[] } | null = null
+      return {
+        settings: {
+          get: () => delay(view()),
+          set: <K extends VoiceSettingKind>(
+            kind: K,
+            value: unknown
+          ): Promise<VoiceSettingsMap[K]> =>
+            delay(apply(kind, value)) as Promise<VoiceSettingsMap[K]>
+        },
+        transcribe: {
+          start: async (language?: string) => {
+            void language
+            if (active) throw new Error('Já há uma sessão de transcrição ativa.')
+            const id = `voice-mock-${++sessionSeq}`
+            const timers = MOCK_PARTIALS.map((text, i) =>
+              setTimeout(
+                () => {
+                  const e: VoicePartialEvent = {
+                    sessionId: id,
+                    text,
+                    isFinal: false,
+                    ms: (i + 1) * 400
+                  }
+                  voiceListeners.forEach((l) => l(e))
+                },
+                350 * (i + 1)
+              )
+            )
+            active = { id, timers }
+            return delay(id, 30)
+          },
+          push: async () => {
+            // o mock não acumula áudio
+          },
+          stop: async (sessionId: string) => {
+            if (active?.id !== sessionId) throw new Error('Sessão de transcrição desconhecida.')
+            active.timers.forEach(clearTimeout)
+            active = null
+            return delay(
+              {
+                text: MOCK_FINAL,
+                model: stt.api.model,
+                baseUrl: stt.api.baseUrl,
+                ms: 320,
+                backend: 'api' as const,
+                fellBack: false
+              },
+              250
+            )
+          },
+          cancel: async (sessionId: string) => {
+            if (active?.id !== sessionId) return
+            active.timers.forEach(clearTimeout)
+            active = null
+          }
+        }
+      }
+    })(),
+    onVoicePartial: (cb: (e: VoicePartialEvent) => void) => {
+      voiceListeners.add(cb)
+      return () => voiceListeners.delete(cb)
+    },
     onEvent: (cb) => {
       listeners.add(cb)
       if (scenario.startsWith('subagents')) {

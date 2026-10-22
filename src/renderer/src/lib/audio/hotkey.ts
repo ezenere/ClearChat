@@ -48,9 +48,10 @@ const KEY_ALIASES: Record<string, string> = {
   right: 'arrowright'
 }
 
-/** Normaliza o nome de uma tecla (minúsculas, aliases aplicados). */
+/** Normaliza o nome de uma tecla (minúsculas, aliases aplicados). O espaço (' ') não é aparado. */
 function normalizeKeyName(name: string): string {
-  const s = name.trim().toLowerCase()
+  const raw = (name ?? '').toLowerCase()
+  const s = raw === ' ' ? ' ' : raw.trim()
   return KEY_ALIASES[s] ?? s
 }
 

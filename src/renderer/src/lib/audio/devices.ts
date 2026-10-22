@@ -32,21 +32,22 @@ function toInputDevice(info: MediaDeviceInfo): InputDevice {
 }
 
 /**
- * Lista os microfones disponíveis. Quando os labels vierem vazios (permissão ainda não concedida),
- * abre uma faixa só para liberar os labels, encerra imediatamente e enumera de novo — se a
- * permissão for negada, devolve a lista com labels vazios sem lançar.
+ * Lista os microfones disponíveis. Quando a lista vier vazia ou com labels vazios (permissão ainda
+ * não concedida — o Electron esconde os dispositivos até o primeiro `getUserMedia`), abre uma faixa
+ * só para liberar a lista/labels, encerra imediatamente e enumera de novo — se a permissão for
+ * negada, devolve o que tiver (possivelmente vazio) sem lançar.
  */
 export async function listInputDevices(): Promise<InputDevice[]> {
   const md = mediaDevices()
   if (!md?.enumerateDevices) return []
   let infos = await enumerateInputs()
-  if (infos.some((d) => !d.label)) {
+  if (infos.length === 0 || infos.some((d) => !d.label)) {
     try {
       const stream = await md.getUserMedia({ audio: true, video: false })
       stream.getTracks().forEach((t) => t.stop())
       infos = await enumerateInputs()
     } catch {
-      // permissão negada: mantém os labels vazios
+      // permissão negada: mantém a lista como veio (labels vazios ou lista vazia)
     }
   }
   return infos.map(toInputDevice)

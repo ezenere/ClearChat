@@ -1123,6 +1123,72 @@ Fiação main+preload para a UI do renderer (SPEC → "API do preload"): setting
 - `stop(sessionId)` cancela o loop e transcreve o buffer **inteiro** como final (`purpose: 'final'`, via `transcribeWithFallback` com o motor local injetado quando houver) → `{ text, model, baseUrl, ms, backend, fellBack, fallbackReason? }`. Erro de API propaga legível (`SttError` pt-BR). Sem áudio capturado → `{ text: '' }` sem ir à rede.
 - `cancel(sessionId)` descarta tudo sem transcrever (aborta o que estiver em voo; id desconhecido = sem efeito; idempotente). Depois de `stop`/`cancel`, `push`/`stop` na sessão → erro legível.
 
+### Ditado por voz — UX (composer + Configurações → Áudio)
+
+UI da Feature A sobre o contrato acima (captura em `src/renderer/src/lib/audio/`, orquestração em
+`src/renderer/src/lib/voice/useDictation.ts`, rascunho em `lib/voice/dictation.ts`, botão/menu em
+`components/voice/MicControls.tsx`, tela em `components/voice/AudioSettings.tsx`).
+
+**Composer (`Composer.tsx`)** — botão `Mic` (`data-testid="voice-mic-button"`) + chevron
+(`voice-mic-menu-button`) que abre o menu de microfone (`voice-mic-menu`): "Padrão do sistema"
+(`deviceId: null`, `voice-mic-option-system`) + os dispositivos de `listInputDevices` (marcação do
+atual, atualiza em hotplug, grava `audioInput.deviceId`; itens `voice-mic-option-device`) e o
+atalho "Configurações → Áudio…" (`voice-settings-link`). Estados do ditado (um por vez):
+`idle → starting → recording → stopping` (`DictationState`); enquanto ≠ `idle`:
+- **Rascunho falado**: as parciais (`onVoicePartial`, melhor-esforço) aparecem no campo de texto como
+  `rascunho + parcial + ▌` (`composeDictationDraft`; a textarea continua controlada e editável — a
+  edição passa por `splitDictationEdit`, que separa o texto do usuário da parcial; mexer na parcial a
+  descarta). No stop, o texto final (`voice:transcribe:stop`) vira **rascunho normal editável**
+  (`mergeDictationDraft`, um espaço de separação) — **o envio é SEMPRE manual**, nada sai sozinho.
+- **Botões**: o de enviar **some** e vira **Parar gravação** (`Square`, estilo do botão de parar de
+  geração, `voice-stop-button`); ao lado, **X** cancelar (`voice-cancel-button`). Clicar no `Mic`
+  de novo também para (clique inicia/para). **Waveform** compacto no toolbar (`voice-waveform`,
+  níveis do `usePushToTalk`; `simulate` no mock).
+- **Teclado**: `Enter` **não envia** durante a gravação (vira quebra de linha; `Shift+Enter` idem);
+  `Esc` com o foco no composer **cancela** a gravação (descarta tudo, nada entra no rascunho).
+- **Erros** (permissão negada, microfone ausente/ocupado, STT fora do ar, sessão indisponível) viram
+  um card `role="alert"` (`voice-error`) no composer, no padrão dos avisos do composer, com X para
+  dispensar — mensagens legíveis em pt-BR (`captureErrorText` para a captura; `SttError`/IPC já vem
+  legível do main).
+
+**Push-to-talk + auto-stop** (`usePushToTalk` plugarado em `audioInput`): a tecla `pttKey`
+configurada **segura** para falar (só com a janela em foco; soltar = parar e transcrever); o clique
+no `Mic` inicia/para; `silenceStopEnabled` + `silenceStopMs` encerram sozinhos quando o usuário para
+de falar (**`0` = sem limite** — só botão/tecla/Esc encerram). A sessão de transcrição é criada de
+forma preguiçosa no primeiro chunk (a tecla do PTT inicia a captura sem passar pelo clique); os
+chunks esperam a sessão e o `stop` espera o push pendente antes de transcrever o buffer inteiro.
+
+**Configurações → Áudio** (nova aba, espelho de "Pesquisa na web"; cada controle grava na hora via
+`voice:settings:set` e adota o valor normalizado devolvido): *Microfone padrão* (select com hotplug +
+"Padrão do sistema"); *Push-to-talk* (liga/desliga + captura de tecla `ptt-key-capture` com a tecla
+atual em `Kbd` — `formatHotkeyLabel`, ex. 'Ctrl + Shift + Espaço' —, Esc cancela a captura, "Remover
+tecla"); *Parar por silêncio* (liga/desliga + campo ms com "0 = sem limite"); *Idioma do ditado*
+(comuns + "Outro (digitar)…" livre); *Transcrição (STT)*: modo (API/Local/Híbrido), endpoint (`baseUrl`,
+modelo) e **chave de API com máscara ecoada no campo** (`type=password`; escrever por cima da máscara
+preserva a chave real — contrato testado em `e2e/voiceSettings.test.ts`; limpar o campo remove; a
+chave real nunca sai do main), parciais ao vivo (liga/desliga) e a seção do **motor local** com
+estado ("não instalado — Baixar" desabilitado + nota: o download entra na próxima fatia;
+`LocalEnginePanel` já aceita `onDownload` para plugar). *Fala (TTS)*: só o heading + "configurado na
+próxima fatia" (TTS não entra nesta fatia).
+
+**Mock de UI** (`VITE_CLEAR_MOCK=1`, `dev/mockApi.ts`): binding `voice` completo — settings fake com
+a mesma semântica da chave mascarada e `transcribe` que emite parciais em timers e devolve texto
+fixo; o `Waveform` simula níveis (`simulate`) e a captura é pulada (sem microfone no mock).
+`ClearApi.voice` continua opcional no tipo com `FullClearApi` obrigatório no preload: remover o
+workaround exigiria tocar em `src/preload/index.d.ts` (fora do escopo desta fatia) — mantido e
+documentado.
+
+**Testes** — `e2e/voiceDictation.test.ts` (em `npm run test:unit`): `mergeDictationDraft`,
+`composeDictationDraft`/`splitDictationEdit` (round-trip compor→editar→compor),
+`formatHotkeyLabel`/`hotkeyFromEvent` (rótulos pt-BR, ordem canônica, modificador solto, round-trip
+com `matchesHotkey`) e `captureErrorText`. **E2E** `e2e/voice-dictation.spec.ts`
+(`npm run test:e2e:voice`): Electron real com microfone falso do Chromium
+(`--use-fake-device-for-media-capture --use-fake-ui-for-media-capture`) + servidor STT falso
+(`e2e/fakes/sttServer.ts`, `sttSettings` apontando para ele): Configurações → Áudio (máscara da
+chave, captura de tecla, silêncio 0) → menu de microfone (Padrão do sistema + dispositivos) → gravar
+com o fake device → parciais com `▌` → Parar → texto final no rascunho sem enviar sozinho → request
+multipart no servidor falso (file/model/language/response_format + Bearer) → Esc cancela descartando.
+
 ### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
 
 ```ts
