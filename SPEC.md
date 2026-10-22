@@ -1024,7 +1024,7 @@ interface SkillsConfig {
 
 ## Áudio — configuração global (contrato — `src/shared/voice.ts`, settings)
 
-Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global e os backends STT/TTS entram em fatias futuras): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` (`src/main/voice.ts`).
+Contratos da feature de áudio/voz (a UI, a captura de áudio, o push-to-talk global, os modelos locais e o TTS entram em fatias futuras; o serviço de transcrição já existe — ver "Serviço de transcrição (STT)" abaixo): **as configurações de ditado são 100% globais; as da chamada de voz vivem em `ChatConfig.voice` (persona/chat) + `voiceCallDefaults` global; o sync dessas configurações entra no protocolo 1.5.0 (fatia futura)**. Tudo JSON-serializável (nunca `undefined` nos writers) e pronto para sincronizar. As 4 settings novas são lidas completas e normalizadas por `getVoiceSettings()` (`src/main/voice.ts`).
 
 ### Ditado — entrada de áudio (setting `audioInput`)
 
@@ -1064,6 +1064,28 @@ interface TtsSettings {
 ```
 - `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting (a UI mostra mascarada; proteção/máscara do `settings:get` genérico é decidida na fatia de UI).
 - `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, strings aparadas (`apiKey` inclusive). **TTS `local`**: objeto parcial é completado com `DEFAULT_TTS_LOCAL` (Kokoro; `installed: false` → a UI mostra "não instalado — baixar"; voz vazia → `'pf_dora'`); `local: null` salvo é **preservado** (= o usuário limpou explicitamente); ausente/lixo → o padrão. A voz `'pf_dora'` é **provisória** — o id real do voice pack pt-BR do Kokoro é confirmado na fatia de TTS. **STT `local`** continua `null` = nenhum instalado (ausente/lixo/null → `null`; engine padrão ao normalizar objeto: `'whisper.cpp'`).
+
+### Serviço de transcrição (STT — `src/main/voice/stt.ts`)
+
+Cliente do endpoint OpenAI-compatível `/audio/transcriptions` (padrão Groq) + política de backend, **sem Electron/UI/IPC** (a fiação vem na fatia de integração) e **sem backend local** (os modelos locais entram em outra fatia; o motor local é injetado como `SttLocalBackend`). O main é dono da rede e das chaves: a `apiKey` nunca sai do serviço (nunca no resultado, nunca ao renderer).
+
+```ts
+transcribeAudio({ audio: Uint8Array; mimeType: string; fileName?: string },
+  opts: { settings: SttSettings; language?: string; timeoutMs?: number; signal?: AbortSignal }
+): Promise<TranscribeResult>            // TranscribeResult = { text, model, baseUrl, ms }
+chooseSttBackend(settings, { hasLocalReady, purpose?: 'final' | 'partial' }): 'api' | 'local'
+transcribeWithFallback(input, opts & { local?: SttLocalBackend }):
+  Promise<TranscribeResult & { backend: 'api' | 'local'; fellBack: boolean; fallbackReason?: string }>
+// parciais ao vivo: TranscribePartial = { text, isFinal, ms }
+```
+
+- **Request**: POST `{baseUrl}/audio/transcriptions` multipart/form-data — `file` com nome/extensão coerentes com o mime (`audioFileName`: wav/mp3/webm/…; o `fileName` do chamador dá o nome-base), `model`, `language` só quando informado (normalizado para ISO-639-1: `'pt-BR'` → `'pt'`; ausente = detecção automática da API) e `response_format: 'json'`; chave no header `Authorization: Bearer …`. Sucesso → `{ text, model, baseUrl, ms }` (baseUrl sem barra final).
+- **Timeout** padrão 60 s (`STT_DEFAULT_TIMEOUT_MS`, configurável por `timeoutMs`, via `AbortSignal`); abort do `signal` do chamador propaga como `AbortError` (nunca vira `SttError`, nunca cai no fallback).
+- **Erros** (`SttError`, mensagem legível em pt-BR, com `kind`/`status`/`backend`): `auth` (401/403 — chave inválida/sem permissão), `quota` (429/402 — limite/cota), `http` (demais 4xx/5xx com o corpo resumido a 160 chars; resposta 2xx sem campo `text` também), `network` (ECONNREFUSED/DNS/reset… via `connectionErrorText`), `timeout`, `config` (sem chave/modelo/baseUrl; motor local não pronto).
+- **Política de backend** (`chooseSttBackend`, pura): `api` → sempre API (parciais melhor-esforço); `local` → sempre local, **mesmo sem motor pronto** (aí o erro `config` é visível — o áudio nunca vaza para a API); `hybrid` → as **parciais** pelo motor local quando pronto (streaming de verdade; senão API melhor-esforço) e a **transcrição final** pela API (mais precisa), com fallback para o local.
+- **Fallback** (`transcribeWithFallback`): tenta o backend primário e cai no secundário **só no modo `hybrid`** e **só em erro de disponibilidade** (`isSttFallbackable`: rede, timeout, cota/429 e 5xx). Autenticação/configuração/demais 4xx nunca caem (config errada falha visível); os modos `api`/`local` nunca trocam de backend; abort sai sem fallback. Os dois falhando → erro do secundário com a falha do primário anotada ("após falha em …", como em `runWebSearch`).
+- **Parciais ao vivo** (`TranscribePartial { text, isFinal, ms }`, pronto para a fatia de integração): via API são **melhor-esforço** — a cada `STT_PARTIAL_INTERVAL_MS` (1 s) transcreve o buffer com sobreposição de `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro e o texto pode ser reescrito no seguinte). Parciais de verdade vêm do motor local em streaming: a integração pede o backend com `chooseSttBackend(settings, { hasLocalReady, purpose: 'partial' })`.
+- **Testes**: `e2e/stt.test.ts` (em `npm run test:unit`) — multipart correto (file/model/language/response_format, filename por mime) com fetch mockado e round-trip real contra servidor local (multipart serializado pelo FormData/Blob/fetch nativos), texto extraído do JSON, 401/429/500/400 com mensagens legíveis, rede/config/resposta sem `text`, timeout e abort, `chooseSttBackend` (api/local/hybrid) e fallback (só hybrid; nunca em 401; "após falha em …" quando os dois falham).
 
 ### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
 
