@@ -147,8 +147,8 @@ export const DEFAULT_TTS_API: TtsEndpointConfig = {
 
 /**
  * Motor local padrão: Kokoro, ainda não instalado (`installed: false` → a UI oferece o download).
- * O id de voz `'pf_dora'` é PROVISÓRIO — a fatia de TTS confirma o id real do voice pack pt-BR do
- * Kokoro antes de a UI/falante entrar em cena.
+ * Voz `'pf_dora'` CONFIRMADA (fatia de TTS): id da voz pt-BR feminina do Kokoro v1.0, conferido em
+ * `hexgrad/Kokoro-82M` VOICES.md (as demais pt-BR são `pm_alex`/`pm_santa`).
  */
 export const DEFAULT_TTS_LOCAL: TtsLocalConfig = {
   engine: 'kokoro',

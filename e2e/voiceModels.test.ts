@@ -178,7 +178,21 @@ test('catálogo: entradas esperadas com as URLs/nomes reais conferidos nas fonte
       'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin',
     'vosk-model-small-pt-0.3': 'https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip',
     'nemotron-3.5-asr-streaming-0.6b':
-      'https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b/resolve/main/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf'
+      'https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b/resolve/main/nemotron-3.5-asr-streaming-0.6b.q8_0.gguf',
+    'kokoro-onnx':
+      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model.onnx',
+    'kokoro-onnx-q8':
+      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_quantized.onnx',
+    'kokoro-voice-pf-dora':
+      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pf_dora.bin',
+    'kokoro-voice-pm-alex':
+      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_alex.bin',
+    'kokoro-voice-pm-santa':
+      'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices/pm_santa.bin',
+    'chatterbox-pt-br-t3':
+      'https://huggingface.co/ResembleAI/Chatterbox-Multilingual-pt-br/resolve/main/t3_pt_br.safetensors',
+    'chatterbox-pt-br-s3gen':
+      'https://huggingface.co/ResembleAI/Chatterbox-Multilingual-pt-br/resolve/main/s3gen_v3.safetensors'
   }
   for (const [id, url] of Object.entries(urls)) {
     const e = findCatalogEntry(id)
@@ -192,14 +206,28 @@ test('catálogo: entradas esperadas com as URLs/nomes reais conferidos nas fonte
   // Vosk pt-BR (Apache-2.0) presente; o vosk-model-pt-fb (GPL-3.0) fica de fora por licença
   assert.ok(findCatalogEntry('vosk-model-small-pt-0.3'))
   assert.ok(!LOCAL_MODEL_CATALOG.some((e) => /pt-fb/.test(e.id) || /pt-fb/.test(e.url ?? '')))
-  // placeholders de TTS: campos ok, sem download, nota apontando a fatia de TTS
-  for (const id of ['kokoro', 'chatterbox']) {
+  // TTS preenchidos na fatia de TTS: Kokoro (modelo + vozes pt-BR) e o fine-tune pt-BR do
+  // Chatterbox — todos com URL real, tamanho exato e sha256 (lfs.oid) do host
+  for (const id of [
+    'kokoro-onnx',
+    'kokoro-onnx-q8',
+    'kokoro-voice-pf-dora',
+    'kokoro-voice-pm-alex',
+    'kokoro-voice-pm-santa',
+    'chatterbox-pt-br-t3',
+    'chatterbox-pt-br-s3gen'
+  ]) {
     const e = findCatalogEntry(id)
     assert.ok(e, id)
     assert.equal(e.kind, 'tts', id)
-    assert.equal(e.url, null, id)
-    assert.match(e.notes ?? '', /fatia de TTS/, id)
+    assert.ok(e.url, `${id} tem download`)
+    assert.ok(e.sizeBytes > 0, id)
+    assert.match(e.sha256Oficial ?? '', /^[0-9a-f]{64}$/, id)
   }
+  // nenhuma entrada TTS virou placeholder (todas baixáveis)
+  assert.ok(!LOCAL_MODEL_CATALOG.some((e) => e.kind === 'tts' && !e.url))
+  // o id de voz padrão (pf_dora) existe como artefato do Kokoro
+  assert.ok(findCatalogEntry('kokoro-voice-pf-dora'))
 })
 
 test('catálogo: magic bytes derivados do formato (ggml, GGUF, zip) e nome de arquivo da URL', () => {
@@ -211,6 +239,12 @@ test('catálogo: magic bytes derivados do formato (ggml, GGUF, zip) e nome de ar
   const zip = findCatalogEntry('vosk-model-small-pt-0.3')!
   assert.deepEqual([...expectedMagic(zip)!], [0x50, 0x4b, 0x03, 0x04])
   assert.equal(catalogFileName(mkEntry({ url: null })), null)
+  // TTS (.onnx/.safetensors/voices .bin) não têm magic de ggml — verificação por tamanho+sha256
+  for (const id of ['kokoro-onnx', 'kokoro-voice-pf-dora', 'chatterbox-pt-br-t3']) {
+    assert.equal(expectedMagic(findCatalogEntry(id)!), null, id)
+  }
+  // o .bin de voz do Kokoro NÃO é ggml (o .bin do whisper é)
+  assert.equal(catalogFileName(findCatalogEntry('kokoro-voice-pf-dora')!), 'pf_dora.bin')
 })
 
 // ---------------- manifest ----------------
@@ -426,17 +460,17 @@ test('download: idempotente (instalado não rebaixa) e rebaixa quando corrompido
 test('download: id desconhecido e placeholder sem URL → erro legível', async () => {
   const base = newBase()
   const entry = mkEntryFor(payload(12))
+  const placeholder = mkEntry({ id: 'placeholder', url: null, sizeBytes: 0 })
   const { fetch } = mockFetchChunks([payload(12)])
   await assert.rejects(
-    downloadLocalModel(base, 'nao-existe', { catalog: [entry], fetch }),
+    downloadLocalModel(base, 'nao-existe', { catalog: [entry, placeholder], fetch }),
     /modelo desconhecido/
   )
-  const kokoro = findCatalogEntry('kokoro')!
   await assert.rejects(
-    downloadLocalModel(base, 'kokoro', { fetch }),
+    downloadLocalModel(base, 'placeholder', { catalog: [entry, placeholder], fetch }),
     /não tem download disponível ainda \(preenchido na fatia de TTS\)/
   )
-  assert.equal(kokoro.url, null)
+  assert.equal(placeholder.url, null)
   assert.deepEqual(filesIn(base), [])
 })
 
@@ -499,12 +533,17 @@ test('remove: apaga arquivo e registro, idempotente; resolve: caminho e erros le
   await removeLocalModel(base, 'antigo')
   assert.deepEqual(filesIn(base), ['manifest.json'])
   assert.deepEqual(await readManifest(base), {})
-  // resolve: id desconhecido e placeholder sem download
+  // resolve: id desconhecido e placeholder sem download (entrada sintética com url: null)
   await assert.rejects(
     resolveLocalModelPath(base, 'nao-existe', { catalog: [entry] }),
     /desconhecido/
   )
-  await assert.rejects(resolveLocalModelPath(base, 'kokoro'), /placeholder sem download/)
+  await assert.rejects(
+    resolveLocalModelPath(base, 'placeholder', {
+      catalog: [entry, mkEntry({ id: 'placeholder', url: null, sizeBytes: 0 })]
+    }),
+    /placeholder sem download/
+  )
 })
 
 test('verifyModelFile: sha256 oficial certo devolve o digest; errado rejeita', async () => {

@@ -24,10 +24,11 @@
 //   **GGUF único** Q8_0 (`nemotron-3.5-asr-streaming-0.6b.q8_0.gguf`, 742.090.464 bytes), então
 //   entra; sha256 = `lfs.oid` da API do HF. O checkpoint `.nemo` (2,37 GB) e os demais arquivos do
 //   repositório não são suportados (o runtime carrega um GGUF por modelo). Licença OpenMDW-1.1.
-// - Kokoro/Chatterbox (TTS): placeholders **sem download** até a fatia de TTS preencher URL,
-//   tamanho, hash e idiomas (`url: null`). Licenças dos MOTORES conferidas nas fontes
-//   (hexgrad/Kokoro-82M: Apache-2.0; resemble-ai/chatterbox: MIT) — o artefato concreto ainda será
-//   escolhido na fatia de TTS.
+// - Kokoro/Chatterbox (TTS): preenchidos na fatia de TTS (2026-10-22) — artefatos do
+//   `onnx-community/Kokoro-82M-v1.0-ONNX` (conversão ONNX do Kokoro-82M, apache-2.0; tamanhos e
+//   sha256 = `lfs.oid` da API tree do HF, conferidos também num download real) e do fine-tune
+//   pt-BR do Chatterbox (`ResembleAI/Chatterbox-Multilingual-pt-br`, mit). Vozes pt-BR do Kokoro:
+//   `pf_dora`/`pm_alex`/`pm_santa` (ids conferidos em `hexgrad/Kokoro-82M` VOICES.md).
 import type { SttLocalEngine, TtsLocalEngine } from '@shared/voice'
 
 export type LocalModelKind = 'stt' | 'tts'
@@ -63,6 +64,12 @@ const WHISPER_HF_BASE = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/ma
 /** URL-base dos artefatos publicados no HF para o Nemotron 3.5 ASR Streaming. */
 const NEMOTRON_HF_BASE =
   'https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b/resolve/main'
+/** URL-base da conversão ONNX do Kokoro-82M v1.0 (modelo + voices/*.bin). */
+const KOKORO_ONNX_HF_BASE =
+  'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main'
+/** URL-base do fine-tune pt-BR do Chatterbox Multilingual v3 (pack single-language). */
+const CHATTERBOX_PTBR_HF_BASE =
+  'https://huggingface.co/ResembleAI/Chatterbox-Multilingual-pt-br/resolve/main'
 
 export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
   // ---------------- STT: whisper.cpp (ggml .bin) ----------------
@@ -160,38 +167,117 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     notes:
       'Download = um .gguf único (o checkpoint .nemo de 2,37 GB e os demais arquivos do repositório não são suportados). Tamanho/sha256 = API tree do HF, 2026-10-22.'
   },
-  // ---------------- TTS: placeholders (fatia de TTS preenche) ----------------
+  // ---------------- TTS: Kokoro (conversão ONNX do Kokoro-82M v1.0) ----------------
   {
-    id: 'kokoro',
+    id: 'kokoro-onnx',
     kind: 'tts',
     engine: 'kokoro',
-    name: 'Kokoro',
+    name: 'Kokoro ONNX fp32 (modelo)',
     description:
-      'Kokoro-82M (TTS) — motor local padrão do app; artefato/voz concretos a definir na fatia de TTS.',
-    languages: [],
-    version: '1',
-    sizeBytes: 0,
-    sha256Oficial: null,
-    url: null,
+      'Kokoro-82M v1.0 convertido para ONNX fp32 — motor local padrão do app; a fp32 é a mais rápida em CPU (spike: ~0,2 s por frase curta, RTF ~0,1).',
+    languages: ['mul'],
+    version: '1.0',
+    sizeBytes: 325_532_232,
+    sha256Oficial: '8fbea51ea711f2af382e88c833d9e288c6dc82ce5e98421ea61c058ce21a34cb',
+    url: `${KOKORO_ONNX_HF_BASE}/onnx/model.onnx`,
     license: 'Apache-2.0',
     notes:
-      'Preenchido na fatia de TTS (URL, tamanho, sha256, idiomas e voice pack). Licença do motor conferida em hexgrad/Kokoro-82M.'
+      'Fonte: HF onnx-community/Kokoro-82M-v1.0-ONNX (pesos originais hexgrad/Kokoro-82M, Apache-2.0); tamanho/sha256 = lfs.oid da API tree do HF, conferidos num download real em 2026-10-22.'
   },
   {
-    id: 'chatterbox',
+    id: 'kokoro-onnx-q8',
+    kind: 'tts',
+    engine: 'kokoro',
+    name: 'Kokoro ONNX int8 (modelo leve)',
+    description:
+      'Kokoro-82M v1.0 quantizado int8 — download e disco muito menores; síntese ~4× mais lenta que a fp32 em CPU (spike: ~0,85 s por frase curta, RTF ~0,5) mas ainda em tempo real.',
+    languages: ['mul'],
+    version: '1.0',
+    sizeBytes: 92_361_116,
+    sha256Oficial: 'fbae9257e1e05ffc727e951ef9b9c98418e6d79f1c9b6b13bd59f5c9028a1478',
+    url: `${KOKORO_ONNX_HF_BASE}/onnx/model_quantized.onnx`,
+    license: 'Apache-2.0',
+    notes:
+      'Fonte: HF onnx-community/Kokoro-82M-v1.0-ONNX; tamanho/sha256 = lfs.oid da API tree do HF (2026-10-22). Com os dois modelos instalados, o motor usa a fp32.'
+  },
+  {
+    id: 'kokoro-voice-pf-dora',
+    kind: 'tts',
+    engine: 'kokoro',
+    name: 'Voz Kokoro pf_dora (pt-BR, feminina)',
+    description:
+      'Voz pt-BR "Dora" (feminina) do Kokoro v1.0 — voz padrão do app (ids conferidos em hexgrad/Kokoro-82M VOICES.md).',
+    languages: ['pt-BR'],
+    version: '1.0',
+    sizeBytes: 522_240,
+    sha256Oficial: '3da7b5b2d91847ebf5646f57631af6ececae3c29a89cd300f06edf9aa6cfe9ee',
+    url: `${KOKORO_ONNX_HF_BASE}/voices/pf_dora.bin`,
+    license: 'Apache-2.0',
+    notes:
+      'Tensor de estilos (510×256 fp32). Fonte: HF onnx-community/Kokoro-82M-v1.0-ONNX, lfs.oid (2026-10-22).'
+  },
+  {
+    id: 'kokoro-voice-pm-alex',
+    kind: 'tts',
+    engine: 'kokoro',
+    name: 'Voz Kokoro pm_alex (pt-BR, masculina)',
+    description: 'Voz pt-BR "Alex" (masculina) do Kokoro v1.0.',
+    languages: ['pt-BR'],
+    version: '1.0',
+    sizeBytes: 522_240,
+    sha256Oficial: '0175c753f59c54e7fd5a995bedef0c5ff2fb67e0043dd3dcb2ae74ec2acbeb2a',
+    url: `${KOKORO_ONNX_HF_BASE}/voices/pm_alex.bin`,
+    license: 'Apache-2.0',
+    notes:
+      'Tensor de estilos (510×256 fp32). Fonte: HF onnx-community/Kokoro-82M-v1.0-ONNX, lfs.oid (2026-10-22).'
+  },
+  {
+    id: 'kokoro-voice-pm-santa',
+    kind: 'tts',
+    engine: 'kokoro',
+    name: 'Voz Kokoro pm_santa (pt-BR, masculina)',
+    description: 'Voz pt-BR "Santa" (masculina) do Kokoro v1.0.',
+    languages: ['pt-BR'],
+    version: '1.0',
+    sizeBytes: 522_240,
+    sha256Oficial: '8b012db3185778afe2e45a62cbad69db73021774fe68dda634bcc748a982eede',
+    url: `${KOKORO_ONNX_HF_BASE}/voices/pm_santa.bin`,
+    license: 'Apache-2.0',
+    notes:
+      'Tensor de estilos (510×256 fp32). Fonte: HF onnx-community/Kokoro-82M-v1.0-ONNX, lfs.oid (2026-10-22).'
+  },
+  // ---------------- TTS: Chatterbox (fine-tune pt-BR — só arquivos nesta fatia) ----------------
+  {
+    id: 'chatterbox-pt-br-t3',
     kind: 'tts',
     engine: 'chatterbox',
-    name: 'Chatterbox',
+    name: 'Chatterbox pt-BR — T3 (fine-tune)',
     description:
-      'Resemble AI Chatterbox (TTS com clonagem de voz) — artefato concreto a definir na fatia de TTS.',
-    languages: [],
-    version: '1',
-    sizeBytes: 0,
-    sha256Oficial: null,
-    url: null,
+      'Fine-tune pt-BR do Chatterbox Multilingual v3 (pack single-language da Resemble AI) — pesos T3 (texto→tokens de fala).',
+    languages: ['pt-BR'],
+    version: 'v3',
+    sizeBytes: 2_143_990_296,
+    sha256Oficial: '074aaf65255eb9cb960288f7cc72e09d3b5008f6e0b14868c0d4e5b0bd7cbb6c',
+    url: `${CHATTERBOX_PTBR_HF_BASE}/t3_pt_br.safetensors`,
     license: 'MIT',
     notes:
-      'Preenchido na fatia de TTS (URL, tamanho, sha256, idiomas). Licença do motor conferida em resemble-ai/chatterbox.'
+      'Fonte: HF ResembleAI/Chatterbox-Multilingual-pt-br, lfs.oid (2026-10-22). O runtime do Chatterbox (e o grapheme_mtl_merged_expanded_v1.json do mesmo repositório) são de outra fatia — aqui só os arquivos.'
+  },
+  {
+    id: 'chatterbox-pt-br-s3gen',
+    kind: 'tts',
+    engine: 'chatterbox',
+    name: 'Chatterbox v3 — S3GEN (tokens→áudio)',
+    description:
+      'S3GEN v3 do pack pt-BR do Chatterbox — gerador de áudio (compartilhado com o Chatterbox Multilingual v3).',
+    languages: ['pt-BR'],
+    version: 'v3',
+    sizeBytes: 1_056_381_804,
+    sha256Oficial: '4a46190f3dccc2230fbb3488a930bccc925862ee68f2662433dfcfe93ce6c2cb',
+    url: `${CHATTERBOX_PTBR_HF_BASE}/s3gen_v3.safetensors`,
+    license: 'MIT',
+    notes:
+      'Fonte: HF ResembleAI/Chatterbox-Multilingual-pt-br, lfs.oid (2026-10-22). O mesmo repositório publica s3gen_v3.pt (mesmos pesos em formato torch).'
   }
 ]
 
@@ -227,8 +313,12 @@ function basename(p: string): string {
  * quando não há sha256 oficial (e como checagem barata sempre):
  * `.bin` → ggml (whisper.cpp: `6c 6d 67 67` = 0x67676d6c little-endian); `.gguf` → `GGUF`;
  * `.zip` → `PK\x03\x04`. Extensão desconhecida → null (sem checagem de magic).
+ *
+ * Artefatos de TTS **não têm magic** (`.onnx`, `.safetensors` e os `voices/*.bin` do Kokoro são
+ * tensores crus): entram sem checagem de magic e são verificados por tamanho exato + sha256.
  */
 export function expectedMagic(entry: LocalModelCatalogEntry): Uint8Array | null {
+  if (entry.kind === 'tts') return null
   const name = catalogFileName(entry)?.toLowerCase() ?? ''
   if (name.endsWith('.bin')) return new Uint8Array([0x6c, 0x6d, 0x67, 0x67])
   if (name.endsWith('.gguf')) return new Uint8Array([0x47, 0x47, 0x55, 0x46])
