@@ -35,8 +35,9 @@ import {
 } from '../src/main/sync/records'
 import { outdatedHosts, SyncEngine } from '../src/main/sync/engine'
 import { EDIT_NEEDS_UPDATE, type RunnerAdapter } from '../src/main/sync/host'
+import { draftMatchesMessage } from '../src/main/sync/stream'
 import { activePath, resolveParents } from '../src/shared/branches'
-import type { AgentEvent, Session } from '../src/shared/types'
+import type { AgentEvent, Session, ToolCall } from '../src/shared/types'
 import { trackFailure, type SubFailure } from '../src/renderer/src/lib/subFailures'
 import { startFakeSyncServer, type FakeSyncServer } from './fakes/syncServer.ts'
 
@@ -1119,6 +1120,161 @@ test('host: comando remoto executado no host, stream ao vivo, queda → host off
   assert.equal(B.eng.host.mode(chatId), 'local')
   srv.setRefuseConnections(A.eng.deviceId, false)
   await waitFor(() => A.eng.host.mode(chatId) === 'remote', 'A volta como controle remoto')
+  A.eng.destroy()
+  B.eng.destroy()
+})
+
+test('draftMatchesMessage: mensagem gravada continua o draft (texto + tool calls)', () => {
+  const d = {
+    content: 'Vou ler',
+    reasoning: '',
+    toolCalls: [{ id: 'c1', name: 'read_file', arguments: '{"pa' }]
+  }
+  const call = (id: string): ToolCall => ({
+    id,
+    type: 'function',
+    function: { name: 'read_file', arguments: '{"path":"a"}' }
+  })
+  // o último pedaço do texto pode não ter ido pelo stream
+  assert.ok(
+    draftMatchesMessage(d, {
+      role: 'assistant',
+      content: 'Vou ler o arquivo.',
+      tool_calls: [call('c1')]
+    })
+  )
+  assert.ok(
+    !draftMatchesMessage(d, {
+      role: 'assistant',
+      content: 'Outra resposta',
+      tool_calls: [call('c1')]
+    })
+  )
+  assert.ok(
+    !draftMatchesMessage(d, { role: 'assistant', content: 'Vou ler', tool_calls: [call('c9')] })
+  )
+  assert.ok(!draftMatchesMessage(d, { role: 'assistant', content: 'Vou ler' }))
+  assert.ok(!draftMatchesMessage(d, { role: 'user', content: 'Vou ler' }))
+  // só tool call (content null) e id ausente no draft
+  const tc = { content: '', reasoning: '', toolCalls: [{ id: '', name: 'shell', arguments: '' }] }
+  assert.ok(draftMatchesMessage(tc, { role: 'assistant', content: null, tool_calls: [call('x')] }))
+})
+
+test('controle remoto: texto antes da tool call não some (draft encerrado até a mensagem) e o status ao vivo sobrevive a sair do chat', async () => {
+  const email = await newAccount()
+  const busy = new Set<string>()
+  const A = device('PC de casa', { runner: { ...stubRunner([]), busyChats: () => busy } })
+  const { chatId, sessionId } = addChat(A.conn, 'Host')
+  addMessage(A.conn, sessionId, 'user', 'oi')
+  await login(A, email)
+  await settled(A)
+  await waitFor(() => A.eng.chatInfo(chatId).host?.self, 'A virou host (replay)')
+  const B = device('Notebook', { runner: stubRunner([]) })
+  await login(B, email)
+  await settled(B)
+  await waitFor(() => B.eng.host.mode(chatId) === 'remote', 'B é controle remoto')
+  B.eng.host.setActive(chatId)
+  await sleep(150)
+
+  // como o runner: status no banco + evento
+  const setStatus = (status: string): void => {
+    A.conn.prepare('UPDATE sessions SET status = ? WHERE id = ?').run(status, sessionId)
+    A.agent({ type: 'session-updated', session: A.eng.sessionsOf(chatId)[0] })
+  }
+  const draft = (d: any): void => A.agent({ type: 'draft', sessionId, draft: d })
+  busy.add(chatId)
+  await A.eng.host.ensureWindow(chatId, 'run')
+  setStatus('running')
+  const call = { id: 'call_1', name: 'read_file', arguments: '{"path":"a.txt"}' }
+  draft({ content: 'Vou ler o arquivo.', reasoning: '', toolCalls: [] })
+  await waitFor(
+    () => B.events.some((e) => e.type === 'draft' && e.draft?.content === 'Vou ler o arquivo.'),
+    'B vê o texto ao vivo'
+  )
+  // tool call chega e o stream termina logo (o último pedaço ainda no temporizador de 100 ms)
+  draft({ content: 'Vou ler o arquivo.', reasoning: '', toolCalls: [call] })
+  draft(null) // o runner manda o fim ANTES de gravar a mensagem
+  const asstId = randomUUID()
+  A.conn
+    .prepare(
+      'INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at) VALUES (?, ?, 2, ?, ?, ?)'
+    )
+    .run(
+      asstId,
+      sessionId,
+      JSON.stringify({
+        role: 'assistant',
+        content: 'Vou ler o arquivo.',
+        tool_calls: [
+          {
+            id: call.id,
+            type: 'function',
+            function: { name: call.name, arguments: call.arguments }
+          }
+        ]
+      }),
+      '{}',
+      Date.now()
+    )
+  A.agent({ type: 'tool-running', sessionId, toolCallId: call.id, running: true })
+  // a próxima resposta começa antes da mensagem gravada chegar em B
+  draft({ content: 'O arquivo diz', reasoning: '', toolCalls: [] })
+  const iMsg = await waitFor(() => {
+    const i = B.events.findIndex((e) => e.type === 'message-added' && e.message.id === asstId)
+    return i >= 0 ? i : null
+  }, 'B recebe a mensagem gravada')
+  const i0 = B.events.findIndex(
+    (e) => e.type === 'draft' && e.draft?.content === 'Vou ler o arquivo.'
+  )
+  const before = B.events.slice(i0, iMsg).filter((e) => e.type === 'draft') as any[]
+  assert.ok(
+    before.every((e) => e.draft?.content === 'Vou ler o arquivo.'),
+    `o texto ficou na tela até a mensagem chegar: ${JSON.stringify(before.map((e) => e.draft))}`
+  )
+  assert.ok(
+    before.some((e) => e.draft?.toolCalls[0]?.id === call.id),
+    'o último pedaço (tool call) chegou antes do fim'
+  )
+  // depois da mensagem: a resposta nova (não some de novo)
+  await waitFor(() => {
+    const last = B.events.filter((e) => e.type === 'draft').at(-1) as any
+    return last?.draft?.content === 'O arquivo diz'
+  }, 'B mostra a resposta seguinte')
+  assert.ok(
+    B.events.some((e) => e.type === 'session-updated' && e.session.status === 'running'),
+    'status ao vivo'
+  )
+
+  // sair do chat no meio do turno: continua "executando" (o banco guarda running como interrupted)
+  await waitFor(
+    () => B.eng.basePlain(B.eng.record('session', sessionId))?.status === 'running',
+    'registro da sessão (running) em B'
+  )
+  const lastStatus = (): string | undefined =>
+    (
+      B.events
+        .filter((e) => e.type === 'session-updated' && e.session.id === sessionId)
+        .at(-1) as any
+    )?.session.status
+  B.eng.host.setActive(null)
+  assert.equal(lastStatus(), 'running', 'sair do chat não o mostra parado')
+  const row = B.eng.sessionsOf(chatId)[0]
+  assert.equal(row.status, 'interrupted', 'banco: transitório gravado como interrupted (§4.3.7)')
+  assert.equal(B.eng.host.displaySession(row).status, 'running', 'sessions.list: status ao vivo')
+  // reabrir: o snapshot e a lista concordam
+  B.eng.host.setActive(chatId)
+  await sleep(300)
+  assert.equal(lastStatus(), 'running')
+  assert.equal(B.eng.host.displaySession(B.eng.sessionsOf(chatId)[0]).status, 'running')
+
+  // fim do turno: status final, janela fecha → B mostra o gravado
+  draft(null)
+  A.agent({ type: 'tool-running', sessionId, toolCallId: call.id, running: false })
+  setStatus('idle')
+  busy.delete(chatId)
+  await waitFor(() => !B.eng.host.windowOpen(chatId), 'janela fecha')
+  await waitFor(() => lastStatus() === 'idle', 'B vê o fim do turno')
+  assert.equal(B.eng.host.displaySession(B.eng.sessionsOf(chatId)[0]).status, 'idle')
   A.eng.destroy()
   B.eng.destroy()
 })

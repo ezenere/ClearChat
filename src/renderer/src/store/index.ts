@@ -29,7 +29,7 @@ import { setToolShellInfo } from '@shared/shellInfo'
 import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
 import { trackFailure, type SubFailure } from '../lib/subFailures'
 import type { UpdateStatus } from '@shared/updates'
-import { buildTree, selectionToReach, selEquals } from '@shared/branches'
+import { createBranchSelects } from '../lib/branchSelects'
 import { canAutoOpen } from '../lib/fileSources'
 import { nextReasoningClock, type ReasoningClock } from '../lib/reasoning'
 
@@ -356,6 +356,14 @@ const pending = new Map<
 let toastSeq = 0
 let attachmentSeq = 0
 let unsubscribe: (() => void) | null = null
+/** Troca de versão otimista + confirmações fora de ordem (ver lib/branchSelects). */
+const branchSelects = createBranchSelects({
+  session: (sid) => useStore.getState().sessions[sid],
+  messages: (sid) => useStore.getState().messages[sid],
+  put: (session) =>
+    useStore.setState((s) => ({ sessions: { ...s.sessions, [session.id]: session } })),
+  call: (messageId) => api.agent.selectBranch(messageId)
+})
 
 const SETTINGS_KEYS: (keyof AppSettings)[] = [
   'defaultProviderId',
@@ -559,28 +567,10 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   async selectBranch(sessionId, messageId) {
-    const before = get().sessions[sessionId]
-    const msgs = get().messages[sessionId]
-    // otimista: o caminho troca já (a confirmação chega como session-updated / retorno)
-    const optimistic =
-      before && msgs ? selectionToReach(buildTree(msgs), before.branchSel, messageId) : null
-    if (before && optimistic)
-      set((s) => ({
-        sessions: { ...s.sessions, [sessionId]: { ...before, branchSel: optimistic } }
-      }))
     try {
-      const updated = await api.agent.selectBranch(messageId)
-      if (updated?.id) set((s) => ({ sessions: { ...s.sessions, [updated.id]: updated } }))
+      await branchSelects.select(sessionId, messageId)
       return true
     } catch (err) {
-      // desfaz só se nada mais mudou a seleção nesse meio-tempo
-      if (before && optimistic)
-        set((s) => {
-          const cur = s.sessions[sessionId]
-          return cur && selEquals(cur.branchSel, optimistic)
-            ? { sessions: { ...s.sessions, [sessionId]: { ...cur, branchSel: before.branchSel } } }
-            : {}
-        })
       get().toast(`Não foi possível trocar de versão: ${errorMessage(err)}`, 'error')
       return false
     }
@@ -1168,14 +1158,10 @@ function applyEvent(e: AgentEvent): void {
     case 'session-updated':
       set((s) => {
         const prev = s.sessions[e.session.id]
-        const subFailures = trackFailure(
-          s.subFailures,
-          prev,
-          e.session,
-          s.view,
-          s.errors[e.session.id]
-        )
-        return { sessions: { ...s.sessions, [e.session.id]: e.session }, subFailures }
+        // troca de versão pendente: a seleção otimista da mais recente fica (lib/branchSelects)
+        const session = branchSelects.incoming(e.session)
+        const subFailures = trackFailure(s.subFailures, prev, session, s.view, s.errors[session.id])
+        return { sessions: { ...s.sessions, [session.id]: session }, subFailures }
       })
       break
     case 'session-deleted':

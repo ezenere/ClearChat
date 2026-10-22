@@ -1377,11 +1377,16 @@ export class SyncEngine {
 
   private flushApply(acc: ApplyResult): void {
     const seen = new Set<string>()
-    for (const e of acc.events) {
+    for (const ev of acc.events) {
+      // registro `session` atrasado (push leva ~1 s) não sobrepõe o status ao vivo do espelho
+      const e: AgentEvent =
+        ev.type === 'session-updated'
+          ? { ...ev, session: this.host.displaySession(ev.session) }
+          : ev
       // eventos repetidos do mesmo registro no lote: só o último importa
       this.emit(e)
       if (e.type === 'message-added' && e.message.message.role === 'assistant')
-        this.host.onPersistedAssistant(e.message.sessionId)
+        this.host.onPersistedAssistant(e.message)
       if (e.type === 'chat-deleted') {
         this.host.forgetChat(e.chatId)
         removeChatToolOutputs(e.chatId) // saídas salvas de tools (só locais)

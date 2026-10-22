@@ -239,7 +239,10 @@ function ChatItem({
       )}
       {status === 'running' && (
         <Tip label="Executando">
-          <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent-strong" />
+          <span
+            data-testid="chat-running"
+            className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-accent-strong"
+          />
         </Tip>
       )}
       {status === 'input' && (

@@ -228,7 +228,13 @@ export function registerIpc(): void {
     [IPC.chats.generateTitle]: (id: string) => generateTitleNow(id),
 
     // ---- sessions ----
-    [IPC.sessions.list]: (chatId: string) => sessionsRepo.list(chatId),
+    // chat executado em outro dispositivo: o status ao vivo (o banco guarda `running` como
+    // interrupted — §4.3.7); sem isso, abrir/voltar ao chat no meio do turno o mostrava parado
+    [IPC.sessions.list]: (chatId: string) => {
+      const list = sessionsRepo.list(chatId)
+      const host = syncEngine()?.host
+      return host ? list.map((s) => host.displaySession(s)) : list
+    },
     [IPC.sessions.messages]: (sessionId: string) => messagesRepo.listAll(sessionId),
 
     // ---- messages ----

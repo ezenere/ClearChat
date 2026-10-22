@@ -686,6 +686,79 @@ export function createMockApi(scenario: string): ClearApi {
     sbr.branchSel = { [a1b.id]: u2b.id }
   }
 
+  // ?scenario=model-compat → modelos com modalidades/tools conhecidas e um chat com imagem no
+  // histórico: o seletor desabilita os modelos sem visão (SPEC → Anexos → Compatibilidade).
+  if (scenario === 'model-compat') {
+    const mods: Record<string, string[]> = {
+      'anthropic/claude-sonnet-4.5': ['text', 'image', 'file'],
+      'anthropic/claude-haiku-4.5': ['text', 'image', 'file'],
+      'openai/gpt-5': ['text', 'image', 'file'],
+      'openai/gpt-5-mini': ['text', 'image', 'file'],
+      'google/gemini-2.5-pro': ['text', 'image', 'file', 'audio'],
+      'deepseek/deepseek-chat-v3.1:free': ['text'],
+      'qwen/qwen3-coder': ['text']
+      // meta-llama/llama-4-maverick: sem modalidades (desconhecido → nunca desabilitado)
+    }
+    for (const m of models) {
+      if (mods[m.id]) m.inputModalities = mods[m.id]
+      m.supportsTools = m.id !== 'deepseek/deepseek-chat-v3.1:free'
+    }
+    chats.unshift({
+      id: 'cimg',
+      title: 'Análise da captura de tela',
+      config: cfg,
+      mainSessionId: 'simg',
+      createdAt: now - 120_000,
+      updatedAt: now - 30_000
+    })
+    sessions.push({
+      id: 'simg',
+      chatId: 'cimg',
+      parentSessionId: null,
+      parentToolCallId: null,
+      depth: 0,
+      model: cfg.model,
+      title: 'Principal',
+      task: null,
+      status: 'idle',
+      createdAt: now - 120_000
+    })
+    messages.push(
+      msg(
+        'simg',
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `clearchat-attachment://${'c'.repeat(64)}.png` },
+              _attachment: {
+                name: 'captura-layout.png',
+                mime: 'image/png',
+                size: 184_320,
+                kind: 'image',
+                file: `${'c'.repeat(64)}.png`
+              }
+            },
+            { type: 'text', text: 'O que está desalinhado nesse layout?' }
+          ]
+        },
+        {},
+        now - 90_000
+      ),
+      msg(
+        'simg',
+        {
+          role: 'assistant',
+          content:
+            'O cabeçalho do card está 4px mais à direita que o corpo — o `padding-left` do título não segue o do conteúdo.'
+        },
+        { usage: { promptTokens: 1650, completionTokens: 60 }, model: cfg.model },
+        now - 60_000
+      )
+    )
+  }
+
   let approvalSettings: ApprovalSettings = normalizeApprovalSettings(
     { commands: 'lists', processes: 'lists', pages: 'lists', search: 'lists' },
     {

@@ -74,6 +74,30 @@ async function startLlm(): Promise<void> {
         res.end(chunk({}, 'stop') + 'data: [DONE]\n\n')
         return
       }
+      if (/^explique e rode o comando/.test(lastUser)) {
+        for (const p of ['Vou rodar ', 'o comando ', 'agora.']) {
+          if (res.destroyed) return
+          res.write(chunk({ role: 'assistant', content: p }))
+          await new Promise((r) => setTimeout(r, 300))
+        }
+        res.write(
+          chunk({
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_${hits.length}`,
+                type: 'function',
+                function: {
+                  name: 'shell',
+                  arguments: JSON.stringify({ command: 'expr texto-e-tool' })
+                }
+              }
+            ]
+          })
+        )
+        res.end(chunk({}, 'tool_calls') + 'data: [DONE]\n\n')
+        return
+      }
       if (/^rode o comando/.test(lastUser)) {
         res.write(
           chunk({
@@ -342,9 +366,46 @@ async function main(): Promise<void> {
     'controle remoto: envio do composer de B executa no host A; stream ao vivo em B',
     async () => {
       await openChatUi(B, 'Projeto compartilhado')
-      await B.page.getByTestId('host-badge').waitFor()
-      const badge = await B.page.getByTestId('host-badge').innerText()
-      assert(/Executando em PC de casa/.test(badge), `selo: ${badge}`)
+      // o host é só um ícone na barra do composer (nada no cabeçalho); o popover tem as ações
+      const ind = B.page.getByTestId('composer-toolbar').getByTestId('host-indicator')
+      await ind.waitFor()
+      assert((await ind.getAttribute('data-mode')) === 'remote', 'ícone remoto')
+      const label = (await ind.getAttribute('aria-label')) ?? ''
+      assert(/Executando em PC de casa/.test(label), `ícone do host: ${label}`)
+      assert(
+        (await B.page.getByRole('banner').getByText('Executando em').count()) === 0,
+        'nada de host no cabeçalho'
+      )
+      await ind.click()
+      const pop = B.page.getByTestId('host-popover')
+      await pop.waitFor()
+      const title = await pop.getByTestId('host-popover-title').innerText()
+      assert(/Controle remoto de PC de casa/.test(title), `popover: ${title}`)
+      await pop.getByTestId('host-takeover').waitFor()
+      await shot(B, '04b-host-remoto-popover')
+      await B.page.keyboard.press('Escape')
+      const localInd = A.page.getByTestId('composer-toolbar').getByTestId('host-indicator')
+      // A ainda está no onboarding (o provedor foi criado pela API): recarrega para ver os chats
+      await A.page.reload()
+      await A.page.waitForFunction(() => !!(window as any).api, null, { timeout: 30_000 })
+      await A.page.evaluate(() => {
+        const w = window as any
+        w.__ev = []
+        w.api.onEvent((e: unknown) => w.__ev.push(e))
+      })
+      await A.page.getByTestId('chat-item').first().waitFor({ timeout: 15_000 })
+      await openChatUi(A, 'Projeto compartilhado')
+      await localInd.waitFor()
+      assert((await localInd.getAttribute('data-mode')) === 'local', 'ícone local em A')
+      await localInd.click()
+      const popA = A.page.getByTestId('host-popover')
+      await popA.waitFor()
+      assert(
+        /Executando em PC de casa/.test(await popA.getByTestId('host-popover-title').innerText()),
+        'popover local'
+      )
+      await shot(A, '04c-host-local-popover')
+      await A.page.keyboard.press('Escape')
       const n0 = hits.length
       const box = B.page.locator('[data-testid="composer-column"] textarea')
       await box.fill('responda devagar, por favor')
@@ -423,6 +484,78 @@ async function main(): Promise<void> {
     await settled(A)
     return 'shell executado em A com a aprovação dada em B'
   })
+
+  await step(
+    'controle remoto: texto antes da tool call fica na tela até a mensagem gravada; status ao vivo ao sair do chat',
+    async () => {
+      await openChatUi(B, 'Chat com terminal')
+      const ev0 = (await events(B)).length
+      await api(B, 'agent.send', toolChat.mainSessionId, 'explique e rode o comando')
+      const req = await waitFor(
+        async () =>
+          (await api<any[]>(B, 'agent.pendingApprovals')).find((a) => a.chatId === toolChat.id),
+        20_000,
+        'aprovação espelhada em B'
+      )
+      // a mensagem do assistente (texto + tool call) chega pelo sync
+      await waitFor(
+        async () =>
+          (await events(B))
+            .slice(ev0)
+            .some(
+              (e) =>
+                e.type === 'message-added' &&
+                e.message.message.role === 'assistant' &&
+                textOf(e.message.message.content).includes('Vou rodar')
+            ),
+        15_000,
+        'mensagem do assistente em B'
+      )
+      const ev = (await events(B)).slice(ev0)
+      const sid = toolChat.mainSessionId
+      const iText = ev.findIndex(
+        (e) => e.type === 'draft' && e.sessionId === sid && e.draft?.content?.includes('Vou rodar')
+      )
+      const iMsg = ev.findIndex(
+        (e) =>
+          e.type === 'message-added' &&
+          e.message.message.role === 'assistant' &&
+          textOf(e.message.message.content).includes('Vou rodar')
+      )
+      assert(iText >= 0 && iText < iMsg, `draft ao vivo antes da mensagem (${iText} < ${iMsg})`)
+      const gap = ev
+        .slice(iText, iMsg)
+        .filter((e) => e.type === 'draft' && e.sessionId === sid && !e.draft?.content)
+      assert(!gap.length, `o texto sumiu antes da mensagem chegar (${gap.length} draft vazio)`)
+      await B.page.getByText('Vou rodar o comando agora.').first().waitFor()
+      await shot(B, '06c-texto-antes-da-tool-call')
+      // sair do chat com o turno parado na aprovação: continua "executando" na barra lateral
+      const item = B.page.locator('[data-testid="chat-item"]', { hasText: 'Chat com terminal' })
+      await openChatUi(B, 'Projeto compartilhado')
+      await sleep(800)
+      assert(
+        (await item.getByTestId('chat-running').count()) === 1,
+        'chat remoto em andamento segue com o ponto de "executando"'
+      )
+      await shot(B, '06d-status-fora-do-chat')
+      // voltar: o status (aguardando aprovação) e o pedido continuam
+      await openChatUi(B, 'Chat com terminal')
+      await B.page.getByTestId('composer-status').waitFor({ timeout: 10_000 })
+      await api(B, 'agent.approve', req.id, 'allow')
+      await waitFor(
+        async () =>
+          (await texts(B, toolChat.mainSessionId)).filter((t) => t.startsWith('FIM:')).length >= 2,
+        20_000,
+        'resultado voltou'
+      )
+      await waitFor(
+        async () => (await item.getByTestId('chat-running').count()) === 0,
+        15_000,
+        'fim do turno apaga o ponto'
+      )
+      await settled(A)
+    }
+  )
 
   let aDevice = ''
   await step(

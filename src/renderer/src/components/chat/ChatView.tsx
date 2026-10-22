@@ -44,7 +44,7 @@ import { GenerateTitleButton } from './GenerateTitleButton'
 import { MessageList } from './MessageList'
 import { ProcessesBadge } from './ProcessesBadge'
 import { SessionSwitcher, StatusDot } from './SessionSwitcher'
-import { DivergencePanel, HostBadge } from '../sync/ChatHost'
+import { DivergencePanel } from '../sync/ChatHost'
 import { useHostInfo } from '../sync/hooks'
 
 function EmptyChat({ chat }: { chat: Chat }): React.JSX.Element {
@@ -387,7 +387,6 @@ export function ChatHeader({
       <SessionSwitcher chatId={chat.id} currentId={session?.id ?? chat.mainSessionId} />
       <ProcessesBadge chatId={chat.id} />
       <AutoApproveBadge chat={chat} />
-      <HostBadge chat={chat} />
     </TopBar>
   )
 }

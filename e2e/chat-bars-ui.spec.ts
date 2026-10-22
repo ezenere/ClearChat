@@ -5,8 +5,9 @@
 //      (?scenario=spend) e atualização ao vivo;
 //   3. pílula do modelo no composer (fora do cabeçalho; clique → aba Modelo) e recolhimento do
 //      cabeçalho/barra do composer em 1440, 1100 e 900 px (painel direito e arquivo abertos/fechados),
-//      sem overflow nem quebra de linha; em 900 px o selo longo do controle remoto vira só ícone com
-//      tooltip. Screenshots em $CLEARCHAT_E2E_DIR/shots.
+//      sem overflow nem quebra de linha; o host do chat é só um ícone na barra do composer (nada no
+//      cabeçalho): remoto roxo / local neutro, tooltip com o nome e popover com as ações.
+//      Screenshots em $CLEARCHAT_E2E_DIR/shots.
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
@@ -310,7 +311,7 @@ app.on('window-all-closed', () => app.quit())
   })
 
   await step(
-    'recolhimento: 1440 / 1100 / 900 px × painel × arquivo, sem overflow; 900 → selo remoto só ícone',
+    'recolhimento: 1440 / 1100 / 900 px × painel × arquivo, sem overflow; host = ícone no composer',
     async () => {
       await open('chat', 'Refatorar o parser de SSE')
       const HOST = 'Workstation do escritório (Linux)'
@@ -324,7 +325,12 @@ app.on('window-all-closed', () => app.quit())
           HOST
         )
       await remote()
-      await page.getByTestId('host-badge').waitFor()
+      const indicator = page.getByTestId('composer-toolbar').getByTestId('host-indicator')
+      await indicator.waitFor()
+      assert.equal(await indicator.getAttribute('data-mode'), 'remote')
+      // um lugar só: nada de "Executando em" no cabeçalho
+      assert.equal(await page.getByRole('banner').getByTestId('host-indicator').count(), 0)
+      assert.equal(await page.getByRole('banner').getByText('Executando em').count(), 0)
       const out: string[] = []
       for (const w of [1440, 1100, 900]) {
         for (const p of [false, true]) {
@@ -347,30 +353,59 @@ app.on('window-all-closed', () => app.quit())
                 .map(([k, v]) => `${k}=${v}`)
                 .join(',')}`
             )
+            assert.ok(await indicator.isVisible(), `${tag}: ícone do host visível`)
+            assert.equal((await indicator.innerText()).trim(), '', `${tag}: só ícone`)
             if (w === 900 && !p && !file) {
-              assert.equal(g.levels['host-badge'], '2', '900: selo do host só ícone')
-              assert.equal((await page.getByTestId('host-badge').innerText()).trim(), '')
-              await page.getByTestId('host-badge').hover()
+              await indicator.hover()
               await page
                 .getByRole('tooltip')
                 .getByText(`Executando em ${HOST}`, { exact: false })
                 .first()
                 .waitFor({ timeout: 3000 })
-              await shot('06-900-host-badge-tooltip')
+              await shot('06-900-host-tooltip')
               await page.mouse.move(5, 400)
               await page.waitForTimeout(300)
             }
-            if (w === 1440 && !p && !file)
-              assert.match(
-                await page.getByTestId('host-badge').innerText(),
-                new RegExp(`Executando em ${HOST.replace(/[()]/g, '\\$&')}`)
-              )
           }
         }
       }
       await panel(false)
       await store(`s.getState().closeFile('c1')`)
       await setSize(1440, 860)
+      // remoto: popover com o nome e as ações (assumir, fixar)
+      await indicator.click()
+      const pop = page.getByTestId('host-popover')
+      await pop.waitFor()
+      assert.match(
+        await pop.getByTestId('host-popover-title').innerText(),
+        /Controle remoto de Workstation/
+      )
+      await pop.getByTestId('host-takeover').waitFor()
+      await pop.getByTestId('host-pin').waitFor()
+      await shot('07-host-remote-popover')
+      await page.keyboard.press('Escape')
+      // local: ícone neutro deste dispositivo, popover "Executando em Notebook" + fixar
+      await store(
+        `const st = s.getState();
+         s.setState({ chatHosts: { ...st.chatHosts, c1: { ...st.chatHosts.c1, mode: 'local', host: { deviceId: 'dev-me', name: 'Notebook', status: 'online', self: true }, running: false } } })`
+      )
+      await page.waitForTimeout(200)
+      assert.equal(await indicator.getAttribute('data-mode'), 'local')
+      assert.equal(await indicator.getAttribute('aria-label'), 'Executando em Notebook')
+      await indicator.click()
+      await pop.waitFor()
+      assert.equal(
+        await pop.getByTestId('host-popover-title').innerText(),
+        'Executando em Notebook'
+      )
+      assert.equal(await pop.getByTestId('host-takeover').count(), 0)
+      await pop.getByTestId('host-pin').waitFor()
+      await shot('08-host-local-popover')
+      await page.keyboard.press('Escape')
+      // sem sync: nada
+      await store(`s.setState({ sync: null })`)
+      await page.waitForTimeout(200)
+      assert.equal(await indicator.count(), 0)
       return out.join(' | ')
     }
   )

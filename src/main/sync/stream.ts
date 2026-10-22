@@ -1,7 +1,7 @@
 // Streaming ao vivo (docs/SYNC_PROTOCOL.md §11): diferenças de draft no host e aplicação no
 // controle remoto. Funções puras (testáveis).
 import { randomUUID } from 'node:crypto'
-import type { StreamDraft } from '@shared/types'
+import type { ApiMessage, StreamDraft } from '@shared/types'
 
 export interface DraftState extends StreamDraft {
   streamId: string
@@ -103,3 +103,16 @@ export const toStreamDraft = (d: DraftState): StreamDraft => ({
   reasoning: d.reasoning,
   toolCalls: d.toolCalls.map((t) => ({ ...t }))
 })
+
+/**
+ * A mensagem `assistant` persistida é a resposta que este draft transmitia? (o texto gravado
+ * continua o do draft — o último pedaço pode não ter ido pelo stream — e as tool calls batem).
+ * Usado pelo controle remoto para trocar o draft encerrado pela mensagem sem buraco na tela.
+ */
+export function draftMatchesMessage(d: StreamDraft, m: ApiMessage): boolean {
+  if (m.role !== 'assistant') return false
+  if (!(m.content ?? '').startsWith(d.content)) return false
+  const calls = m.tool_calls ?? []
+  if (calls.length < d.toolCalls.length) return false
+  return d.toolCalls.every((t, i) => !t.id || !calls[i].id || calls[i].id === t.id)
+}

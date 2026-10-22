@@ -18,6 +18,7 @@ import { Tip } from '../ui/Tooltip'
 import { AutoTextarea } from '../ui/controls'
 import { ComposerAttachmentChip } from './Attachments'
 import { useAttachmentSupport } from './attachmentSupport'
+import { useHistoryIncompatibility } from '../../lib/chatCompat'
 import { CompactBanner, ContextMeter } from './ContextMeter'
 import { QuestionForm } from './AskUser'
 import { RetryForm } from './RetryCard'
@@ -26,9 +27,9 @@ import { SkillChip, SkillPickerButton } from '../skills/SkillPicker'
 import { skillsConfigOf } from '../../lib/skills'
 import {
   HostComposerLine,
+  HostIndicator,
   HostOfflineCard,
-  OutdatedHostsBanner,
-  RemoteHint
+  OutdatedHostsBanner
 } from '../sync/ChatHost'
 import { useHostInfo } from '../sync/hooks'
 import { sessionProviderId } from '@shared/models'
@@ -203,6 +204,8 @@ export function Composer({
   const skillsOn = !!chat && skillsConfigOf(chat.config).enabled
   const pendingSkills = skillsOn ? pendingSkillsRaw : []
   const { supportOf, tooltip: attachTip } = useAttachmentSupport(session)
+  /** O histórico tem mídia/tools que o modelo atual não aceita (trocado fora do seletor). */
+  const historyWarning = useHistoryIncompatibility(session)
   /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
@@ -214,12 +217,13 @@ export function Composer({
   const loading = pending.some((a) => a.status === 'loading')
   const warnings = useMemo(() => {
     const out = new Set<string>()
+    if (historyWarning) out.add(historyWarning)
     for (const a of ready) {
       const w = modalityWarning(a.info!.kind, supportOf(a.info!))
       if (w) out.add(w)
     }
     return [...out]
-  }, [ready, supportOf])
+  }, [ready, supportOf, historyWarning])
   const warnKey = warnings.join('|')
   const confirming = !!warnKey && confirmKey === warnKey
   const canSend = !loading && (!!text.trim() || ready.length > 0 || pendingSkills.length > 0)
@@ -404,9 +408,9 @@ export function Composer({
                     </Tip>
                   )}
                   {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
+                  {chat && <HostIndicator chat={chat} />}
                   <span className="flex shrink-0 items-center gap-1.5 text-[11px] whitespace-nowrap text-faint">
                     <ComposerInfo running={busy} />
-                    {chat && <RemoteHint chat={chat} />}
                     {busy ? (
                       <ComposerStatus
                         text={

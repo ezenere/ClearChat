@@ -38,6 +38,8 @@ export type PickerRow =
       providerName: string
       model: ModelInfo
       selected: boolean
+      /** Incompatível com o chat (ver @shared/modelCompat): não selecionável. */
+      disabled?: ModelDisabled
     }
   | {
       kind: 'status'
@@ -50,6 +52,12 @@ export type PickerRow =
   | { kind: 'free'; key: string; providerId: string; providerName: string; text: string }
 
 export type SelectableRow = Extract<PickerRow, { kind: 'model' | 'free' }>
+
+/** Por que um modelo não pode ser escolhido aqui (tooltip completo + rótulo curto da linha). */
+export interface ModelDisabled {
+  reason: string
+  label: string
+}
 
 /** Altura (px) de cada tipo de linha — a virtualização depende delas serem fixas. */
 export const ROW_HEIGHT: Record<PickerRow['kind'], number> = {
@@ -85,7 +93,7 @@ export function modelMatches(m: ModelInfo, providerName: string, tokens: string[
 }
 
 export function isSelectable(r: PickerRow | undefined): r is SelectableRow {
-  return !!r && (r.kind === 'model' || r.kind === 'free')
+  return !!r && ((r.kind === 'model' && !r.disabled) || r.kind === 'free')
 }
 
 /**
@@ -93,7 +101,9 @@ export function isSelectable(r: PickerRow | undefined): r is SelectableRow {
  * / erro / vazio viram uma linha de status no grupo. Com busca: os grupos ignoram o recolhimento,
  * mostram só o que casa e somem se nada casar (exceto carregando/erro, que continuam visíveis).
  * ID livre: com texto digitado, "Usar <texto>" para cada provedor que não tem esse id exato
- * (o provedor da seleção atual primeiro), no fim.
+ * (o provedor da seleção atual primeiro), no fim — ID livre não tem metadados (capacidades
+ * desconhecidas), então nunca é desabilitado. `disabledReason` (opcional) marca modelos
+ * incompatíveis com o chat.
  */
 export function buildPickerRows(opts: {
   providers: PickerProvider[]
@@ -101,8 +111,9 @@ export function buildPickerRows(opts: {
   query: string
   collapsed: ReadonlySet<string>
   selected: ModelRef | null
+  disabledReason?: (providerId: string, model: ModelInfo) => ModelDisabled | null
 }): PickerRow[] {
-  const { providers, models, query, collapsed, selected } = opts
+  const { providers, models, query, collapsed, selected, disabledReason } = opts
   const tokens = queryTokens(query)
   const searching = tokens.length > 0
   const rows: PickerRow[] = []
@@ -127,13 +138,15 @@ export function buildPickerRows(opts: {
     })
     if (isCollapsed) continue
     for (const m of matched) {
+      const disabled = disabledReason?.(p.id, m)
       rows.push({
         kind: 'model',
         key: `m:${p.id}:${m.id}`,
         providerId: p.id,
         providerName: p.name,
         model: m,
-        selected: !!selected && selected.providerId === p.id && selected.model === m.id
+        selected: !!selected && selected.providerId === p.id && selected.model === m.id,
+        ...(disabled ? { disabled } : {})
       })
     }
     if (matched.length) continue
@@ -177,10 +190,13 @@ export function nextSelectable(rows: PickerRow[], from: number, dir: 1 | -1): nu
   return isSelectable(rows[from]) ? from : -1
 }
 
-/** Linha destacada ao abrir/buscar: a seleção atual, senão a primeira selecionável (-1 = nenhuma). */
+/**
+ * Linha destacada ao abrir/buscar: a seleção atual (se selecionável), senão a primeira
+ * selecionável (-1 = nenhuma).
+ */
 export function initialHighlight(rows: PickerRow[]): number {
   const sel = rows.findIndex((r) => r.kind === 'model' && r.selected)
-  return sel >= 0 ? sel : nextSelectable(rows, -1, 1)
+  return sel >= 0 && isSelectable(rows[sel]) ? sel : nextSelectable(rows, -1, 1)
 }
 
 /** Topo (px) de cada linha + altura total no fim (`offsets[rows.length]`). */

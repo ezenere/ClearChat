@@ -12,12 +12,10 @@ export type BarItemId =
   | 'approval-indicator'
   | 'retry-indicator'
   | 'question-indicator'
-  | 'host-badge'
   | 'session-switcher'
   | 'auto-approve'
   | 'processes'
-  // composer
-  | 'remote-hint'
+  // composer (o ícone do host, tamanho fixo, não é item)
   | 'composer-status'
   | 'context-meter'
   | 'model-pill'
@@ -41,12 +39,6 @@ export const BAR_ITEMS: Record<BarItemId, BarItemSpec> = {
   },
   'retry-indicator': { priority: 96, levels: [0, 1], doc: '"Falha de conexão" → ícone (+ nº)' },
   'question-indicator': { priority: 95, levels: [0, 1], doc: '"Pergunta pendente" → ícone (+ nº)' },
-  'host-badge': {
-    priority: 90,
-    levels: [0, 1, 2],
-    doc: '"Executando em <host>" / "<host> offline" → só o nome do host → ícone'
-  },
-  'remote-hint': { priority: 85, levels: [0, 2], doc: '"controle remoto · <host>" → ícone' },
   'composer-status': {
     priority: 80,
     levels: [0, 2],

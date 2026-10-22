@@ -422,9 +422,9 @@ test('BAR_ITEMS: prioridades distintas onde importam e níveis começando no com
     assert.ok(spec.levels.length >= 2, id)
   }
   const p = (id: BarItemId): number => BAR_ITEMS[id].priority
-  // título não é item; pendências e estado do host ficam legíveis por mais tempo
-  assert.ok(p('approval-indicator') > p('host-badge'))
-  assert.ok(p('host-badge') > p('session-switcher'))
+  // título não é item; pendências ficam legíveis por mais tempo (o host é um ícone fixo no composer)
+  assert.ok(p('approval-indicator') > p('question-indicator'))
+  assert.ok(p('question-indicator') > p('session-switcher'))
   assert.ok(p('session-switcher') > p('auto-approve'))
   assert.ok(p('auto-approve') > p('processes'))
   assert.ok(p('context-meter') > p('model-pill'))
@@ -435,45 +435,45 @@ test('BAR_ITEMS: prioridades distintas onde importam e níveis começando no com
 test('planCollapse: tudo cabe → completo; aperta → menor prioridade desce primeiro', () => {
   const items = [
     { id: 'approval-indicator' as const, widths: { 0: 160, 1: 44 } },
-    { id: 'host-badge' as const, widths: { 0: 200, 1: 110, 2: 40 } },
+    { id: 'context-meter' as const, widths: { 0: 200, 1: 110, 2: 40 } },
     { id: 'auto-approve' as const, widths: { 0: 180, 2: 28 } },
     { id: 'processes' as const, widths: { 0: 100, 1: 44 } }
   ]
   const full = 160 + 200 + 180 + 100
   assert.deepEqual(planCollapse(items, full), {
     'approval-indicator': 0,
-    'host-badge': 0,
+    'context-meter': 0,
     'auto-approve': 0,
     processes: 0
   })
   // falta 40 px → só processos encolhe
   assert.deepEqual(planCollapse(items, full - 40), {
     'approval-indicator': 0,
-    'host-badge': 0,
+    'context-meter': 0,
     'auto-approve': 0,
     processes: 1
   })
   // falta mais → aprovações vira ícone (e processos, que desceu antes, volta: cabe)
   assert.deepEqual(planCollapse(items, full - 100), {
     'approval-indicator': 0,
-    'host-badge': 0,
+    'context-meter': 0,
     'auto-approve': 2,
     processes: 0
   })
-  // o host desceu até o ícone: a folga devolve o degrau de quem tem mais prioridade e cabe
+  // o medidor desceu até o anel: a folga devolve o degrau de quem tem mais prioridade e cabe
   assert.deepEqual(planCollapse(items, 160 + 40 + 28 + 100), {
     'approval-indicator': 0,
-    'host-badge': 2,
+    'context-meter': 2,
     'auto-approve': 2,
     processes: 0
   })
   const tight = planCollapse(items, 160 + 40 + 28 + 44)
-  assert.equal(tight['host-badge'], 2)
+  assert.equal(tight['context-meter'], 2)
   assert.equal(tight['approval-indicator'], 0)
   // nada cabe: tudo no mínimo, sem laço infinito
   assert.deepEqual(planCollapse(items, 0), {
     'approval-indicator': 1,
-    'host-badge': 2,
+    'context-meter': 2,
     'auto-approve': 2,
     processes: 1
   })

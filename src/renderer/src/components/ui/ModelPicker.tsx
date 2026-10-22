@@ -1,6 +1,8 @@
 // Seletor único de modelo: os modelos de TODOS os provedores numa lista, agrupados por provedor
 // (cabeçalho com nome, contagem e recolher/expandir), busca em todos os grupos, ID livre por
 // provedor. O valor é o par { providerId, model } — o mesmo id em dois provedores são duas opções.
+// `requires` (capacidades que o histórico do chat exige — @shared/modelCompat) desabilita os
+// modelos que declaradamente não as têm, com o motivo no tooltip; desconhecido nunca desabilita.
 import {
   AlertTriangle,
   AudioLines,
@@ -12,11 +14,15 @@ import {
   FileText,
   RefreshCw,
   Search,
+  TriangleAlert,
   Settings2,
   Wrench
 } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ModelRef } from '@shared/models'
+import { compatLabel, compatReason, modelCompat, type ChatCapability } from '@shared/modelCompat'
+import { providerKind } from '@shared/providerKinds'
+import type { ModelInfo } from '@shared/types'
 import { cn, formatTokens, pricePerMillion } from '../../lib/format'
 import {
   ROW_HEIGHT,
@@ -24,6 +30,7 @@ import {
   initialHighlight,
   isSelectable,
   nextSelectable,
+  type ModelDisabled,
   rowOffsets,
   scrollToRow,
   stickyHeader,
@@ -33,6 +40,7 @@ import {
 import { useStore } from '../../store'
 import { Popover } from './layers'
 import { Spinner } from './controls'
+import { Tip } from './Tooltip'
 
 const COLLAPSED_KEY = 'clearchat.modelPicker.collapsed'
 
@@ -66,13 +74,16 @@ export function ModelPicker({
   onChange,
   autoFocus,
   className,
-  placeholder = 'Escolha um modelo…'
+  placeholder = 'Escolha um modelo…',
+  requires
 }: {
   value: ModelRef | null
   onChange: (ref: ModelRef) => void
   autoFocus?: boolean
   className?: string
   placeholder?: string
+  /** Capacidades exigidas pelo histórico do chat (vazio/ausente = sem restrição). */
+  requires?: readonly ChatCapability[]
 }): React.JSX.Element {
   const providers = useStore((s) => s.providers)
   const models = useStore((s) => s.models)
@@ -121,9 +132,23 @@ export function ModelPicker({
     return c
   }, [stored, forcedOpen])
 
+  const reqKey = requires?.join(',') ?? ''
+  const disabledReason = useMemo(() => {
+    const req = reqKey ? (reqKey.split(',') as ChatCapability[]) : []
+    if (!req.length) return undefined
+    return (providerId: string, m: ModelInfo): ModelDisabled | null => {
+      const p = providers.find((x) => x.id === providerId)
+      if (!p) return null
+      const pk = providerKind(p)
+      const { missing } = modelCompat(req, m, pk)
+      const reason = compatReason(missing, pk)
+      return reason ? { reason: `${reason}.`, label: compatLabel(missing) } : null
+    }
+  }, [reqKey, providers])
+
   const rows = useMemo(
-    () => buildPickerRows({ providers, models, query, collapsed, selected }),
-    [providers, models, query, collapsed, selected]
+    () => buildPickerRows({ providers, models, query, collapsed, selected, disabledReason }),
+    [providers, models, query, collapsed, selected, disabledReason]
   )
   const offsets = useMemo(() => rowOffsets(rows), [rows])
   const total = offsets[rows.length]
@@ -291,22 +316,26 @@ export function ModelPicker({
         const vision = m.inputModalities?.includes('image')
         const pdf = m.inputModalities?.includes('file')
         const audio = m.inputModalities?.includes('audio')
-        return (
+        const off = r.disabled
+        const row = (
           <button
             type="button"
             tabIndex={-1}
             role="option"
             aria-selected={r.selected}
+            aria-disabled={off ? true : undefined}
             data-provider={r.providerName}
             data-model={m.id}
-            onMouseMove={() => hiKey !== r.key && setHiKey(r.key)}
+            data-disabled={off ? '' : undefined}
+            onMouseMove={() => !off && hiKey !== r.key && setHiKey(r.key)}
             onClick={() => commit(r)}
             className={cn(
               'mx-1 flex h-[42px] w-[calc(100%-8px)] items-center gap-2 rounded-lg pr-2.5 pl-[26px] text-left',
-              i === hi && 'bg-hover'
+              i === hi && 'bg-hover',
+              off && 'cursor-not-allowed'
             )}
           >
-            <span className="min-w-0 flex-1">
+            <span className={cn('min-w-0 flex-1', off && 'opacity-45')}>
               <span className="flex items-center gap-1.5">
                 <span
                   className={cn(
@@ -329,22 +358,39 @@ export function ModelPicker({
               </span>
               <span className="block truncate font-mono text-[10.5px] text-subtle">{m.id}</span>
             </span>
-            {(m.contextLength || price) && (
-              <span className="shrink-0 text-right text-[10.5px] leading-tight text-subtle tabular-nums">
-                {m.contextLength ? (
-                  <span className="block">{formatTokens(m.contextLength)} ctx</span>
-                ) : null}
-                {price && (
-                  <span className="block" title="Entrada / saída por 1M tokens">
-                    {price}
-                  </span>
-                )}
+            {off ? (
+              <span
+                data-testid="model-incompatible"
+                className="flex max-w-[45%] shrink-0 items-center gap-1 text-[10.5px] text-warning/85"
+              >
+                <TriangleAlert className="size-3 shrink-0" />
+                <span className="truncate">{off.label}</span>
               </span>
+            ) : (
+              (m.contextLength || price) && (
+                <span className="shrink-0 text-right text-[10.5px] leading-tight text-subtle tabular-nums">
+                  {m.contextLength ? (
+                    <span className="block">{formatTokens(m.contextLength)} ctx</span>
+                  ) : null}
+                  {price && (
+                    <span className="block" title="Entrada / saída por 1M tokens">
+                      {price}
+                    </span>
+                  )}
+                </span>
+              )
             )}
             <span className="flex w-3.5 shrink-0 justify-center">
               {r.selected && <Check className="size-3.5 text-accent-strong" />}
             </span>
           </button>
+        )
+        return off ? (
+          <Tip label={<span className="max-w-[340px]">{off.reason}</span>} side="left">
+            {row}
+          </Tip>
+        ) : (
+          row
         )
       }
       case 'status':

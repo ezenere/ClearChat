@@ -4,7 +4,9 @@
 // Rodar: node --import ./e2e/ts-hooks.mjs --test e2e/branchView.test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import type { StoredMessage } from '../src/shared/types.ts'
+import type { Session, StoredMessage } from '../src/shared/types.ts'
+import { pruneSel, selectionToReach, type BranchSel } from '../src/shared/branches.ts'
+import { createBranchSelects } from '../src/renderer/src/lib/branchSelects.ts'
 import {
   branchGroup,
   branchView,
@@ -120,4 +122,102 @@ test('subagentsBelow: só os que nasceram abaixo da bifurcação', () => {
   assert.equal(subagentsBelow(tree, 'a2b', ['tc-bg']), 0) // a própria origem é o tronco
   assert.equal(subagentsBelow(tree, 'a1b', []), 0)
   assert.equal(subagentsBelow(tree, 'a1b', ['desconhecida']), 0)
+})
+
+/**
+ * Troca de versão no renderer contra um "main" falso com a ordem do IPC real: cada chamada grava a
+ * seleção (sobre a anterior), emite `session-updated` na hora e a resposta só chega quando o teste
+ * manda (`reply()`), sempre na ordem das chamadas.
+ */
+interface BranchSelectHarness {
+  sel: ReturnType<typeof createBranchSelects>
+  shown(): string[]
+  main(): string[]
+  failNext(v: boolean): void
+  reply(): Promise<void>
+}
+function branchSelectHarness(initial: BranchSel): BranchSelectHarness {
+  let mainSel: BranchSel = { ...initial }
+  const base = { id: 's', chatId: 'c', status: 'idle' } as unknown as Session
+  const sessions: Record<string, Session> = { s: { ...base, branchSel: { ...initial } } }
+  const replies: {
+    session?: Session
+    error?: Error
+    resolve: (s: Session) => void
+    reject: (e: Error) => void
+  }[] = []
+  let fail = false
+  const sel = createBranchSelects({
+    session: (sid) => sessions[sid],
+    messages: () => all,
+    put: (session) => void (sessions[session.id] = session),
+    call: (messageId) =>
+      new Promise<Session>((resolve, reject) => {
+        if (fail) return void replies.push({ error: new Error('recusada'), resolve, reject })
+        mainSel = pruneSel(all, selectionToReach(all, mainSel, messageId))
+        const session = { ...base, branchSel: mainSel }
+        sessions.s = sel.incoming(session) // session-updated (applyEvent)
+        replies.push({ session, resolve, reject })
+      })
+  })
+  return {
+    sel,
+    shown: (): string[] => ids(branchView(all, sessions.s.branchSel).path),
+    main: (): string[] => ids(branchView(all, mainSel).path),
+    failNext: (v: boolean): void => void (fail = v),
+    /** entrega a resposta da chamada mais antiga ainda pendente */
+    async reply(): Promise<void> {
+      const r = replies.shift()!
+      if (r.error) r.reject(r.error)
+      else r.resolve(r.session!)
+      await new Promise((ok) => setImmediate(ok))
+    }
+  }
+}
+
+test('troca de versão: resposta atrasada da troca anterior não volta a tela (←/→ rápidos)', async () => {
+  // Python (u2b) ativo; ← vai para TypeScript (u2a) e → volta para Python antes da 1ª resposta
+  const h = branchSelectHarness({ a1b: 'u2b' })
+  const t = h.sel.select('s', 'u2a')
+  assert.equal(h.shown()[2], 'u2a')
+  const p = h.sel.select('s', 'u2b')
+  assert.equal(h.shown()[2], 'u2b')
+  await h.reply() // resposta da troca para TypeScript chega depois do otimista de Python
+  assert.equal(h.shown()[2], 'u2b', 'a resposta atrasada não pode trazer TypeScript de volta')
+  // a troca seguinte (resposta do assistente v1 → v2) parte do caminho certo
+  const a = h.sel.select('s', 'a1')
+  assert.deepEqual(h.shown(), ['u1', 'a1'])
+  await h.reply()
+  assert.deepEqual(h.shown(), ['u1', 'a1'])
+  const b = h.sel.select('s', 'a1b')
+  await h.reply()
+  await h.reply()
+  await Promise.all([t, p, a, b])
+  assert.equal(h.shown()[2], 'u2b', 'a versão lembrada sob a resposta é Python')
+  assert.deepEqual(h.shown(), h.main())
+})
+
+test('troca de versão: falha da mais recente volta ao que o main gravou; falha antiga não desfaz', async () => {
+  const h = branchSelectHarness({ a1b: 'u2b' })
+  const t = h.sel.select('s', 'u2a')
+  h.failNext(true)
+  const g = h.sel.select('s', 'u2c').catch((e: Error) => e.message)
+  assert.equal(h.shown()[2], 'u2c')
+  await h.reply()
+  assert.equal(h.shown()[2], 'u2c') // a Go ainda pendente
+  await h.reply()
+  assert.equal(await g, 'recusada')
+  await t
+  assert.equal(h.shown()[2], 'u2a', 'volta para TypeScript (gravada pelo main), não para Python')
+  assert.deepEqual(h.shown(), h.main())
+  // falha de uma troca antiga com outra mais nova pendente: a nova fica
+  const f = h.sel.select('s', 'u2b').catch(() => 'erro')
+  h.failNext(false)
+  const ok = h.sel.select('s', 'u2c')
+  await h.reply()
+  assert.equal(await f, 'erro')
+  assert.equal(h.shown()[2], 'u2c')
+  await h.reply()
+  await ok
+  assert.deepEqual(h.shown(), h.main())
 })

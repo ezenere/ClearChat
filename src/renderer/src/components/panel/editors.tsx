@@ -8,6 +8,7 @@ import {
   defaultToolsPrompt,
   supportsCacheControl
 } from '@shared/defaults'
+import type { ChatCapability } from '@shared/modelCompat'
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import {
   conflictOmitted,
@@ -165,14 +166,21 @@ export function ModelSection({
   cfg,
   patch,
   note,
+  requires,
   children
-}: CfgProps & { note?: ReactNode; children?: ReactNode }): React.JSX.Element {
+}: CfgProps & {
+  note?: ReactNode
+  /** Capacidades exigidas pelo histórico do chat (@shared/modelCompat); persona → nenhuma. */
+  requires?: readonly ChatCapability[]
+  children?: ReactNode
+}): React.JSX.Element {
   return (
     <Section title="Modelo" aside={<ModelFieldInfo side="left" />}>
       <div>
         <ModelPicker
           value={{ providerId: cfg.providerId, model: cfg.model }}
           onChange={(ref) => patch({ providerId: ref.providerId, model: ref.model })}
+          requires={requires}
         />
         <div className="mt-1.5 empty:hidden">
           <ModelInfoLine providerId={cfg.providerId} model={cfg.model} />
@@ -442,11 +450,20 @@ export function RequestExtrasSection({
  * parâmetros e request recolhidos (com resumo do que difere do padrão).
  */
 export function ModelEditor(
-  props: CfgProps & { scope: string; modelNote?: ReactNode }
+  props: CfgProps & {
+    scope: string
+    modelNote?: ReactNode
+    requires?: readonly ChatCapability[]
+  }
 ): React.JSX.Element {
   return (
     <>
-      <ModelSection cfg={props.cfg} patch={props.patch} note={props.modelNote}>
+      <ModelSection
+        cfg={props.cfg}
+        patch={props.patch}
+        note={props.modelNote}
+        requires={props.requires}
+      >
         <ReasoningField {...props} />
       </ModelSection>
       <SystemPromptSection {...props} />

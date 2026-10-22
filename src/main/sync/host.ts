@@ -37,10 +37,11 @@ import {
   type Envelope
 } from './crypto'
 import { WsRequestError } from './ws'
-import { usesLocalTools, type Plain } from './records'
+import { TRANSIENT_STATUS, usesLocalTools, type Plain } from './records'
 import {
   applyDraftDelta,
   diffDraft,
+  draftMatchesMessage,
   toStreamDraft,
   type DraftDelta,
   type DraftState
@@ -133,6 +134,13 @@ interface Mirror {
   lastN: number
   sessions: Map<string, string>
   drafts: Map<string, DraftState>
+  /**
+   * Drafts já encerrados (`draft.end`) cuja mensagem persistida ainda não chegou pelo sync: seguem
+   * na tela (o 1º da fila) até ela chegar — o stream é mais rápido que o push/pull dos registros e,
+   * sem isso, o texto sumia entre o fim da resposta e a chegada da mensagem (ex.: durante a tool call).
+   */
+  ended: Map<string, StreamDraft[]>
+  endedTimers: Map<string, ReturnType<typeof setTimeout>>
   tools: Map<string, Map<string, ToolRun>>
   compaction: Map<string, { state: 'scheduled' | 'running'; text?: string }>
   queues: Map<string, QueuedMessage[]>
@@ -183,6 +191,8 @@ const BUSY_STATUS = new Set([
 ])
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 const MAX_STREAM_ENV = 200 * 1024
+/** Teto para um draft encerrado esperar a mensagem persistida (o push leva ~1 s; rede lenta, mais). */
+export const ENDED_DRAFT_HOLD_MS = 8_000
 
 /** Tipos de comando que mudam conteúdo (precisam da janela do host). */
 const CONTENT_CMDS = new Set([
@@ -360,6 +370,35 @@ export class HostController {
     return !!this.states.get(chatId)?.window
   }
 
+  /** O chat é executado em OUTRO dispositivo (o banco local não tem o status ao vivo). */
+  private hostedElsewhere(chatId: string): boolean {
+    const h = this.states.get(chatId)?.host
+    return !!h && h.device_id !== this.me
+  }
+
+  /** Status gravado no último registro `session` recebido (o banco guarda transitório como interrupted). */
+  private recordStatus(sessionId: string): string | null {
+    const st = this.engine.basePlain(this.engine.record('session', sessionId))?.status
+    return typeof st === 'string' ? st : null
+  }
+
+  /**
+   * Sessão com o status a EXIBIR (§4.3.7). Chat executado em outro dispositivo: o status ao vivo do
+   * espelho (chat aberto) → com a janela do host aberta, o transitório do último registro (ex.:
+   * `running` de um chat que não está aberto aqui) → o do banco (transitório sem janela =
+   * `interrupted`). No host (e sem sync), o banco já é o ao vivo.
+   */
+  displaySession(s: Session): Session {
+    if (!this.engine.active || !this.hostedElsewhere(s.chatId)) return s
+    const live = this.mirrors.get(s.chatId)?.sessions.get(s.id)
+    if (live) return live === s.status ? s : { ...s, status: live as Session['status'] }
+    if (!this.windowOpen(s.chatId)) return s
+    const rec = this.recordStatus(s.id)
+    if (rec && TRANSIENT_STATUS.has(rec) && rec !== s.status)
+      return { ...s, status: rec as Session['status'] }
+    return s
+  }
+
   hostName(chatId: string): string {
     return this.states.get(chatId)?.host?.name ?? 'outro dispositivo'
   }
@@ -454,11 +493,20 @@ export class HostController {
     }
     if (!s.window) {
       this.endMirrorTurn(id)
+      // janela fechou sem o status final (host caiu): o que aparecia como transitório vira o gravado
+      if (prev?.window && this.hostedElsewhere(id)) this.emitStaleTransient(id)
       // a janela de outro fechou: conteúdo local que esperava pode subir agora (replay)
       if (prev?.window && this.engine.hasPendingContent(id)) this.engine.schedulePush()
     }
     if (live && event) this.onStateEvent(id, s, prev, event)
     this.emitInfo(id)
+  }
+
+  private emitStaleTransient(chatId: string): void {
+    for (const s of this.engine.sessionsOf(chatId)) {
+      const rec = this.recordStatus(s.id)
+      if (rec && TRANSIENT_STATUS.has(rec)) this.emitM({ type: 'session-updated', session: s })
+    }
   }
 
   private onStateEvent(
@@ -1572,11 +1620,15 @@ export class HostController {
         break
     }
     if (e.type === 'draft') {
-      pub.pendingDraft.set(e.sessionId, e.draft)
       if (!e.draft) {
+        // o último pedaço (ainda esperando o temporizador) vai antes do fim: o controle remoto
+        // mostra o draft encerrado até a mensagem persistida chegar
+        this.flushDrafts(chatId)
+        pub.pendingDraft.set(e.sessionId, null)
         this.flushDrafts(chatId)
         return
       }
+      pub.pendingDraft.set(e.sessionId, e.draft)
       if (!pub.draftTimer) pub.draftTimer = setTimeout(() => this.flushDrafts(chatId), 100)
       return
     }
@@ -1758,6 +1810,8 @@ export class HostController {
         lastN: 0,
         sessions: new Map(),
         drafts: new Map(),
+        ended: new Map(),
+        endedTimers: new Map(),
         tools: new Map(),
         compaction: new Map(),
         queues: new Map(),
@@ -1831,15 +1885,14 @@ export class HostController {
           return
         }
         m.drafts.set(d.sessionId, next)
-        this.emitM({ type: 'draft', sessionId: d.sessionId, draft: toStreamDraft(next) })
+        // um draft encerrado ainda na tela: a resposta nova aparece quando a mensagem dele chegar
+        if (!m.ended.get(d.sessionId)?.length)
+          this.emitM({ type: 'draft', sessionId: d.sessionId, draft: toStreamDraft(next) })
         return
       }
-      case 'draft.end': {
-        const sid = String(p.sessionId)
-        m.drafts.delete(sid)
-        this.emitM({ type: 'draft', sessionId: sid, draft: null })
+      case 'draft.end':
+        this.endLiveDraft(m, String(p.sessionId))
         return
-      }
       case 'session': {
         const s = p.session as Session
         if (!s?.id) return
@@ -1900,6 +1953,8 @@ export class HostController {
       case 'retry.requested': {
         const r = p.request as RetryRequest
         m.retries.set(r.id, r)
+        // falha de rede: o parcial foi descartado no host (nada será persistido)
+        if (this.dropEnded(m, r.sessionId)) this.emitShown(m, r.sessionId)
         this.emitM({ type: 'retry-requested', request: r })
         return
       }
@@ -1953,10 +2008,10 @@ export class HostController {
         const cur = m.drafts.get(sid)
         const st: DraftState = { streamId: cur?.streamId ?? '', ...s.draft }
         m.drafts.set(sid, st)
-        this.emitM({ type: 'draft', sessionId: sid, draft: s.draft })
+        if (!m.ended.get(sid)?.length) this.emitM({ type: 'draft', sessionId: sid, draft: s.draft })
       } else if (m.drafts.has(sid)) {
-        m.drafts.delete(sid)
-        this.emitM({ type: 'draft', sessionId: sid, draft: null })
+        // o `draft.end` se perdeu: como se tivesse chegado
+        this.endLiveDraft(m, sid)
       }
       // tools
       const old = m.tools.get(sid) ?? new Map<string, ToolRun>()
@@ -2040,17 +2095,26 @@ export class HostController {
   private endMirrorTurn(chatId: string): void {
     const m = this.mirrors.get(chatId)
     if (!m) return
-    for (const sid of m.drafts.keys()) this.emitM({ type: 'draft', sessionId: sid, draft: null })
+    for (const t of m.endedTimers.values()) clearTimeout(t)
+    m.endedTimers.clear()
+    for (const sid of new Set([...m.drafts.keys(), ...m.ended.keys()]))
+      this.emitM({ type: 'draft', sessionId: sid, draft: null })
     m.drafts.clear()
+    m.ended.clear()
     for (const [sid, runs] of m.tools)
       for (const id of runs.keys())
         this.emitM({ type: 'tool-running', sessionId: sid, toolCallId: id, running: false })
     m.tools.clear()
-    for (const sid of m.sessions.keys()) {
-      const s = this.engine.sessionsOf(chatId).find((x) => x.id === sid)
-      if (s) this.emitM({ type: 'session-updated', session: s })
-    }
+    // sem o espelho, vale o status gravado — com a janela ainda aberta (saiu do chat no meio do
+    // turno), o transitório do registro: o chat continua aparecendo como "executando"
+    const sids = [...m.sessions.keys()]
     m.sessions.clear()
+    if (!sids.length) return
+    const all = this.engine.sessionsOf(chatId)
+    for (const sid of sids) {
+      const s = all.find((x) => x.id === sid)
+      if (s) this.emitM({ type: 'session-updated', session: this.displaySession(s) })
+    }
   }
 
   /** Esquece o espelho do chat (emite as resoluções para a UI limpar). */
@@ -2068,11 +2132,82 @@ export class HostController {
     this.mirrors.delete(chatId)
   }
 
-  /** Mensagem assistant persistida chegou: some o draft daquela sessão (§11). */
-  onPersistedAssistant(sessionId: string): void {
-    for (const [, m] of this.mirrors) {
-      if (m.drafts.delete(sessionId)) this.emitM({ type: 'draft', sessionId, draft: null })
+  /**
+   * Mensagem assistant persistida chegou: some o draft daquela sessão (§11) — o encerrado que ela
+   * substitui (e os mais velhos que ele); o ao vivo só se for a resposta dela (`draft.end` perdido).
+   * Uma mensagem de uma resposta anterior não apaga o draft da resposta nova.
+   */
+  onPersistedAssistant(msg: StoredMessage): void {
+    const sid = msg.sessionId
+    const synthetic = !!msg.meta.synthetic
+    for (const m of this.mirrors.values()) {
+      const list = m.ended.get(sid)
+      if (list?.length) {
+        const i = synthetic
+          ? list.length - 1
+          : list.findIndex((d) => draftMatchesMessage(d, msg.message))
+        if (i < 0) continue
+        list.splice(0, i + 1)
+        if (list.length) this.armEnded(m, sid)
+        else this.dropEnded(m, sid)
+        this.emitShown(m, sid)
+        continue
+      }
+      const live = m.drafts.get(sid)
+      if (live && (synthetic || draftMatchesMessage(toStreamDraft(live), msg.message))) {
+        m.drafts.delete(sid)
+        this.emitM({ type: 'draft', sessionId: sid, draft: null })
+      }
     }
+  }
+
+  /** O que a tela mostra como draft da sessão: o 1º encerrado ainda sem mensagem, senão o ao vivo. */
+  private shownDraft(m: Mirror, sid: string): StreamDraft | null {
+    const ended = m.ended.get(sid)
+    if (ended?.length) return ended[0]
+    const live = m.drafts.get(sid)
+    return live ? toStreamDraft(live) : null
+  }
+
+  private emitShown(m: Mirror, sid: string): void {
+    this.emitM({ type: 'draft', sessionId: sid, draft: this.shownDraft(m, sid) })
+  }
+
+  /**
+   * Fim da resposta ao vivo (`draft.end`): com texto/tool calls, o draft continua na tela até a
+   * mensagem persistida chegar (ou o teto `ENDED_DRAFT_HOLD_MS`, o fim do turno, a falha de rede).
+   */
+  private endLiveDraft(m: Mirror, sid: string): void {
+    const had = m.drafts.get(sid)
+    m.drafts.delete(sid)
+    if (had && (had.content.trim() || had.toolCalls.length)) {
+      const list = m.ended.get(sid) ?? []
+      list.push(toStreamDraft(had))
+      m.ended.set(sid, list)
+      this.armEnded(m, sid)
+      return // a tela já mostra este (ou um encerrado mais velho)
+    }
+    this.emitShown(m, sid)
+  }
+
+  private armEnded(m: Mirror, sid: string): void {
+    const old = m.endedTimers.get(sid)
+    if (old) clearTimeout(old)
+    const t = setTimeout(() => {
+      if (m.endedTimers.get(sid) !== t) return
+      m.endedTimers.delete(sid)
+      if (m.ended.delete(sid) && [...this.mirrors.values()].includes(m)) this.emitShown(m, sid)
+    }, ENDED_DRAFT_HOLD_MS)
+    t.unref?.()
+    m.endedTimers.set(sid, t)
+  }
+
+  /** Esquece os drafts encerrados da sessão (sem emitir); true se havia algum. */
+  private dropEnded(m: Mirror, sid: string): boolean {
+    const t = m.endedTimers.get(sid)
+    if (t) clearTimeout(t)
+    m.endedTimers.delete(sid)
+    return m.ended.delete(sid)
   }
 
   // ---------------- consultas do espelho (IPC) ----------------

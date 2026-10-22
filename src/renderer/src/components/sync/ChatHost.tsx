@@ -1,6 +1,6 @@
-// Host de execução na UI (docs/SYNC_PROTOCOL.md §8–§9): selo "Executando em <dispositivo>" no
-// cabeçalho do chat, faixa do controle remoto / host offline no composer, troca de host com o aviso
-// de ferramentas locais, painel de divergência e perguntas do sync.
+// Host de execução na UI (docs/SYNC_PROTOCOL.md §8–§9): ícone do host na barra do composer (popover
+// "Executando em <dispositivo>" com as ações), cartão do host offline e avisos acima do composer,
+// troca de host com o aviso de ferramentas locais, painel de divergência e perguntas do sync.
 import {
   CircleAlert,
   Cloud,
@@ -9,7 +9,6 @@ import {
   Laptop,
   Lock,
   MonitorSmartphone,
-  Radio,
   TriangleAlert,
   Unlock,
   X,
@@ -31,22 +30,33 @@ import { useHostInfo, useTakeover, deviceName } from './hooks'
 import { useBranchView } from '../../lib/useBranchView'
 import { branchGroup } from '../../lib/branchView'
 import { BranchSwitcher } from '../chat/BranchSwitcher'
-import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 
-// ---------------- selo no cabeçalho ----------------
+// ---------------- indicador do host (barra do composer) ----------------
 
-export function HostBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
+/**
+ * Onde o chat executa, só como ícone na barra do composer (antes era o selo "Executando em
+ * <dispositivo>" no cabeçalho + "controle remoto · <host>" no composer — redundante): remoto = ícone
+ * roxo (ponto verde com o host online), local = ícone neutro deste dispositivo, sem conexão = nuvem
+ * cortada, host offline = ícone apagado (no cartão "Executar neste dispositivo"). O tooltip leva o
+ * nome; o clique abre o popover com as ações de antes (assumir, forçar, cancelar troca, fixar host).
+ * Sem sync (sem conta / bloqueado), nada.
+ */
+export function HostIndicator({
+  chat,
+  className
+}: {
+  chat: Chat
+  className?: string
+}): React.JSX.Element | null {
   const info = useHostInfo(chat.id)
   const sync = useStore((s) => s.sync)
   const run = useStore((s) => s.run)
   const [open, setOpen] = useState(false)
   const anchor = useRef<HTMLButtonElement>(null)
   const { start, dialog } = useTakeover(chat)
-  const level = useBarLevel('host-badge')
   if (!info || info.mode === 'off' || !sync || sync.phase !== 'ready') return null
   const host = info.host
   const self = !!host?.self
-  if (info.mode === 'local' && !host && !info.running) return null
   const label =
     info.mode === 'diverged'
       ? 'Divergente'
@@ -58,77 +68,90 @@ export function HostBadge({ chat }: { chat: Chat }): React.JSX.Element | null {
           ? `${host?.name ?? 'Host'} offline`
           : `Executando em ${self ? deviceName() : (host?.name ?? deviceName())}`
   const tone =
-    info.mode === 'diverged' || info.mode === 'host-offline'
-      ? 'border-danger/35 bg-danger/[0.08] text-danger'
+    info.mode === 'diverged'
+      ? 'text-danger hover:bg-danger/10'
       : info.mode === 'remote'
-        ? 'border-accent/40 bg-accent-soft/50 text-accent-strong'
-        : info.mode === 'offline'
-          ? 'border-border text-subtle'
-          : 'border-border text-muted'
+        ? 'text-accent-strong hover:bg-accent-soft'
+        : info.mode === 'host-offline' || info.mode === 'offline'
+          ? 'text-faint hover:bg-hover hover:text-subtle'
+          : 'text-subtle hover:bg-hover hover:text-fg'
   const Icon =
     info.mode === 'diverged'
       ? GitFork
       : info.mode === 'offline'
         ? CloudOff
-        : info.mode === 'remote'
+        : info.mode === 'remote' || info.mode === 'host-offline'
           ? MonitorSmartphone
           : Laptop
   const handoverToMe = info.handover?.self
   const fullLabel = handoverToMe ? `Aguardando ${host?.name ?? 'host'}` : label
-  // curto (cabeçalho apertado): só o nome do host (ou o estado, sem host)
-  const shortLabel =
-    info.mode === 'diverged'
-      ? 'Divergente'
-      : info.mode === 'host-offline'
-        ? `${host?.name ?? 'Host'} off`
-        : (host?.name ?? (info.mode === 'offline' ? 'Offline' : deviceName()))
-  const badge = (
-    <button
-      ref={anchor}
-      type="button"
-      data-testid="host-badge"
-      {...barAttrs('host-badge', level)}
-      aria-label={level > 0 ? fullLabel : undefined}
-      onClick={() => setOpen((o) => !o)}
-      className={cn(
-        'no-drag flex h-7 max-w-[260px] shrink-0 items-center gap-1.5 rounded-lg border px-2 text-xs whitespace-nowrap transition-colors hover:brightness-125',
-        tone
-      )}
-    >
-      <Icon className="size-3.5 shrink-0" />
-      {info.mode === 'remote' && host?.status === 'online' && (
-        <span className="size-1.5 shrink-0 animate-pulse-soft rounded-full bg-success" />
-      )}
-      {level < 2 && (
-        <span className="truncate">
-          {level === 0 ? fullLabel : handoverToMe ? `→ ${host?.name ?? 'host'}` : shortLabel}
-        </span>
-      )}
-      {info.pinned && <Lock className="size-3 shrink-0 opacity-70" />}
-    </button>
-  )
   return (
     <>
-      <Tip side="bottom" label={`${fullLabel} · clique para detalhes`}>
-        {badge}
+      <Tip label={`${fullLabel} · clique para opções`}>
+        <button
+          ref={anchor}
+          type="button"
+          data-testid="host-indicator"
+          data-mode={info.mode}
+          aria-label={fullLabel}
+          aria-expanded={open}
+          onClick={(e) => {
+            e.stopPropagation()
+            setOpen((o) => !o)
+          }}
+          className={cn(
+            'relative flex size-7 shrink-0 items-center justify-center rounded-lg transition-colors',
+            tone,
+            open && 'bg-hover',
+            className
+          )}
+        >
+          <Icon className={cn('size-4', handoverToMe && 'animate-pulse-soft')} />
+          {info.mode === 'remote' && host?.status === 'online' && (
+            <span
+              data-testid="host-online-dot"
+              className="absolute top-1 right-1 size-1.5 animate-pulse-soft rounded-full bg-success ring-2 ring-surface"
+            />
+          )}
+          {info.pinned && (
+            <Lock className="absolute right-0.5 bottom-0.5 size-2.5 rounded-sm bg-surface opacity-80" />
+          )}
+        </button>
       </Tip>
-      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} width={330} align="end">
-        <div className="space-y-2.5 p-3 text-[12.5px]" data-testid="host-popover">
+      <Popover open={open} onClose={() => setOpen(false)} anchor={anchor} width={330}>
+        <div
+          className="space-y-2.5 p-3 text-[12.5px]"
+          data-testid="host-popover"
+          onClick={(e) => e.stopPropagation()}
+        >
           <div>
-            <div className="font-medium text-fg">
-              {info.mode === 'remote'
-                ? `Controle remoto de ${host?.name}`
-                : info.mode === 'host-offline'
-                  ? `O host (${host?.name}) está offline`
-                  : info.mode === 'diverged'
-                    ? 'Versões divergentes'
-                    : info.mode === 'offline'
-                      ? 'Sem conexão com o servidor'
-                      : `Executando em ${deviceName()}`}
+            <div className="flex items-center gap-2 font-medium text-fg">
+              <Icon
+                className={cn(
+                  'size-3.5 shrink-0',
+                  info.mode === 'remote' ? 'text-accent-strong' : 'text-subtle'
+                )}
+              />
+              <span className="min-w-0 truncate" data-testid="host-popover-title">
+                {info.mode === 'remote'
+                  ? `Controle remoto de ${host?.name}`
+                  : info.mode === 'host-offline'
+                    ? `O host (${host?.name}) está offline`
+                    : info.mode === 'diverged'
+                      ? 'Versões divergentes'
+                      : info.mode === 'offline'
+                        ? 'Sem conexão com o servidor'
+                        : `Executando em ${deviceName()}`}
+              </span>
+              {info.mode === 'remote' && host?.status === 'online' && (
+                <span className="ml-auto shrink-0 text-[10.5px] font-normal text-success">
+                  online
+                </span>
+              )}
             </div>
             <p className="mt-0.5 text-[11.5px] leading-relaxed text-subtle">
               {info.mode === 'remote'
-                ? 'As mensagens e comandos vão para o host; as ferramentas agem na máquina dele. Você acompanha ao vivo.'
+                ? 'As mensagens, ⚡, aprovações e respostas vão cifradas para o host, que executa o chat; as ferramentas agem na máquina dele. Você acompanha ao vivo.'
                 : info.mode === 'host-offline'
                   ? 'Comandos remotos só funcionam com o host online. Você pode assumir o chat aqui.'
                   : info.mode === 'diverged'
@@ -244,6 +267,7 @@ export function HostOfflineCard({ chat }: { chat: Chat }): React.JSX.Element {
           Mensagens e comandos só chegam com ele online. Para continuar, execute o chat aqui.
         </div>
       </div>
+      <HostIndicator chat={chat} />
       <Button
         variant="primary"
         loading={busy}
@@ -364,33 +388,6 @@ export function OutdatedHostsBanner(): React.JSX.Element | null {
         <X className="size-3.5" />
       </button>
     </div>
-  )
-}
-
-/** Rodapé do composer no controle remoto. */
-export function RemoteHint({ chat }: { chat: Chat }): React.JSX.Element | null {
-  const info = useHostInfo(chat.id)
-  const level = useBarLevel('remote-hint')
-  if (info?.mode !== 'remote') return null
-  return (
-    <Tip
-      label={
-        <span className="max-w-[300px]">
-          <span className="block font-medium">Controle remoto · {info.host?.name}</span>
-          As mensagens, ⚡, aprovações e respostas vão cifradas para o host, que executa o chat.
-        </span>
-      }
-    >
-      <span
-        data-testid="remote-hint"
-        {...barAttrs('remote-hint', level)}
-        aria-label={`Controle remoto · ${info.host?.name ?? 'host'}`}
-        className="flex max-w-[180px] shrink-0 items-center gap-1 truncate text-[11px] whitespace-nowrap text-accent-strong/90"
-      >
-        <Radio className="size-3 shrink-0" />
-        {level === 0 && <span className="truncate">controle remoto · {info.host?.name}</span>}
-      </span>
-    </Tip>
   )
 }
 

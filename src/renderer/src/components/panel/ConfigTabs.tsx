@@ -3,6 +3,7 @@ import { ArrowUpRight, BookmarkPlus, FolderOpen, Layers } from 'lucide-react'
 import { useState } from 'react'
 import { snapshotPreset } from '@shared/presets'
 import type { Chat, ChatConfig } from '@shared/types'
+import { useChatRequirements } from '../../lib/chatCompat'
 import { baseName, rootSummary } from '../../lib/configSummary'
 import { compactPath, formatTokens } from '../../lib/format'
 import { useContextInfo } from '../../lib/useContextInfo'
@@ -27,7 +28,12 @@ function usePatch(chat: Chat): (p: Partial<ChatConfig>) => void {
 }
 
 export function ModelTab({ chat }: { chat: Chat }): React.JSX.Element {
-  return <ModelEditor cfg={chat.config} patch={usePatch(chat)} scope={chat.id} />
+  // o modelo do chat é o da sessão principal: o histórico dela decide o que é compatível
+  const main = useStore((s) => s.sessions[chat.mainSessionId])
+  const requires = useChatRequirements(main)
+  return (
+    <ModelEditor cfg={chat.config} patch={usePatch(chat)} scope={chat.id} requires={requires} />
+  )
 }
 
 export function ToolsTab({ chat }: { chat: Chat }): React.JSX.Element {
