@@ -8,6 +8,7 @@ import {
   DEFAULT_AUDIO_INPUT,
   DEFAULT_INTERJECTION_POLICY,
   DEFAULT_STT_SETTINGS,
+  DEFAULT_TTS_LOCAL,
   DEFAULT_TTS_SETTINGS,
   DEFAULT_VOICE_CALL_CONFIG,
   DEFAULT_VOICE_CALL_DEFAULTS,
@@ -49,6 +50,15 @@ test('os DEFAULT_* são JSON-serializáveis (round-trip igual)', () => {
     normalizeVoiceCallConfig({ enabled: true, voicePrompt: 'fale curto' })
   ])
     assert.deepEqual(JSON.parse(JSON.stringify(d)), d)
+})
+
+test('defaults de produto: chamada de voz, interjeições e fillers ligados; TTS local aponta o Kokoro', () => {
+  assert.equal(DEFAULT_VOICE_CALL_DEFAULTS.enabled, true)
+  assert.equal(DEFAULT_INTERJECTION_POLICY.enabled, true)
+  assert.equal(DEFAULT_INTERJECTION_POLICY.shadow, false) // shadow continua desligado
+  assert.equal(DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled, true)
+  assert.deepEqual(DEFAULT_TTS_SETTINGS.local, DEFAULT_TTS_LOCAL)
+  assert.deepEqual(DEFAULT_TTS_LOCAL, { engine: 'kokoro', voice: 'pf_dora', installed: false })
 })
 
 // ---------------- entrada de áudio ----------------
@@ -118,18 +128,27 @@ test('sttSettings.local: engine inválido → whisper.cpp; installed false prese
 
 // ---------------- fala (TTS) ----------------
 
-test('ttsSettings: backend padrão local, engine local padrão kokoro, voz da API null', () => {
+test('ttsSettings: backend padrão local; local padrão = Kokoro não instalado; null explícito = limpo', () => {
   assert.equal(DEFAULT_TTS_SETTINGS.backend, 'local')
-  assert.equal(DEFAULT_TTS_SETTINGS.local, null)
+  assert.deepEqual(DEFAULT_TTS_SETTINGS.local, {
+    engine: 'kokoro',
+    voice: 'pf_dora',
+    installed: false
+  })
+  // local ausente/lixo → o padrão (Kokoro); local: null salvo é preservado (usuário limpou)
+  assert.deepEqual(normalizeTtsSettings({ backend: 'api' }).local, DEFAULT_TTS_SETTINGS.local)
+  assert.deepEqual(normalizeTtsSettings({ local: 'kokoro' }).local, DEFAULT_TTS_SETTINGS.local)
+  assert.equal(normalizeTtsSettings({ local: null }).local, null)
   const s = normalizeTtsSettings({ backend: 'api', api: { voice: ' shimmer ' } })
   assert.equal(s.backend, 'api')
   assert.equal(s.api.voice, 'shimmer')
   assert.equal(s.api.baseUrl, '')
   const l = normalizeTtsSettings({ local: { voice: ' bf_emma ' } })
   assert.deepEqual(l.local, { engine: 'kokoro', voice: 'bf_emma', installed: false })
-  // backend desconhecido → padrão; engine desconhecida → kokoro
-  assert.equal(normalizeTtsSettings({ backend: 'wat' }).backend, 'local')
+  // voz vazia → a voz padrão; engine desconhecida → kokoro; backend desconhecido → padrão
+  assert.equal(normalizeTtsSettings({ local: { voice: '' } }).local?.voice, 'pf_dora')
   assert.equal(normalizeTtsSettings({ local: { engine: 'wat' } }).local?.engine, 'kokoro')
+  assert.equal(normalizeTtsSettings({ backend: 'wat' }).backend, 'local')
   assert.equal(normalizeTtsSettings({ api: { voice: 7 } }).api.voice, null)
 })
 
@@ -143,10 +162,12 @@ test('enabled: null ≠ false (null herda o padrão global)', () => {
   assert.equal(normalizeVoiceCallConfig({ enabled: 'yes' }).enabled, null)
   // null ≠ objeto: fillers/interjections/model/tools null herdam; objeto vira config normalizada
   assert.equal(normalizeVoiceCallConfig({ fillers: null }).fillers, null)
+  // objeto presente = override; enabled ausente completa com o padrão (ligado); false explícito vale
   assert.deepEqual(normalizeVoiceCallConfig({ fillers: {} }).fillers, {
-    enabled: false,
+    enabled: true,
     prompt: null
   })
+  assert.equal(normalizeVoiceCallConfig({ fillers: { enabled: false } }).fillers?.enabled, false)
   assert.equal(normalizeVoiceCallConfig({ interjections: null }).interjections, null)
   assert.deepEqual(normalizeVoiceCallConfig({ interjections: {} }).interjections, {
     ...DEFAULT_INTERJECTION_POLICY,
@@ -240,9 +261,11 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
       cooldownMs: 1000,
       classes: ['ACK']
     },
-    fillers: { enabled: false, prompt: 'fale "ãh"' }
+    fillers: { enabled: true, prompt: 'fale "ãh"' }
   })
   assert.deepEqual(normalizeVoiceCallDefaults({ fillers: null }), DEFAULT_VOICE_CALL_DEFAULTS)
+  // false explícito no fillers global vale (não vira o padrão ligado)
+  assert.equal(normalizeVoiceCallDefaults({ fillers: { enabled: false } }).fillers.enabled, false)
 })
 
 // ---------------- personas ----------------

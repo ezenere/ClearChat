@@ -122,7 +122,7 @@ export interface TtsEndpointConfig {
 export interface TtsLocalConfig {
   /** Motor local (padrão ao instalar: 'kokoro'). */
   engine: TtsLocalEngine
-  /** Voz do motor (livre; vazia = a voz padrão do motor). */
+  /** Voz do motor (vazia/ausente → `DEFAULT_TTS_LOCAL.voice`). */
   voice: string
   /** O app detectou o motor instalado. */
   installed: boolean
@@ -133,7 +133,7 @@ export interface TtsSettings {
   backend: 'api' | 'local'
   /** Endpoint de API (padrão: não configurado). */
   api: TtsEndpointConfig
-  /** Motor local; null = nenhum instalado. */
+  /** Motor local (padrão: Kokoro não instalado); null = o usuário limpou explicitamente. */
   local: TtsLocalConfig | null
 }
 
@@ -145,10 +145,21 @@ export const DEFAULT_TTS_API: TtsEndpointConfig = {
   voice: null
 }
 
+/**
+ * Motor local padrão: Kokoro, ainda não instalado (`installed: false` → a UI oferece o download).
+ * O id de voz `'pf_dora'` é PROVISÓRIO — a fatia de TTS confirma o id real do voice pack pt-BR do
+ * Kokoro antes de a UI/falante entrar em cena.
+ */
+export const DEFAULT_TTS_LOCAL: TtsLocalConfig = {
+  engine: 'kokoro',
+  voice: 'pf_dora',
+  installed: false
+}
+
 export const DEFAULT_TTS_SETTINGS: TtsSettings = {
   backend: 'local',
   api: { ...DEFAULT_TTS_API },
-  local: null
+  local: { ...DEFAULT_TTS_LOCAL }
 }
 
 // ---------------- chamada de voz (persona/chat — `ChatConfig.voice`) ----------------
@@ -163,7 +174,7 @@ export const INTERJECTION_CLASSES: readonly InterjectionClass[] = [
 ]
 
 export interface InterjectionPolicy {
-  /** Liga as interjeições (padrão false). */
+  /** Liga as interjeições (padrão true). */
   enabled: boolean
   /** Modo sombra: o app decide mas não toca áudio (padrão false) — calibra as regras sem interromper. */
   shadow: boolean
@@ -180,7 +191,7 @@ export interface InterjectionPolicy {
 }
 
 export const DEFAULT_INTERJECTION_POLICY: InterjectionPolicy = {
-  enabled: false,
+  enabled: true,
   shadow: false,
   cooldownMs: 2500,
   fireProbability: 0.8,
@@ -189,9 +200,9 @@ export const DEFAULT_INTERJECTION_POLICY: InterjectionPolicy = {
   classes: [...INTERJECTION_CLASSES]
 }
 
-/** Falas preenchidoras ("ãh", "deixa eu ver…") enquanto o modelo pensa. */
+/** Falas preenchidoras ("ãh", "só um minutinho…") enquanto o modelo pensa. */
 export interface VoiceFillers {
-  /** Liga as falas preenchidoras (padrão false). */
+  /** Liga as falas preenchidoras (padrão true). */
   enabled: boolean
   /** Prompt das falas preenchidoras; null = o padrão. */
   prompt: string | null
@@ -235,9 +246,13 @@ export interface VoiceCallConfig {
   interjections: InterjectionPolicy | null
 }
 
-/** Padrões GLOBAIS da chamada de voz (setting `voiceCallDefaults`). */
+/**
+ * Padrões GLOBAIS da chamada de voz (setting `voiceCallDefaults`). Por padrão a chamada está
+ * **disponível** (ligada aqui, com interjeições e fillers): dá para desligar globalmente nestes
+ * padrões ou por chat/persona em `VoiceCallConfig.enabled: false`.
+ */
 export interface VoiceCallDefaults {
-  /** Chamada de voz ligada por padrão (padrão false). */
+  /** Chamada de voz ligada por padrão (padrão true). */
   enabled: boolean
   /** Política de interjeições padrão. */
   interjections: InterjectionPolicy
@@ -246,9 +261,9 @@ export interface VoiceCallDefaults {
 }
 
 export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
-  enabled: false,
+  enabled: true,
   interjections: { ...DEFAULT_INTERJECTION_POLICY, classes: [...INTERJECTION_CLASSES] },
-  fillers: { enabled: false, prompt: null }
+  fillers: { enabled: true, prompt: null }
 }
 
 /** Config "vazia": tudo null = herda os padrões globais (`voiceCallDefaults`) e o próprio chat. */
@@ -356,7 +371,11 @@ export function normalizeSttSettings(v: unknown): SttSettings {
   }
 }
 
-/** Settings completas de fala (ausente/inválido → `DEFAULT_TTS_SETTINGS`). */
+/**
+ * Settings completas de fala (ausente/inválido → `DEFAULT_TTS_SETTINGS`). `local: null` salvo é
+ * preservado (= o usuário limpou explicitamente); `local` ausente/lixo → o padrão (Kokoro não
+ * instalado) e objeto parcial é completado com `DEFAULT_TTS_LOCAL`.
+ */
 export function normalizeTtsSettings(v: unknown): TtsSettings {
   const src = asObject(v)
   const api = asObject(src?.api)
@@ -370,16 +389,18 @@ export function normalizeTtsSettings(v: unknown): TtsSettings {
       model: strOr(api?.model, DEFAULT_TTS_API.model),
       voice: strOrNull(api?.voice)
     },
-    // null = nenhum motor instalado (objeto inválido também cai em null)
-    local: local
-      ? {
-          engine: (TTS_LOCAL_ENGINES as readonly string[]).includes(local.engine as string)
-            ? (local.engine as TtsLocalEngine)
-            : 'kokoro',
-          voice: typeof local.voice === 'string' ? local.voice.trim() : '',
-          installed: local.installed === true
-        }
-      : null
+    // null explícito = limpo pelo usuário; ausente/lixo → o motor padrão (Kokoro)
+    local:
+      src && 'local' in src && src.local === null
+        ? null
+        : {
+            engine:
+              local && (TTS_LOCAL_ENGINES as readonly string[]).includes(local.engine as string)
+                ? (local.engine as TtsLocalEngine)
+                : DEFAULT_TTS_LOCAL.engine,
+            voice: strOr(local?.voice, DEFAULT_TTS_LOCAL.voice),
+            installed: local?.installed === true
+          }
   }
 }
 
@@ -431,8 +452,12 @@ export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
         }
       : null,
     voicePrompt: promptOrNull(src.voicePrompt),
+    // objeto presente = override do global; `enabled` ausente completa com o padrão (ligado)
     fillers: fillers
-      ? { enabled: fillers.enabled === true, prompt: promptOrNull(fillers.prompt) }
+      ? {
+          enabled: boolOr(fillers.enabled, DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled),
+          prompt: promptOrNull(fillers.prompt)
+        }
       : null,
     interjections: interjections ? normalizeInterjectionPolicy(interjections) : null
   }

@@ -1055,21 +1055,22 @@ interface SttSettings {
 }
 type TtsLocalEngine = 'kokoro' | 'chatterbox'
 interface TtsEndpointConfig { providerId: string | null; baseUrl: string; apiKey: string; model: string; voice: string | null }
+interface TtsLocalConfig { engine: TtsLocalEngine; voice: string; installed: boolean }
 interface TtsSettings {
   backend: 'api' | 'local'       // padrão 'local' (Kokoro)
   api: TtsEndpointConfig         // padrão: não configurado (baseUrl/model vazios; voice null = voz padrão da API)
-  local: TtsLocalConfig | null   // null = nenhum instalado (engine padrão ao instalar: 'kokoro'; voice vazia = voz padrão do motor)
+  local: TtsLocalConfig | null   // padrão: DEFAULT_TTS_LOCAL = { engine: 'kokoro', voice: 'pf_dora', installed: false }; null = o usuário limpou explicitamente
 }
 ```
 - `providerId` null = endpoint avulso (`baseUrl` + `apiKey`). A `apiKey` é guardada no JSON da setting (a UI mostra mascarada; proteção/máscara do `settings:get` genérico é decidida na fatia de UI).
-- `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, `local` que não é objeto → `null` (e `local: null` salvo é preservado = nenhum instalado), strings aparadas (`apiKey` inclusive).
+- `DEFAULT_STT_SETTINGS` / `DEFAULT_TTS_SETTINGS` + `normalizeSttSettings` / `normalizeTtsSettings`: campos faltantes completados, `mode`/`backend`/`engine` desconhecidos → padrão, strings aparadas (`apiKey` inclusive). **TTS `local`**: objeto parcial é completado com `DEFAULT_TTS_LOCAL` (Kokoro; `installed: false` → a UI mostra "não instalado — baixar"; voz vazia → `'pf_dora'`); `local: null` salvo é **preservado** (= o usuário limpou explicitamente); ausente/lixo → o padrão. A voz `'pf_dora'` é **provisória** — o id real do voice pack pt-BR do Kokoro é confirmado na fatia de TTS. **STT `local`** continua `null` = nenhum instalado (ausente/lixo/null → `null`; engine padrão ao normalizar objeto: `'whisper.cpp'`).
 
 ### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
 
 ```ts
 type InterjectionClass = 'ACK' | 'AGREEMENT' | 'ENCOURAGEMENT' | 'THINKING'
 interface InterjectionPolicy {
-  enabled: boolean               // padrão false
+  enabled: boolean               // padrão true (interjeições ligadas; desligar aqui ou por chat)
   shadow: boolean                // modo sombra: decide mas não toca (padrão false) — calibra sem interromper
   cooldownMs: number             // intervalo mínimo entre interjeições (padrão 2500)
   fireProbability: number        // 0–1, aparado fora da faixa (padrão 0.8)
@@ -1087,11 +1088,11 @@ interface VoiceCallConfig {
 }
 ```
 - **Herança persona→chat como `memory`/`skills`**: `voice` entra em `PRESET_FIELDS` (gravado **normalizado** por `sanitizePresetConfig`; chaves desconhecidas descartadas) e `applyPreset` o aplica como os demais campos; o chat herda da persona por snapshot na criação. `voice` ausente = `DEFAULT_VOICE_CALL_CONFIG` = **tudo null** = herda: `enabled`/`fillers`/`interjections` do global, `model`/`tools` do próprio chat (modelo/tools da conversa).
-- Setting global `voiceCallDefaults` = `{ enabled: boolean; interjections: InterjectionPolicy; fillers: { enabled: boolean; prompt: string | null } }` — `DEFAULT_VOICE_CALL_DEFAULTS` = tudo desligado (`DEFAULT_INTERJECTION_POLICY` com todas as classes). É o que os nulls de `ChatConfig.voice` herdam; `normalizeVoiceCallDefaults` completa parciais.
+- Setting global `voiceCallDefaults` = `{ enabled: boolean; interjections: InterjectionPolicy; fillers: { enabled: boolean; prompt: string | null } }` — `DEFAULT_VOICE_CALL_DEFAULTS` = **ligado por padrão** (`enabled: true`; `DEFAULT_INTERJECTION_POLICY` ligada, `shadow: false`, todas as classes; fillers ligados): o modo chamada de voz fica disponível e pode ser desligado **globalmente** aqui (ou por **chat/persona** em `VoiceCallConfig.enabled: false`). É o que os nulls de `ChatConfig.voice` herdam; `normalizeVoiceCallDefaults` completa parciais (e `VoiceCallConfig.fillers`/`interjections` presentes porém parciais completam com esses mesmos padrões).
 - `normalizeVoiceCallConfig` (tolerante a null/ausente/lixo; **null preservado** — `enabled: null` ≠ `false`): campos desconhecidos descartados (como os demais normalizadores), mas `model.params` preserva as chaves que não conhece (mesma semântica de `cleanParams` em presets.ts) e zera o que for null/NaN; `model` sem `providerId` **e** `model` não vale (→ null = herda o do chat); `tools.enabledTools` passa por `normalizeToolList` (alias antigos mapeados, sem duplicatas); `maxToolOutputChars` inválido → null (0 válido); prompts sem CR, vazios → null.
 
 ### Testes
-`e2e/voice.test.ts` (em `npm run test:unit`): defaults quando null/ausente/lixo (4 settings + config) e round-trip JSON, `silenceStopMs: 0` preservado, `enabled: null` ≠ false (e null ≠ objeto em fillers/interjections), campos desconhecidos descartados com `params` preservados, interjeições (classes vazias → padrão, limites aparados, 0 preservado), `voiceCallDefaults` parcial e a ligação com personas (`PRESET_FIELDS` contém `voice`; `sanitizePresetConfig` copia normalizado; `memory`/`skills` inalterados).
+`e2e/voice.test.ts` (em `npm run test:unit`): defaults quando null/ausente/lixo (4 settings + config) e round-trip JSON, defaults de produto (chamada de voz/interjeições/fillers ligados; TTS local = Kokoro não instalado, `local: null` preservado como limpeza explícita), `silenceStopMs: 0` preservado, `enabled: null` ≠ false (e null ≠ objeto em fillers/interjections), campos desconhecidos descartados com `params` preservados, interjeições (classes vazias → padrão, limites aparados, 0 preservado), `voiceCallDefaults` parcial e a ligação com personas (`PRESET_FIELDS` contém `voice`; `sanitizePresetConfig` copia normalizado; `memory`/`skills` inalterados).
 
 ## Atualizações (aviso de versão nova — `src/shared/updates.ts`, `src/main/updates.ts`, `components/UpdateNotice.tsx`)
 
