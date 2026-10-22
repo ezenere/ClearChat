@@ -5,6 +5,7 @@ import {
   ALL_CHANNELS,
   IPC,
   VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_TIMELINE_CHANNEL,
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
@@ -297,6 +298,7 @@ export function registerIpc(): void {
     emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
     emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
     emitUtteranceCancel: (id) => sendToWindows(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, { id }),
+    emitTimeline: (event) => sendToWindows(VOICE_CALL_TIMELINE_CHANNEL, event),
     clip: (cls, n) =>
       loadClipAudio(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts), cls, n),
     sessionInfo: (sessionId) => {
@@ -884,6 +886,17 @@ export function registerIpc(): void {
       voiceCalls.turn(input && typeof input.text === 'string' ? input.text : ''),
     [IPC.voice.callPlaybackIdle]: () => voiceCalls.playbackIdle(),
     [IPC.voice.callBargeIn]: () => voiceCalls.bargeIn(),
+    [IPC.voice.callInterjectionObserved]: (input: {
+      speechMs: number
+      pauseMs: number
+      tail: string
+      observedAt: number
+    }) =>
+      voiceCalls.interjectionObserved(
+        input ?? { speechMs: 0, pauseMs: 0, tail: '', observedAt: 0 }
+      ),
+    [IPC.voice.callBackchannel]: (input: { ms: number }) =>
+      voiceCalls.backchannel(input ?? { ms: 0 }),
 
     // ---- sync ----
     ...syncHandlers()

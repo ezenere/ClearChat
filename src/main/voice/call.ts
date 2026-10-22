@@ -12,6 +12,7 @@
 // persistidos (`meta.kind 'error'`) NÃO são falados. Barge-in descarta a fala pendente de síntese
 // e aborta a síntese em voo; o texto da resposta continua completo no histórico.
 import type { Chat, ChatConfig, Session, StoredMessage, AgentEvent } from '@shared/types'
+import type { VoiceCallTimelineEvent } from '@shared/ipc'
 import { isDisplayOnly } from '@shared/context'
 import {
   DEFAULT_TURN_SILENCE_MS,
@@ -26,10 +27,14 @@ import {
 } from '@shared/voice'
 import {
   EMPTY_FILLER_STATE,
+  EVAL_TAIL_MAX_CHARS,
   FILLER_DELAY_MS,
+  INTERJECTION_MAX_AGE_MS,
+  decideInterjection,
   fillerShouldFire,
   pickClipVariant,
-  type FillerState
+  type FillerState,
+  type InterjectionObservation
 } from '@shared/voicePolicy'
 import type { ClipClass } from './clips'
 import { splitSentences } from './sentences'
@@ -50,6 +55,12 @@ export interface VoiceCallSessionInfo {
   busy: boolean
 }
 
+/** Número finito ≥ 0 arredondado (lixo/negativo → 0; nunca NaN/Infinity na timeline). */
+const finiteMs = (v: unknown): number => {
+  const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : 0
+  return n > 0 ? n : 0
+}
+
 /** Dependências injetadas (testes usam fakes; a fiação real está em `src/main/ipc.ts`). */
 export interface VoiceCallDeps {
   /** Envia a transcrição final como mensagem do usuário (mesmo caminho do composer). */
@@ -62,6 +73,8 @@ export interface VoiceCallDeps {
   emitUtterance(utterance: VoiceCallUtterance): void
   /** Cancela uma utterance no renderer (canal `voice:call:utterance-cancel` — filler interrompido). */
   emitUtteranceCancel(id: string): void
+  /** Evento da timeline da chamada (canal `voice:call:timeline` — UI/métricas/calibração). */
+  emitTimeline(event: VoiceCallTimelineEvent): void
   /**
    * Bytes de um clipe pré-gerado (`resolveClip` — SPEC → "Serviço de TTS (clipes)");
    * null = clipe ausente (filler/interjeição não tocam — nada é sintetizado no lugar).
@@ -116,12 +129,24 @@ export class VoiceCallManager {
   #lastFillerVariant: number | null = null
   /** Reprodução em curso no renderer (utterance emitida e fila ainda não vazia). */
   #playbackActive = false
+  /** O agente já falou algo no turno em andamento (sentença emitida). */
+  #agentSpoke = false
+  // ---- interjeições na fala do usuário (fase 2) ----
+  #lastInterjectAt: number | null = null
+  #lastInterjectVariant: Partial<Record<string, number>> = {}
+  /** Última interjeição emitida (id + classe) — cancelada no stop da chamada. */
+  #interjectUtt: { id: string; cls: string; n: number } | null = null
 
   constructor(deps: VoiceCallDeps) {
     this.#deps = deps
     this.#machine = new VoiceTurnMachine((text) => {
       if (this.#sessionId) {
         this.#deps.sendTurn(this.#sessionId, text)
+        this.#emitTimeline({
+          ts: this.#now(),
+          kind: 'turn-sent',
+          text: text.slice(0, EVAL_TAIL_MAX_CHARS)
+        })
         this.#armFiller() // turno do usuário disparado: o filler entra se a resposta demorar
       }
     })
@@ -157,6 +182,7 @@ export class VoiceCallManager {
     this.#speakCancelled = true
     this.#clearSynth()
     this.#resetFiller(true)
+    this.#cancelInterject()
     this.#machine.stop()
     this.#sessionId = null
     this.#chatId = null
@@ -174,10 +200,11 @@ export class VoiceCallManager {
     return this.state()
   }
 
-  /** O usuário começou a falar (durante a reprodução = barge-in, tratado pelo renderer). */
+  /** O usuário começou a falar (durante a reprodução = barge-in/backchannel, tratado pelo renderer). */
   speechBegin(): VoiceCallState {
     if (!this.#sessionId) return this.state()
     this.#machine.speechBegan()
+    this.#emitTimeline({ ts: this.#now(), kind: 'speech-start' })
     this.#emitState()
     return this.state()
   }
@@ -186,6 +213,7 @@ export class VoiceCallManager {
   speechEnd(): VoiceCallState {
     if (!this.#sessionId) return this.state()
     this.#machine.speechEnded()
+    this.#emitTimeline({ ts: this.#now(), kind: 'speech-end' })
     this.#emitState()
     return this.state()
   }
@@ -207,6 +235,8 @@ export class VoiceCallManager {
     if (!this.#sessionId) return this.state()
     this.#playbackActive = false
     this.#machine.playbackIdle()
+    // filler segurado enquanto um clipe tocava (ex.: interjeição): tenta de novo agora
+    void this.#tryFiller()
     this.#emitState()
     return this.state()
   }
@@ -214,6 +244,7 @@ export class VoiceCallManager {
   /** Barge-in: o usuário falou durante a reprodução — cancela a fala do assistente. */
   bargeIn(): VoiceCallState {
     if (!this.#sessionId) return this.state()
+    this.#emitTimeline({ ts: this.#now(), kind: 'barge-in' })
     this.#speakCancelled = true
     this.#clearSynth()
     this.#playbackActive = false
@@ -221,6 +252,58 @@ export class VoiceCallManager {
     this.#machine.bargeIn()
     this.#emitState()
     return this.state()
+  }
+
+  /**
+   * Observação do detector de pausas na fala do usuário (SPEC → "Interjeições (regras)"): a
+   * política pura (`decideInterjection`) decide classe + variante e o clipe é tocado pela mesma
+   * fila de utterances — nunca durante a reprodução do assistente nem depois de a resposta
+   * começar a falar. Em modo sombra (`interjections.shadow`) decide mas não toca.
+   */
+  interjectionObserved(input: {
+    speechMs: number
+    pauseMs: number
+    tail: string
+    observedAt: number
+  }): void {
+    if (!this.#sessionId) return
+    // assistente calado: sem interjeição sobre a fala do assistente ou sobre a resposta em curso
+    if (this.#playbackActive || this.#agentSpoke) return
+    if (this.#machine.phase !== 'listening') return
+    const resolved = this.#resolved()
+    const now = this.#now()
+    const obs: InterjectionObservation = {
+      speechMs: finiteMs(input?.speechMs),
+      pauseMs: finiteMs(input?.pauseMs),
+      tail: typeof input?.tail === 'string' ? input.tail.slice(-EVAL_TAIL_MAX_CHARS) : '',
+      observedAt: finiteMs(input?.observedAt) || now
+    }
+    const decision = decideInterjection(
+      obs,
+      resolved.interjections,
+      {
+        now,
+        lastFiredAt: this.#lastInterjectAt,
+        lastVariant: this.#lastInterjectVariant
+      },
+      () => this.#rng()
+    )
+    if (decision.class === 'NONE') return
+    this.#lastInterjectAt = decision.decidedAt
+    this.#lastInterjectVariant = {
+      ...this.#lastInterjectVariant,
+      [decision.class]: decision.variant
+    }
+    void this.#playInterjection(decision.class, decision.variant, decision.decidedAt, obs)
+  }
+
+  /**
+   * Backchannel do usuário durante a reprodução (fala curta — não cancelou nada nem virou turno):
+   * só registra na timeline (calibração das regras de barge-in).
+   */
+  backchannel(input: { ms: number }): void {
+    if (!this.#sessionId) return
+    this.#emitTimeline({ ts: this.#now(), kind: 'backchannel', speechMs: finiteMs(input?.ms) })
   }
 
   /**
@@ -402,9 +485,17 @@ export class VoiceCallManager {
         if (item.gen !== this.#synthGen) continue // descartada enquanto sintetizava
         this.#uttSeq++
         this.#cancelFiller() // começo da resposta: o filler (se tocando) sai de cena
+        this.#agentSpoke = true
         this.#playbackActive = true
         this.#machine.utteranceEmitted()
-        this.#deps.emitUtterance({ id: `u${this.#uttSeq}`, audio, mime, kind: 'sentence' })
+        const id = `u${this.#uttSeq}`
+        this.#deps.emitUtterance({ id, audio, mime, kind: 'sentence' })
+        this.#emitTimeline({
+          ts: this.#now(),
+          kind: 'sentence-emitted',
+          id,
+          text: item.text.slice(0, EVAL_TAIL_MAX_CHARS)
+        })
       }
     } finally {
       this.#synthRunning = false
@@ -418,6 +509,7 @@ export class VoiceCallManager {
     this.#feed = ''
     this.#speakCancelled = false
     this.#error = null
+    this.#agentSpoke = false
     this.#resetFiller(true) // turno novo: o filler do turno anterior (se tocando) é cancelado
   }
 
@@ -470,6 +562,8 @@ export class VoiceCallManager {
     // assistente audível (fila de turnos: resposta anterior ainda falando) — não interrompe
     if (this.#playbackActive) return
     this.#filler.usedThisTurn = true
+    const decidedAt = this.#now()
+    const base = this.#filler.toolsRunning ? 'tools' : 'delay'
     const gen = this.#fillerGen
     const resolved = this.#resolved()
     const variants = [1, 2, 3]
@@ -483,17 +577,86 @@ export class VoiceCallManager {
       n = cand
       if (clip) break
     }
-    if (!clip) return // clipes não gerados: sem filler (nada é sintetizado no lugar)
     if (gen !== this.#fillerGen || !this.#sessionId) return // reset/stop durante a carga
     this.#lastFillerVariant = n
-    if (resolved.interjections.shadow) return // modo sombra: decide mas não toca
     // 1ª sentença chegou (ou a resposta caiu) durante a carga do clipe: não toca mais
-    if (this.#filler.spokenThisTurn || !this.#filler.responseInFlight) return
+    const blocked = this.#filler.spokenThisTurn || !this.#filler.responseInFlight
+    const shadow = resolved.interjections.shadow
+    const played = !!clip && !shadow && !blocked
+    const reason = played
+      ? base
+      : !clip
+        ? `${base}/no-clip`
+        : blocked
+          ? `${base}/spoken`
+          : `${base}/shadow`
+    this.#emitTimeline({
+      ts: this.#now(),
+      kind: 'decision',
+      class: 'FILLER',
+      variant: n,
+      played,
+      latencyMs: Math.max(0, this.#now() - decidedAt),
+      reason
+    })
+    if (!played || !clip) return
     this.#uttSeq++
     const id = `u${this.#uttSeq}`
     this.#fillerUttId = id
     this.#playbackActive = true
     this.#deps.emitUtterance({ id, audio: clip.audio, mime: clip.mime, kind: 'filler' })
+    this.#emitTimeline({ ts: this.#now(), kind: 'clip-emitted', class: 'FILLER', id, variant: n })
+  }
+
+  /**
+   * Interjeição decidida: carrega o clipe (`resolveClip`) e toca na mesma fila de utterances —
+   * a decisão que chega > `INTERJECTION_MAX_AGE_MS` tarde demais é descartada (o momento da pausa
+   * passou). Em modo sombra decide mas não toca.
+   */
+  async #playInterjection(
+    cls: string,
+    variant: number,
+    decidedAt: number,
+    obs: InterjectionObservation
+  ): Promise<void> {
+    const resolved = this.#resolved()
+    const clip = await this.#deps.clip(cls as ClipClass, variant)
+    const now = this.#now()
+    const latencyMs = Math.max(0, now - decidedAt)
+    const stale = latencyMs > INTERJECTION_MAX_AGE_MS
+    const shadow = resolved.interjections.shadow
+    const blocked = this.#playbackActive || this.#agentSpoke || this.#machine.phase !== 'listening'
+    const played = !!clip && !shadow && !stale && !blocked && !!this.#sessionId
+    const reason = played
+      ? 'ok'
+      : !this.#sessionId
+        ? 'stopped'
+        : !clip
+          ? 'no-clip'
+          : stale
+            ? 'stale'
+            : blocked
+              ? 'blocked'
+              : 'shadow'
+    this.#emitTimeline({
+      ts: now,
+      kind: 'decision',
+      class: cls,
+      variant,
+      played,
+      latencyMs,
+      speechMs: obs.speechMs,
+      pauseMs: obs.pauseMs,
+      text: obs.tail,
+      reason
+    })
+    if (!played || !clip) return
+    this.#uttSeq++
+    const id = `u${this.#uttSeq}`
+    this.#interjectUtt = { id, cls, n: variant }
+    this.#playbackActive = true
+    this.#deps.emitUtterance({ id, audio: clip.audio, mime: clip.mime, kind: 'interjection' })
+    this.#emitTimeline({ ts: now, kind: 'clip-emitted', class: cls, id, variant })
   }
 
   /** 1ª utterance da resposta: o filler (se ainda tocando) é cancelado e não pode mais sair. */
@@ -505,7 +668,10 @@ export class VoiceCallManager {
     }
     const id = this.#fillerUttId
     this.#fillerUttId = null
-    if (id) this.#deps.emitUtteranceCancel(id)
+    if (id) {
+      this.#deps.emitUtteranceCancel(id)
+      this.#emitTimeline({ ts: this.#now(), kind: 'clip-cancelled', class: 'FILLER', id })
+    }
   }
 
   /** Zera o filler do turno (timer/carga em voo); `cancelPlaying` cancela o clipe tocando. */
@@ -518,7 +684,20 @@ export class VoiceCallManager {
     this.#filler = { ...EMPTY_FILLER_STATE }
     const id = this.#fillerUttId
     this.#fillerUttId = null
-    if (cancelPlaying && id) this.#deps.emitUtteranceCancel(id)
+    if (cancelPlaying && id) {
+      this.#deps.emitUtteranceCancel(id)
+      this.#emitTimeline({ ts: this.#now(), kind: 'clip-cancelled', class: 'FILLER', id })
+    }
+  }
+
+  /** Cancela a interjeição tocando (stop da chamada). */
+  #cancelInterject(): void {
+    const u = this.#interjectUtt
+    this.#interjectUtt = null
+    if (u) {
+      this.#deps.emitUtteranceCancel(u.id)
+      this.#emitTimeline({ ts: this.#now(), kind: 'clip-cancelled', class: u.cls, id: u.id })
+    }
   }
 
   #now(): number {
@@ -531,5 +710,11 @@ export class VoiceCallManager {
 
   #emitState(): void {
     this.#deps.emitState(this.state())
+  }
+
+  /** Registra um evento da timeline (só com chamada ativa). */
+  #emitTimeline(event: VoiceCallTimelineEvent): void {
+    if (!this.#sessionId) return
+    this.#deps.emitTimeline(event)
   }
 }

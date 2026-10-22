@@ -19,7 +19,13 @@ import type {
   StoredMessage,
   StreamDraft
 } from '@shared/types'
-import type { AppCapabilities, ApprovalDecision, PresetInput, ViewerTarget } from '@shared/ipc'
+import type {
+  AppCapabilities,
+  ApprovalDecision,
+  PresetInput,
+  ViewerTarget,
+  VoiceCallTimelineEvent
+} from '@shared/ipc'
 import type { MemoryCollection } from '@shared/memory'
 import type { ChatHostInfo, SyncScope, SyncStatus } from '@shared/sync'
 import { api, errorMessage } from '../lib/api'
@@ -247,6 +253,8 @@ interface State {
   outdatedHostsDismissed: boolean
   /** Chamada de voz (meia-duplex) — espelho do estado do main (`voice:call:state`). */
   voiceCall: VoiceCallState
+  /** Timeline da chamada de voz atual (eventos do main + do sensor; zerada a cada chamada). */
+  voiceCallTimeline: VoiceCallTimelineEvent[]
 }
 
 interface Actions {
@@ -291,6 +299,8 @@ interface Actions {
   setVoiceCallMuted(muted: boolean): Promise<void>
   /** Espelho do estado da chamada (evento `voice:call:state` / retorno dos canais `voice:call:*`). */
   applyVoiceCallState(state: VoiceCallState): void
+  /** Acrescenta um evento à timeline da chamada atual (sensor local ou canal `voice:call:timeline`). */
+  pushVoiceCallTimeline(event: VoiceCallTimelineEvent): void
   /** Chips "Carregar skill" do composer. */
   setPendingSkills(sessionId: string, names: string[]): void
   /** Abre Configurações → Skills (opcionalmente destacando uma skill). */
@@ -473,6 +483,7 @@ export const useStore = create<Store>()((set, get) => ({
   update: null,
   outdatedHostsDismissed: false,
   voiceCall: { ...VOICE_CALL_INACTIVE },
+  voiceCallTimeline: [],
 
   async refreshSync() {
     try {
@@ -610,6 +621,8 @@ export const useStore = create<Store>()((set, get) => ({
       const offs: (() => void)[] = [api.onEvent((e) => applyEvent(e))]
       const onVoiceCallState = api.onVoiceCallState
       if (onVoiceCallState) offs.push(onVoiceCallState((e) => get().applyVoiceCallState(e)))
+      const onVoiceCallTimeline = api.onVoiceCallTimeline
+      if (onVoiceCallTimeline) offs.push(onVoiceCallTimeline((e) => get().pushVoiceCallTimeline(e)))
       unsubscribe = () => {
         for (const off of offs) off()
       }
@@ -947,7 +960,20 @@ export const useStore = create<Store>()((set, get) => ({
   },
 
   applyVoiceCallState(state) {
-    set({ voiceCall: state })
+    // chamada nova (inativo→ativo) e fim da chamada zeram a timeline da chamada atual
+    const prev = get().voiceCall
+    const fresh = state.active && !prev.active
+    set({
+      voiceCall: state,
+      voiceCallTimeline: fresh || !state.active ? [] : get().voiceCallTimeline
+    })
+  },
+
+  pushVoiceCallTimeline(event) {
+    // teto da lista (a UI mostra a chamada atual; o log de avaliação guarda o histórico)
+    set((s) => ({
+      voiceCallTimeline: [...s.voiceCallTimeline, event].slice(-500)
+    }))
   },
 
   setPendingSkills(sessionId, names) {

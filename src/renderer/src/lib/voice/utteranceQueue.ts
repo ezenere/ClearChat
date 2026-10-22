@@ -72,6 +72,8 @@ export interface UtteranceQueueOptions {
   playerFactory?: PlayerFactory
   /** Mudança de estado ('idle' = fila vazia e nada tocando; 'playing' = há áudio em curso). */
   onState?: (state: UtteranceState) => void
+  /** Início/fim da reprodução de cada utterance (timeline da chamada — cancelas não emitem 'end'). */
+  onItem?: (e: { item: VoiceCallUtteranceEvent; phase: 'start' | 'end' }) => void
 }
 
 /**
@@ -82,6 +84,7 @@ export interface UtteranceQueueOptions {
 export class UtteranceQueue {
   #factory: PlayerFactory
   #onState: ((state: UtteranceState) => void) | undefined
+  #onItem: ((e: { item: VoiceCallUtteranceEvent; phase: 'start' | 'end' }) => void) | undefined
   #queue: VoiceCallUtteranceEvent[] = []
   #current: UtterancePlayer | null = null
   #currentItem: VoiceCallUtteranceEvent | null = null
@@ -91,6 +94,7 @@ export class UtteranceQueue {
   constructor(options: UtteranceQueueOptions = {}) {
     this.#factory = options.playerFactory ?? domPlayerFactory
     this.#onState = options.onState
+    this.#onItem = options.onItem
   }
 
   get state(): UtteranceState {
@@ -164,6 +168,7 @@ export class UtteranceQueue {
     this.#setState('playing')
     let player: UtterancePlayer | null = null
     let settled = false
+    let started = false
     const done = (): void => {
       if (settled) return
       settled = true
@@ -173,6 +178,7 @@ export class UtteranceQueue {
       this.#current = null
       this.#currentItem = null
       player?.dispose?.()
+      if (started) this.#onItem?.({ item: next, phase: 'end' })
       if (!this.#queue.length) this.#setState('idle')
       void this.#pump()
     }
@@ -188,6 +194,8 @@ export class UtteranceQueue {
     player.volume = this.#volume
     player.onended = done
     player.onerror = done
+    started = true
+    this.#onItem?.({ item: next, phase: 'start' })
     try {
       await player.play()
     } catch {

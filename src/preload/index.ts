@@ -3,6 +3,7 @@ import {
   EVENT_CHANNEL,
   IPC,
   VOICE_CALL_STATE_CHANNEL,
+  VOICE_CALL_TIMELINE_CHANNEL,
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
@@ -10,6 +11,7 @@ import {
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
   type FullClearApi,
   type TtsClipProgressEvent,
+  type VoiceCallTimelineEvent,
   type VoiceCallUtteranceCancelEvent,
   type VoiceCallUtteranceEvent,
   type VoiceModelProgressEvent,
@@ -191,7 +193,9 @@ const api: FullClearApi = {
       speechEnd: () => invoke(IPC.voice.callSpeechEnd),
       turn: (input) => invoke(IPC.voice.callTurn, input),
       playbackIdle: () => invoke(IPC.voice.callPlaybackIdle),
-      bargeIn: () => invoke(IPC.voice.callBargeIn)
+      bargeIn: () => invoke(IPC.voice.callBargeIn),
+      interjectionObserved: (input) => invoke(IPC.voice.callInterjectionObserved, input),
+      backchannel: (input) => invoke(IPC.voice.callBackchannel, input)
     }
   },
   sync: {
@@ -282,6 +286,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
+    }
+  },
+  onVoiceCallTimeline: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceCallTimelineEvent): void => cb(event)
+    ipcRenderer.on(VOICE_CALL_TIMELINE_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_CALL_TIMELINE_CHANNEL, listener)
     }
   }
 }

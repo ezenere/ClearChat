@@ -16,6 +16,7 @@ import type {
   TtsSynthResult,
   TtsVoicesView,
   VoiceApi,
+  VoiceCallTimelineEvent,
   VoiceCallUtteranceCancelEvent,
   VoiceCallUtteranceEvent,
   VoiceModelInfo,
@@ -2743,6 +2744,12 @@ export function createMockApi(scenario: string): ClearApi {
             bargeIn: async () => {
               clearTimers()
               return setState({ phase: 'listening' })
+            },
+            interjectionObserved: async () => {
+              // mock sem interjeições: a observação é aceita e ignorada
+            },
+            backchannel: async () => {
+              // mock sem backchannel: só aceita o registro
             }
           }
         })()
@@ -2770,6 +2777,11 @@ export function createMockApi(scenario: string): ClearApi {
     },
     onVoiceCallUtteranceCancel: (cb: (e: VoiceCallUtteranceCancelEvent) => void) => {
       // mock sem fillers/interjeições: o cancelamento nunca dispara, mas o canal existe
+      void cb
+      return () => void 0
+    },
+    onVoiceCallTimeline: (cb: (e: VoiceCallTimelineEvent) => void) => {
+      // mock sem atos de fala curta: a timeline não enche, mas o canal existe
       void cb
       return () => void 0
     },

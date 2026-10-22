@@ -5,11 +5,20 @@
 // (`UtteranceQueue`, utterances `voice:call:utterance` na ordem, sem sobreposição).
 //
 // Os eventos de fronteira vão ao main pelos canais `voice:call:*` (o main é o dono do turno e do
-// envio): `speech-begin`/`speech-end` → `turn(text)` com a transcrição final. Barge-in: a fala do
-// usuário durante a reprodução cancela a fila local e chama `voice:call:barge-in`. Mudo = captura
-// pausada (microfone liberado). Build de dev com `VITE_CLEAR_MOCK=1`: sem captura (o mock `voice`
-// emite os estados/utterances e o `Waveform` simula os níveis).
+// envio): `speech-begin`/`speech-end` → `turn(text)` com a transcrição final. Fala do usuário
+// durante a reprodução: curta (≤ `BACKCHANNEL_MAX_MS`) = backchannel (só registra — não cancela
+// nem vira turno); longa = barge-in (cancela a fala do assistente, como sempre). Pausas na fala
+// do usuário viram observações de interjeição (`interjectionObserved` — a política decide no main).
+// Mudo = captura pausada (microfone liberado). Build de dev com `VITE_CLEAR_MOCK=1`: sem captura
+// (o mock `voice` emite os estados/utterances e o `Waveform` simula os níveis).
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { VoiceCallTimelineEvent } from '@shared/ipc'
+import {
+  DEFAULT_INTERJECTION_POLICY,
+  resolveVoiceCallConfig,
+  type InterjectionPolicy
+} from '@shared/voice'
+import { INTERJECTION_TAIL_CHARS, InterjectionWatcher, PlaybackHold } from '@shared/voicePolicy'
 import { DEFAULT_SILENCE_THRESHOLD } from '../audio/silence'
 import { AudioCapture } from '../audio/capture'
 import { api, errorMessage } from '../api'
@@ -55,6 +64,14 @@ export function useVoiceCall(): VoiceCallControls {
   /** Fala em curso (utterance aberto): chunks vão para a sessão; senão ficam no pre-roll. */
   const speakingRef = useRef(false)
   const prerollRef = useRef<Uint8Array[]>([])
+  /** Política de interjeições resolvida (persona→chat→global) do chat da chamada. */
+  const policyRef = useRef<InterjectionPolicy>(DEFAULT_INTERJECTION_POLICY)
+  /** Detector de pausas na fala do usuário (observações → política de interjeições no main). */
+  const watcherRef = useRef<InterjectionWatcher | null>(null)
+  /** Fala do usuário durante a reprodução: backchannel (curta) × barge-in (longa). */
+  const holdRef = useRef<PlaybackHold | null>(null)
+  /** Cauda da transcrição parcial ao vivo (escolhe a classe da interjeição). */
+  const partialRef = useRef('')
 
   const voice = api.voice
 
@@ -136,11 +153,30 @@ export function useVoiceCall(): VoiceCallControls {
   useEffect(() => {
     volumeRef.current = volume
   }, [volume])
+  // parciais ao vivo: a cauda do texto escolhe a classe da interjeição (SPEC → "Interjeições")
+  useEffect(() => {
+    const off = api.onVoicePartial?.((e) => {
+      partialRef.current = typeof e.text === 'string' ? e.text : ''
+    })
+    return () => off?.()
+  }, [])
   useEffect(() => {
     if (!active || !voice) return
     const queue = new UtteranceQueue({
       onState: (state) => {
         if (state === 'idle') void api.voice?.call.playbackIdle().catch(() => {})
+      },
+      // início/fim de cada reprodução entra na timeline da chamada (métricas decisão→áudio)
+      onItem: ({ item, phase }) => {
+        const kind: VoiceCallTimelineEvent['kind'] =
+          item.kind === 'sentence'
+            ? phase === 'start'
+              ? 'sentence-start'
+              : 'sentence-end'
+            : phase === 'start'
+              ? 'clip-start'
+              : 'clip-end'
+        useStore.getState().pushVoiceCallTimeline({ ts: Date.now(), kind, id: item.id })
       }
     })
     queueRef.current = queue
@@ -165,25 +201,87 @@ export function useVoiceCall(): VoiceCallControls {
     })
     gateRef.current = gate
 
+    // atos de fala curta: pausas viram observações de interjeição; fala durante a reprodução é
+    // backchannel (curta) ou barge-in (longa) — `InterjectionWatcher`/`PlaybackHold` puros
+    const watcher = new InterjectionWatcher(DEFAULT_INTERJECTION_POLICY.minPauseMs)
+    const hold = new PlaybackHold()
+    watcherRef.current = watcher
+    holdRef.current = hold
+    // política resolvida do chat da chamada (persona→chat→global) — habilita e define minPauseMs
+    void voice.settings
+      .get()
+      .then((all) => {
+        const chatCfg =
+          useStore.getState().chats.find((c) => c.id === useStore.getState().voiceCall.chatId)
+            ?.config.voice ?? null
+        const resolved = resolveVoiceCallConfig(chatCfg, all.voiceCallDefaults)
+        policyRef.current = resolved.interjections
+        watcherRef.current = new InterjectionWatcher(resolved.interjections.minPauseMs)
+      })
+      .catch(() => void 0)
+
     const onLevel = (rms: number): void => {
       setLevel(rms)
       const ev = gate.push(rms, FRAME_MS)
       if (ev === 'start') {
-        // barge-in: fala do usuário durante a reprodução → cancela a fala do assistente
         const queue = queueRef.current
         const queueBusy = queue?.state === 'playing' || (queue?.pending ?? 0) > 0
         const mainSpeaking = useStore.getState().voiceCall.phase === 'speaking'
         if (queue && (queueBusy || mainSpeaking)) {
-          queue.cancel()
-          void api.voice?.call.bargeIn().catch(() => {})
+          // fala do usuário durante a reprodução: backchannel (curta) × barge-in (longa) —
+          // nada é cancelado até a fala detectada passar de `BACKCHANNEL_MAX_MS`
+          hold.start(rms, FRAME_MS, DEFAULT_SILENCE_THRESHOLD)
+        } else {
+          void api.voice?.call.speechBegin().catch(() => {})
         }
-        void api.voice?.call.speechBegin().catch(() => {})
         speakingRef.current = true
         for (const bytes of prerollRef.current.splice(0)) pushChunk(bytes)
-      } else if (ev === 'end') {
+        watcherRef.current?.reset()
+        return
+      }
+      if (ev === 'end') {
         speakingRef.current = false
         prerollRef.current = []
-        endUtterance()
+        const holdMs = hold.speechMs
+        const kind = hold.end()
+        if (kind === 'backchannel') {
+          // backchannel do usuário ("uhum", "sim"): NÃO cancela a resposta nem vira turno
+          dropSession()
+          void api.voice?.call.backchannel({ ms: holdMs }).catch(() => {})
+        } else {
+          endUtterance()
+        }
+        watcherRef.current?.reset()
+        return
+      }
+      if (hold.open) {
+        if (hold.frame(rms, FRAME_MS, DEFAULT_SILENCE_THRESHOLD) === 'barge-in') {
+          // barge-in real (fala longa): cancela a fala do assistente (texto segue no histórico)
+          queueRef.current?.cancel()
+          void api.voice?.call.bargeIn().catch(() => {})
+        }
+        return
+      }
+      if (!speakingRef.current) return
+      const obs = watcherRef.current?.push(rms, FRAME_MS, DEFAULT_SILENCE_THRESHOLD, Date.now())
+      if (obs) {
+        // pausa na fala do usuário virou observação → a política decide (main) e a timeline registra
+        useStore.getState().pushVoiceCallTimeline({
+          ts: Date.now(),
+          kind: 'pause',
+          pauseMs: obs.pauseMs,
+          speechMs: obs.speechMs
+        })
+        if (policyRef.current.enabled) {
+          void api.voice?.call
+            .interjectionObserved({
+              speechMs: obs.speechMs,
+              pauseMs: obs.pauseMs,
+              tail: partialRef.current.slice(-INTERJECTION_TAIL_CHARS),
+              observedAt: obs.observedAt
+            })
+            .catch(() => {})
+        }
       }
     }
     const onPcm = (chunk: Int16Array): void => {
@@ -232,6 +330,9 @@ export function useVoiceCall(): VoiceCallControls {
       speakingRef.current = false
       prerollRef.current = []
       gate.reset()
+      hold.reset()
+      watcherRef.current = null
+      holdRef.current = null
       dropSession()
       const capture = captureRef.current
       captureRef.current = null
@@ -246,6 +347,7 @@ export function useVoiceCall(): VoiceCallControls {
       speakingRef.current = false
       prerollRef.current = []
       gateRef.current?.reset()
+      holdRef.current?.reset()
       dropSession()
       const capture = captureRef.current
       captureRef.current = null

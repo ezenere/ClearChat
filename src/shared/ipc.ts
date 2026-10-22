@@ -252,7 +252,9 @@ export const IPC = {
     callSpeechEnd: 'voice:call:speech-end',
     callTurn: 'voice:call:turn',
     callPlaybackIdle: 'voice:call:playback-idle',
-    callBargeIn: 'voice:call:barge-in'
+    callBargeIn: 'voice:call:barge-in',
+    callInterjectionObserved: 'voice:call:interjection-observed',
+    callBackchannel: 'voice:call:backchannel'
   }
 } as const
 
@@ -270,6 +272,8 @@ export const VOICE_CALL_STATE_CHANNEL = 'voice:call:state'
 export const VOICE_CALL_UTTERANCE_CHANNEL = 'voice:call:utterance'
 /** Canal main → renderer com o cancelamento de uma utterance (`VoiceCallUtteranceCancelEvent`). */
 export const VOICE_CALL_UTTERANCE_CANCEL_CHANNEL = 'voice:call:utterance-cancel'
+/** Canal main → renderer com eventos da timeline da chamada (`VoiceCallTimelineEvent`). */
+export const VOICE_CALL_TIMELINE_CHANNEL = 'voice:call:timeline'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -573,6 +577,22 @@ export interface VoiceApi {
     playbackIdle(): Promise<VoiceCallState>
     /** Barge-in: o usuário falou durante a reprodução (a fala do assistente é cancelada). */
     bargeIn(): Promise<VoiceCallState>
+    /**
+     * Observação do detector de pausas na fala do usuário (SPEC → "Interjeições (regras)"): a
+     * política pura decide e o main toca o clipe (ou não, em modo sombra). `observedAt` = momento
+     * da observação em ms (decisão que chega > 600 ms tarde demais é descartada).
+     */
+    interjectionObserved(input: {
+      speechMs: number
+      pauseMs: number
+      tail: string
+      observedAt: number
+    }): Promise<void>
+    /**
+     * Backchannel do usuário durante a reprodução (fala curta ≤ ~800 ms): só registra — NÃO
+     * cancela a resposta nem vira turno (fala longa é barge-in, via `bargeIn`).
+     */
+    backchannel(input: { ms: number }): Promise<void>
   }
 }
 
@@ -689,6 +709,61 @@ export interface VoiceCallUtteranceEvent {
 export interface VoiceCallUtteranceCancelEvent {
   /** Id da utterance a cancelar (tocando → pausa e descarta; na fila → só descarta). */
   id: string
+}
+
+/**
+ * Evento da timeline da chamada de voz (canal `voice:call:timeline`; SPEC → "Modo sombra e
+ * timeline"). O main emite decisões/emissões/envio; o renderer acrescenta os eventos do sensor
+ * (fala/pausa/reprodução/barge-in/backchannel) — tudo com `ts` e relativo ao início da chamada.
+ */
+export interface VoiceCallTimelineEvent {
+  /** Momento do evento (ms desde epoch). */
+  ts: number
+  kind:
+    /** Decisão de ato de fala (filler/interjeição) — tocou, sombra ou descartada (`reason`). */
+    | 'decision'
+    /** Clique (filler/interjeição) emitido ao renderer. */
+    | 'clip-emitted'
+    /** Clipe cancelado (filler interrompido pela 1ª sentença/reset). */
+    | 'clip-cancelled'
+    /** Sentença da resposta emitida ao renderer. */
+    | 'sentence-emitted'
+    /** Transcrição do usuário enviada como turno. */
+    | 'turn-sent'
+    /** Fala do usuário detectada (renderer). */
+    | 'speech-start'
+    /** Silêncio encerrou a fala do usuário (renderer). */
+    | 'speech-end'
+    /** Pausa na fala do usuário que virou observação de interjeição (renderer). */
+    | 'pause'
+    /** Reprodução de clipe começou/terminou (renderer). */
+    | 'clip-start'
+    | 'clip-end'
+    /** Reprodução de sentença começou/terminou (renderer). */
+    | 'sentence-start'
+    | 'sentence-end'
+    /** Fala longa do usuário durante a reprodução cancelou a fala do assistente (renderer). */
+    | 'barge-in'
+    /** Fala curta do usuário durante a reprodução (backchannel — só registrou). */
+    | 'backchannel'
+  /** Classe do ato ('FILLER'/'ACK'/…); ausente em eventos sem classe. */
+  class?: string | null
+  /** Id da utterance dona do evento (pareia decisão → áudio). */
+  id?: string | null
+  /** Variante do clipe decidida (1..3). */
+  variant?: number | null
+  /** Tocou de fato (false = sombra/descartada). */
+  played?: boolean
+  /** Fala do usuário até o evento (ms). */
+  speechMs?: number | null
+  /** Pausa do usuário no evento (ms). */
+  pauseMs?: number | null
+  /** Latência decisão→emissão em ms (o pareamento com o início do áudio é da UI). */
+  latencyMs?: number | null
+  /** Texto curto (cauda da transcrição/trecho do turno) — truncado. */
+  text?: string | null
+  /** Motivo/regra da decisão. */
+  reason?: string | null
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -968,6 +1043,8 @@ export interface ClearApi {
   onVoiceCallUtterance?(cb: (e: VoiceCallUtteranceEvent) => void): () => void
   /** Cancelamento de utterance da chamada (canal `voice:call:utterance-cancel`); unsubscribe como em `onEvent`. */
   onVoiceCallUtteranceCancel?(cb: (e: VoiceCallUtteranceCancelEvent) => void): () => void
+  /** Timeline da chamada de voz (canal `voice:call:timeline`); unsubscribe como em `onEvent`. */
+  onVoiceCallTimeline?(cb: (e: VoiceCallTimelineEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -1047,5 +1124,6 @@ export type FullClearApi = ClearApi &
       | 'onVoiceCallState'
       | 'onVoiceCallUtterance'
       | 'onVoiceCallUtteranceCancel'
+      | 'onVoiceCallTimeline'
     >
   >

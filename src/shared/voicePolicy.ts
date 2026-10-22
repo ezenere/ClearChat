@@ -7,6 +7,7 @@
 // v1 é por REGRA (sem classificador treinado): os limiares abaixo + a cauda textual da transcrição
 // parcial decidem. `VoiceFillers.prompt`/`InterjectionPolicy` existem na config; o `prompt` dos
 // fillers NÃO é consumido em v1 — fica pronto para o classificador futuro (documentado na SPEC).
+import type { InterjectionClass, InterjectionPolicy } from './voice'
 
 // ---------------- constantes de tempo ----------------
 
@@ -91,4 +92,282 @@ export function pickClipVariant(rng: () => number, last: number | null, variants
   const v = Math.min(n, Math.max(1, Math.floor(Math.min(Math.max(r, 0), 0.999999999) * n) + 1))
   if (last == null || v !== last) return v
   return (last % n) + 1
+}
+
+// ---------------- fala/pausa do usuário (quadros RMS) ----------------
+
+/**
+ * Acumulador puro de fala/pausa a partir do RMS dos quadros da captura: `speechMs` cresce nos
+ * quadros audíveis e `pauseMs` acumula o silêncio CONTÍNUO atual (zera ao falar de novo).
+ */
+export class SpeechMeter {
+  #speechMs = 0
+  #pauseMs = 0
+
+  /** Fala do usuário acumulada desde o último `reset` (ms). */
+  get speechMs(): number {
+    return this.#speechMs
+  }
+
+  /** Pausa contínua atual (ms; 0 = está falando). */
+  get pauseMs(): number {
+    return this.#pauseMs
+  }
+
+  /** Registra um quadro (`rms` 0..1, `frameMs` duração, `threshold` limiar de fala). */
+  push(rms: number, frameMs: number, threshold: number): void {
+    const dt = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 0
+    if (rms >= threshold) {
+      this.#speechMs += dt
+      this.#pauseMs = 0
+    } else {
+      this.#pauseMs += dt
+    }
+  }
+
+  /** Zera fala e pausa (início/fim de utterance). */
+  reset(): void {
+    this.#speechMs = 0
+    this.#pauseMs = 0
+  }
+}
+
+/**
+ * Fala do usuário DURANTE a reprodução do assistente: backchannel (curta — "uhum", "sim"; só
+ * registra, não cancela) ou barge-in real (longa; cancela a fala do assistente). Classe pura —
+ * `useVoiceCall` alimenta com os quadros e executa as ações (`maxMs` = `BACKCHANNEL_MAX_MS`).
+ */
+export class PlaybackHold {
+  /** Fala detectada (ms) acima da qual é barge-in real. */
+  readonly maxMs: number
+  #meter = new SpeechMeter()
+  #open = false
+  #committed = false
+
+  constructor(maxMs: number = BACKCHANNEL_MAX_MS) {
+    this.maxMs = Number.isFinite(maxMs) && maxMs > 0 ? maxMs : BACKCHANNEL_MAX_MS
+  }
+
+  /** Há uma fala retida em avaliação (backchannel × barge-in). */
+  get open(): boolean {
+    return this.#open
+  }
+
+  /** Fala detectada até agora (ms). */
+  get speechMs(): number {
+    return this.#meter.speechMs
+  }
+
+  /** Abre a retenção (o frame de início da fala já conta). */
+  start(rms: number, frameMs: number, threshold: number): void {
+    this.#open = true
+    this.#committed = false
+    this.#meter.reset()
+    this.#meter.push(rms, frameMs, threshold)
+  }
+
+  /**
+   * Quadro durante a fala retida: `'barge-in'` na transição em que a fala detectada passa de
+   * `maxMs` (o chamador cancela a fala do assistente — uma única vez); senão `'pending'`.
+   */
+  frame(rms: number, frameMs: number, threshold: number): 'pending' | 'barge-in' {
+    this.#meter.push(rms, frameMs, threshold)
+    if (!this.#committed && this.#meter.speechMs > this.maxMs) {
+      this.#committed = true
+      return 'barge-in'
+    }
+    return 'pending'
+  }
+
+  /**
+   * Fim da fala retida: `'backchannel'` quando curta (≤ `maxMs` — não cancelou nada) ou
+   * `'barge-in'` quando longa (já cancelou durante os quadros). Sem fala retida → `'none'`.
+   */
+  end(): 'backchannel' | 'barge-in' | 'none' {
+    if (!this.#open) return 'none'
+    const long = this.#committed || this.#meter.speechMs > this.maxMs
+    this.#open = false
+    this.#committed = false
+    return long ? 'barge-in' : 'backchannel'
+  }
+
+  /** Descarta a fala retida sem classificar (mudo/parada da chamada). */
+  reset(): void {
+    this.#open = false
+    this.#committed = false
+    this.#meter.reset()
+  }
+}
+
+// ---------------- interjeições (fase 2) ----------------
+
+/** Por que a política decidiu o que decidiu (calibração/testes). */
+export type InterjectionReason =
+  | 'ok'
+  | 'disabled'
+  | 'stale'
+  | 'short-speech'
+  | 'short-pause'
+  | 'cooldown'
+  | 'probability'
+  | 'tail-skip'
+  | 'class-filtered'
+
+/** Resultado da política: `NONE` (o caso comum) ou a classe + variante a tocar. */
+export type InterjectionDecision =
+  | { class: 'NONE'; reason: InterjectionReason }
+  | { class: InterjectionClass; variant: number; decidedAt: number; reason: InterjectionReason }
+
+/** Observação do detector (pausa na fala do usuário) — o que a política tem para decidir. */
+export interface InterjectionObservation {
+  /** Fala do usuário acumulada no utterance atual (ms). */
+  speechMs: number
+  /** Pausa CONTÍNUA atual do usuário (ms). */
+  pauseMs: number
+  /** Cauda da transcrição parcial (texto livre; escolhe a classe; vazia = sem confiança). */
+  tail: string
+  /** Momento da observação (ms, mesmo relógio de `ctx.now`) — observação velha não decide. */
+  observedAt: number
+}
+
+export interface InterjectionContext {
+  /** Agora (ms — o mesmo relógio de `observedAt`). */
+  now: number
+  /** Última interjeição DECIDIDA (ms); null = nenhuma ainda (cooldown). */
+  lastFiredAt: number | null
+  /** Última variante tocada por classe (rotação sem repetir). */
+  lastVariant?: Partial<Record<InterjectionClass, number>>
+}
+
+const strip = (s: string): string =>
+  s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+
+const TAIL_NONE =
+  /\b(nao|nunca|jamais|talvez|quem sabe|depende|nao sei|acho que nao|duvida|sera que|ta dificil|pera|espera ai)\b/
+const TAIL_THINKING =
+  /\b(hum+|hm+|ahn+|deixa (eu )?ver|vamos? ver|como (assim|e que)|ou seja|tipo assim)\b/
+const TAIL_AGREEMENT =
+  /\b(sim|isso|exato|certo|perfeito|otimo|beleza|ok|concordo|verdade|e isso|isso ai|tudo certo|show)\b/
+const TAIL_ENCOURAGEMENT =
+  /\b(consegui|deu certo|funcionou|terminei|fiz|pronto|vou tentar|vamos la|bora|seguindo|ai em diante)\b/
+
+/**
+ * Classe sugerida pela cauda textual da transcrição parcial (regra v1, sem classificador):
+ * - pergunta ("?") → `ACK` — o `THINKING` ("hum…, deixa eu pensar…") é EVITADO em perguntas
+ *   (soa resposta/ hesitação indecisa no meio de uma pergunta do usuário);
+ * - negação/incerteza → `NONE` (backchannel no meio de uma dúvida soa desatenção);
+ * - hesitação → `THINKING`; concordância → `AGREEMENT`; progresso/resultado → `ENCOURAGEMENT`;
+ * - sem confiança (resto/vazio) → `ACK` neutro.
+ */
+export function classifyInterjectionTail(tail: string): InterjectionClass | 'NONE' {
+  const t = strip(String(tail ?? ''))
+    .slice(-INTERJECTION_TAIL_CHARS)
+    .trim()
+  if (!t) return 'ACK'
+  if (t.endsWith('?')) return 'ACK' // THINKING evitado em perguntas
+  if (TAIL_NONE.test(t)) return 'NONE'
+  if (TAIL_THINKING.test(t)) return 'THINKING'
+  // "deu certo"/"consegui" antes da concordância ("certo" também casa com AGREEMENT)
+  if (TAIL_ENCOURAGEMENT.test(t)) return 'ENCOURAGEMENT'
+  if (TAIL_AGREEMENT.test(t)) return 'AGREEMENT'
+  return 'ACK'
+}
+
+/**
+ * Decide a interjeição de uma observação (função pura; PRNG injetável — sorteio da probabilidade
+ * e da variante são 2 chamadas ao `rng` quando a decisão sai). Portões, na ordem: habilitada,
+ * observação fresca (≤ `INTERJECTION_MAX_AGE_MS`), fala ≥ `minSpeechMs`, pausa ≥ `minPauseMs`,
+ * cooldown desde a última, classe da cauda nas `classes` permitidas e `fireProbability`.
+ * `NONE` é, de longe, o resultado mais comum — inclusive porque o detector só observa pausas.
+ */
+export function decideInterjection(
+  obs: InterjectionObservation,
+  policy: InterjectionPolicy,
+  ctx: InterjectionContext,
+  rng: () => number = Math.random
+): InterjectionDecision {
+  const none = (reason: InterjectionReason): InterjectionDecision => ({ class: 'NONE', reason })
+  if (!policy.enabled) return none('disabled')
+  const now = Number.isFinite(ctx.now) ? ctx.now : 0
+  const observedAt = Number.isFinite(obs.observedAt) ? obs.observedAt : now
+  if (now - observedAt > INTERJECTION_MAX_AGE_MS) return none('stale')
+  const speechMs = Number.isFinite(obs.speechMs) ? obs.speechMs : 0
+  const pauseMs = Number.isFinite(obs.pauseMs) ? obs.pauseMs : 0
+  if (speechMs < policy.minSpeechMs) return none('short-speech')
+  if (pauseMs < policy.minPauseMs) return none('short-pause')
+  if (ctx.lastFiredAt != null && now - ctx.lastFiredAt < policy.cooldownMs) return none('cooldown')
+  const cls = classifyInterjectionTail(obs.tail)
+  if (cls === 'NONE') return none('tail-skip')
+  if (!policy.classes.includes(cls)) return none('class-filtered')
+  const fire = Number.isFinite(policy.fireProbability) ? policy.fireProbability : 0
+  // rng chamado UMA vez por sorteio (probabilidade e depois a variante)
+  let roll = typeof rng === 'function' ? Number(rng()) : NaN
+  if (!Number.isFinite(roll)) roll = Math.random()
+  if (!(roll < fire)) return none('probability')
+  const last = ctx.lastVariant?.[cls] ?? null
+  return {
+    class: cls,
+    variant: pickClipVariant(rng, last, 3),
+    decidedAt: now,
+    reason: 'ok'
+  }
+}
+
+/**
+ * Detector de pausas para as interjeições: emite UMA observação por episódio de pausa, quando o
+ * silêncio contínuo cruza `minPauseMs` (o `decideInterjection` filtra o resto). Novo episódio só
+ * depois de o usuário falar de novo.
+ */
+export class InterjectionWatcher {
+  readonly minPauseMs: number
+  #meter = new SpeechMeter()
+  #emitted = false
+
+  constructor(minPauseMs: number) {
+    this.minPauseMs = Number.isFinite(minPauseMs) && minPauseMs > 0 ? minPauseMs : 0
+  }
+
+  get speechMs(): number {
+    return this.#meter.speechMs
+  }
+
+  get pauseMs(): number {
+    return this.#meter.pauseMs
+  }
+
+  /**
+   * Registra um quadro e devolve a observação no momento em que a pausa cruza `minPauseMs`
+   * (uma por episódio; `tail` é preenchida pelo chamador).
+   */
+  push(
+    rms: number,
+    frameMs: number,
+    threshold: number,
+    now: number
+  ): InterjectionObservation | null {
+    const before = this.#meter.pauseMs
+    this.#meter.push(rms, frameMs, threshold)
+    if (this.#meter.pauseMs === 0) {
+      this.#emitted = false // voltou a falar: episódio novo
+      return null
+    }
+    if (this.#emitted || before >= this.minPauseMs) return null
+    if (this.#meter.pauseMs < this.minPauseMs) return null
+    this.#emitted = true
+    return {
+      speechMs: this.#meter.speechMs,
+      pauseMs: this.#meter.pauseMs,
+      tail: '',
+      observedAt: now
+    }
+  }
+
+  /** Fim do utterance (descarta o episódio em curso). */
+  reset(): void {
+    this.#meter.reset()
+    this.#emitted = false
+  }
 }
