@@ -228,6 +228,29 @@ test('splitSentences: decimais, listas numeradas e abreviações não cortam', (
   ])
 })
 
+test('splitSentences: ordinais (2.º/N.º), reticências e marcas com fecho cortam certo', () => {
+  assert.deepEqual(splitSentences('O 2.º andar. N.º 25.', { final: true }).sentences, [
+    'O 2.º andar.',
+    'N.º 25.'
+  ])
+  assert.deepEqual(splitSentences('São Paulo, 3.º quarto. Fim.', { final: true }).sentences, [
+    'São Paulo, 3.º quarto.',
+    'Fim.'
+  ])
+  assert.deepEqual(
+    splitSentences('Fim… Segue. Ele disse "tá bom." E saiu.', { final: true }).sentences,
+    ['Fim…', 'Segue.', 'Ele disse "tá bom."', 'E saiu.']
+  )
+  assert.deepEqual(splitSentences('Frase um... Depois.', { final: true }).sentences, [
+    'Frase um...',
+    'Depois.'
+  ])
+  assert.deepEqual(splitSentences('Dr.ª Ana saiu. Segue.', { final: true }).sentences, [
+    'Dr.ª Ana saiu.',
+    'Segue.'
+  ])
+})
+
 test('splitSentences: corte forçado por maxChars sem pontuação (latência)', () => {
   const long = 'palavra '.repeat(80).trim() // ~630 chars sem nenhuma marca
   const { sentences, rest } = splitSentences(long)
@@ -331,6 +354,22 @@ test('VoiceTurnMachine: start com agente ocupado; stop zera tudo', () => {
   assert.equal(m.phase, 'listening')
   m.turnArrived('ignorado')
   assert.equal(m.pendingText, '', 'fora da chamada nada é guardado')
+})
+
+test('VoiceTurnMachine: synthCleared zera as sentenças pendentes (falha de TTS não fica "Falando…")', () => {
+  const m = new VoiceTurnMachine(() => {})
+  m.start(false)
+  m.turnArrived('pergunta')
+  m.synthEnqueued()
+  m.synthEnqueued()
+  assert.equal(m.phase, 'speaking')
+  m.synthCleared()
+  assert.equal(m.phase, 'thinking', 'sentenças descartadas não contam mais como "Falando…"')
+  m.synthEnqueued()
+  m.utteranceEmitted()
+  m.playbackIdle()
+  m.responseDone()
+  assert.equal(m.phase, 'listening')
 })
 
 // ---------------- fila de utterances (reprodução) ----------------
@@ -456,6 +495,51 @@ test('UtteranceQueue: player que falha pula para a próxima', () => {
     await new Promise((r) => setTimeout(r, 5))
     assert.equal(players.length, 2, 'a segunda toca apesar da falha da primeira')
   })
+})
+
+test('UtteranceQueue: play() interrompido pelo cancel não derruba a utterance seguinte', async () => {
+  type Pending = {
+    paused: boolean
+    disposed: boolean
+    onended: (() => void) | null
+    onerror: (() => void) | null
+    volume: number
+    play(): Promise<void>
+    pause(): void
+    dispose(): void
+    fail(): void
+  }
+  const made: Pending[] = []
+  const q = new UtteranceQueue({
+    playerFactory: () => {
+      let rejectPlay: (() => void) | null = null
+      const p: Pending = {
+        paused: false,
+        disposed: false,
+        onended: null,
+        onerror: null,
+        volume: 1,
+        // play() fica pendente até o teste rejeitar (o que acontece com `new Audio` ao pausar)
+        play: () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectPlay = reject
+          }),
+        pause: () => void (p.paused = true),
+        dispose: () => void (p.disposed = true),
+        fail: () => rejectPlay?.()
+      }
+      made.push(p)
+      return p
+    }
+  })
+  q.enqueue(utt('u1')) // player 1: play() pendente
+  q.cancel() // barge-in: pausa/descarta (o play pendente rejeita depois)
+  q.enqueue(utt('u2')) // player 2: tocando
+  made[0].fail() // o play() interrompido rejeita agora (done velho)
+  await new Promise((r) => setTimeout(r, 5))
+  assert.equal(made.length, 2)
+  assert.equal(made[1].disposed, false, 'o player atual não foi derrubado pelo done velho')
+  assert.equal(q.state, 'playing', 'a utterance seguinte segue tocando')
 })
 
 // ---------------- porta de fala (fronteiras do turno) ----------------

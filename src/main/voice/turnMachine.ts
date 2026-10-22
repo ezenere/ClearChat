@@ -153,6 +153,15 @@ export class VoiceTurnMachine {
     this.#audioActive = true
   }
 
+  /**
+   * A fila de síntese foi descartada inteira (falha de TTS, barge-in ou stop): as sentenças
+   * pendentes nunca viram utterance — sem isso a fase ficaria "Falando…" para sempre.
+   */
+  synthCleared(): void {
+    if (!this.#active) return
+    this.#synthPending = 0
+  }
+
   /** A fila de reprodução do renderer esvaziou (tudo emitido já tocou). */
   playbackIdle(): void {
     if (!this.#active) return

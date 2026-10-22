@@ -10,7 +10,7 @@
 import { after, before, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -82,9 +82,39 @@ before(async () => {
       const body = JSON.parse((await readBody(req)) || '{}')
       requests.push({ url: req.url ?? '', body })
       const msgs: any[] = body.messages ?? []
+      const last = msgs[msgs.length - 1]
       const lastUser = [...msgs].reverse().find((m) => m.role === 'user')
       const key = textOf(lastUser?.content).trim().split(/\s+/)[0] || ''
       res.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      // resultado de tool voltou: encerra com o eco do resultado (ciclo de tool fecha aqui)
+      if (last?.role === 'tool') {
+        res.write(
+          chunk(body.model, {
+            role: 'assistant',
+            content: `FIM: ${textOf(last.content).slice(0, 40)}`
+          })
+        )
+        res.end(chunk(body.model, {}, 'stop') + 'data: [DONE]\n\n')
+        return
+      }
+      // 'ferramenta' → o modelo chama read_file (mesmo sem a request ter liberado tools)
+      if (key === 'ferramenta') {
+        res.write(
+          chunk(body.model, {
+            role: 'assistant',
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_${requests.length}`,
+                type: 'function',
+                function: { name: 'read_file', arguments: JSON.stringify({ path: 'alvo.txt' }) }
+              }
+            ]
+          })
+        )
+        res.end(chunk(body.model, {}, 'tool_calls') + 'data: [DONE]\n\n')
+        return
+      }
       const reply =
         key === 'duas'
           ? 'Primeira frase. Segunda frase.'
@@ -154,6 +184,8 @@ async function waitFor<T>(
 
 /** Síntese por sentença: registrada na ordem; em modo 'gated' o teste libera cada uma na mão. */
 let synthMode: 'auto' | 'gated' = 'auto'
+/** Falha de TTS (a sentença rejeita como o backend fora do ar — para a fala, texto segue). */
+let failSynth = false
 const synthCalls: string[] = []
 const gates: { open: () => void }[] = []
 const openGate = (i: number): void => gates[i]?.open()
@@ -167,6 +199,7 @@ async function synth(
   signal: AbortSignal
 ): Promise<{ audio: Uint8Array; mime: string }> {
   synthCalls.push(text)
+  if (failSynth) throw new Error('TTS fora do ar')
   if (synthMode === 'gated') {
     await Promise.race([new Promise<void>((r) => gates.push({ open: r })), aborted(signal)])
   } else {
@@ -250,7 +283,10 @@ async function boot(): Promise<{ manager: Manager }> {
 
 let providerId = ''
 let providerVozId = ''
-async function newChat(voiceConfig?: unknown): Promise<{ chatId: string; sid: string }> {
+async function newChat(
+  voiceConfig?: unknown,
+  chatTools: string[] = []
+): Promise<{ chatId: string; sid: string }> {
   const { repo } = await load()
   if (!providerId) {
     providerId = repo.providersRepo.create({
@@ -273,6 +309,7 @@ async function newChat(voiceConfig?: unknown): Promise<{ chatId: string; sid: st
       cwd: TMP,
       systemPrompt: 'persona base',
       params: { temperature: 0.7 },
+      ...(chatTools.length ? { enabledTools: chatTools } : {}),
       ...(voiceConfig ? { voice: voiceConfig } : {})
     } as any
   })
@@ -481,4 +518,85 @@ test('overrides do modo voz: voice.model/voice.tools/voicePrompt só nas request
   )
   const after = JSON.parse(JSON.stringify(repo.chatsRepo.get(chatId)!.config))
   assert.deepEqual(after, before, 'a config salva do chat não muda')
+})
+
+test('start com chamada desativada no chat (voice.enabled: false) → erro legível', async () => {
+  const { manager: m } = await boot()
+  m.stop()
+  const { sid } = await newChat({ enabled: false })
+  assert.throws(() => m.start(sid), /desativada/)
+  assert.equal(m.state().active, false, 'nada de chamada aberta por cima do erro')
+})
+
+test('falha de TTS: erro no estado e a fase não fica "Falando…" (texto segue no histórico)', async () => {
+  synthMode = 'auto'
+  failSynth = true
+  synthCalls.length = 0
+  emitted.length = 0
+  const { manager: m } = await boot()
+  m.stop()
+  const { sid } = await newChat()
+  m.start(sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('duas')
+  await idle(sid)
+  await waitFor(() => m.state().error != null, 4000, 'erro de TTS no estado')
+  assert.match(m.state().error!, /TTS fora do ar/)
+  assert.equal(synthCalls.length, 1, 'a 2ª sentença foi descartada junto')
+  assert.deepEqual(emitted, [], 'nada foi emitido para tocar')
+  assert.notEqual(m.state().phase, 'speaking', 'a fase não fica presa em "Falando…"')
+  const msgs = path(sid)
+  assert.equal(
+    textOf(msgs[1].message.content),
+    'Primeira frase. Segunda frase.',
+    'o texto da resposta segue completo no histórico'
+  )
+  failSynth = false
+  m.stop()
+})
+
+test('tools da chamada: voice.tools.enabledTools vale na execução (libera e recusa)', async () => {
+  synthMode = 'auto'
+  failSynth = false
+  const { manager: m } = await boot()
+  m.stop()
+  writeFileSync(join(TMP, 'alvo.txt'), 'CONTEUDO-ARQUIVO')
+  // chat SEM tools + chamada libera read_file → o gate de execução honra a lista da chamada
+  const a = await newChat({
+    enabled: true,
+    tools: { enabledTools: ['read_file'], maxToolOutputChars: null }
+  })
+  m.start(a.sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('ferramenta')
+  await idle(a.sid)
+  m.stop()
+  const pa = path(a.sid)
+  const toolA = pa.find((x) => x.message.role === 'tool')
+  assert.ok(toolA, 'a tool rodou')
+  assert.ok(
+    textOf(toolA!.message.content).includes('CONTEUDO-ARQUIVO'),
+    `executou de verdade (${textOf(toolA!.message.content).slice(0, 60)})`
+  )
+  assert.ok(textOf(pa[pa.length - 1].message.content).startsWith('FIM:'))
+  // chat COM read_file + chamada com tools [] ("nenhuma tool") → execução recusa
+  const b = await newChat(
+    { enabled: true, tools: { enabledTools: [], maxToolOutputChars: null } },
+    ['read_file']
+  )
+  m.start(b.sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('ferramenta')
+  await idle(b.sid)
+  m.stop()
+  const pb = path(b.sid)
+  const toolB = pb.find((x) => x.message.role === 'tool')
+  assert.ok(toolB, 'a tentativa virou tool message com o erro')
+  assert.ok(
+    textOf(toolB!.message.content).includes('não está disponível'),
+    textOf(toolB!.message.content).slice(0, 80)
+  )
 })

@@ -223,8 +223,8 @@ export function Composer({
     onFinal: (spoken) => setText((t) => mergeDictationDraft(t, spoken))
   })
   const dictating = dictation.state !== 'idle'
-  /** Chamada de voz ativa nesta sessão: o microfone do ditado some (um de cada vez). */
-  const callActive = useStore((s) => s.voiceCall.active && s.voiceCall.sessionId === session.id)
+  /** Chamada de voz ativa (em qualquer chat): o microfone do ditado some (um de cada vez). */
+  const callActive = useStore((s) => s.voiceCall.active)
 
   useEffect(() => {
     if (autoFocus) ref.current?.focus()

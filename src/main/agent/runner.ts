@@ -1411,7 +1411,11 @@ async function executeTool(
   const chat = chatsRepo.get(session.chatId)
   if (!chat) return done({ content: 'Erro: chat não encontrado.', status: 'error' })
   const name = (TOOL_ALIASES[rawName] ?? rawName) as ToolName // 'bash' (antigo) → 'shell'
-  if (!availableTools(chat, session).includes(name)) {
+  // chamada de voz: as tools do turno (`voice.tools.enabledTools`) valem também na execução —
+  // o gate espelha as tools enviadas na request (SPEC → "Chamada de voz (meia-duplex)")
+  const call = voiceCallContextFor(chat, session)
+  const gateChat = call ? applyVoiceCallChat(chat, call) : chat
+  if (!availableTools(gateChat, session).includes(name)) {
     return done({
       content: `Erro: a ferramenta "${rawName}" não está disponível nesta sessão.`,
       status: 'error'

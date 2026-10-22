@@ -102,7 +102,8 @@ export class VoiceCallManager {
     if (!info) throw new Error('Sessão não encontrada.')
     if (info.depth > 0) throw new Error('A chamada de voz é só em sessões principais.')
     const { defaults, audioInput } = this.#deps.settings()
-    const resolved = this.#resolved()
+    // resolve com o chat da sessão (this.#chatId ainda não está setado aqui)
+    const resolved = this.#resolvedFor(info.chatId)
     if (!resolved.enabled) throw new Error('Chamada de voz desativada para este chat.')
     this.#sessionId = sessionId
     this.#chatId = info.chatId
@@ -223,7 +224,11 @@ export class VoiceCallManager {
   }
 
   #resolved(): ResolvedVoiceCall {
-    const cfg = this.#chatId ? this.#deps.chatConfig(this.#chatId) : null
+    return this.#resolvedFor(this.#chatId)
+  }
+
+  #resolvedFor(chatId: string | null): ResolvedVoiceCall {
+    const cfg = chatId ? this.#deps.chatConfig(chatId) : null
     return resolveVoiceCallConfig(cfg?.voice ?? null, this.#deps.settings().defaults)
   }
 
@@ -318,6 +323,7 @@ export class VoiceCallManager {
     this.#synthQueue = []
     this.#synthAbort?.abort()
     this.#synthAbort = null
+    this.#machine.synthCleared() // sentenças descartadas nunca viram utterance
   }
 
   async #pumpSynth(): Promise<void> {

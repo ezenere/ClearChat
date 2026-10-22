@@ -138,21 +138,23 @@ export class UtteranceQueue {
     const next = this.#queue.shift()
     if (!next) return
     this.#setState('playing')
+    let player: UtterancePlayer | null = null
     let settled = false
     const done = (): void => {
       if (settled) return
       settled = true
-      const cur = this.#current
+      // só age se este player ainda for o atual (cancel() + enqueue novo tornam o done velho:
+      // o play() interrompido rejeita depois e não pode derrubar quem está tocando agora)
+      if (this.#current !== player) return
       this.#current = null
-      cur?.dispose?.()
+      player?.dispose?.()
       if (!this.#queue.length) this.#setState('idle')
       void this.#pump()
     }
-    let player: UtterancePlayer
     try {
       player = this.#factory(next.audio, next.mime)
     } catch {
-      // bytes ilegíveis: pula para a próxima
+      // bytes ilegíveis: pula para a próxima (player/current continuam null → done avança)
       done()
       return
     }
