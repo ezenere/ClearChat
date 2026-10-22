@@ -141,8 +141,8 @@ export function audioFileName(mimeType: string, fileName?: string): string {
   return `${base}.${extFor(mimeType)}`
 }
 
-/** `language` do app ('pt-BR') → ISO-639-1 da API ('pt'); vazio/ausente → null (detecção automática). */
-function languageParam(language?: string): string | null {
+/** `language` do app ('pt-BR') → ISO-639-1 da API/local ('pt'); vazio/ausente → null (detecção automática). */
+export function languageParam(language?: string): string | null {
   const s = (language ?? '').trim()
   if (!s) return null
   const base = s.replace(/_/g, '-').split('-')[0].toLowerCase()
@@ -321,14 +321,29 @@ export function chooseSttBackend(settings: SttSettings, ctx: SttBackendContext):
 
 // ---------------- wrapper com fallback ----------------
 
-/** Motor local de transcrição (injetado pela fatia de modelos locais — não implementado aqui). */
+/** Opções de uma chamada ao motor local. */
+export interface SttLocalTranscribeOptions {
+  /** Idioma do áudio ('pt-BR' → 'pt'). */
+  language?: string
+  /** Timeout da chamada em ms (o motor local pode ignorar quando não há como interromper). */
+  timeoutMs?: number
+  /** Cancelamento — aborta antes/depois da inferência quando ela não é interrompível. */
+  signal?: AbortSignal
+  /**
+   * Texto incremental enquanto o engine consome o áudio (engines de streaming — Vosk sim; o
+   * whisper.cpp emite parciais por **janelas** na sessão, `STT_PARTIAL_INTERVAL_MS`).
+   */
+  onPartial?: (text: string) => void
+}
+
+/** Motor local de transcrição (injetado pela fatia de runtime local — `src/main/voice/sttLocal.ts`). */
 export interface SttLocalBackend {
   /** Motor instalado/carregado e pronto para transcrever. */
   ready: boolean
   /** Transcreve localmente (no resultado, `baseUrl` = 'local' e `model` = motor/modelo local). */
   transcribe(
     input: TranscribeAudioInput,
-    opts: { language?: string; timeoutMs?: number; signal?: AbortSignal }
+    opts: SttLocalTranscribeOptions
   ): Promise<TranscribeResult>
 }
 

@@ -4,7 +4,7 @@
 // (`src/main/voice/session.ts`). Sem DOM, sem Electron, sem download. Rodar: npm run test:unit
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { findCatalogEntry } from '../src/main/voice/catalog.ts'
+import { findCatalogEntry, LOCAL_MODEL_CATALOG } from '../src/main/voice/catalog.ts'
 import type { LocalModelInfo, LocalModelState } from '../src/main/voice/models.ts'
 import { deriveHasLocalReady } from '../src/main/voice/session.ts'
 import {
@@ -112,8 +112,19 @@ test('deriveHasLocalReady: só o estado "installed" conta — corrupt/downloadin
   assert.equal(deriveHasLocalReady({ engine: 'whisper.cpp' }, models), false)
 })
 
-test('deriveHasLocalReady: modelo de TTS instalado não conta para o STT (e vice-verso)', () => {
-  const models = [model('kokoro', 'installed'), model('vosk-model-small-pt-0.3', 'installed')]
-  assert.equal(deriveHasLocalReady({ engine: 'vosk' }, models), true)
-  assert.equal(deriveHasLocalReady({ engine: 'whisper.cpp' }, models), false)
+test('deriveHasLocalReady: modelo de TTS não conta, e "pronto" exige runtime carregável (só whisper.cpp)', () => {
+  // id de TTS resolvido do catálogo (o catálogo de TTS evolui em outra fatia)
+  const ttsId = LOCAL_MODEL_CATALOG.find((e) => e.kind === 'tts')!.id
+  const models = [
+    model(ttsId, 'installed'),
+    model('vosk-model-small-pt-0.3', 'installed'),
+    model('nemotron-3.5-asr-streaming-0.6b', 'installed'),
+    model('ggml-tiny', 'installed')
+  ]
+  // modelo instalado mas SEM motor de inferência nesta versão (vosk/nemotron) → false
+  assert.equal(deriveHasLocalReady({ engine: 'vosk' }, models), false)
+  assert.equal(deriveHasLocalReady({ engine: 'nemotron' }, models), false)
+  // whisper.cpp: modelo instalado + runtime carregável → true; TTS nunca conta para o STT
+  assert.equal(deriveHasLocalReady({ engine: 'whisper.cpp' }, models), true)
+  assert.equal(deriveHasLocalReady({ engine: 'whisper.cpp' }, [model(ttsId, 'installed')]), false)
 })

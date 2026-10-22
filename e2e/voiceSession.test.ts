@@ -412,3 +412,119 @@ test('erros de API: parcial engole (melhor-esforço) e a sessão segue; o final 
   assert.deepEqual(events, [])
   await assert.rejects(() => s.stop(), /HTTP 500/)
 })
+
+// ---------------- parciais pelo motor local (janelas) ----------------
+
+test('parciais locais: modo "local" com motor pronto emite parciais por janelas (API nunca)', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'não deve chegar aqui' }))
+  t.after(m.restore)
+  const texts = ['UM', 'DOIS']
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: texts.shift() ?? '?', model: 'ggml-tiny', baseUrl: 'local', ms: 1 })
+  )
+  const c = clock()
+  const events: string[] = []
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local' }) },
+    {
+      now: c.now,
+      local: local.backend,
+      hasLocalReady: true,
+      onPartial: (e) => events.push(e.text)
+    }
+  )
+  t.after(() => s.cancel())
+
+  const A = bytes(8_000, 7)
+  const B = bytes(8_000, 8)
+  s.push(A, VOICE_SAMPLE_RATE)
+  c.advance(STT_PARTIAL_INTERVAL_MS)
+  s.push(B, VOICE_SAMPLE_RATE) // 1ª janela: [0, 16000)
+  await sleep(0)
+  assert.deepEqual(events, ['UM'])
+  assert.equal(local.calls.length, 1)
+  assert.ok(sameBytes(wavPcm(local.calls[0]), new Uint8Array([...A, ...B])), 'janela = acumulado')
+
+  const C = bytes(8_000, 9)
+  c.advance(STT_PARTIAL_INTERVAL_MS)
+  s.push(C, VOICE_SAMPLE_RATE) // 2ª janela: [16000 − sobreposição, 24000)
+  await sleep(0)
+  assert.deepEqual(events, ['UM', 'UM DOIS'], 'parciais acumuladas como na API')
+  assert.equal(local.calls.length, 2)
+  const overlap = Math.round(300 * ((VOICE_SAMPLE_RATE * 2) / 1000)) // 300 ms de PCM = 9600 bytes
+  const pieceStart = 16_000 - overlap // recua da fronteira já coberta (A+B)
+  assert.ok(
+    sameBytes(
+      wavPcm(local.calls[1]),
+      new Uint8Array([
+        ...bytes(8_000 - pieceStart, 7), // resto de A
+        ...bytes(8_000, 8), // B inteiro
+        ...bytes(8_000, 9) // C inteiro
+      ])
+    ),
+    '2ª janela recua a sobreposição de 300 ms'
+  )
+  assert.equal(m.calls.length, 0, 'modo local nunca vaza para a API (nem nas parciais)')
+})
+
+test('parciais locais: hybrid usa o motor local quando pronto e a API melhor-esforço quando não', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'api' }))
+  t.after(m.restore)
+
+  // pronto: parciais pelo motor local
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: 'local', model: 'ggml-tiny', baseUrl: 'local', ms: 1 })
+  )
+  const c = clock()
+  const events: string[] = []
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'hybrid' }) },
+    { now: c.now, local: local.backend, hasLocalReady: true, onPartial: (e) => events.push(e.text) }
+  )
+  s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  c.advance(STT_PARTIAL_INTERVAL_MS)
+  s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  await sleep(0)
+  s.cancel()
+  assert.deepEqual(events, ['local'])
+  assert.equal(local.calls.length, 1)
+  assert.equal(m.calls.length, 0, 'hybrid + pronto: parciais locais, sem API')
+
+  // sem pronto: parciais seguem melhor-esforço pela API
+  const events2: string[] = []
+  const c2 = clock()
+  const s2 = startTranscribeSession(
+    { settings: sttSettings({ mode: 'hybrid' }) },
+    { now: c2.now, onPartial: (e) => events2.push(e.text) }
+  )
+  s2.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  c2.advance(STT_PARTIAL_INTERVAL_MS)
+  s2.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  await sleep(0)
+  s2.cancel()
+  assert.deepEqual(events2, ['api'])
+  assert.equal(m.calls.length, 1, 'hybrid sem pronto: parcial melhor-esforço pela API')
+})
+
+test('modo "local" sem motor pronto não dispara parciais (nem locais nem de API)', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'x' }))
+  t.after(m.restore)
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: '?', model: 'ggml-tiny', baseUrl: 'local', ms: 1 })
+  )
+  local.backend.ready = false
+  const c = clock()
+  const events: string[] = []
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local' }) },
+    { now: c.now, local: local.backend, hasLocalReady: true, onPartial: (e) => events.push(e.text) }
+  )
+  s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  c.advance(STT_PARTIAL_INTERVAL_MS * 2)
+  s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  await sleep(0)
+  s.cancel()
+  assert.deepEqual(events, [])
+  assert.equal(local.calls.length, 0)
+  assert.equal(m.calls.length, 0)
+})

@@ -20,6 +20,12 @@ import {
   transcribeWithFallback,
   type SttLocalBackend
 } from './stt'
+import {
+  createSttLocalBackend,
+  engineUnavailableError,
+  isSttEngineRuntimeAvailable,
+  resolveSttModelsBaseDir
+} from './sttLocal'
 
 /** PCM16 mono a esta taxa (Hz): o formato do buffer da sessão e do wav enviado à API. */
 export const VOICE_SAMPLE_RATE = 16_000
@@ -65,41 +71,71 @@ export function encodeWav(pcm16: Uint8Array, sampleRate: number): Uint8Array {
 
 /**
  * `hasLocalReady` da sessão: há modelo de STT **instalado** para o engine escolhido em
- * `sttSettings.local`? Pura — o estado em disco vem de `listLocalModels` (`'installed'` conta;
- * `'corrupt'`/`'downloading'`/`'notInstalled'` não). `local: null` (nenhum modelo escolhido) → false.
- * A semântica é por ENGINE (o modelo concreto a carregar é escolhido pelo runtime de inferência,
- * outra fatia); `installed` em `sttSettings.local`/`ttsSettings.local` é só um espelho da UI — a
- * verdade é sempre o disco (SPEC → "Áudio → Componentes locais").
+ * `sttSettings.local` **e** o runtime deste engine é carregável nesta versão ("pronto = modelo
+ * instalado + runtime", SPEC → "Áudio → Runtime local de STT")? Pura — o estado em disco vem de
+ * `listLocalModels` (`'installed'` conta; `'corrupt'`/`'downloading'`/`'notInstalled'` não) e o
+ * runtime de `isSttEngineRuntimeAvailable` (hoje só `whisper.cpp`; `vosk`/`nemotron` → false). A
+ * semântica é por ENGINE (o modelo concreto a carregar é escolhido pelo runtime — ver
+ * `resolveModelEntry` em `voice/sttLocal.ts`); `installed` em `sttSettings.local`/`ttsSettings.local`
+ * é só um espelho da UI — a verdade é sempre o disco (SPEC → "Áudio → Componentes locais").
  */
 export function deriveHasLocalReady(
   local: Pick<SttLocalConfig, 'engine'> | null,
   models: readonly LocalModelInfo[]
 ): boolean {
   if (!local) return false
+  if (!isSttEngineRuntimeAvailable(local.engine)) return false
   return models.some(
     (m) => m.entry.kind === 'stt' && m.entry.engine === local.engine && m.state === 'installed'
   )
 }
 
 /**
- * Erro honesto quando o backend local é o escolhido mas não há motor de inferência nesta versão:
- * os arquivos do modelo podem estar instalados, mas rodar whisper/vosk/nemotron é outra fatia.
- * `kind: 'config'` (nunca cai em fallback) e o conselho é usar o modo API.
+ * Erro honesto quando o backend local é o escolhido mas não dá para transcrever: sem modelo
+ * escolhido, engine sem motor de inferência nesta versão (os arquivos podem estar instalados — ver
+ * `engineUnavailableError`), nada instalado para o engine ou arquivo ausente/corrompido. Todos os
+ * casos mantêm a frase-âncora "motor local de transcrição não está pronto"; `kind: 'config'`
+ * (nunca cai em fallback) e o conselho é usar o modo API.
  */
-function localRuntimeError(modelInstalled: boolean): SttError {
+function localRuntimeError(
+  local: Pick<SttLocalConfig, 'engine' | 'model'> | null,
+  modelReady: boolean
+): SttError {
+  if (!local)
+    return new SttError(
+      'config',
+      'motor local de transcrição não está pronto — nenhum modelo local configurado (escolha/baixe um modelo em Configurações → Áudio) ou use o modo API',
+      { backend: 'local' }
+    )
+  if (!isSttEngineRuntimeAvailable(local.engine)) return engineUnavailableError(local.engine)
   return new SttError(
     'config',
-    modelInstalled
-      ? 'modelo local instalado, mas o motor de inferência local ainda não está disponível nesta versão — use o modo API'
-      : 'motor local de transcrição não está pronto — nenhum modelo local instalado (baixe em Configurações → Áudio) ou use o modo API',
+    modelReady
+      ? 'motor local de transcrição não está pronto — o arquivo do modelo local está ausente/corrompido (reinstale em Configurações → Áudio) ou use o modo API'
+      : `motor local de transcrição não está pronto — nenhum modelo local instalado para o engine '${local.engine}' (baixe em Configurações → Áudio) ou use o modo API`,
     { backend: 'local' }
   )
+}
+
+/** Nota curta (pt-BR) do porquê não há fallback local (anexada ao erro da API no modo hybrid). */
+function localFallbackNote(
+  local: Pick<SttLocalConfig, 'engine'> | null,
+  modelReady: boolean
+): string {
+  if (!local) return 'nenhum modelo local configurado'
+  if (!isSttEngineRuntimeAvailable(local.engine))
+    return `o engine '${local.engine}' ainda não tem motor de inferência nesta versão`
+  if (!modelReady) return `nenhum modelo local instalado para o engine '${local.engine}'`
+  return 'o modelo local não está pronto (arquivo ausente/corrompido — reinstale em Configurações → Áudio)'
 }
 
 export interface TranscribeSessionDeps {
   /** Relógio (testes); padrão `Date.now`. */
   now?: () => number
-  /** Motor local injetado (fatia de modelos locais); sem ele, o modo 'local' falha legível. */
+  /**
+   * Motor local injetado; sem ele, a sessão cria o runtime padrão (`voice/sttLocal.ts`) para o
+   * `settings.local` atual (modo 'local' sem motor pronto falha legível).
+   */
   local?: SttLocalBackend
   /**
    * Modelo local instalado para o engine escolhido (`deriveHasLocalReady`); padrão false. O
@@ -186,10 +222,12 @@ const joinText = (a: string, b: string): string => [a, b].filter((x) => x.trim()
 
 /**
  * Dispara a parcial quando o intervalo decorreu e há áudio novo: pedaço `[covered − sobreposição,
- * agora]` como wav, `purpose: 'partial'` via `chooseSttBackend` com `hasLocalReady: false` (o motor
- * local é outra fatia; no modo 'local' a parcial NÃO vai para a API). Melhor-esforço: aborta a
- * request em voo (a seguinte recobre o pedaço dela), resultados velhos expiram e erros de parcial
- * nunca interrompem a sessão.
+ * agora]` como wav, `purpose: 'partial'` via `chooseSttBackend` com o runtime local pronto. Pela
+ * **API** (melhor-esforço) ou pelo **motor local em janelas** (whisper.cpp — a cada
+ * `STT_PARTIAL_INTERVAL_MS`; engines de streaming emitem dentro da chamada via `onPartial`). Sem
+ * motor pronto, parciais locais não existem (o modo 'local' nunca vaza para a API). Melhor-esforço:
+ * aborta a request em voo (a seguinte recobre o pedaço dela), resultados velhos expiram e erros de
+ * parcial nunca interrompem a sessão.
  */
 function maybeFirePartial(state: SessionState): void {
   if (state.status !== 'active') return
@@ -198,8 +236,8 @@ function maybeFirePartial(state: SessionState): void {
   // pronto = modelo instalado (hasLocalReady) E motor de inferência disponível (local.ready) — sem
   // runtime, as parciais continuam melhor-esforço na API (modo 'local' nunca vaza para a API)
   const localReady = state.hasLocalReady && state.local?.ready === true
-  if (chooseSttBackend(settings, { hasLocalReady: localReady, purpose: 'partial' }) !== 'api')
-    return
+  const chosen = chooseSttBackend(settings, { hasLocalReady: localReady, purpose: 'partial' })
+  if (chosen === 'local' && !localReady) return
   const now = state.now()
   if (now - state.lastFireAt < STT_PARTIAL_INTERVAL_MS) return
   const pieceEnd = state.totalBytes
@@ -212,14 +250,23 @@ function maybeFirePartial(state: SessionState): void {
   const controller = new AbortController()
   state.inFlight = { seq, controller }
   const audio = sliceBuffer(state, pieceStart, pieceEnd)
-  void transcribeAudio(
-    {
-      audio: encodeWav(audio, VOICE_SAMPLE_RATE),
-      mimeType: 'audio/wav',
-      fileName: 'partial'
-    },
-    { settings, language: state.opts.language, signal: controller.signal }
-  )
+  const input = {
+    audio: encodeWav(audio, VOICE_SAMPLE_RATE),
+    mimeType: 'audio/wav',
+    fileName: 'partial'
+  }
+  const partial: Promise<{ text: string; ms: number }> =
+    chosen === 'local'
+      ? state.local!.transcribe(input, {
+          language: state.opts.language,
+          signal: controller.signal
+        })
+      : transcribeAudio(input, {
+          settings,
+          language: state.opts.language,
+          signal: controller.signal
+        })
+  void partial
     .then((r) => {
       // resultado velho (request abortada/superseded) expira; nunca entra na fila
       if (state.status !== 'active' || state.seq !== seq) return
@@ -250,7 +297,14 @@ export function startTranscribeSession(
     id: crypto.randomUUID(),
     opts,
     now: deps.now ?? Date.now,
-    local: deps.local,
+    // sem injeção (produção/testes de integração): o runtime local padrão para o engine/modelo
+    // escolhidos em `settings.local` (`voice/sttLocal.ts`; baseDir = userData, lazy)
+    local:
+      deps.local ??
+      createSttLocalBackend({
+        baseDir: resolveSttModelsBaseDir(),
+        selection: opts.settings.local
+      }),
     hasLocalReady: deps.hasLocalReady === true,
     onPartial: deps.onPartial,
     chunks: [],
@@ -318,13 +372,13 @@ export function startTranscribeSession(
         const controller = new AbortController()
         state.finalController = controller
         const runtimeReady = state.local?.ready === true
-        // sem motor de inferência nesta versão, o backend local não tem como transcrever: erro
-        // `config` honesto (o modelo pode estar instalado) em vez de falha genérica no fim
+        // sem motor pronto, o backend local não tem como transcrever: erro `config` honesto (o
+        // modelo pode estar instalado) em vez de falha genérica no fim
         if (
           !runtimeReady &&
           chooseSttBackend(state.opts.settings, { hasLocalReady: false }) === 'local'
         )
-          throw localRuntimeError(state.hasLocalReady)
+          throw localRuntimeError(state.opts.settings.local, state.hasLocalReady)
         return await transcribeWithFallback(
           {
             audio: encodeWav(sliceBuffer(state, 0, state.totalBytes), VOICE_SAMPLE_RATE),
@@ -340,18 +394,18 @@ export function startTranscribeSession(
         )
       } catch (e) {
         if (state.finalController?.signal.aborted) throw abortError()
-        // hybrid com modelo instalado mas sem motor: o fallback local fica bloqueado — anota a
+        // hybrid com o fallback local bloqueado (modelo/engine/runtime): a anotação conta a
         // verdade junto do erro da API em vez de deixar o fallback "sumir" em silêncio
         if (
           state.opts.settings.mode === 'hybrid' &&
-          state.hasLocalReady &&
+          state.opts.settings.local &&
           state.local?.ready !== true &&
           isSttFallbackable(e)
         ) {
           const msg = e instanceof Error ? e.message : String(e)
           throw new SttError(
             'config',
-            `${msg} — sem fallback local: modelo instalado, mas o motor de inferência local ainda não está disponível nesta versão`,
+            `${msg} — sem fallback local: ${localFallbackNote(state.opts.settings.local, state.hasLocalReady)}`,
             { backend: 'local', cause: e }
           )
         }
