@@ -4,6 +4,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import {
   ALL_CHANNELS,
   IPC,
+  VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   type AppCapabilities,
   type ApprovalDecision,
@@ -18,6 +19,7 @@ import {
   type ProviderPatch,
   type ProviderTestInput,
   type SmartApproveTestInput,
+  type VoiceModelInfo,
   type VoiceSettingKind
 } from '@shared/ipc'
 import type { ApiMessage, AttachmentInfo, Chat, QuestionAnswer } from '@shared/types'
@@ -102,9 +104,23 @@ import type {
   MemoryListQuery,
   MemoryPatch
 } from '@shared/memory'
-import { getVoiceSettings, getVoiceSettingsView, setVoiceSetting } from './voice'
+import {
+  getVoiceSettings,
+  getVoiceSettingsView,
+  setVoiceSetting,
+  syncLocalModelInstalled
+} from './voice'
+import { findCatalogEntry } from './voice/catalog'
+import {
+  downloadLocalModel,
+  listLocalModels,
+  modelsDir,
+  removeLocalModel,
+  type LocalModelInfo
+} from './voice/models'
 import {
   activeTranscribeSession,
+  deriveHasLocalReady,
   startTranscribeSession,
   type TranscribeSession
 } from './voice/session'
@@ -133,6 +149,40 @@ function requireTranscribeSession(sessionId: string): TranscribeSession {
   if (!s || s.id !== sessionId)
     throw new Error('Sessão de transcrição não encontrada (encerrada, cancelada ou substituída).')
   return s
+}
+
+// ---- modelos locais de áudio (SPEC → "Áudio → Componentes locais") ----
+
+/** `<userData>/models` — onde o gerenciador instala os modelos locais de áudio. */
+const localModelsDir = (): string => modelsDir(app.getPath('userData'))
+
+/** Downloads de modelos locais em voo por id (cancelamento via `voice:models:cancel`). */
+const localDownloads = new Map<string, AbortController>()
+
+/** Progresso emitido no máximo a cada 100 ms por modelo (e sempre ao terminar). */
+const PROGRESS_MIN_MS = 100
+const lastProgressAt = new Map<string, number>()
+
+/** Entrada do catálogo + estado em disco → visão do renderer (`VoiceModelInfo`). */
+const toModelView = (info: LocalModelInfo): VoiceModelInfo => ({
+  id: info.entry.id,
+  kind: info.entry.kind,
+  engine: info.entry.engine,
+  name: info.entry.name,
+  description: info.entry.description,
+  languages: [...info.entry.languages],
+  version: info.entry.version,
+  sizeBytes: info.entry.sizeBytes,
+  hasDownload: !!info.entry.url,
+  state: info.state,
+  installedBytes: info.installedBytes
+})
+
+/** `{ id }` dos canais `voice:models:*`, validado (id não vazio). */
+function requireModelId(input: { id: string } | undefined): string {
+  const id = input && typeof input.id === 'string' ? input.id.trim() : ''
+  if (!id) throw new Error('Modelo não informado (esperado { id }).')
+  return id
 }
 
 /** Banco + sync para o visualizador de arquivos (fileViewer.ts é sem Electron). */
@@ -629,13 +679,18 @@ export function registerIpc(): void {
     [IPC.voice.settingsGet]: () => getVoiceSettingsView(),
     [IPC.voice.settingsSet]: (kind: VoiceSettingKind, value: unknown) =>
       setVoiceSetting(kind, value),
-    [IPC.voice.transcribeStart]: (language?: string) => {
+    [IPC.voice.transcribeStart]: async (language?: string) => {
       const v = getVoiceSettings()
       const lang =
         typeof language === 'string' && language.trim() ? language : v.audioInput.language
+      const models = await listLocalModels(localModelsDir())
       return startTranscribeSession(
         { settings: v.stt, language: lang },
-        { onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e) }
+        {
+          // coerência installed/hasLocalReady: a presença real de modelo instalado vem do disco
+          hasLocalReady: deriveHasLocalReady(v.stt.local, models),
+          onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e)
+        }
       ).id
     },
     [IPC.voice.transcribePush]: (sessionId: string, pcm16: Uint8Array, sampleRate?: number) => {
@@ -646,6 +701,48 @@ export function registerIpc(): void {
     [IPC.voice.transcribeCancel]: (sessionId: string) => {
       const s = activeTranscribeSession()
       if (s && s.id === sessionId) s.cancel()
+    },
+    // ---- modelos locais (catálogo + download/estado em disco) ----
+    [IPC.voice.modelsList]: async (): Promise<VoiceModelInfo[]> =>
+      (await listLocalModels(localModelsDir())).map(toModelView),
+    [IPC.voice.modelsDownload]: async (input: { id: string }): Promise<VoiceModelInfo | null> => {
+      const id = requireModelId(input)
+      if (localDownloads.has(id)) throw new Error(`download já em andamento para ${id}`)
+      const controller = new AbortController()
+      localDownloads.set(id, controller)
+      const emitProgress = (bytes: number, total: number): void => {
+        const now = Date.now()
+        const last = lastProgressAt.get(id) ?? 0
+        if (bytes < total && now - last < PROGRESS_MIN_MS) return
+        lastProgressAt.set(id, now)
+        sendToWindows(VOICE_MODELS_PROGRESS_CHANNEL, { id, bytes, total })
+      }
+      try {
+        const info = await downloadLocalModel(localModelsDir(), id, {
+          signal: controller.signal,
+          onProgress: emitProgress
+        })
+        emitProgress(info.installedBytes ?? info.entry.sizeBytes, info.entry.sizeBytes)
+        syncLocalModelInstalled(info.entry, true)
+        return toModelView(info)
+      } catch (e) {
+        // cancelado pelo usuário (abort limpa o `.part` no gerenciador) → null, não é erro
+        if (controller.signal.aborted) return null
+        throw e
+      } finally {
+        localDownloads.delete(id)
+        lastProgressAt.delete(id)
+      }
+    },
+    // cancel é tolerante: id desconhecido/já encerrado = sem efeito (o gerenciador limpa o `.part`)
+    [IPC.voice.modelsCancel]: (input: { id: string }): void => {
+      localDownloads.get(requireModelId(input))?.abort()
+    },
+    [IPC.voice.modelsRemove]: async (input: { id: string }): Promise<void> => {
+      const id = requireModelId(input)
+      await removeLocalModel(localModelsDir(), id)
+      const entry = findCatalogEntry(id)
+      if (entry) syncLocalModelInstalled(entry, false)
     },
 
     // ---- sync ----

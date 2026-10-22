@@ -1,16 +1,24 @@
 // Configurações → Áudio: ditado por voz (microfone padrão, push-to-talk com captura de tecla,
 // auto-stop por silêncio, idioma) e transcrição (STT — modo, endpoint de API com chave mascarada,
-// motor local sem download nesta fatia, parciais ao vivo). TTS entra em outra fatia (só o heading).
-// Espelha o padrão de "Pesquisa na web" (`WebSearchSettings.tsx`): cada controle grava na hora via
-// `voice:settings:set`; a chave de API é ECOADA mascarada no campo — escrever por cima da máscara
-// preserva a chave real (contrato do main, testado em `e2e/voiceSettings.test.ts`).
-import { Download, KeyRound, X } from 'lucide-react'
+// motor local com download real dos modelos, parciais ao vivo). TTS: o heading + a lista de modelos
+// com ações desabilitadas (o download entra na fatia de TTS). Espelha o padrão de "Pesquisa na web"
+// (`WebSearchSettings.tsx`): cada controle grava na hora via `voice:settings:set`; a chave de API é
+// ECOADA mascarada no campo — escrever por cima da máscara preserva a chave real (contrato do main,
+// testado em `e2e/voiceSettings.test.ts`).
+import { Check, Download, KeyRound, TriangleAlert, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import type { VoiceModelInfo } from '@shared/ipc'
 import type { SttLocalConfig, SttMode, SttSettings, TtsSettings } from '@shared/voice'
 import { DEFAULT_AUDIO_INPUT, DEFAULT_STT_SETTINGS, DEFAULT_TTS_SETTINGS } from '@shared/voice'
 import type { AudioInputSettings } from '@shared/voice'
-import { api } from '../../lib/api'
+import { api, errorMessage } from '../../lib/api'
 import { formatHotkeyLabel, hotkeyFromEvent } from '../../lib/voice/hotkeyLabel'
+import {
+  formatModelLanguages,
+  formatModelSize,
+  modelAction,
+  type LocalModelAction
+} from '../../lib/voice/modelList'
 import { Button, Kbd, Label, Switch } from '../ui/controls'
 import { Select } from '../ui/Select'
 import { HelpTip } from '../ui/Tooltip'
@@ -50,6 +58,14 @@ export function AudioSettings(): React.JSX.Element | null {
   const [keyDraft, setKeyDraft] = useState('')
   /** Rascunho do idioma livre ("Outro…") enquanto digita; null = lista comum. */
   const [langDraft, setLangDraft] = useState<string | null>(null)
+  /** Modelos locais (catálogo + estado em disco, `voice:models:list`). */
+  const [models, setModels] = useState<VoiceModelInfo[]>([])
+  /** Progresso de download por modelo id (evento `voice:models:progress`). */
+  const [modelProgress, setModelProgress] = useState<
+    Record<string, { bytes: number; total: number }>
+  >({})
+  /** Erro de download/remoção de modelo (aviso legível no painel). */
+  const [modelError, setModelError] = useState<string | null>(null)
   const devices = useInputDevices()
 
   useEffect(() => {
@@ -64,10 +80,26 @@ export function AudioSettings(): React.JSX.Element | null {
         setKeyDraft(all.sttSettings.api.apiKey)
       })
       .catch(() => void 0)
+    void voice?.models
+      .list()
+      .then((list) => {
+        if (alive) setModels(list)
+      })
+      .catch(() => void 0)
     return () => {
       alive = false
     }
   }, [voice])
+
+  // progresso dos downloads em voo (main → renderer); o estado 'downloading' vem junto
+  useEffect(
+    () =>
+      api.onVoiceModelProgress?.((e) => {
+        setModelProgress((p) => ({ ...p, [e.id]: { bytes: e.bytes, total: e.total } }))
+        setModels((ms) => ms.map((m) => (m.id === e.id ? { ...m, state: 'downloading' } : m)))
+      }),
+    []
+  )
 
   if (!voice) {
     return (
@@ -108,6 +140,65 @@ export function AudioSettings(): React.JSX.Element | null {
   }
   const saveSttApi = (patch: Partial<SttSettings['api']>): void => {
     commitStt({ ...stt, api: { ...stt.api, ...patch } }, patch.apiKey ?? stt.api.apiKey)
+  }
+
+  // ---- modelos locais (download/remoção com progresso) ----
+
+  const refreshModels = (): void => {
+    void voice.models
+      .list()
+      .then(setModels)
+      .catch(() => void 0)
+  }
+
+  /** O main sincroniza `installed` nas settings ao instalar/remover — relee os grupos. */
+  const refreshModelSettings = (): void => {
+    void voice.settings
+      .get()
+      .then((all) => {
+        setStt(all.sttSettings)
+        setTts(all.ttsSettings)
+      })
+      .catch(() => void 0)
+  }
+
+  /** Ação da linha do modelo (`modelAction`): baixar/rebaixar, cancelar ou remover. */
+  const runModelAction = (model: VoiceModelInfo, action: LocalModelAction['action']): void => {
+    if (!action) return
+    setModelError(null)
+    if (action === 'cancel') {
+      void voice.models.cancel({ id: model.id }).catch(() => void 0)
+      return
+    }
+    if (action === 'remove') {
+      setModels((ms) =>
+        ms.map((m) =>
+          m.id === model.id ? { ...m, state: 'notInstalled', installedBytes: null } : m
+        )
+      )
+      void voice.models
+        .remove({ id: model.id })
+        .then(refreshModelSettings)
+        .catch((e) => {
+          setModelError(errorMessage(e))
+          refreshModels()
+        })
+      return
+    }
+    // 'download' | 'retry': baixa com progresso (`voice:models:progress`); cancelado resolve null
+    setModels((ms) => ms.map((m) => (m.id === model.id ? { ...m, state: 'downloading' } : m)))
+    setModelProgress((p) => ({ ...p, [model.id]: { bytes: 0, total: model.sizeBytes } }))
+    void voice.models
+      .download({ id: model.id })
+      .then((info) => {
+        if (info) setModels((ms) => ms.map((m) => (m.id === model.id ? info : m)))
+        else refreshModels() // cancelado: volta ao estado em disco
+        refreshModelSettings()
+      })
+      .catch((e) => {
+        setModelError(errorMessage(e))
+        refreshModels()
+      })
   }
 
   const langIsCommon = LANGUAGES.some((l) => l.value === input.language)
@@ -331,18 +422,28 @@ export function AudioSettings(): React.JSX.Element | null {
           </div>
           <LocalEnginePanel
             local={stt.local}
+            models={models}
+            progress={modelProgress}
+            error={modelError}
             onEngine={(engine) =>
               saveStt({
-                local: stt.local
-                  ? { ...stt.local, engine }
-                  : { engine, model: '', installed: false }
+                local: {
+                  engine,
+                  model: stt.local?.engine === engine ? stt.local.model : '',
+                  // `installed` espelha o disco para o engine escolhido (a verdade é o disco)
+                  installed: models.some(
+                    (m) => m.kind === 'stt' && m.engine === engine && m.state === 'installed'
+                  )
+                }
               })
             }
+            onAction={runModelAction}
+            onDismissError={() => setModelError(null)}
           />
         </div>
       </section>
 
-      {/* ---- TTS (outra fatia) ---- */}
+      {/* ---- TTS (configuração na fatia de TTS; a lista de modelos já aparece) ---- */}
       <section className="border-t border-border pt-4" data-testid="tts-section">
         <div className="mb-1 flex items-baseline gap-2">
           <span className="text-[13px] font-medium text-fg/90">Fala (TTS)</span>
@@ -350,14 +451,20 @@ export function AudioSettings(): React.JSX.Element | null {
             <p>
               Síntese de fala para a chamada de voz (Feature B). Os contratos de configuração já
               existem (<code className="font-mono">ttsSettings</code>: backend API/local, Kokoro
-              local por padrão) — a UI e o falante entram na próxima fatia.
+              local por padrão) — o download dos modelos e o falante entram na fatia de TTS.
             </p>
           </HelpTip>
         </div>
         <p className="text-xs leading-relaxed text-subtle">
-          Configurado na próxima fatia. Padrão provisório: motor local Kokoro (não instalado){' '}
-          {tts.backend === 'api' ? '· backend atual: API' : ''}.
+          Configuração completa na próxima fatia. Padrão provisório: motor local Kokoro (não
+          instalado) {tts.backend === 'api' ? '· backend atual: API' : ''}.
         </p>
+        <LocalModelList
+          kind="tts"
+          models={models}
+          progress={modelProgress}
+          onAction={runModelAction}
+        />
       </section>
     </div>
   )
@@ -451,16 +558,26 @@ function SilenceMsField({
 }
 
 /**
- * Estado do motor local de STT — pronto para plugar o download (outra fatia): `onDownload` ausente
- * mantém o botão "Baixar" desabilitado com a nota da fatia futura.
- */ export function LocalEnginePanel({
+ * Motor local de STT: seletor de engine + status (espelho de `sttSettings.local.installed`) e a
+ * lista dos modelos do catálogo por engine com download/remoção reais (progresso, estados e avisos
+ * de `modelAction`). Erros de download/remoção viram aviso legível no painel.
+ */
+export function LocalEnginePanel({
   local,
+  models,
+  progress,
+  error,
   onEngine,
-  onDownload
+  onAction,
+  onDismissError
 }: {
   local: SttLocalConfig | null
+  models: VoiceModelInfo[]
+  progress: Record<string, { bytes: number; total: number }>
+  error: string | null
   onEngine?: (engine: SttLocalConfig['engine']) => void
-  onDownload?: (engine: SttLocalConfig['engine']) => void
+  onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
+  onDismissError: () => void
 }): React.JSX.Element {
   const engine = local?.engine ?? 'whisper.cpp'
   return (
@@ -493,22 +610,188 @@ function SilenceMsField({
         >
           {local?.installed ? 'instalado' : 'não instalado'}
         </span>
-        <Button
-          size="sm"
-          variant="secondary"
-          icon={<Download className="size-3.5" />}
-          disabled={!onDownload || local?.installed}
-          onClick={() => onDownload?.(engine)}
-        >
-          Baixar
-        </Button>
       </div>
-      {!local?.installed && (
-        <p className="mt-1.5 text-[11px] leading-relaxed text-subtle">
-          O download dos modelos locais entra na próxima fatia — o botão fica desabilitado até lá.
-          Até lá, use o modo <strong>API</strong> ou <strong>Híbrido</strong>.
+      <ModelError error={error} onDismiss={onDismissError} />
+      <LocalModelList kind="stt" models={models} progress={progress} onAction={onAction} />
+      <p className="mt-2 text-[11px] leading-relaxed text-subtle">
+        Os arquivos ficam em <code className="font-mono">userData/models</code> (verificados por
+        tamanho/magic bytes/sha256). A inferência local (rodar whisper/vosk/nemotron) entra numa
+        fatia futura — até lá, use o modo <strong>API</strong> ou <strong>Híbrido</strong>.
+      </p>
+    </div>
+  )
+}
+
+/** Lista dos modelos locais agrupados por engine (nome, descrição, idiomas, tamanho). */
+function LocalModelList({
+  kind,
+  models,
+  progress,
+  onAction
+}: {
+  kind: VoiceModelInfo['kind']
+  models: VoiceModelInfo[]
+  progress: Record<string, { bytes: number; total: number }>
+  onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
+}): React.JSX.Element | null {
+  const items = models.filter((m) => m.kind === kind)
+  if (!items.length) return null
+  const groups: { engine: string; items: VoiceModelInfo[] }[] = []
+  for (const m of items) {
+    const g = groups.find((x) => x.engine === m.engine)
+    if (g) g.items.push(m)
+    else groups.push({ engine: m.engine, items: [m] })
+  }
+  return (
+    <div className="mt-2 space-y-2.5">
+      {groups.map((g) => (
+        <div key={g.engine} data-testid={`voice-models-${g.engine}`}>
+          <div className="mb-1 font-mono text-[10px] tracking-wide text-faint uppercase">
+            {g.engine}
+          </div>
+          <div className="space-y-1.5">
+            {g.items.map((m) => (
+              <ModelRow key={m.id} model={m} progress={progress[m.id]} onAction={onAction} />
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Linha de um modelo local: nome/descrição/idiomas/tamanho + estado, ação e progresso. */
+function ModelRow({
+  model,
+  progress,
+  onAction
+}: {
+  model: VoiceModelInfo
+  progress?: { bytes: number; total: number }
+  onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
+}): React.JSX.Element {
+  const a = modelAction(model.state, model.hasDownload)
+  const total = progress?.total || model.sizeBytes || 1
+  const pct = progress ? Math.max(0, Math.min(100, Math.round((progress.bytes / total) * 100))) : 0
+  return (
+    <div
+      className="rounded-lg border border-border/70 bg-elevated/20 px-2.5 py-2"
+      data-testid={`voice-model-${model.id}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-[12px] font-medium text-fg/90">{model.name}</span>
+        <span
+          className={`rounded-full border px-1.5 py-px text-[10px] leading-4 ${
+            model.state === 'installed'
+              ? 'border-success/30 text-success'
+              : model.state === 'corrupt'
+                ? 'border-danger/30 text-danger'
+                : 'border-warning/30 text-warning'
+          }`}
+        >
+          {a.badge}
+        </span>
+        {model.state === 'installed' && (
+          <span className="inline-flex items-center gap-1 text-[11px] text-success">
+            <Check className="size-3" />
+            {formatModelSize(model.installedBytes ?? model.sizeBytes)}
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-1.5">
+          {a.action ? (
+            <Button
+              size="sm"
+              variant={a.action === 'remove' ? 'ghost' : 'secondary'}
+              data-testid={`voice-model-action-${model.id}`}
+              icon={
+                a.action === 'remove' ? (
+                  <X className="size-3.5" />
+                ) : a.action === 'cancel' ? (
+                  <X className="size-3.5" />
+                ) : (
+                  <Download className="size-3.5" />
+                )
+              }
+              onClick={() => onAction(model, a.action)}
+            >
+              {a.label}
+            </Button>
+          ) : (
+            <>
+              <Button size="sm" variant="secondary" disabled>
+                {a.label}
+              </Button>
+              <span className="text-[10px] text-subtle">disponível na fatia de TTS</span>
+            </>
+          )}
+        </span>
+      </div>
+      <p className="mt-1 text-[11px] leading-relaxed text-subtle">{model.description}</p>
+      <p className="text-[10.5px] text-faint">
+        {formatModelLanguages(model.languages)}
+        {model.sizeBytes > 0
+          ? ` · ${formatModelSize(model.sizeBytes)}`
+          : ' · tamanho a definir na fatia de TTS'}
+      </p>
+      {model.state === 'downloading' && (
+        <div className="mt-1.5">
+          <div
+            className="h-1.5 overflow-hidden rounded-full bg-elevated"
+            role="progressbar"
+            aria-label={`Download de ${model.name}`}
+            aria-valuenow={pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            data-testid={`voice-model-progress-${model.id}`}
+          >
+            <div
+              className="h-full rounded-full bg-accent transition-[width] duration-150"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+          <p className="mt-0.5 text-[10.5px] text-subtle tabular-nums">
+            {formatModelSize(progress?.bytes ?? 0)} / {formatModelSize(total)} ({pct}%)
+          </p>
+        </div>
+      )}
+      {a.warning && (
+        <p
+          className="mt-1 flex items-center gap-1 text-[11px] text-warning"
+          role="alert"
+          data-testid={`voice-model-warning-${model.id}`}
+        >
+          <TriangleAlert className="size-3 shrink-0" /> {a.warning}
         </p>
       )}
+    </div>
+  )
+}
+
+/** Erro de download/remoção de modelo (padrão dos avisos do composer) com X para dispensar. */
+function ModelError({
+  error,
+  onDismiss
+}: {
+  error: string | null
+  onDismiss: () => void
+}): React.JSX.Element | null {
+  if (!error) return null
+  return (
+    <div
+      role="alert"
+      data-testid="voice-model-error"
+      className="mt-2 flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+    >
+      <TriangleAlert className="size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1">{error}</span>
+      <button
+        type="button"
+        aria-label="Dispensar erro de modelos locais"
+        onClick={onDismiss}
+        className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+      >
+        <X className="size-3.5" />
+      </button>
     </div>
   )
 }

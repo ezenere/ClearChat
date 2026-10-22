@@ -272,12 +272,17 @@ interface ClearApi {
               transcribe: { start(language?): sessionId   // sessão global única de transcrição (PCM16 mono 16 kHz); language ausente → audioInput.language; já há sessão → erro legível
                             push(sessionId, pcm16: Uint8Array, sampleRate?): void   // acumula; sampleRate informado precisa ser 16000
                             stop(sessionId): { text, model, baseUrl, ms, backend, fellBack, fallbackReason? }   // final do buffer inteiro (erro legível propaga)
-                            cancel(sessionId): void } }   // descarta sem transcrever (id desconhecido = sem efeito)
+                            cancel(sessionId): void }   // descarta sem transcrever (id desconhecido = sem efeito)
+              models: { list(): VoiceModelInfo[]          // catálogo de modelos locais + estado em disco (ver "Áudio → Modelos locais por IPC")
+                        download(input: { id }): VoiceModelInfo | null   // baixa/verifica/instala (evento voice:models:progress); null = cancelado por cancel; mesmo id em voo → erro legível
+                        cancel(input: { id }): void      // aborta e limpa o `.part` (id desconhecido = sem efeito)
+                        remove(input: { id }): void } }  // idempotente; download em voo → erro legível (cancele antes)
   onVoicePartial(cb: (e: VoicePartialEvent) => void): () => void   // parciais ao vivo (canal voice:partial); unsubscribe como onEvent
+  onVoiceModelProgress(cb: (e: VoiceModelProgressEvent) => void): () => void   // progresso de downloads (canal voice:models:progress)
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
-Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event` e parciais de voz em `voice:partial` (os canais de voz são `voice:settings:get|set` e `voice:transcribe:start|push|stop|cancel` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
+Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`, parciais de voz em `voice:partial` e progresso de modelos locais em `voice:models:progress` (os canais de voz são `voice:settings:get|set`, `voice:transcribe:start|push|stop|cancel` e `voice:models:list|download|cancel|remove` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
 
 ## Construção da request (`src/main/agent/request.ts` — função pura `buildRequest(chat, session, history, provider)`, usada pelo runner E pelo preview)
 
@@ -1096,7 +1101,7 @@ transcribeWithFallback(input, opts & { local?: SttLocalBackend }):
 
 ### Componentes locais (download — `src/main/voice/catalog.ts`, `src/main/voice/models.ts`)
 
-Gerenciador dos arquivos dos modelos locais de áudio: catálogo versionado, download com progresso e verificação, instalação/remoção em `<userData>/models/` com `manifest.json`. **Sem Electron, sem UI e sem IPC** (a fiação vem na fatia de integração; a API já sai pronta para ser embrulhada) e **sem inferência** — rodar whisper/vosk/nemotron/kokoro é outra fatia; aqui só se guardam os arquivos. `baseDir` (= userData) e o fetch são injetáveis (testes nunca fazem download real).
+Gerenciador dos arquivos dos modelos locais de áudio: catálogo versionado, download com progresso e verificação, instalação/remoção em `<userData>/models/` com `manifest.json`. **Sem Electron, sem UI e sem IPC** (a fiação main+preload+UI está plugada — ver "Modelos locais por IPC" abaixo — e consome esta API) e **sem inferência** — rodar whisper/vosk/nemotron/kokoro é outra fatia; aqui só se guardam os arquivos. `baseDir` (= userData) e o fetch são injetáveis (testes nunca fazem download real).
 
 - **Catálogo** (`LOCAL_MODEL_CATALOG`; campos por entrada: `id`, `kind`, `engine`, `name`, `description`, `languages` (`'mul'` = multilingue), `version`, `sizeBytes` (tamanho EXATO publicado pelo host), `sha256Oficial: string | null`, `url: string | null`, `license`, `notes?`):
   - whisper.cpp: `ggml-tiny` (77.691.713 B), `ggml-base` (147.951.465 B), `ggml-small` (487.601.967 B), `ggml-large-v3-turbo` (1.624.555.275 B) — arquivos `.bin` em formato **ggml** (NÃO `.gguf`) em `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/` (fonte usada pelo script oficial `models/download-ggml-model.sh` do whisper.cpp; o `https://huggingface.co/ggml-org/whisper.cpp` citado no `models/README.md` responde 401/404). Licença MIT; sha256 = `lfs.oid` da API `…/api/models/ggerganov/whisper.cpp/tree/main` (confere com o header `x-linked-etag` do download). Linha quantizada (`-q5_1`/`-q8_0`) e `.en` não entram por enquanto.
@@ -1119,9 +1124,16 @@ Fiação main+preload para a UI do renderer (SPEC → "API do preload"): setting
 **Sessão de transcrição (`voice:transcribe:*`, `src/main/voice/session.ts` — sem Electron)** — buffer PCM16 mono **16 kHz** (`VOICE_SAMPLE_RATE`); o áudio vai para a API como **wav** (`encodeWav`, PCM 16-bit mono, cabeçalho RIFF de 44 bytes) nas parciais e no final:
 - `start(language?)` cria a sessão e devolve o id (canal `voice:transcribe:start`; `language` ausente → `audioInput.language`). **Sessão global única** por janela: iniciar com outra ativa → erro legível; `stop`/`cancel` liberam a vaga (o `stop` libera ao terminar).
 - `push(sessionId, pcm16, sampleRate?)` acumula (sampleRate informado, se vier, precisa ser 16000; tamanho ímpar/bytes inválidos → erro legível).
-- **Parciais melhor-esforço** (evento `voice:partial`, assinado por `onVoicePartial`, payload `VoicePartialEvent = { sessionId, text, isFinal: false, ms }`): a cada `STT_PARTIAL_INTERVAL_MS` (1 s, disparado no `push` seguinte) transcreve-se o pedaço do acumulado desde o fim da parcial aceita anterior menos `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro — palavras na fronteira podem sair reescritas/duplicadas; a final reescreve tudo). Só quando `settings.livePartials` e `chooseSttBackend(settings, { purpose: 'partial', hasLocalReady: false })` = 'api' (no modo `local` a parcial **nunca** vai para a API; parciais de verdade vêm do motor local em streaming, outra fatia). Regra de latência: a request em voo é **abortada** quando a seguinte dispara, resultados velhos expiram (geração anterior) e nunca há fila; falha de parcial é engolida (melhor-esforço — a sessão segue).
+- **Parciais melhor-esforço** (evento `voice:partial`, assinado por `onVoicePartial`, payload `VoicePartialEvent = { sessionId, text, isFinal: false, ms }`): a cada `STT_PARTIAL_INTERVAL_MS` (1 s, disparado no `push` seguinte) transcreve-se o pedaço do acumulado desde o fim da parcial aceita anterior menos `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro — palavras na fronteira podem sair reescritas/duplicadas; a final reescreve tudo). Só quando `settings.livePartials` e `chooseSttBackend(settings, { purpose: 'partial', hasLocalReady })` = 'api', com `hasLocalReady` = modelo instalado **e** motor de inferência pronto (nesta fatia o motor não existe → false — ver "Modelos locais por IPC" abaixo; no modo `local` a parcial **nunca** vai para a API; parciais de verdade vêm do motor local em streaming, outra fatia). Regra de latência: a request em voo é **abortada** quando a seguinte dispara, resultados velhos expiram (geração anterior) e nunca há fila; falha de parcial é engolida (melhor-esforço — a sessão segue).
 - `stop(sessionId)` cancela o loop e transcreve o buffer **inteiro** como final (`purpose: 'final'`, via `transcribeWithFallback` com o motor local injetado quando houver) → `{ text, model, baseUrl, ms, backend, fellBack, fallbackReason? }`. Erro de API propaga legível (`SttError` pt-BR). Sem áudio capturado → `{ text: '' }` sem ir à rede.
 - `cancel(sessionId)` descarta tudo sem transcrever (aborta o que estiver em voo; id desconhecido = sem efeito; idempotente). Depois de `stop`/`cancel`, `push`/`stop` na sessão → erro legível.
+
+**Modelos locais por IPC (`voice:models:*` — canais em `src/main/ipc.ts`, gerenciador em `src/main/voice/models.ts`, sincronia de settings em `src/main/voice.ts`, helpers puros da UI em `src/renderer/src/lib/voice/modelList.ts`)** — os canais embrulham o gerenciador de componentes locais (baseDir = `app.getPath('userData')`) e mantêm a UI coerente com o disco:
+- `voice:models:list` devolve o catálogo inteiro como `VoiceModelInfo[]` (visão serializável de `LocalModelInfo`: `id`, `kind`, `engine`, `name`, `description`, `languages`, `version`, `sizeBytes`, `hasDownload` (false = placeholder sem URL — TTS), `state`, `installedBytes`).
+- `voice:models:download` `{ id }` baixa/verifica/instala e emite o evento **`voice:models:progress`** `{ id, bytes, total }` (assinado por `onVoiceModelProgress`; no máximo 1 evento a cada 100 ms por modelo e sempre o total no fim). Resolve com o estado final (`VoiceModelInfo`) ou **`null` quando cancelado** (não é erro). Download do mesmo id em voo → erro legível ("download já em andamento para …"); falhas de rede/verificação rejeitam com a mensagem legível do gerenciador (o `.part` é limpo).
+- `voice:models:cancel` `{ id }` aborta o download em voo (o gerenciador limpa o `.part`; id desconhecido/já encerrado = sem efeito). `voice:models:remove` `{ id }` remove arquivo+registro (idempotente); com download em voo → erro legível (cancele antes).
+- **Semântica `installed`/`hasLocalReady` (escolha desta fatia)**: o flag `installed` de `sttSettings.local`/`ttsSettings.local` é um **espelho** mantido em sincronia pelo main ao instalar/remover via `voice:models:*` (a escrita passa por `setVoiceSetting`, a `apiKey` nunca é tocada): **instalar escolhe o modelo como atual** (`local = { engine, model: id, installed: true }`) e **remover o atual derruba o flag** para `false` (a seleção engine/modelo fica — a UI oferece "Baixar novamente"); remover um modelo que não é o atual não mexe nas settings. Já o `hasLocalReady` da sessão de transcrição é derivado da **presença real de modelo instalado** para o engine escolhido (`deriveHasLocalReady`, em `src/main/voice/session.ts`, puro: estado `'installed'` em disco para `sttSettings.local.engine`; `local: null`/corrupt/downloading → false). A **verdade é sempre o disco** — o flag da setting nunca decide.
+- **Pronto = instalado + runtime**: o backend local só está "pronto" (`hasLocalReady` de `chooseSttBackend`) quando o modelo está instalado **e** o motor de inferência (`SttLocalBackend.ready`, outra fatia) existe. Sem runtime (esta versão): as parciais em `hybrid` seguem melhor-esforço pela API e as transcrições que exigem o motor local falham com erro **`SttError` `config` honesto e legível**: modo `local` → "modelo local instalado, mas o motor de inferência local ainda não está disponível nesta versão — use o modo API" (ou "motor local de transcrição não está pronto — nenhum modelo local instalado (baixe em Configurações → Áudio) ou use o modo API" quando nada está instalado); `hybrid` cujo fallback local ficou bloqueado → o erro da API ganha a anotação "— sem fallback local: modelo instalado, mas o motor de inferência local ainda não está disponível nesta versão".
 
 ### Ditado por voz — UX (composer + Configurações → Áudio)
 
@@ -1166,14 +1178,24 @@ tecla"); *Parar por silêncio* (liga/desliga + campo ms com "0 = sem limite"); *
 (comuns + "Outro (digitar)…" livre); *Transcrição (STT)*: modo (API/Local/Híbrido), endpoint (`baseUrl`,
 modelo) e **chave de API com máscara ecoada no campo** (`type=password`; escrever por cima da máscara
 preserva a chave real — contrato testado em `e2e/voiceSettings.test.ts`; limpar o campo remove; a
-chave real nunca sai do main), parciais ao vivo (liga/desliga) e a seção do **motor local** com
-estado ("não instalado — Baixar" desabilitado + nota: o download entra na próxima fatia;
-`LocalEnginePanel` já aceita `onDownload` para plugar). *Fala (TTS)*: só o heading + "configurado na
-próxima fatia" (TTS não entra nesta fatia).
+chave real nunca sai do main), parciais ao vivo (liga/desliga) e a seção do **motor local**
+(`LocalEnginePanel`): seletor de engine + badge "instalado/não instalado" (espelho de
+`sttSettings.local.installed`) e a **lista dos modelos do catálogo agrupados por engine** (nome,
+descrição, idiomas — `formatModelLanguages`, `'mul'` = Multilíngue — e tamanho — `formatModelSize`,
+KB/MB/GB) com ações reais por `voice:models:*`, o mapeamento estado→ação de `modelAction`
+(`notInstalled` → "Baixar" com barra de progresso + "Cancelar" durante o download; `installed` →
+✓ + tamanho + "Remover"; `corrupt` → "Baixar novamente" com aviso) e erros de download/remoção como
+aviso `role="alert"` dispensável (`voice-model-error`, padrão dos avisos do composer, texto vindo de
+`errorMessage`). *Fala (TTS)*: heading + a **mesma lista** de modelos de TTS com as ações
+**desabilitadas** (catálogo com `url: null` → nota "disponível na fatia de TTS") — a configuração do
+falante entra na fatia de TTS.
 
 **Mock de UI** (`VITE_CLEAR_MOCK=1`, `dev/mockApi.ts`): binding `voice` completo — settings fake com
-a mesma semântica da chave mascarada e `transcribe` que emite parciais em timers e devolve texto
-fixo; o `Waveform` simula níveis (`simulate`) e a captura é pulada (sem microfone no mock).
+a mesma semântica da chave mascarada, `transcribe` que emite parciais em timers e devolve texto
+fixo e `models` com **2 modelos fake** (`mock-whisper-tiny` STT e `mock-kokoro` TTS placeholder):
+download simulado em 10 passos com progresso por `onVoiceModelProgress`, cancelável (resolve
+`null`, como no main), remoção e a mesma sincronia de `installed` nas settings do mock; o `Waveform`
+simula níveis (`simulate`) e a captura é pulada (sem microfone no mock).
 `ClearApi.voice` continua opcional no tipo com `FullClearApi` obrigatório no preload: remover o
 workaround exigiria tocar em `src/preload/index.d.ts` (fora do escopo desta fatia) — mantido e
 documentado.
@@ -1181,7 +1203,10 @@ documentado.
 **Testes** — `e2e/voiceDictation.test.ts` (em `npm run test:unit`): `mergeDictationDraft`,
 `composeDictationDraft`/`splitDictationEdit` (round-trip compor→editar→compor),
 `formatHotkeyLabel`/`hotkeyFromEvent` (rótulos pt-BR, ordem canônica, modificador solto, round-trip
-com `matchesHotkey`) e `captureErrorText`. **E2E** `e2e/voice-dictation.spec.ts`
+com `matchesHotkey`) e `captureErrorText`. `e2e/voiceModelsUi.test.ts` (idem): `formatModelSize`
+(B/KB/MB/GB, vírgula pt-BR, inválido → '—'), `formatModelLanguages`, `modelAction` (estado → ação,
+incl. placeholder sem URL) e `deriveHasLocalReady` (só `'installed'` do engine escolhido conta).
+**E2E** `e2e/voice-dictation.spec.ts`
 (`npm run test:e2e:voice`): Electron real com microfone falso do Chromium
 (`--use-fake-device-for-media-capture --use-fake-ui-for-media-capture`) + servidor STT falso
 (`e2e/fakes/sttServer.ts`, `sttSettings` apontando para ele): Configurações → Áudio (máscara da

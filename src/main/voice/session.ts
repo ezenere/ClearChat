@@ -7,12 +7,15 @@
 // legível ao iniciar outra). `encodeWav` monta o wav PCM enviado à API (`transcribeAudio` usa
 // `audio/wav` nas parciais e no final). Ver SPEC.md → "Áudio → Sessão de transcrição".
 import type { VoicePartialEvent, VoiceTranscribeResult } from '@shared/ipc'
-import type { SttSettings } from '@shared/voice'
+import type { SttLocalConfig, SttSettings } from '@shared/voice'
 import { abortError } from '../tools/util'
+import type { LocalModelInfo } from './models'
 import {
   chooseSttBackend,
+  isSttFallbackable,
   STT_PARTIAL_INTERVAL_MS,
   STT_PARTIAL_OVERLAP_MS,
+  SttError,
   transcribeAudio,
   transcribeWithFallback,
   type SttLocalBackend
@@ -60,11 +63,51 @@ export function encodeWav(pcm16: Uint8Array, sampleRate: number): Uint8Array {
 
 // ---------------- sessão ----------------
 
+/**
+ * `hasLocalReady` da sessão: há modelo de STT **instalado** para o engine escolhido em
+ * `sttSettings.local`? Pura — o estado em disco vem de `listLocalModels` (`'installed'` conta;
+ * `'corrupt'`/`'downloading'`/`'notInstalled'` não). `local: null` (nenhum modelo escolhido) → false.
+ * A semântica é por ENGINE (o modelo concreto a carregar é escolhido pelo runtime de inferência,
+ * outra fatia); `installed` em `sttSettings.local`/`ttsSettings.local` é só um espelho da UI — a
+ * verdade é sempre o disco (SPEC → "Áudio → Componentes locais").
+ */
+export function deriveHasLocalReady(
+  local: Pick<SttLocalConfig, 'engine'> | null,
+  models: readonly LocalModelInfo[]
+): boolean {
+  if (!local) return false
+  return models.some(
+    (m) => m.entry.kind === 'stt' && m.entry.engine === local.engine && m.state === 'installed'
+  )
+}
+
+/**
+ * Erro honesto quando o backend local é o escolhido mas não há motor de inferência nesta versão:
+ * os arquivos do modelo podem estar instalados, mas rodar whisper/vosk/nemotron é outra fatia.
+ * `kind: 'config'` (nunca cai em fallback) e o conselho é usar o modo API.
+ */
+function localRuntimeError(modelInstalled: boolean): SttError {
+  return new SttError(
+    'config',
+    modelInstalled
+      ? 'modelo local instalado, mas o motor de inferência local ainda não está disponível nesta versão — use o modo API'
+      : 'motor local de transcrição não está pronto — nenhum modelo local instalado (baixe em Configurações → Áudio) ou use o modo API',
+    { backend: 'local' }
+  )
+}
+
 export interface TranscribeSessionDeps {
   /** Relógio (testes); padrão `Date.now`. */
   now?: () => number
   /** Motor local injetado (fatia de modelos locais); sem ele, o modo 'local' falha legível. */
   local?: SttLocalBackend
+  /**
+   * Modelo local instalado para o engine escolhido (`deriveHasLocalReady`); padrão false. O
+   * backend local só está "pronto" (`hasLocalReady` de `chooseSttBackend`) quando isto E o runtime
+   * (`local.ready`) valem — sem runtime, as parciais seguem pela API melhor-esforço e as
+   * transcrições que exigem o motor local falham com erro `config` honesto.
+   */
+  hasLocalReady?: boolean
   /** Recebe as parciais ao vivo (o IPC repassa em `voice:partial`). */
   onPartial?: (e: VoicePartialEvent) => void
 }
@@ -91,6 +134,8 @@ interface SessionState {
   opts: StartTranscribeOptions
   now: () => number
   local?: SttLocalBackend
+  /** Modelo instalado para o engine escolhido (ver `deriveHasLocalReady`). */
+  hasLocalReady: boolean
   onPartial?: (e: VoicePartialEvent) => void
   chunks: Uint8Array[]
   totalBytes: number
@@ -150,7 +195,11 @@ function maybeFirePartial(state: SessionState): void {
   if (state.status !== 'active') return
   const { settings } = state.opts
   if (!settings.livePartials) return
-  if (chooseSttBackend(settings, { hasLocalReady: false, purpose: 'partial' }) !== 'api') return
+  // pronto = modelo instalado (hasLocalReady) E motor de inferência disponível (local.ready) — sem
+  // runtime, as parciais continuam melhor-esforço na API (modo 'local' nunca vaza para a API)
+  const localReady = state.hasLocalReady && state.local?.ready === true
+  if (chooseSttBackend(settings, { hasLocalReady: localReady, purpose: 'partial' }) !== 'api')
+    return
   const now = state.now()
   if (now - state.lastFireAt < STT_PARTIAL_INTERVAL_MS) return
   const pieceEnd = state.totalBytes
@@ -202,6 +251,7 @@ export function startTranscribeSession(
     opts,
     now: deps.now ?? Date.now,
     local: deps.local,
+    hasLocalReady: deps.hasLocalReady === true,
     onPartial: deps.onPartial,
     chunks: [],
     totalBytes: 0,
@@ -267,6 +317,14 @@ export function startTranscribeSession(
         }
         const controller = new AbortController()
         state.finalController = controller
+        const runtimeReady = state.local?.ready === true
+        // sem motor de inferência nesta versão, o backend local não tem como transcrever: erro
+        // `config` honesto (o modelo pode estar instalado) em vez de falha genérica no fim
+        if (
+          !runtimeReady &&
+          chooseSttBackend(state.opts.settings, { hasLocalReady: false }) === 'local'
+        )
+          throw localRuntimeError(state.hasLocalReady)
         return await transcribeWithFallback(
           {
             audio: encodeWav(sliceBuffer(state, 0, state.totalBytes), VOICE_SAMPLE_RATE),
@@ -282,6 +340,21 @@ export function startTranscribeSession(
         )
       } catch (e) {
         if (state.finalController?.signal.aborted) throw abortError()
+        // hybrid com modelo instalado mas sem motor: o fallback local fica bloqueado — anota a
+        // verdade junto do erro da API em vez de deixar o fallback "sumir" em silêncio
+        if (
+          state.opts.settings.mode === 'hybrid' &&
+          state.hasLocalReady &&
+          state.local?.ready !== true &&
+          isSttFallbackable(e)
+        ) {
+          const msg = e instanceof Error ? e.message : String(e)
+          throw new SttError(
+            'config',
+            `${msg} — sem fallback local: modelo instalado, mas o motor de inferência local ainda não está disponível nesta versão`,
+            { backend: 'local', cause: e }
+          )
+        }
         throw e
       } finally {
         end()

@@ -12,6 +12,8 @@ import {
 import type {
   ClearApi,
   VoiceApi,
+  VoiceModelInfo,
+  VoiceModelProgressEvent,
   VoicePartialEvent,
   VoiceSettingKind,
   VoiceSettingsMap,
@@ -26,7 +28,9 @@ import {
   normalizeSttSettings,
   normalizeTtsSettings,
   normalizeVoiceCallDefaults,
+  type SttLocalEngine,
   type SttSettings,
+  type TtsLocalEngine,
   type TtsSettings
 } from '@shared/voice'
 import type { UpdateStatus } from '@shared/updates'
@@ -145,6 +149,8 @@ export function createMockApi(scenario: string): ClearApi {
   const emit = (e: AgentEvent): void => listeners.forEach((l) => l(e))
   // parciais ao vivo da transcrição (canal `voice:partial`) — só o mock de áudio emite
   const voiceListeners = new Set<(e: VoicePartialEvent) => void>()
+  // progresso de download de modelos locais (canal `voice:models:progress`)
+  const voiceModelListeners = new Set<(e: VoiceModelProgressEvent) => void>()
   // gancho para os E2E contra o mock (só existe neste build de desenvolvimento)
   ;(window as unknown as { __clearMockEmit?: typeof emit }).__clearMockEmit = emit
 
@@ -2387,12 +2393,147 @@ export function createMockApi(scenario: string): ClearApi {
             active.timers.forEach(clearTimeout)
             active = null
           }
-        }
+        },
+        // modelos locais (mock): 2 entradas fake e download simulado com progresso (cancelável)
+        models: ((): VoiceApi['models'] => {
+          const MOCK_MODEL_STEPS = 10
+          const mockModels: VoiceModelInfo[] = [
+            {
+              id: 'mock-whisper-tiny',
+              kind: 'stt',
+              engine: 'whisper.cpp',
+              name: 'Whisper tiny (mock)',
+              description:
+                'Modelo falso de STT para validar a UI de download (progresso, instalação e remoção).',
+              languages: ['mul'],
+              version: '1',
+              sizeBytes: 77_691_713,
+              hasDownload: true,
+              state: 'notInstalled',
+              installedBytes: null
+            },
+            {
+              id: 'mock-kokoro',
+              kind: 'tts',
+              engine: 'kokoro',
+              name: 'Kokoro (mock)',
+              description: 'Placeholder de TTS — o download entra na fatia de TTS.',
+              languages: [],
+              version: '1',
+              sizeBytes: 0,
+              hasDownload: false,
+              state: 'notInstalled',
+              installedBytes: null
+            }
+          ]
+          /** Downloads simulados em voo (id → timer + resolve da promise de `download`). */
+          const mockDownloads = new Map<
+            string,
+            {
+              timer: ReturnType<typeof setInterval>
+              resolve: (v: VoiceModelInfo | null) => void
+            }
+          >()
+          // mesma semântica do main: instalar escolhe o modelo como atual; remover o atual
+          // derruba `installed` (a seleção engine/modelo fica)
+          const syncMockModelSetting = (m: VoiceModelInfo, installed: boolean): void => {
+            if (m.kind === 'stt') {
+              const cur = stt.local
+              if (installed) {
+                stt = normalizeSttSettings({
+                  ...stt,
+                  local: {
+                    engine: m.engine as SttLocalEngine,
+                    model: m.id,
+                    installed: true
+                  }
+                })
+              } else if (
+                cur &&
+                cur.engine === m.engine &&
+                (cur.model === m.id || !cur.model.trim())
+              ) {
+                stt = normalizeSttSettings({ ...stt, local: { ...cur, installed: false } })
+              }
+              return
+            }
+            const cur = tts.local
+            if (installed) {
+              tts = normalizeTtsSettings({
+                ...tts,
+                local: {
+                  engine: m.engine as TtsLocalEngine,
+                  voice: cur?.voice || 'pf_dora',
+                  installed: true
+                }
+              })
+            } else if (cur && cur.engine === m.engine) {
+              tts = normalizeTtsSettings({ ...tts, local: { ...cur, installed: false } })
+            }
+          }
+          return {
+            list: () => delay(mockModels.map((m) => ({ ...m }))),
+            download: (input: { id: string }) => {
+              const m = mockModels.find((x) => x.id === input?.id)
+              if (!m) return Promise.reject(new Error(`modelo desconhecido: ${String(input?.id)}`))
+              if (!m.hasDownload)
+                return Promise.reject(
+                  new Error(
+                    `modelo ${m.id} não tem download disponível ainda (preenchido na fatia de TTS)`
+                  )
+                )
+              if (mockDownloads.has(m.id))
+                return Promise.reject(new Error(`download já em andamento para ${m.id}`))
+              m.state = 'downloading'
+              return new Promise<VoiceModelInfo | null>((resolve) => {
+                let step = 0
+                const timer = setInterval(() => {
+                  if (!mockDownloads.has(m.id)) return
+                  step++
+                  const bytes = Math.round((m.sizeBytes * step) / MOCK_MODEL_STEPS)
+                  voiceModelListeners.forEach((l) => l({ id: m.id, bytes, total: m.sizeBytes }))
+                  if (step >= MOCK_MODEL_STEPS) {
+                    clearInterval(timer)
+                    mockDownloads.delete(m.id)
+                    m.state = 'installed'
+                    m.installedBytes = m.sizeBytes
+                    syncMockModelSetting(m, true)
+                    resolve({ ...m })
+                  }
+                }, 120)
+                mockDownloads.set(m.id, { timer, resolve })
+              })
+            },
+            cancel: async (input: { id: string }) => {
+              const job = mockDownloads.get(input?.id ?? '')
+              if (!job) return
+              clearInterval(job.timer)
+              mockDownloads.delete(input.id)
+              const m = mockModels.find((x) => x.id === input.id)
+              if (m) m.state = 'notInstalled'
+              // cancelado: como no main, `download` resolve null (não é erro)
+              job.resolve(null)
+            },
+            remove: async (input: { id: string }) => {
+              const m = mockModels.find((x) => x.id === input?.id)
+              if (!m) return
+              if (mockDownloads.has(m.id))
+                throw new Error(`download em andamento para ${m.id} — cancele antes de remover`)
+              m.state = 'notInstalled'
+              m.installedBytes = null
+              syncMockModelSetting(m, false)
+            }
+          }
+        })()
       }
     })(),
     onVoicePartial: (cb: (e: VoicePartialEvent) => void) => {
       voiceListeners.add(cb)
       return () => voiceListeners.delete(cb)
+    },
+    onVoiceModelProgress: (cb: (e: VoiceModelProgressEvent) => void) => {
+      voiceModelListeners.add(cb)
+      return () => voiceModelListeners.delete(cb)
     },
     onEvent: (cb) => {
       listeners.add(cb)

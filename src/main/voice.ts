@@ -9,6 +9,7 @@
 import type { VoiceSettingKind, VoiceSettingsMap, VoiceSettingsView } from '@shared/ipc'
 import {
   AUDIO_INPUT_SETTING,
+  DEFAULT_TTS_LOCAL,
   normalizeAudioInput,
   normalizeSttSettings,
   normalizeTtsSettings,
@@ -17,11 +18,16 @@ import {
   TTS_SETTINGS_SETTING,
   VOICE_CALL_DEFAULTS_SETTING,
   type AudioInputSettings,
+  type SttLocalConfig,
+  type SttLocalEngine,
   type SttSettings,
+  type TtsLocalConfig,
+  type TtsLocalEngine,
   type TtsSettings,
   type VoiceCallDefaults
 } from '@shared/voice'
 import { maskKey } from '@shared/webSearchSettings'
+import type { LocalModelCatalogEntry } from './voice/catalog'
 import { settingsRepo } from './repo'
 
 export interface VoiceSettings {
@@ -141,4 +147,58 @@ export function setVoiceSetting(
     }
   }
   throw new Error(`Grupo de configuração de áudio desconhecido: ${String(kind)}.`)
+}
+
+// ---------------- sincronia installed ↔ disco (SPEC → "Áudio → Componentes locais") ----------------
+
+/**
+ * Mantém `installed` de `sttSettings.local`/`ttsSettings.local` em sincronia com o disco quando um
+ * modelo local é instalado/removido pelos canais `voice:models:*` (a escrita passa por
+ * `setVoiceSetting`, então a `apiKey` nunca é tocada). Instalar **escolhe** o modelo como atual
+ * (`installed: true`); remover o atual derruba o flag para `false` (a seleção engine/modelo fica —
+ * a UI oferece "Baixar novamente"). Remover um modelo que não é o atual não mexe nas settings.
+ * Idempotente; a SEMÂNTICA de "pronto para transcrever" não é o flag — é `deriveHasLocalReady`
+ * (disco) na sessão de transcrição.
+ */
+export function syncLocalModelInstalled(entry: LocalModelCatalogEntry, installed: boolean): void {
+  switch (entry.kind) {
+    case 'stt': {
+      const cur = normalizeSttSettings(settingsRepo.get(STT_SETTINGS_SETTING))
+      const local: SttLocalConfig | null = cur.local
+      if (installed) {
+        setVoiceSetting('sttSettings', {
+          ...cur,
+          local: { engine: entry.engine as SttLocalEngine, model: entry.id, installed: true }
+        })
+        return
+      }
+      // só o modelo atual perde o flag (engine atual + id atual ou seleção "padrão do motor")
+      if (
+        local &&
+        local.engine === entry.engine &&
+        (local.model === entry.id || !local.model.trim())
+      ) {
+        setVoiceSetting('sttSettings', { ...cur, local: { ...local, installed: false } })
+      }
+      return
+    }
+    case 'tts': {
+      const cur = normalizeTtsSettings(settingsRepo.get(TTS_SETTINGS_SETTING))
+      const local: TtsLocalConfig | null = cur.local
+      if (installed) {
+        setVoiceSetting('ttsSettings', {
+          ...cur,
+          local: {
+            engine: entry.engine as TtsLocalEngine,
+            voice: local?.voice || DEFAULT_TTS_LOCAL.voice,
+            installed: true
+          }
+        })
+        return
+      }
+      if (local && local.engine === entry.engine) {
+        setVoiceSetting('ttsSettings', { ...cur, local: { ...local, installed: false } })
+      }
+    }
+  }
 }

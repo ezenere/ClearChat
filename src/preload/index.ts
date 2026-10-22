@@ -2,8 +2,10 @@ import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 import {
   EVENT_CHANNEL,
   IPC,
+  VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   type FullClearApi,
+  type VoiceModelProgressEvent,
   type VoicePartialEvent
 } from '@shared/ipc'
 import type { AgentEvent } from '@shared/types'
@@ -157,6 +159,12 @@ const api: FullClearApi = {
         invoke(IPC.voice.transcribePush, sessionId, pcm16, sampleRate),
       stop: (sessionId) => invoke(IPC.voice.transcribeStop, sessionId),
       cancel: (sessionId) => invoke(IPC.voice.transcribeCancel, sessionId)
+    },
+    models: {
+      list: () => invoke(IPC.voice.modelsList),
+      download: (input) => invoke(IPC.voice.modelsDownload, input),
+      cancel: (input) => invoke(IPC.voice.modelsCancel, input),
+      remove: (input) => invoke(IPC.voice.modelsRemove, input)
     }
   },
   sync: {
@@ -212,6 +220,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_PARTIAL_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_PARTIAL_CHANNEL, listener)
+    }
+  },
+  onVoiceModelProgress: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceModelProgressEvent): void => cb(event)
+    ipcRenderer.on(VOICE_MODELS_PROGRESS_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_MODELS_PROGRESS_CHANNEL, listener)
     }
   }
 }

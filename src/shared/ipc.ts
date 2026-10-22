@@ -1,7 +1,14 @@
 // Nomes dos canais IPC (formato `domínio:método`) + interface `window.api`.
 // Ver SPEC.md → "API do preload". Todo método (exceto onEvent/onVoicePartial) é ipcRenderer.invoke → ipcMain.handle.
 import type { EngineConfig } from './webSearchSettings'
-import type { AudioInputSettings, SttSettings, TtsSettings, VoiceCallDefaults } from './voice'
+import type {
+  AudioInputSettings,
+  SttLocalEngine,
+  SttSettings,
+  TtsLocalEngine,
+  TtsSettings,
+  VoiceCallDefaults
+} from './voice'
 import type {
   ChatHostInfo,
   CloudSkill,
@@ -227,7 +234,11 @@ export const IPC = {
     transcribeStart: 'voice:transcribe:start',
     transcribePush: 'voice:transcribe:push',
     transcribeStop: 'voice:transcribe:stop',
-    transcribeCancel: 'voice:transcribe:cancel'
+    transcribeCancel: 'voice:transcribe:cancel',
+    modelsList: 'voice:models:list',
+    modelsDownload: 'voice:models:download',
+    modelsCancel: 'voice:models:cancel',
+    modelsRemove: 'voice:models:remove'
   }
 } as const
 
@@ -235,6 +246,8 @@ export const IPC = {
 export const EVENT_CHANNEL = 'agent:event'
 /** Canal main → renderer com as parciais ao vivo de uma sessão de transcrição (`VoicePartialEvent`). */
 export const VOICE_PARTIAL_CHANNEL = 'voice:partial'
+/** Canal main → renderer com o progresso de downloads de modelos locais (`VoiceModelProgressEvent`). */
+export const VOICE_MODELS_PROGRESS_CHANNEL = 'voice:models:progress'
 
 type ValueOf<T> = T[keyof T]
 export type IpcChannel = ValueOf<{ [D in keyof typeof IPC]: ValueOf<(typeof IPC)[D]> }>
@@ -477,6 +490,53 @@ export interface VoiceApi {
     /** Descarta a sessão sem transcrever (id desconhecido = sem efeito). */
     cancel(sessionId: string): Promise<void>
   }
+  models: {
+    /** O catálogo de modelos locais completo, com o estado em disco de cada entrada. */
+    list(): Promise<VoiceModelInfo[]>
+    /**
+     * Baixa, verifica e instala o modelo (`{ id }`), emitindo `voice:models:progress` pelo caminho.
+     * Resolve com o estado final, ou `null` quando cancelado por `cancel` (não é erro). Download já
+     * em andamento para o mesmo id → erro legível.
+     */
+    download(input: { id: string }): Promise<VoiceModelInfo | null>
+    /** Cancela o download do id (aborta e limpa o `.part`; id desconhecido = sem efeito). */
+    cancel(input: { id: string }): Promise<void>
+    /** Remove o modelo instalado (idempotente). Download em voo para o id → erro legível. */
+    remove(input: { id: string }): Promise<void>
+  }
+}
+
+/** Estado do modelo local no disco (espelho de `LocalModelState` em `src/main/voice/models.ts`). */
+export type VoiceModelState = 'notInstalled' | 'downloading' | 'installed' | 'corrupt'
+
+/** Entrada do catálogo de modelos locais com o estado em disco (`voice:models:list`). */
+export interface VoiceModelInfo {
+  /** Id estável da entrada do catálogo (usado em `voice:models:*`). */
+  id: string
+  kind: 'stt' | 'tts'
+  engine: SttLocalEngine | TtsLocalEngine
+  name: string
+  description: string
+  /** Idiomas cobertos; `'mul'` = multilingue. */
+  languages: string[]
+  version: string
+  /** Tamanho exato publicado pelo host (0 = desconhecido — placeholders de TTS). */
+  sizeBytes: number
+  /** O catálogo tem URL de download (`false` = placeholder — ação desabilitada na UI). */
+  hasDownload: boolean
+  state: VoiceModelState
+  /** Tamanho do arquivo instalado em bytes (null = sem arquivo em disco). */
+  installedBytes: number | null
+}
+
+/** Progresso de um download de modelo local (canal `voice:models:progress`, assinado por `onVoiceModelProgress`). */
+export interface VoiceModelProgressEvent {
+  /** Modelo (id do catálogo) a que o progresso se refere. */
+  id: string
+  /** Bytes baixados até agora. */
+  bytes: number
+  /** Total esperado em bytes (0 = desconhecido). */
+  total: number
 }
 
 /** Persona nova. `config` passa por sanitizePresetConfig (só PRESET_FIELDS + cwd opcional). */
@@ -746,6 +806,8 @@ export interface ClearApi {
   voice?: VoiceApi
   /** Parciais ao vivo da sessão de transcrição (canal `voice:partial`); unsubscribe como em `onEvent`. */
   onVoicePartial?(cb: (e: VoicePartialEvent) => void): () => void
+  /** Progresso de downloads de modelos locais (canal `voice:models:progress`); unsubscribe como em `onEvent`. */
+  onVoiceModelProgress?(cb: (e: VoiceModelProgressEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
   sync: {
     status(): Promise<SyncStatus>
@@ -814,4 +876,5 @@ export interface ClearApi {
 }
 
 /** `ClearApi` com os membros de voz obrigatórios — o que o preload real expõe em `window.api`. */
-export type FullClearApi = ClearApi & Required<Pick<ClearApi, 'voice' | 'onVoicePartial'>>
+export type FullClearApi = ClearApi &
+  Required<Pick<ClearApi, 'voice' | 'onVoicePartial' | 'onVoiceModelProgress'>>
