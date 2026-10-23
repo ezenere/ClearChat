@@ -121,7 +121,7 @@ export function detectScript(tokens: string[]): ScriptRef | null {
       !/^\/(usr\/)?(local\/)?s?bin\//.test(prog) &&
       !prog.startsWith('/opt/homebrew/bin/')
     )
-      return { kind: 'file', path: prog, interpreter: base(prog) }
+      return fileRef(prog, base(prog))
     return null
   }
   let i = 1
@@ -144,9 +144,11 @@ export function detectScript(tokens: string[]): ScriptRef | null {
       i++
       break
     }
+    // `python3 - arg…` / `node - arg…`: o script vem do stdin (heredoc, pipe) — o resto é argv
+    if (tok === '-') return null
     if (spec.fileFlag) {
       const ff = spec.fileFlag.find((f) => f.toLowerCase() === tok.toLowerCase())
-      if (ff) return t[i + 1] ? { kind: 'file', path: t[i + 1], interpreter: name } : null
+      if (ff) return fileRef(t[i + 1], name)
     }
     if (!tok.startsWith('-') && !tok.startsWith('+')) break
     const inl = opt(tok, spec.inline)
@@ -161,9 +163,16 @@ export function detectScript(tokens: string[]): ScriptRef | null {
     // demais opções (`-u`, `--inspect`, `--inspect=9229`, `-A`, `--allow-read`): sem valor
   }
   if (spec.fileFlag) return null // pwsh sem -File: comando, não arquivo
-  const file = t[i]
-  if (!file || file === '-') return null
-  return { kind: 'file', path: file, interpreter: name }
+  return fileRef(t[i], name)
+}
+
+/**
+ * Arquivo do script — null sem caminho, `-` (stdin) ou com variável/substituição não resolvida
+ * (`"$f"`, `` `x` ``): o valor só existe na execução; ler o nome literal daria "não encontrado".
+ */
+function fileRef(path: string | undefined, interpreter: string): ScriptRef | null {
+  if (!path || path === '-' || /[$`]/.test(path)) return null
+  return { kind: 'file', path, interpreter }
 }
 
 /** Recorte do começo de um texto: até `maxLines` linhas e `maxChars` chars. */

@@ -1260,6 +1260,15 @@ test('script: detecção (interpretadores, opções, -m sem arquivo, -c inline, 
   assert.equal(f('/bin/rm -rf x'), null, 'programa do sistema por caminho')
   assert.equal(f('/usr/bin/env node'), null)
   assert.equal(f('git status'), null)
+  // `-` = script do stdin (heredoc/pipe): o que vem depois é argv, não o arquivo do script
+  assert.equal(f('python3 - $f'), null)
+  assert.equal(f('python3 -u - data.txt'), null)
+  assert.equal(f('node - x.js'), null)
+  // variável/substituição não resolvida: o nome só existe na execução — sem prévia
+  assert.equal(f('python3 $script'), null)
+  assert.equal(f('bash ${dir}/run.sh'), null)
+  assert.equal(f('./$tool'), null)
+  assert.equal(f('pwsh -File $p'), null)
 })
 
 test('script: recorte (linhas, chars, "…"), binário; itens do card (remoto, inline, sudo local)', () => {
@@ -1294,6 +1303,18 @@ test('script: recorte (linhas, chars, "…"), binário; itens do card (remoto, i
   assert.equal(byText('python3 c.py').status, 'pending', 'sudo é local')
   assert.equal(byText("node -e 'console.log(1)'").status, 'inline')
   assert.equal(byText("node -e 'console.log(1)'").content, 'console.log(1)')
+  // caso real: variável definida na mesma linha + script via heredoc (`python3 - "$f" <<'EOF'`)
+  const real = evaluateLists(
+    'commands',
+    {
+      command:
+        'f=/tmp/out.txt\ngrep -n "###" "$f"\npython3 - "$f" <<\'EOF\'\nimport sys\nprint(open(sys.argv[1]).read())\nEOF'
+    },
+    lists
+  ).check.items
+  const py = real.find((i) => i.text.startsWith('python3 -'))
+  assert.ok(py, 'item do python3')
+  assert.equal(py!.script, undefined, 'sem "arquivo não encontrado: $f"')
 })
 
 test('script: leitura no main (cwd, cd, inexistente, binário, limite de 64 KiB) e texto do juiz', async () => {
