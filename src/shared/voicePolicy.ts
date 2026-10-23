@@ -7,12 +7,28 @@
 // v1 é por REGRA (sem classificador treinado): os limiares abaixo + a cauda textual da transcrição
 // parcial decidem. `VoiceFillers.prompt`/`InterjectionPolicy` existem na config; o `prompt` dos
 // fillers NÃO é consumido em v1 — fica pronto para o classificador futuro (documentado na SPEC).
-import type { InterjectionClass, InterjectionPolicy } from './voice'
+import {
+  DEFAULT_FILLER_DELAY_MS,
+  type FillerContext,
+  type FillerPhrase,
+  type InterjectionClass,
+  type InterjectionPolicy
+} from './voice'
+import { classifyUtteranceEnd, isCommandLike, isQuestionLike, type UtteranceEnd } from './voiceTurn'
 
 // ---------------- constantes de tempo ----------------
 
-/** Espera da 1ª sentença da resposta antes de tocar um filler (ms). */
-export const FILLER_DELAY_MS = 1200
+/**
+ * Espera padrão entre o turno enviado e o preâmbulo (ms): se a 1ª frase da resposta ficar pronta
+ * antes disso, o preâmbulo nem sai (configurável em `voiceCallDefaults.fillers.delayMs`).
+ */
+export const FILLER_DELAY_MS = DEFAULT_FILLER_DELAY_MS
+
+/** Preâmbulo não repete nenhum dos últimos N usados. */
+export const FILLER_RECENT_WINDOW = 4
+
+/** Fala do usuário com menos palavras que isto (e que não é pergunta) não ganha preâmbulo. */
+export const FILLER_MIN_WORDS = 3
 
 /**
  * Fala do usuário curta DURANTE a reprodução (ms de fala detectada) = provável backchannel do
@@ -61,9 +77,10 @@ export const EMPTY_FILLER_STATE: FillerState = {
 }
 
 /**
- * O filler deste turno deve tocar AGORA? Regra v1 (por regra, sem classificador):
- * - no máximo 1 por turno (`usedThisTurn`) e NUNCA depois da 1ª fala do agente (`spokenThisTurn`);
- * - com tools em execução, dispara já; senão após `delayMs` sem a 1ª sentença tocar;
+ * O filler (preâmbulo) deste turno deve tocar AGORA? Regra v2 (por regra, sem classificador):
+ * - no máximo 1 por turno (`usedThisTurn`) e NUNCA depois de a 1ª frase da resposta ficar pronta
+ *   (`spokenThisTurn`) — resposta rápida dispensa o preâmbulo;
+ * - com tools em execução, dispara já; senão após `delayMs` (0 = já; inválido/negativo → o padrão);
  * - só com resposta em voo e filler habilitado.
  */
 export function fillerShouldFire(
@@ -74,8 +91,84 @@ export function fillerShouldFire(
   if (!s.enabled || s.usedThisTurn || s.spokenThisTurn || !s.responseInFlight) return false
   if (s.turnStartedAt == null) return false
   if (s.toolsRunning) return true
-  const wait = Number.isFinite(delayMs) && delayMs > 0 ? delayMs : FILLER_DELAY_MS
+  const wait = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : FILLER_DELAY_MS
   return now - s.turnStartedAt >= wait
+}
+
+const CORRECTION_START =
+  /^(nao|na verdade|espera|espere|pera|perai|peraí|pera ai|calma|opa|ops|quer dizer|errado|nao e isso|nao nao)\b/
+
+const foldText = (s: string): string =>
+  s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .trim()
+
+/** Contagem de palavras (para "fala curta"/"pedido longo"). */
+export function wordCount(text: string): number {
+  return String(text ?? '')
+    .split(/\s+/)
+    .filter((w) => /[\p{L}\p{N}]/u.test(w)).length
+}
+
+/**
+ * Contexto do turno que escolhe o preâmbulo: correção/interrupção ("não…", "espera", "peraí") →
+ * `correction`; pedido longo (≥ 25 palavras ou > 160 chars) → `complex`; pergunta → `question`;
+ * comando/tarefa → `command`; resto → `generic`.
+ */
+export function classifyFillerContext(text: string): FillerContext {
+  const t = String(text ?? '').trim()
+  if (!t) return 'generic'
+  if (CORRECTION_START.test(foldText(t))) return 'correction'
+  if (wordCount(t) >= 25 || t.length > 160) return 'complex'
+  if (isQuestionLike(t)) return 'question'
+  if (isCommandLike(t)) return 'command'
+  return 'generic'
+}
+
+/**
+ * Escolhe a frase do pool (índice 0-based) para o contexto: candidatas = frases do contexto (sem
+ * contexto declarado = `generic`) fora das `recent` (últimos `FILLER_RECENT_WINDOW` índices usados);
+ * sem candidata → as `generic` fora das recentes → qualquer frase fora das recentes → a usada há
+ * mais tempo entre as do contexto. Sorteio uniforme via `rng` (1 chamada). Pool vazio → null.
+ */
+export function pickFillerPhrase(
+  pool: readonly FillerPhrase[],
+  ctx: FillerContext,
+  recent: readonly number[],
+  rng: () => number = Math.random
+): number | null {
+  if (!pool.length) return null
+  const window = recent.slice(-FILLER_RECENT_WINDOW)
+  const fits = (i: number, c: FillerContext): boolean => {
+    const cs = pool[i].contexts.length ? pool[i].contexts : (['generic'] as FillerContext[])
+    return cs.includes(c)
+  }
+  const all = pool.map((_, i) => i)
+  const fresh = (xs: number[]): number[] => xs.filter((i) => !window.includes(i))
+  let cands = fresh(all.filter((i) => fits(i, ctx)))
+  if (!cands.length && ctx !== 'generic') cands = fresh(all.filter((i) => fits(i, 'generic')))
+  if (!cands.length) cands = fresh(all)
+  if (!cands.length) {
+    // tudo recente (pool pequeno): a do contexto usada há mais tempo
+    const ofCtx = all.filter((i) => fits(i, ctx))
+    const pickFrom = ofCtx.length ? ofCtx : all
+    return pickFrom.reduce((best, i) => (window.indexOf(i) < window.indexOf(best) ? i : best))
+  }
+  let r = typeof rng === 'function' ? Number(rng()) : NaN
+  if (!Number.isFinite(r)) r = Math.random()
+  const k = Math.min(
+    cands.length - 1,
+    Math.floor(Math.min(Math.max(r, 0), 0.999999999) * cands.length)
+  )
+  return cands[k]
+}
+
+/** A fala é curta demais para preâmbulo (menos de `FILLER_MIN_WORDS` palavras e não é pergunta)? */
+export function fillerTooShort(text: string): boolean {
+  const t = String(text ?? '').trim()
+  return wordCount(t) < FILLER_MIN_WORDS && !isQuestionLike(t)
 }
 
 // ---------------- variantes de clipe ----------------
@@ -212,6 +305,7 @@ export type InterjectionReason =
   | 'probability'
   | 'tail-skip'
   | 'class-filtered'
+  | 'turn-end'
 
 /** Resultado da política: `NONE` (o caso comum) ou a classe + variante a tocar. */
 export type InterjectionDecision =
@@ -228,6 +322,12 @@ export interface InterjectionObservation {
   tail: string
   /** Momento da observação (ms, mesmo relógio de `ctx.now`) — observação velha não decide. */
   observedAt: number
+  /**
+   * Veredito do fim de turno adaptativo para esta pausa (transcrição especulativa); ausente/null =
+   * sem especulação (a cauda decide com `classifyUtteranceEnd`). `complete` = fim de turno provável
+   * (pergunta/comando) → nunca backchannel.
+   */
+  end?: UtteranceEnd | null
 }
 
 export interface InterjectionContext {
@@ -237,6 +337,8 @@ export interface InterjectionContext {
   lastFiredAt: number | null
   /** Última variante tocada por classe (rotação sem repetir). */
   lastVariant?: Partial<Record<InterjectionClass, number>>
+  /** Variantes disponíveis por classe (clipes gerados; ausente = 3). */
+  variants?: Partial<Record<InterjectionClass, number>>
 }
 
 const strip = (s: string): string =>
@@ -299,6 +401,11 @@ export function decideInterjection(
   if (speechMs < policy.minSpeechMs) return none('short-speech')
   if (pauseMs < policy.minPauseMs) return none('short-pause')
   if (ctx.lastFiredAt != null && now - ctx.lastFiredAt < policy.cooldownMs) return none('cooldown')
+  // fim de turno provável (pergunta/comando/fecho): o backchannel vira "Aham." → preâmbulo →
+  // resposta; quem fala agora é a resposta
+  const end = obs.end ?? classifyUtteranceEnd(obs.tail)
+  if (end === 'complete') return none('turn-end')
+  if (isQuestionLike(obs.tail) || isCommandLike(obs.tail)) return none('turn-end')
   const cls = classifyInterjectionTail(obs.tail)
   if (cls === 'NONE') return none('tail-skip')
   if (!policy.classes.includes(cls)) return none('class-filtered')
@@ -310,7 +417,7 @@ export function decideInterjection(
   const last = ctx.lastVariant?.[cls] ?? null
   return {
     class: cls,
-    variant: pickClipVariant(rng, last, 3),
+    variant: pickClipVariant(rng, last, ctx.variants?.[cls] ?? 3),
     decidedAt: now,
     reason: 'ok'
   }

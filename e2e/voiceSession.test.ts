@@ -714,3 +714,97 @@ test('modo "local" sem motor pronto não dispara parciais (nem locais nem de API
   assert.equal(local.calls.length, 0)
   assert.equal(m.calls.length, 0)
 })
+
+// ---------------- transcrição especulativa (fim de turno adaptativo) ----------------
+
+test('speculate: motor local transcreve o buffer sem encerrar; stop({reuseSpeculative}) reusa (sem 2ª chamada)', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'api' }))
+  t.after(m.restore)
+  let n = 0
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: `fala ${++n}`, model: 'ggml-base', baseUrl: 'local', ms: 5 })
+  )
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local', livePartials: false }) },
+    { now: clock().now, local: local.backend, hasLocalReady: true }
+  )
+  s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  const spec = await s.speculate()
+  assert.deepEqual(spec, { text: 'fala 1', ms: 5, backend: 'local', reusable: true })
+  // sem áudio novo: a mesma especulação (sem chamar o motor de novo)
+  assert.deepEqual(await s.speculate(), spec)
+  assert.equal(local.calls.length, 1)
+  // silêncio chegou depois (o usuário não voltou a falar): a especulativa vira a final
+  s.push(new Uint8Array(3_200), VOICE_SAMPLE_RATE)
+  const r = await s.stop({ reuseSpeculative: true })
+  assert.equal(r.text, 'fala 1')
+  assert.equal(r.speculative, true)
+  assert.equal(r.backend, 'local')
+  assert.equal(local.calls.length, 1, 'nenhuma 2ª transcrição')
+  assert.equal(m.calls.length, 0)
+})
+
+test('speculate: sem reuse (usuário voltou a falar) a final transcreve tudo de novo', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'api' }))
+  t.after(m.restore)
+  let n = 0
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: `fala ${++n}`, model: 'ggml-base', baseUrl: 'local', ms: 5 })
+  )
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local', livePartials: false }) },
+    { now: clock().now, local: local.backend, hasLocalReady: true }
+  )
+  s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  await s.speculate()
+  s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  const r = await s.stop()
+  assert.equal(r.text, 'fala 2')
+  assert.equal(r.speculative, undefined)
+  assert.equal(local.calls.length, 2)
+})
+
+test('speculate: modo api só com allowApi; híbrido com motor local especula local mas não reusa', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'pela api' }))
+  t.after(m.restore)
+  const api = startTranscribeSession(
+    { settings: sttSettings({ livePartials: false }) },
+    { now: clock().now }
+  )
+  api.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  assert.equal(await api.speculate(), null, 'API sem permissão: indisponível (custa request)')
+  assert.equal(m.calls.length, 0)
+  const spec = await api.speculate({ allowApi: true })
+  assert.deepEqual(
+    { text: spec?.text, backend: spec?.backend, reusable: spec?.reusable },
+    { text: 'pela api', backend: 'api', reusable: true }
+  )
+  api.cancel()
+
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: 'local', model: 'ggml-base', baseUrl: 'local', ms: 1 })
+  )
+  const hy = startTranscribeSession(
+    { settings: sttSettings({ mode: 'hybrid', livePartials: false }) },
+    { now: clock().now, local: local.backend, hasLocalReady: true }
+  )
+  hy.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  const h = await hy.speculate()
+  assert.equal(h?.backend, 'local')
+  assert.equal(h?.reusable, false, 'a final do híbrido é pela API (qualidade)')
+  const before = m.calls.length
+  const r = await hy.stop({ reuseSpeculative: true })
+  assert.equal(r.backend, 'api')
+  assert.equal(m.calls.length, before + 1, 'não reusável: a final transcreve')
+})
+
+test('speculate: falha do motor resolve null (o chamador cai no silêncio fixo)', async () => {
+  const local = fakeLocal(() => Promise.reject(new Error('boom')))
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local', livePartials: false }) },
+    { now: clock().now, local: local.backend, hasLocalReady: true }
+  )
+  s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  assert.equal(await s.speculate(), null)
+  s.cancel()
+})

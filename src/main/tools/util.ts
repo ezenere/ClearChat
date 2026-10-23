@@ -38,6 +38,11 @@ export interface ToolContext {
   /** Id da tool_call (nome do arquivo da saída salva). */
   toolCallId?: string
   signal: AbortSignal
+  /**
+   * Turno de chamada de voz: list_dir/read_file com caminho inexistente tentam a grafia ignorando
+   * maiúsculas/minúsculas dentro do diretório raiz (o STT erra caixa — "SRC" para "src").
+   */
+  voicePaths?: boolean
   /** Saída parcial (ex.: bash) — o chamador faz throttle e emite `tool-running`. */
   onOutput?: (partial: string) => void
   /** shell / process_start: diretório do shell persistido entre chamadas (por sessão). */
@@ -218,6 +223,73 @@ export async function assertInsideRoot(
   const rootReal = await realpathDeep(root)
   const real = await realpathDeep(abs)
   if (!isInside(rootReal, real)) throw outsideRootError(root, original || abs)
+}
+
+/**
+ * Caminho que NÃO existe → a grafia que existe ignorando maiúsculas/minúsculas, segmento a segmento,
+ * só DENTRO de `root` (turno de voz: o STT erra caixa — "SRC" para "src"). Cada segmento ausente
+ * precisa de exatamente UMA entrada com o mesmo nome em minúsculas; ambíguo/ausente/fora do root →
+ * null. Caminho que existe → null (nada a ajustar).
+ */
+export async function caseInsensitiveMatch(root: string, abs: string): Promise<string | null> {
+  try {
+    await fs.stat(abs)
+    return null
+  } catch {
+    /* não existe: tenta ajustar */
+  }
+  const base = resolve(root)
+  if (!isInside(base, abs) || base === resolve(abs)) return null
+  const parts = relative(base, abs).split(sep).filter(Boolean)
+  let cur = base
+  let changed = false
+  for (const part of parts) {
+    const exact = join(cur, part)
+    try {
+      await fs.lstat(exact)
+      cur = exact
+      continue
+    } catch {
+      /* segmento ausente: procura pela caixa */
+    }
+    let names: string[]
+    try {
+      names = await fs.readdir(cur)
+    } catch {
+      return null
+    }
+    const want = part.toLocaleLowerCase()
+    const hits = names.filter((n) => n.toLocaleLowerCase() === want)
+    if (hits.length !== 1) return null
+    cur = join(cur, hits[0])
+    changed = true
+  }
+  return changed ? cur : null
+}
+
+/**
+ * Turno de voz (`ctx.voicePaths`): caminho inexistente → a grafia que existe ignorando a caixa
+ * (`caseInsensitiveMatch`), revalidada pela confinação. Devolve o caminho a usar e a nota para o
+ * resultado ("caminho ajustado") — ou o original sem nota.
+ */
+export async function voicePathFallback(
+  ctx: Pick<ToolContext, 'cwd' | 'confine' | 'voicePaths'>,
+  abs: string
+): Promise<{ path: string; note: string }> {
+  if (!ctx.voicePaths) return { path: abs, note: '' }
+  const alt = await caseInsensitiveMatch(ctx.cwd, abs)
+  if (!alt) return { path: abs, note: '' }
+  if (ctx.confine) {
+    try {
+      await assertInsideRoot(ctx.cwd, alt, alt)
+    } catch {
+      return { path: abs, note: '' }
+    }
+  }
+  return {
+    path: alt,
+    note: `[caminho ajustado (maiúsculas/minúsculas): "${relative(ctx.cwd, abs) || abs}" → "${relative(ctx.cwd, alt) || alt}"]\n`
+  }
 }
 
 /** Resolve o caminho de uma tool de arquivo, aplicando a confinação ao diretório raiz se ativa. */

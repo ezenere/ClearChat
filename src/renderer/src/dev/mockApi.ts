@@ -2439,7 +2439,9 @@ export function createMockApi(scenario: string): ClearApi {
             if (active?.id !== sessionId) return
             active.timers.forEach(clearTimeout)
             active = null
-          }
+          },
+          // fim de turno adaptativo: o mock não especula (o turno fecha pelo silêncio fixo)
+          speculate: async () => null
         },
         // modelos locais (mock): 2 entradas fake e download simulado com progresso (cancelável)
         models: ((): VoiceApi['models'] => {

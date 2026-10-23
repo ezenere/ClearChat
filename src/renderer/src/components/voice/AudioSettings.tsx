@@ -101,6 +101,29 @@ const TTS_BACKEND_LABELS: Record<TtsSettings['backend'], { label: string; descri
   }
 }
 
+/**
+ * Combo "híbrido rápido" (SPEC → "Serviço de TTS → OpenRouter"): fala pela API do OpenRouter com o
+ * ElevenLabs Flash v2.5 (~0,5 s até o 1º áudio, PCM em streaming na chamada). Voz curta do
+ * ElevenLabs ('sarah', 'george'…) — passa como está.
+ */
+const OPENROUTER_TTS_PRESET = {
+  baseUrl: 'https://openrouter.ai/api/v1',
+  model: 'elevenlabs/eleven-flash-v2.5',
+  voice: 'sarah'
+} as const
+
+/** Sugestões de voz do ElevenLabs via OpenRouter (o campo aceita qualquer id). */
+const ELEVENLABS_VOICES = ['sarah', 'george', 'laura', 'charlie', 'roger', 'alice', 'brian', 'lily']
+
+/** Provedor salvo para reaproveitar a chave (só id/nome/endpoint — a chave nunca vem para cá). */
+interface ProviderOption {
+  id: string
+  name: string
+  baseUrl: string
+}
+
+const isOpenRouterUrl = (u: string): boolean => /(^|\.|\/\/)openrouter\.ai(\/|:|$)/i.test(u.trim())
+
 const TTS_ENGINE_LABELS: Record<TtsLocalEngine, string> = {
   kokoro: 'kokoro (Kokoro-82M, ONNX)',
   chatterbox: 'chatterbox — ainda não suportado'
@@ -142,6 +165,8 @@ export function AudioSettings(): React.JSX.Element | null {
     error: string | null
     count: number | null
   }>({ busy: false, done: 0, total: 0, error: null, count: null })
+  /** Provedores salvos (id/nome/endpoint) para reaproveitar a chave no STT/TTS (`providerId`). */
+  const [providers, setProviders] = useState<ProviderOption[]>([])
   /** Modelos locais (catálogo + estado em disco, `voice:models:list`). */
   const [models, setModels] = useState<VoiceModelInfo[]>([])
   /** Progresso de download por modelo id (evento `voice:models:progress`). */
@@ -164,6 +189,13 @@ export function AudioSettings(): React.JSX.Element | null {
       setTts(all.ttsSettings)
       setCallDefaults(all.voiceCallDefaults)
     })
+    void api.providers
+      ?.list()
+      .then((list) => {
+        // só o que a tela precisa: a chave do provedor é usada pelo main a partir do `providerId`
+        if (alive) setProviders(list.map((p) => ({ id: p.id, name: p.name, baseUrl: p.baseUrl })))
+      })
+      .catch(() => void 0)
     void voice?.models
       .list()
       .then((list) => {
@@ -185,7 +217,7 @@ export function AudioSettings(): React.JSX.Element | null {
     void voice?.tts.clips
       .list()
       .then((m) => {
-        if (alive) setTtsClips((c) => ({ ...c, count: m ? m.clips.length : 0 }))
+        if (alive) setTtsClips((c) => ({ ...c, count: m && !m.stale ? m.clips.length : 0 }))
       })
       .catch(() => void 0)
     return () => {
@@ -284,7 +316,7 @@ export function AudioSettings(): React.JSX.Element | null {
   const refreshClipCount = (): void => {
     void voice.tts.clips
       .list()
-      .then((m) => setTtsClips((c) => ({ ...c, count: m ? m.clips.length : 0 })))
+      .then((m) => setTtsClips((c) => ({ ...c, count: m && !m.stale ? m.clips.length : 0 })))
       .catch(() => void 0)
   }
 
@@ -305,6 +337,27 @@ export function AudioSettings(): React.JSX.Element | null {
   }
   const saveTtsKey = (key: string | null): Promise<boolean> =>
     commitTts({ ...tts, api: { ...tts.api, apiKey: key as string } })
+
+  /** Primeiro provedor salvo do OpenRouter (a chave dele serve à fala/transcrição pelo `providerId`). */
+  const openRouterProvider = providers.find((p) => isOpenRouterUrl(p.baseUrl)) ?? null
+  /** Provedor escolhido para a fala (null = endpoint avulso / provedor apagado). */
+  const ttsProvider = providers.find((p) => p.id === tts.api.providerId) ?? null
+  const sttProvider = providers.find((p) => p.id === stt.api.providerId) ?? null
+
+  /** "Usar OpenRouter (ElevenLabs Flash)": backend API + endpoint/modelo/voz + chave do provedor salvo. */
+  const applyOpenRouterTts = (): void => {
+    void commitTts({
+      ...tts,
+      backend: 'api',
+      api: {
+        ...tts.api,
+        providerId: openRouterProvider?.id ?? tts.api.providerId,
+        baseUrl: OPENROUTER_TTS_PRESET.baseUrl,
+        model: OPENROUTER_TTS_PRESET.model,
+        voice: OPENROUTER_TTS_PRESET.voice
+      }
+    })
+  }
 
   /** Recarrega as vozes (`voice:tts:voices`) — a lista local muda com o engine escolhido. */
   const refreshTtsVoices = (): void => {
@@ -675,7 +728,8 @@ export function AudioSettings(): React.JSX.Element | null {
               <Label>Endpoint (baseUrl)</Label>
               <input
                 type="text"
-                value={stt.api.baseUrl}
+                value={sttProvider ? sttProvider.baseUrl : stt.api.baseUrl}
+                disabled={!!sttProvider}
                 spellCheck={false}
                 aria-label="Endpoint de transcrição (baseUrl)"
                 data-testid="stt-base-url"
@@ -703,7 +757,20 @@ export function AudioSettings(): React.JSX.Element | null {
               <Label help="Chave do endpoint (header Authorization: Bearer). A máscara da chave salva aparece no campo vazio; cole uma chave nova e clique em Salvar para trocar, ou em Remover (X) para apagar.">
                 Chave de API
               </Label>
-              <ApiKeyField mask={stt.api.apiKey} onSave={saveSttKey} />
+              <ProviderKeyChoice
+                providers={providers}
+                value={stt.api.providerId}
+                testId="stt-provider"
+                onChange={(providerId) => saveSttApi({ providerId })}
+              />
+              {sttProvider ? (
+                <p className="mt-1 text-[11px] text-subtle" data-testid="stt-provider-key">
+                  Usa o endpoint e a chave do provedor “{sttProvider.name}” (no OpenRouter: modelos{' '}
+                  <C>openai/whisper-large-v3-turbo</C> ou <C>elevenlabs/scribe-v2</C>).
+                </p>
+              ) : (
+                <ApiKeyField mask={stt.api.apiKey} onSave={saveSttKey} />
+              )}
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -777,13 +844,45 @@ export function AudioSettings(): React.JSX.Element | null {
               }))}
             />
           </div>
+          {!(
+            tts.backend === 'api' &&
+            tts.api.model === OPENROUTER_TTS_PRESET.model &&
+            isOpenRouterUrl(ttsProvider?.baseUrl ?? tts.api.baseUrl)
+          ) && (
+            <div className="flex flex-wrap items-center gap-2" data-testid="tts-preset">
+              <Button
+                size="sm"
+                variant="secondary"
+                data-testid="tts-preset-openrouter"
+                onClick={applyOpenRouterTts}
+              >
+                Usar OpenRouter (ElevenLabs Flash)
+              </Button>
+              <span className="text-[11px] text-subtle">
+                {openRouterProvider
+                  ? `fala rápida pela API, com a chave do provedor “${openRouterProvider.name}”`
+                  : 'fala rápida pela API — cole a chave do OpenRouter depois de aplicar'}
+              </span>
+              <HelpTip label="Híbrido rápido">
+                <p>
+                  Combinação recomendada para a chamada de voz: transcrição <C>híbrida</C> (whisper{' '}
+                  <C>base</C> local como reserva) e fala pelo OpenRouter com o ElevenLabs Flash v2.5
+                  (~0,5 s até o 1º áudio; o áudio chega em streaming e a frase começa a tocar antes
+                  de terminar de baixar). O texto falado vai ao OpenRouter (cobrança por caractere).
+                  O Kokoro local continua disponível offline e para os clipes.
+                </p>
+              </HelpTip>
+            </div>
+          )}
           {tts.backend === 'api' ? (
             <div className="grid grid-cols-2 gap-x-4 gap-y-3">
               <div>
                 <Label>Endpoint (baseUrl)</Label>
                 <input
                   type="text"
-                  value={tts.api.baseUrl}
+                  value={ttsProvider ? ttsProvider.baseUrl : tts.api.baseUrl}
+                  disabled={!!ttsProvider}
+                  title={ttsProvider ? `Endpoint do provedor “${ttsProvider.name}”` : undefined}
                   spellCheck={false}
                   aria-label="Endpoint de síntese de fala (baseUrl)"
                   data-testid="tts-base-url"
@@ -824,8 +923,11 @@ export function AudioSettings(): React.JSX.Element | null {
                   className="field h-8 px-2 py-0 font-mono text-[12px]"
                 />
                 <datalist id="tts-api-voices">
-                  {ttsVoices.api.map((v) => (
-                    <option key={v.id} value={v.id} />
+                  {(tts.api.model.startsWith('elevenlabs/')
+                    ? ELEVENLABS_VOICES
+                    : ttsVoices.api.map((v) => v.id)
+                  ).map((id) => (
+                    <option key={id} value={id} />
                   ))}
                 </datalist>
               </div>
@@ -833,12 +935,24 @@ export function AudioSettings(): React.JSX.Element | null {
                 <Label help="Chave do endpoint (header Authorization: Bearer). A máscara da chave salva aparece no campo vazio; cole uma chave nova e clique em Salvar para trocar, ou em Remover (X) para apagar.">
                   Chave de API
                 </Label>
-                <ApiKeyField
-                  mask={tts.api.apiKey}
-                  onSave={saveTtsKey}
-                  what="fala"
-                  testId="tts-api-key"
+                <ProviderKeyChoice
+                  providers={providers}
+                  value={tts.api.providerId}
+                  testId="tts-provider"
+                  onChange={(providerId) => saveTtsApi({ providerId })}
                 />
+                {ttsProvider ? (
+                  <p className="mt-1 text-[11px] text-subtle" data-testid="tts-provider-key">
+                    Usa a chave do provedor “{ttsProvider.name}” (fica no processo principal).
+                  </p>
+                ) : (
+                  <ApiKeyField
+                    mask={tts.api.apiKey}
+                    onSave={saveTtsKey}
+                    what="fala"
+                    testId="tts-api-key"
+                  />
+                )}
               </div>
             </div>
           ) : (
@@ -975,7 +1089,7 @@ export function AudioSettings(): React.JSX.Element | null {
                 className="text-[11px] text-subtle tabular-nums"
                 data-testid="tts-clips-progress"
               >
-                gerando clipes… {ttsClips.done}/{ttsClips.total || 15}
+                gerando clipes… {ttsClips.done}/{ttsClips.total || '…'}
               </span>
             )}
             {!ttsClips.busy && ttsClips.count !== null && ttsClips.count > 0 && (
@@ -1068,7 +1182,7 @@ export function AudioSettings(): React.JSX.Element | null {
           <div className="flex items-center gap-2">
             <Label
               className="mb-0"
-              help={`Silêncio contínuo (ms) que encerra a SUA vez de falar na chamada (padrão ${DEFAULT_TURN_SILENCE_MS} ms). Mais curto = respostas mais rápidas, mas pausas para pensar podem cortar a frase. Independente do "Parar por silêncio" do ditado.`}
+              help={`Silêncio contínuo (ms) que encerra a SUA vez de falar quando não há transcrição especulativa (fim de turno adaptativo desligado, ou STT só por API sem especulação) — padrão ${DEFAULT_TURN_SILENCE_MS} ms. Independente do "Parar por silêncio" do ditado.`}
             >
               Silêncio que encerra a fala (ms)
             </Label>
@@ -1082,8 +1196,121 @@ export function AudioSettings(): React.JSX.Element | null {
               onCommit={(v) =>
                 saveCallDefaults({
                   // o padrão volta a ser "segue o padrão" (null) — muda junto se o padrão mudar
-                  turn: { silenceStopMs: v === DEFAULT_TURN_SILENCE_MS ? null : v }
+                  turn: {
+                    ...callDefaults.turn,
+                    silenceStopMs: v === DEFAULT_TURN_SILENCE_MS ? null : v
+                  }
                 })
+              }
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Label
+              className="mb-0"
+              help='Aos ~250 ms de pausa o app transcreve o que você já disse (motor local) e decide: pergunta/comando fecha a vez rápido; frase que termina em vírgula, "e", "mas", "porque"… espera mais. Se você não voltar a falar, essa transcrição já é a final.'
+            >
+              Fim de turno adaptativo
+            </Label>
+            <Switch
+              checked={callDefaults.turn.adaptive}
+              label="Fim de turno adaptativo"
+              onChange={(adaptive) =>
+                saveCallDefaults({ turn: { ...callDefaults.turn, adaptive } })
+              }
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Label
+              className="mb-0"
+              help="Permite a transcrição especulativa pela API quando não há motor local (1 request a mais por pausa — custo)."
+            >
+              Especular pela API
+            </Label>
+            <Switch
+              checked={callDefaults.turn.speculativeApi}
+              label="Especular pela API"
+              onChange={(speculativeApi) =>
+                saveCallDefaults({ turn: { ...callDefaults.turn, speculativeApi } })
+              }
+            />
+          </div>
+        </div>
+        <div className="mt-3 grid grid-cols-3 gap-x-4 gap-y-3 sm:max-w-[560px]">
+          <div>
+            <Label help='Silêncio (ms) que fecha uma fala completa: pergunta, comando ou fecho ("obrigado").'>
+              Fala completa (ms)
+            </Label>
+            <NumberField
+              value={callDefaults.turn.completeSilenceMs}
+              min={200}
+              max={5000}
+              step={50}
+              label="Silêncio para fala completa (ms)"
+              testId="voice-call-turn-complete"
+              onCommit={(v) =>
+                saveCallDefaults({ turn: { ...callDefaults.turn, completeSilenceMs: v } })
+              }
+            />
+          </div>
+          <div>
+            <Label help="Silêncio (ms) que fecha uma afirmação (o ponto final do STT não prova que você terminou — pode ser uma história no meio).">
+              Afirmação (ms)
+            </Label>
+            <NumberField
+              value={callDefaults.turn.statementSilenceMs}
+              min={200}
+              max={10000}
+              step={50}
+              label="Silêncio para afirmação (ms)"
+              testId="voice-call-turn-statement"
+              onCommit={(v) =>
+                saveCallDefaults({ turn: { ...callDefaults.turn, statementSilenceMs: v } })
+              }
+            />
+          </div>
+          <div>
+            <Label help="Silêncio (ms) que fecha uma fala inacabada (termina em vírgula, conectivo ou hesitação) — o teto.">
+              Fala inacabada (ms)
+            </Label>
+            <NumberField
+              value={callDefaults.turn.unfinishedSilenceMs}
+              min={200}
+              max={10000}
+              step={50}
+              label="Silêncio para fala inacabada (ms)"
+              testId="voice-call-turn-unfinished"
+              onCommit={(v) =>
+                saveCallDefaults({ turn: { ...callDefaults.turn, unfinishedSilenceMs: v } })
+              }
+            />
+          </div>
+          <div>
+            <Label help="Teto de tokens da resposta nos turnos de voz (respostas curtas, fala começa antes). 0 = sem teto. Não vale quando o modelo da chamada define max_tokens ou raciocínio.">
+              Teto de tokens
+            </Label>
+            <NumberField
+              value={callDefaults.maxTokens}
+              min={0}
+              max={8000}
+              step={10}
+              label="Teto de tokens da resposta na chamada"
+              testId="voice-call-max-tokens"
+              onCommit={(v) => saveCallDefaults({ maxTokens: v })}
+            />
+          </div>
+          <div>
+            <Label help='Espera (ms) entre o fim da sua fala e o preâmbulo ("Hum, deixa eu ver…"). Se a 1ª frase da resposta ficar pronta antes, o preâmbulo nem sai. 0 = já.'>
+              Preâmbulo após (ms)
+            </Label>
+            <NumberField
+              value={callDefaults.fillers.delayMs}
+              min={0}
+              max={5000}
+              step={50}
+              label="Espera do preâmbulo (ms)"
+              testId="voice-call-filler-delay"
+              onCommit={(v) =>
+                saveCallDefaults({ fillers: { ...callDefaults.fillers, delayMs: v } })
               }
             />
           </div>
@@ -1149,7 +1376,7 @@ export function AudioSettings(): React.JSX.Element | null {
               <Label
                 className="mb-0"
                 help={
-                  'Falas preenchidoras ("Só um minutinho…") quando a resposta demora a começar (~1,2 s) ou com tools em execução. No máximo 1 por turno.'
+                  'Preâmbulo curto logo depois da sua fala ("Hum, deixa eu ver aqui.", "Beleza, só um minutinho.") escolhido pelo tipo de pedido, enquanto a resposta não começa. No máximo 1 por turno; a resposta espera ele terminar.'
                 }
               >
                 Fillers
@@ -1418,6 +1645,49 @@ function ApiKeyField({
 }
 
 /** `</>` da transcrição: a request multipart exata do `/audio/transcriptions`. */
+/**
+ * "Chave de": endpoint avulso (chave própria, campo abaixo) ou um provedor salvo — com provedor, o
+ * main usa o endpoint e a chave dele (`providerId`); a chave nunca passa pela tela.
+ */
+function ProviderKeyChoice({
+  providers,
+  value,
+  onChange,
+  testId
+}: {
+  providers: ProviderOption[]
+  value: string | null
+  onChange: (providerId: string | null) => void
+  testId: string
+}): React.JSX.Element | null {
+  if (!providers.length && !value) return null
+  const known = providers.some((p) => p.id === value)
+  return (
+    <div className="mb-1.5" data-testid={testId}>
+      <Select
+        value={value && known ? value : ''}
+        label="Origem da chave"
+        className="h-8 w-full max-w-[360px]"
+        menuMinWidth={320}
+        onChange={(v) => onChange(v ? v : null)}
+        options={[
+          { value: '', label: 'Chave própria (campo abaixo)' },
+          ...providers.map((p) => ({
+            value: p.id,
+            label: `Provedor: ${p.name}`,
+            description: p.baseUrl
+          }))
+        ]}
+      />
+      {value && !known && (
+        <p className="mt-1 text-[11px] text-warning" role="alert">
+          O provedor escolhido não existe mais — usando o endpoint e a chave próprios.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function SttApiInfo({ stt, language }: { stt: SttSettings; language: string }): React.JSX.Element {
   const lang = language.split(/[-_]/)[0]?.toLowerCase() || language
   return (

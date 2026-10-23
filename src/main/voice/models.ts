@@ -394,8 +394,7 @@ export async function downloadLocalModel(
 ): Promise<LocalModelInfo> {
   const entry = findCatalogEntry(id, opts.catalog ?? LOCAL_MODEL_CATALOG)
   if (!entry) throw new Error(`modelo desconhecido: ${id}`)
-  if (!entry.url)
-    throw new Error(`modelo ${id} ainda não tem download disponível`)
+  if (!entry.url) throw new Error(`modelo ${id} ainda não tem download disponível`)
   const key = downloadKey(baseDir, id)
   if (activeDownloads.has(key)) throw new Error(`download já em andamento para ${id}`)
   const fileName = catalogFileName(entry)!

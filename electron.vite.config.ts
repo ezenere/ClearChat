@@ -14,10 +14,12 @@ export default defineConfig({
       externalizeDeps: true,
       rolldownOptions: {
         external: ['better-sqlite3'],
-        // 2º entry: o processo do motor local de STT (utilityProcess — whisper.cpp fora do main)
+        // entries extras: os processos dos motores locais (utilityProcess — fora do main):
+        // STT (whisper.cpp) e TTS (Kokoro/onnxruntime-node — `session.run` síncrono)
         input: {
           index: resolve('src/main/index.ts'),
-          sttWorker: resolve('src/main/voice/sttWorker.ts')
+          sttWorker: resolve('src/main/voice/sttWorker.ts'),
+          ttsWorker: resolve('src/main/voice/ttsWorker.ts')
         }
       }
     }

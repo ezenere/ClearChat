@@ -11,7 +11,9 @@
 //   um número ("1." de lista) ou quando a última palavra é uma abreviação pt-BR comum ("ex.",
 //   "etc.", "Dr.", "p.ex."…) — exceto no fim do buffer com `final: true` (é o fim da resposta);
 // - sem fronteira há muito tempo: corte forçado no último espaço antes de `maxChars` (padrão 240)
-//   — resposta sem pontuação nunca espera o fim inteiro para começar a falar.
+//   — resposta sem pontuação nunca espera o fim inteiro para começar a falar;
+// - `commaCutMin` (1º pedaço da resposta): vírgula + espaço depois de ≥ N chars também corta — o
+//   TTS começa a falar antes (a 1ª frase longa vira duas utterances).
 export interface SentenceSplit {
   /** Sentenças completas, na ordem, já aparadas (uma por utterance do TTS). */
   sentences: string[]
@@ -20,6 +22,9 @@ export interface SentenceSplit {
 }
 
 export const DEFAULT_SENTENCE_MAX_CHARS = 240
+
+/** Mínimo de chars do 1º pedaço da resposta para a vírgula cortar (TTS começa antes). */
+export const FIRST_CHUNK_COMMA_MIN = 25
 
 /** Abreviações pt-BR comuns (minúsculas, sem o ponto final) — o `.` delas não corta sentença. */
 const ABBREVIATIONS: ReadonlySet<string> = new Set([
@@ -113,8 +118,10 @@ function dotCuts(
  */
 export function splitSentences(
   buffer: string,
-  opts: { final?: boolean; maxChars?: number } = {}
+  opts: { final?: boolean; maxChars?: number; commaCutMin?: number } = {}
 ): SentenceSplit {
+  const commaMin =
+    typeof opts.commaCutMin === 'number' && opts.commaCutMin > 0 ? opts.commaCutMin : 0
   const maxChars =
     typeof opts.maxChars === 'number' && opts.maxChars > 0
       ? Math.round(opts.maxChars)
@@ -123,6 +130,21 @@ export function splitSentences(
   let segStart = 0
   let i = 0
   while (i < buffer.length) {
+    // 1º pedaço: vírgula seguida de espaço depois de ≥ commaMin chars também é fronteira
+    if (
+      commaMin &&
+      !sentences.length &&
+      buffer[i] === ',' &&
+      i + 1 < buffer.length &&
+      /\s/.test(buffer[i + 1]) &&
+      buffer.slice(segStart, i).trim().length >= commaMin
+    ) {
+      const chunk = buffer.slice(segStart, i + 1).trim()
+      if (chunk) sentences.push(chunk)
+      segStart = i + 1
+      i = i + 1
+      continue
+    }
     if (!isMark(buffer[i])) {
       i++
       continue

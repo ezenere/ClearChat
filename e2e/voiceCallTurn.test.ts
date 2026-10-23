@@ -245,6 +245,7 @@ type Queue = InstanceType<
 >
 let manager: Manager | null = null
 const emitted: string[] = []
+const emittedIds: string[] = []
 let queue: Queue | null = null
 const states: VoiceCallState[] = []
 
@@ -264,6 +265,7 @@ async function boot(): Promise<{ manager: Manager }> {
     emitState: (s) => states.push({ ...s }),
     emitUtterance: (u) => {
       emitted.push(new TextDecoder().decode(u.audio))
+      emittedIds.push(u.id)
       queue?.enqueue(u)
     },
     // fillers/interjeições ficam fora destes testes (clip ausente = nada toca; ver
@@ -283,7 +285,11 @@ async function boot(): Promise<{ manager: Manager }> {
       stt: DEFAULT_STT_SETTINGS,
       tts: DEFAULT_TTS_SETTINGS
     }),
-    onEvent: (cb) => events.onAgentEvent(cb)
+    onEvent: (cb) => events.onAgentEvent(cb),
+    // turno continuado / barge-in: o runner real para o turno e ajusta o histórico ao falado
+    amendTurn: async (sid, amend) => {
+      await runner.amendVoiceTurn(sid, amend)
+    }
   })
   request.setVoiceCallSource((chat, session) => manager!.callContextFor(chat, session))
   return { manager }
@@ -384,9 +390,10 @@ test('turno completo: fala → transcrição → envio → stream → 2 sentenç
   assert.equal(m.state().active, false)
 })
 
-test('fila de turnos: fala durante a resposta vira o PRÓXIMO turno (enviada após a resposta)', async () => {
+test('fila de turnos: fala depois de OUVIR a resposta vira o próximo turno', async () => {
   synthMode = 'auto'
   synthCalls.length = 0
+  emitted.length = 0
   const { manager: m } = await boot()
   m.stop() // cada teste começa com a chamada fechada (idempotente)
   const { sid } = await newChat()
@@ -394,12 +401,12 @@ test('fila de turnos: fala durante a resposta vira o PRÓXIMO turno (enviada ap�
   m.speechBegin()
   m.speechEnd()
   m.turn('duas')
-  await sleep(10) // resposta em voo
+  // a resposta foi falada (as duas frases emitidas e ouvidas) — a fala seguinte é turno novo
+  await waitFor(() => emitted.length >= 2, 8000, 'resposta falada')
   m.speechBegin()
   m.speechEnd()
   m.turn('ok, obrigado')
-  assert.equal(m.state().pendingText, 'ok, obrigado', 'fala guardada como próximo turno')
-  await idle(sid) // primeira resposta termina → o pendente sai sozinho
+  await idle(sid) // primeira resposta termina → o pendente (se houver) sai sozinho
   await idle(sid) // segunda resposta termina
   const msgs = path(sid)
   assert.deepEqual(
@@ -411,7 +418,7 @@ test('fila de turnos: fala durante a resposta vira o PRÓXIMO turno (enviada ap�
   m.stop()
 })
 
-test('barge-in: fala durante a reprodução cancela a fala do assistente (texto segue no histórico)', async () => {
+test('barge-in: fala durante a reprodução cancela a fala e o histórico fica só com o FALADO', async () => {
   synthMode = 'gated'
   synthCalls.length = 0
   emitted.length = 0
@@ -428,28 +435,107 @@ test('barge-in: fala durante a reprodução cancela a fala do assistente (texto 
   await waitFor(() => synthCalls.length >= 1, 8000, '1ª síntese')
   openGate(0)
   await waitFor(() => emitted.length >= 1, 8000, '1ª utterance')
+  const firstId = emittedIds[emittedIds.length - 1]
   // barge-in com a 2ª sentença ainda em síntese
   await waitFor(() => synthCalls.length >= 2, 8000, '2ª síntese em voo')
-  queue!.cancel() // o renderer pausa e descarta a fila (o texto da resposta segue completo)
-  m.bargeIn()
+  queue!.cancel() // o renderer pausa e descarta a fila
+  m.bargeIn({ playedIds: [firstId] }) // a 1ª frase começou a tocar
   openGate(1)
   await sleep(50)
   assert.equal(emitted.length, 1, 'a fala do assistente foi cancelada — a 2ª sentença não saiu')
   assert.equal(
     playerLog.includes('pause:WAV:Primeira frase.'),
     true,
-    'o áudio em curso foi pausado'
+    `o áudio em curso foi pausado: ${playerLog.join(',')} / ${emitted.join(',')}`
   )
   assert.equal(m.state().phase, 'listening', 'volta a escutar')
   await idle(sid)
+  await waitFor(
+    () => textOf(path(sid)[1]?.message.content) === 'Primeira frase.',
+    8000,
+    'histórico truncado ao falado'
+  ).catch((e) => {
+    throw new Error(
+      `${e.message}: ${m.state().error} ${JSON.stringify(path(sid).map((x) => [x.id, x.message.content, x.meta]))}`
+    )
+  })
   const msgs = path(sid)
-  assert.equal(
-    textOf(msgs[1].message.content),
-    'Primeira frase. Segunda frase.',
-    'texto completo no histórico'
+  assert.deepEqual(
+    msgs.map((x) => x.message.role),
+    ['user', 'assistant']
   )
+  assert.equal(msgs[1].meta.interrupted, true, 'marcada como interrompida')
   m.stop()
   synthMode = 'auto'
+})
+
+test('turno continuado: falar de novo antes de ouvir a resposta une as falas e apaga a resposta não ouvida', async () => {
+  synthMode = 'gated'
+  synthCalls.length = 0
+  emitted.length = 0
+  gates.length = 0
+  const { manager: m } = await boot()
+  m.stop()
+  const { sid } = await newChat()
+  m.start(sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('duas coisas')
+  // a resposta chega do modelo, mas nada foi falado ainda (síntese presa)
+  await waitFor(() => synthCalls.length >= 1, 8000, '1ª síntese')
+  assert.equal(emitted.length, 0)
+  // o usuário volta a falar (a pausa tinha fechado o turno no meio da frase)
+  m.speechBegin({ dropped: [] })
+  m.speechEnd()
+  synthMode = 'auto'
+  m.turn('e mais uma')
+  await waitFor(
+    () => {
+      const ms = path(sid)
+      return ms.length === 2 && ms[1].message.role === 'assistant' && ms
+    },
+    8000,
+    'turno refeito'
+  ).catch((e) => {
+    throw new Error(
+      `${e.message}: ${m.state().error} ${JSON.stringify(m.state())} ${JSON.stringify(path(sid).map((x) => [x.message.role, x.message.content]))}`
+    )
+  })
+  await idle(sid)
+  const msgs = path(sid)
+  assert.deepEqual(
+    msgs.map((x) => x.message.role),
+    ['user', 'assistant'],
+    'o turno anterior (e a resposta nunca falada) saiu do histórico'
+  )
+  assert.equal(textOf(msgs[0].message.content), 'duas coisas e mais uma', 'falas unidas')
+  // a resposta do turno refeito é falada
+  await waitFor(() => emitted.length >= 1, 8000, 'resposta nova falada')
+  assert.ok(emitted.every((e) => e.startsWith('WAV:')))
+  m.stop()
+})
+
+test('turno continuado: fala sem texto (ruído) devolve a resposta retida', async () => {
+  synthMode = 'auto'
+  emitted.length = 0
+  const { manager: m } = await boot()
+  m.stop()
+  const { sid } = await newChat()
+  m.start(sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('duas')
+  m.speechBegin({ dropped: [] }) // ruído antes de qualquer frase tocar: retém
+  m.speechEnd()
+  await idle(sid)
+  await sleep(30)
+  const held = emitted.length
+  m.turn('') // transcrição vazia: a resposta volta a ser falada
+  await waitFor(() => emitted.length >= held + 1, 8000, 'resposta liberada')
+  assert.ok(emitted.includes('WAV:Primeira frase.'))
+  const msgs = path(sid)
+  assert.equal(textOf(msgs[1].message.content), 'Primeira frase. Segunda frase.', 'nada apagado')
+  m.stop()
 })
 
 // ---------------- histórico idêntico + overrides ----------------
@@ -521,9 +607,18 @@ test('overrides do modo voz: voice.model/voice.tools/voicePrompt só nas request
     'só as tools liberadas na chamada'
   )
   assert.ok(
-    textOf(req.body.messages[0].content).includes('persona base\n\nFale em frases curtas.'),
-    'voicePrompt somado ao system prompt'
+    textOf(req.body.messages[0].content).includes('persona base\n\n'),
+    'system prompt do chat primeiro'
   )
+  assert.ok(
+    textOf(req.body.messages[0].content).includes('\n\nFale em frases curtas.'),
+    'voicePrompt somado ao system prompt (depois do prompt-base do modo voz)'
+  )
+  assert.ok(
+    textOf(req.body.messages[0].content).includes('conversa por voz'),
+    'prompt-base do modo voz'
+  )
+  assert.equal(req.body.max_tokens, 120, 'teto de tokens do turno de voz')
   const after = JSON.parse(JSON.stringify(repo.chatsRepo.get(chatId)!.config))
   assert.deepEqual(after, before, 'a config salva do chat não muda')
 })

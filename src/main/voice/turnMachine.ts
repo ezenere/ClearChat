@@ -8,7 +8,9 @@
 //   listening → speechEnded → transcribing → turnArrived(texto) → thinking
 //   thinking → responseDone → listening (ou o turno pendente sai já, vira thinking)
 //   speaking = áudio do assistente tocando/por tocar (utterances emitidas + sentenças na síntese)
-//   barge-in (fala durante a reprodução) → para a fala; o texto da resposta continua no histórico.
+//   barge-in (fala durante a reprodução) → para a fala (o main ajusta o histórico ao que foi falado).
+//   suspend()/resume(): enquanto o main refaz o histórico (turno continuado/barge-in), nada é
+//   enviado — falas viram o pendente e saem no resume() (se o agente já parou).
 import type { VoiceCallPhase } from '@shared/voice'
 
 /** Estados de sessão que significam "o agente ainda responde" (espelha `isBusy` do store). */
@@ -37,6 +39,8 @@ export class VoiceTurnMachine {
   #synthPending = 0
   /** Fala já transcrita aguardando o próximo turno (máx. 1 — falas seguintes se acumulam). */
   #pendingText = ''
+  /** Envios suspensos (o main está ajustando o histórico — o pendente espera o `resume`). */
+  #suspended = 0
 
   constructor(onSend: (text: string) => void) {
     this.#onSend = onSend
@@ -51,6 +55,7 @@ export class VoiceTurnMachine {
     this.#audioActive = false
     this.#synthPending = 0
     this.#pendingText = ''
+    this.#suspended = 0
   }
 
   /** Sai da chamada (tudo volta ao repouso; o turno em voo segue normalmente no histórico). */
@@ -62,6 +67,7 @@ export class VoiceTurnMachine {
     this.#audioActive = false
     this.#synthPending = 0
     this.#pendingText = ''
+    this.#suspended = 0
   }
 
   get active(): boolean {
@@ -110,7 +116,7 @@ export class VoiceTurnMachine {
     this.#userSpeaking = false
     const t = text.trim()
     if (!t) return
-    if (this.#responseInFlight) {
+    if (this.#responseInFlight || this.#suspended) {
       this.#pendingText = this.#pendingText ? `${this.#pendingText} ${t}` : t
       return
     }
@@ -187,8 +193,27 @@ export class VoiceTurnMachine {
     this.#userSpeaking = true
   }
 
+  /** Suspende os envios (aninhável): falas viram o pendente até o `resume` correspondente. */
+  suspend(): void {
+    if (!this.#active) return
+    this.#suspended++
+  }
+
+  /** Fim de um `suspend`: sem outro em curso, o pendente sai (se o agente estiver livre). */
+  resume(): void {
+    if (this.#suspended > 0) this.#suspended--
+    if (!this.#active) return
+    this.#flushPending()
+  }
+
+  /** Troca o texto do turno pendente (turno continuado: a fala anterior + a nova, unidas). */
+  replacePending(text: string): void {
+    if (!this.#active) return
+    this.#pendingText = text.trim()
+  }
+
   #flushPending(): void {
-    if (!this.#pendingText || this.#responseInFlight) return
+    if (!this.#pendingText || this.#responseInFlight || this.#suspended) return
     const t = this.#pendingText
     this.#pendingText = ''
     this.#responseInFlight = true

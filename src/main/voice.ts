@@ -27,8 +27,9 @@ import {
   type VoiceCallDefaults
 } from '@shared/voice'
 import { maskKey } from '@shared/webSearchSettings'
+import type { Provider } from '@shared/types'
 import type { LocalModelCatalogEntry } from './voice/catalog'
-import { settingsRepo } from './repo'
+import { providersRepo, settingsRepo } from './repo'
 
 export interface VoiceSettings {
   /** Ditado: microfone, push-to-talk, silêncio e idioma (100% global). */
@@ -41,13 +42,43 @@ export interface VoiceSettings {
   voiceCallDefaults: VoiceCallDefaults
 }
 
-/** Settings de áudio/voz completas (ausente/inválido → os padrões de `@shared/voice`). */
-export function getVoiceSettings(): VoiceSettings {
+/** Settings de áudio/voz como estão gravadas (normalizadas; `providerId` NÃO resolvido). */
+function readVoiceSettings(): VoiceSettings {
   return {
     audioInput: normalizeAudioInput(settingsRepo.get(AUDIO_INPUT_SETTING)),
     stt: normalizeSttSettings(settingsRepo.get(STT_SETTINGS_SETTING)),
     tts: normalizeTtsSettings(settingsRepo.get(TTS_SETTINGS_SETTING)),
     voiceCallDefaults: normalizeVoiceCallDefaults(settingsRepo.get(VOICE_CALL_DEFAULTS_SETTING))
+  }
+}
+
+/**
+ * Endpoint efetivo de STT/TTS: com `providerId` apontando para um provedor salvo, `baseUrl` e
+ * `apiKey` vêm do provedor (a chave dele nunca é copiada para a setting nem sai do main); provedor
+ * ausente/apagado → os campos próprios da setting (endpoint avulso). Puro (lookup injetado).
+ */
+export function resolveVoiceEndpoint<
+  T extends { providerId: string | null; baseUrl: string; apiKey: string }
+>(api: T, lookup: (id: string) => Pick<Provider, 'baseUrl' | 'apiKey'> | null): T {
+  const id = api.providerId?.trim()
+  if (!id) return api
+  const p = lookup(id)
+  if (!p || !p.baseUrl.trim()) return api
+  return { ...api, baseUrl: p.baseUrl.trim(), apiKey: p.apiKey.trim() }
+}
+
+/**
+ * Settings de áudio/voz completas para os SERVIÇOS do main (ausente/inválido → os padrões de
+ * `@shared/voice`), com o `providerId` de stt/tts resolvido para o endpoint/chave do provedor salvo.
+ * Nunca vai ao renderer (a visão é `getVoiceSettingsView`, sem resolver e mascarada).
+ */
+export function getVoiceSettings(): VoiceSettings {
+  const v = readVoiceSettings()
+  const lookup = (id: string): Provider | null => providersRepo.get(id)
+  return {
+    ...v,
+    stt: { ...v.stt, api: resolveVoiceEndpoint(v.stt.api, lookup) },
+    tts: { ...v.tts, api: resolveVoiceEndpoint(v.tts.api, lookup) }
   }
 }
 
@@ -67,7 +98,8 @@ const maskTts = (s: TtsSettings): TtsSettings => ({
  * `api.apiKey` **mascarada** (`maskKey`; `''` quando não há chave). A chave real nunca sai do main.
  */
 export function getVoiceSettingsView(): VoiceSettingsView {
-  const v = getVoiceSettings()
+  // sem resolver o `providerId`: a chave do provedor nunca entra na visão (nem mascarada)
+  const v = readVoiceSettings()
   return {
     audioInput: v.audioInput,
     sttSettings: maskStt(v.stt),

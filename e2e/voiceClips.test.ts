@@ -11,9 +11,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   CLIP_CLASSES,
+  CLIP_MAX_VARIANTS,
   CLIP_PHRASES,
-  CLIP_VARIANTS,
   clipFileName,
+  clipPhraseSet,
+  loadCurrentClipAudio,
+  loadCurrentClips,
+  trimWavSilence,
   clipVoiceId,
   clipsDir,
   clipsHash,
@@ -23,7 +27,8 @@ import {
   resolveClip
 } from '../src/main/voice/clips.ts'
 import type { TtsLocalBackend, TtsLocalInput, TtsLocalResult } from '../src/main/voice/tts.ts'
-import { normalizeTtsSettings, type TtsSettings } from '../src/shared/voice.ts'
+import { DEFAULT_FILLER_POOL, normalizeTtsSettings, type TtsSettings } from '../src/shared/voice.ts'
+import { encodeWav } from '../src/main/voice/session.ts'
 
 // ---------------- helpers ----------------
 
@@ -68,20 +73,21 @@ function fakeEngine(): { backend: TtsLocalBackend; calls: TtsLocalInput[] } {
   }
 }
 
-const totalClips = CLIP_CLASSES.length * CLIP_VARIANTS
+const PHRASES = clipPhraseSet()
+const totalClips = CLIP_CLASSES.reduce((a, c) => a + PHRASES[c].length, 0)
 
 // ---------------- nomes e ids (whitelist/segurança) ----------------
 
-test('clipFileName: whitelist de classes e variantes 1..3; fora disso → erro legível', () => {
+test('clipFileName: whitelist de classes e variantes 1..16; fora disso → erro legível', () => {
   for (const cls of CLIP_CLASSES) {
-    for (let n = 1; n <= CLIP_VARIANTS; n++) {
+    for (let n = 1; n <= CLIP_MAX_VARIANTS; n++) {
       assert.equal(clipFileName(cls, n), `${cls}_${n}.wav`)
     }
   }
   assert.throws(() => clipFileName('EXEC', 1), /classe de clipe desconhecida/)
   assert.throws(() => clipFileName('../../evil', 1), /classe de clipe desconhecida/)
   assert.throws(() => clipFileName('ACK', 0), /variante de clipe inválida/)
-  assert.throws(() => clipFileName('ACK', 4), /variante de clipe inválida/)
+  assert.throws(() => clipFileName('ACK', CLIP_MAX_VARIANTS + 1), /variante de clipe inválida/)
   assert.throws(() => clipFileName('ACK', 1.5), /variante de clipe inválida/)
 })
 
@@ -102,7 +108,7 @@ test('clipVoiceId: engine+voz por trás de um segmento seguro (sem separadores d
 
 // ---------------- geração + manifest ----------------
 
-test('generateClips: 15 clipes na whitelist, manifest com voz/engine/hash e progresso', async () => {
+test('generateClips: interjeições + pool de preâmbulos na whitelist, manifest com voz/engine/hash e progresso', async () => {
   const base = newBase()
   const { backend, calls } = fakeEngine()
   const progress: { id: string; done: number; total: number }[] = []
@@ -124,9 +130,14 @@ test('generateClips: 15 clipes na whitelist, manifest com voz/engine/hash e prog
   for (const c of manifest.clips) {
     assert.equal(c.id, `${c.class}_${c.n}`)
     assert.equal(c.file, clipFileName(c.class, c.n))
-    assert.equal(c.text, CLIP_PHRASES[c.class][c.n - 1])
+    assert.equal(c.text, PHRASES[c.class][c.n - 1])
   }
-  // progresso 1..15 com o id do clipe
+  // FILLER = o pool padrão de preâmbulos, na ordem
+  assert.deepEqual(
+    manifest.clips.filter((c) => c.class === 'FILLER').map((c) => c.text),
+    DEFAULT_FILLER_POOL.map((f) => f.text)
+  )
+  // progresso 1..N com o id do clipe
   assert.equal(progress.length, totalClips)
   assert.deepEqual(
     progress.map((p) => p.done),
@@ -300,18 +311,72 @@ test('clipsHash: estável para a mesma definição e sensível a frases/voz/mode
   assert.match(h1, /^[0-9a-f]{64}$/)
 })
 
-// catálogo de frases: 3 variantes por classe, sem vazias (o manifest depende disso)
-test('CLIP_PHRASES: 3 variantes não vazias por classe (whitelist inteira)', () => {
+// catálogo de frases: variantes não vazias por classe (o manifest depende disso)
+test('CLIP_PHRASES: frases por extenso que os dois motores pronunciam; ACK só Uhum/Aham', () => {
   assert.equal(CLIP_CLASSES.length, 5)
   for (const cls of CLIP_CLASSES) {
-    const phrases = CLIP_PHRASES[cls]
-    assert.equal(phrases.length, CLIP_VARIANTS, cls)
-    for (const p of phrases) assert.ok(p.trim().length > 0, `${cls}: ${p}`)
+    const phrases = PHRASES[cls]
+    assert.ok(phrases.length >= 2 && phrases.length <= CLIP_MAX_VARIANTS, cls)
+    for (const p of phrases) {
+      assert.ok(p.trim().length > 0, `${cls}: ${p}`)
+      // "Hmm"/"Hum..." soltos: soletrados (Kokoro) / anglicanizados (ElevenLabs) — proibidos
+      assert.ok(!/\bhmm\b/i.test(p) && !/^hum\.*$/i.test(p) && !/\.\.\./.test(p), p)
+    }
   }
-  // fillers pós-turno do contrato
-  assert.ok(CLIP_PHRASES.FILLER.some((p) => p.includes('minutinho')))
-  assert.ok(CLIP_PHRASES.FILLER.some((p) => p.includes('calma')))
-  assert.ok(CLIP_PHRASES.FILLER.some((p) => p.includes('instante')))
+  assert.deepEqual(CLIP_PHRASES.ACK, ['Uhum.', 'Aham.'])
+  assert.ok(CLIP_PHRASES.THINKING.includes('Hum, deixa eu ver.'))
+  // o longo "Só um minutinho que eu tô vendo isso." saiu
+  assert.ok(!PHRASES.FILLER.some((p) => p.includes('tô vendo isso')))
   // sanity: nenhum arquivo temporário criado na raiz do tmp por engano
   assert.ok(existsSync(tmpdir()))
+})
+
+test('clipsHash: o pool de preâmbulos entra no hash (mudou → cache velho → regerar)', async () => {
+  const base = newBase()
+  const { backend, calls } = fakeEngine()
+  const settings = localSettings()
+  const pool = [
+    { text: 'Tá, já vejo.', contexts: [] },
+    { text: 'Hum, deixa eu ver.', contexts: [] }
+  ]
+  assert.notEqual(await clipsHash(settings), await clipsHash(settings, pool))
+  await generateClips({ baseDir: base, settings, local: backend })
+  assert.ok(await loadCurrentClips(base, settings))
+  // pool mudou: o cache da voz é velho → nada toca (null) até regerar
+  assert.equal(await loadCurrentClips(base, settings, pool), null)
+  assert.equal(await loadCurrentClipAudio(base, settings, pool, 'FILLER', 1), null)
+  const before = calls.length
+  const m = await generateClips({ baseDir: base, settings, local: backend, fillerPool: pool })
+  assert.equal(calls.length - before, totalClips - DEFAULT_FILLER_POOL.length + pool.length)
+  assert.deepEqual(
+    m.clips.filter((c) => c.class === 'FILLER').map((c) => c.text),
+    pool.map((p) => p.text)
+  )
+  // clipes de variantes que não existem mais (pool menor) saem do disco
+  const dir = clipsDir(base, m.voiceId)!
+  assert.ok(!existsSync(join(dir, 'FILLER_3.wav')))
+  assert.ok(await loadCurrentClipAudio(base, settings, pool, 'FILLER', 2))
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('trimWavSilence: apara o silêncio das pontas (pad curto + rampa); não-WAV/silêncio intactos', () => {
+  const rate = 24000
+  const lead = Math.round(0.18 * rate) // os ~180 ms do Kokoro
+  const body = Math.round(0.3 * rate)
+  const tail = Math.round(0.25 * rate)
+  const pcm = new Int16Array(lead + body + tail)
+  for (let i = 0; i < body; i++) pcm[lead + i] = Math.round(8000 * Math.sin(i / 5))
+  const wav = encodeWav(new Uint8Array(pcm.buffer), rate)
+  const out = trimWavSilence(wav)
+  const samples = (out.length - 44) / 2
+  const pad = Math.round(0.015 * rate)
+  assert.ok(Math.abs(samples - (body + 2 * pad)) <= 4, `amostras: ${samples}`)
+  assert.equal(new DataView(out.buffer, out.byteOffset).getUint32(24, true), rate)
+  // rampa: 1ª amostra zerada (sem clique)
+  assert.equal(new DataView(out.buffer, out.byteOffset).getInt16(44, true), 0)
+  // não-WAV e tudo-silêncio voltam iguais
+  const mp3 = new Uint8Array([0x49, 0x44, 0x33, 1, 2, 3])
+  assert.equal(trimWavSilence(mp3), mp3)
+  const silent = encodeWav(new Uint8Array(4000), rate)
+  assert.equal(trimWavSilence(silent), silent)
 })

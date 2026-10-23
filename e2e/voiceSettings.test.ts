@@ -207,3 +207,77 @@ test('setVoiceSetting: grupo desconhecido é erro legível', async () => {
   const v = await voice()
   assert.throws(() => v.setVoiceSetting('nope' as never, {}), /desconhecido/)
 })
+
+// ---------------- providerId (endpoint/chave de um provedor salvo) ----------------
+
+test('providerId: serviços usam baseUrl/chave do provedor salvo; a visão nunca leva a chave dele', async () => {
+  const v = await voice()
+  const r = await repo()
+  const providerKey = 'sk-or-v1-PROVIDERSECRET0123456789'
+  const p = r.providersRepo.create({
+    name: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1/',
+    apiKey: providerKey
+  })
+  const view = v.setVoiceSetting('ttsSettings', {
+    backend: 'api',
+    api: {
+      providerId: p.id,
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKey: '',
+      model: 'elevenlabs/eleven-flash-v2.5',
+      voice: 'sarah'
+    }
+  })
+  v.setVoiceSetting('sttSettings', {
+    mode: 'hybrid',
+    api: { providerId: p.id, baseUrl: '', apiKey: '', model: 'openai/whisper-large-v3-turbo' }
+  })
+  // a setting guarda só o id — nunca a chave do provedor (nem mascarada)
+  assert.equal(await realTtsKey(), '')
+  assert.equal(view.api.apiKey, '')
+  const json = JSON.stringify(v.getVoiceSettingsView())
+  assert.equal(json.includes('PROVIDERSECRET'), false)
+  assert.equal(json.includes(providerKey.slice(-4)), false, 'nem a máscara da chave do provedor')
+  // os serviços do main recebem o endpoint efetivo
+  const eff = v.getVoiceSettings()
+  assert.equal(eff.tts.api.baseUrl, 'https://openrouter.ai/api/v1')
+  assert.equal(eff.tts.api.apiKey, providerKey)
+  assert.equal(eff.tts.api.model, 'elevenlabs/eleven-flash-v2.5')
+  assert.equal(eff.stt.api.baseUrl, 'https://openrouter.ai/api/v1')
+  assert.equal(eff.stt.api.apiKey, providerKey)
+  // provedor apagado → volta aos campos próprios (endpoint avulso)
+  r.providersRepo.delete(p.id)
+  const after = v.getVoiceSettings()
+  assert.equal(after.tts.api.apiKey, '')
+  assert.equal(after.stt.api.baseUrl, 'https://api.groq.com/openai/v1')
+  // limpa para os demais testes
+  v.setVoiceSetting('ttsSettings', { backend: 'local' })
+  v.setVoiceSetting('sttSettings', {})
+})
+
+test('resolveVoiceEndpoint: puro — sem providerId/provedor sem baseUrl mantém o avulso', async () => {
+  const { resolveVoiceEndpoint } = await voice()
+  const api = { providerId: null, baseUrl: 'https://a/v1', apiKey: 'k', model: 'm' }
+  assert.equal(
+    resolveVoiceEndpoint(api, () => ({ baseUrl: 'x', apiKey: 'y' })),
+    api
+  )
+  const withId = { ...api, providerId: 'p1' }
+  assert.deepEqual(
+    resolveVoiceEndpoint(withId, () => null),
+    withId
+  )
+  assert.deepEqual(
+    resolveVoiceEndpoint(withId, () => ({ baseUrl: ' ', apiKey: 'y' })),
+    withId
+  )
+  assert.deepEqual(
+    resolveVoiceEndpoint(withId, () => ({ baseUrl: 'https://p/v1', apiKey: ' s ' })),
+    {
+      ...withId,
+      baseUrl: 'https://p/v1',
+      apiKey: 's'
+    }
+  )
+})

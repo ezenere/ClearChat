@@ -11,6 +11,7 @@ import {
   DEFAULT_INTERJECTION_POLICY,
   DEFAULT_STT_SETTINGS,
   DEFAULT_TTS_SETTINGS,
+  DEFAULT_FILLER_POOL,
   DEFAULT_VOICE_CALL_DEFAULTS,
   type InterjectionPolicy
 } from '@shared/voice'
@@ -185,8 +186,8 @@ function speakTurn(h: Harness, text: string): void {
 
 // ---------------- política pura: fillers ----------------
 
-test('fillerShouldFire: limiar de FILLER_DELAY_MS (1200 ms), tools disparam já, 1 por turno', () => {
-  assert.equal(FILLER_DELAY_MS, 1200, 'limiar documentado: ~1,2 s')
+test('fillerShouldFire: limiar de FILLER_DELAY_MS (250 ms; 0 = já), tools disparam já, 1 por turno', () => {
+  assert.equal(FILLER_DELAY_MS, 250, 'preâmbulo logo depois do turno: ~250 ms')
   const base: FillerState = {
     ...EMPTY_FILLER_STATE,
     turnStartedAt: 1000,
@@ -218,6 +219,9 @@ test('fillerShouldFire: limiar de FILLER_DELAY_MS (1200 ms), tools disparam já,
     'sem turno em andamento'
   )
   assert.equal(fillerShouldFire(base, 1000 + 50, 50), true, 'delayMs configurável')
+  // bug antigo: 0 virava 1200 e o filler nunca saía na hora
+  assert.equal(fillerShouldFire(base, 1000, 0), true, 'delayMs 0 = já')
+  assert.equal(fillerShouldFire(base, 1000, -5), false, 'negativo → o padrão')
 })
 
 test('pickClipVariant: uniforme 1..3, rotação sem repetir a última, rng lixo é aparado', () => {
@@ -265,11 +269,14 @@ test('pickClipVariant: uniforme 1..3, rotação sem repetir a última, rng lixo 
 
 // ---------------- fillers no turno mockado ----------------
 
-test('filler: resposta muda por ~delay toca UM clipe FILLER; a 1ª sentença o cancela', async () => {
+/** Fala longa o bastante para ganhar preâmbulo (fala curta — "oi", "valeu" — não ganha). */
+const LONG = 'me conta como funciona o cache de disco'
+
+test('filler: preâmbulo logo depois do turno; a 1ª sentença NÃO o corta (espera na fila)', async () => {
   const h = harness({ fillerDelayMs: 25 })
-  speakTurn(h, 'algo')
-  h.emit(userMsg('algo')) // o runner persiste a mensagem do usuário (rearma o filler, como no real)
-  assert.deepEqual(h.sent, ['algo'])
+  speakTurn(h, LONG)
+  h.emit(userMsg(LONG)) // o runner persiste a mensagem do usuário (rearma o filler, como no real)
+  assert.deepEqual(h.sent, [LONG])
   await waitFor(() => h.emitted.length > 0, 2000, 'filler emitido')
   assert.equal(h.emitted[0].kind, 'filler')
   assert.equal(
@@ -278,12 +285,12 @@ test('filler: resposta muda por ~delay toca UM clipe FILLER; a 1ª sentença o c
     'o clipe tocado é o sorteado'
   )
 
-  // a resposta começa → a utterance do filler é cancelada e a sentença toca
+  // a resposta começa → a sentença entra na fila DEPOIS do preâmbulo; nada é cancelado
   h.emit(draft('Primeira frase.'))
   h.emit(assistantMsg('Primeira frase.'))
   await waitFor(() => h.emitted.length > 1, 2000, 'sentença emitida')
   assert.equal(h.emitted[1].kind, 'sentence')
-  assert.deepEqual(h.cancelled, [h.emitted[0].id], 'começo da resposta cancela o filler')
+  assert.deepEqual(h.cancelled, [], 'o preâmbulo nunca é cortado pela resposta')
 
   // máximo 1 por turno (o tempo segue passando e nada mais sai)
   await sleep(80)
@@ -293,7 +300,7 @@ test('filler: resposta muda por ~delay toca UM clipe FILLER; a 1ª sentença o c
 
 test('filler: resposta rápida (1ª sentença antes do limiar) não toca filler', async () => {
   const h = harness({ fillerDelayMs: 40 })
-  speakTurn(h, 'algo')
+  speakTurn(h, LONG)
   h.emit(draft('Resposta imediata.'))
   h.emit(assistantMsg('Resposta imediata.'))
   await waitFor(() => h.emitted.length > 0, 2000, 'sentença emitida')
@@ -304,9 +311,23 @@ test('filler: resposta rápida (1ª sentença antes do limiar) não toca filler'
   h.m.stop()
 })
 
+test('filler: fala curta ("valeu") não ganha preâmbulo; delay 0 sai já', async () => {
+  const h = harness({ fillerDelayMs: 0 })
+  speakTurn(h, 'valeu')
+  await sleep(40)
+  assert.equal(h.clips.length, 0, 'fala curta: sem preâmbulo')
+  h.emit(assistantMsg('De nada.'))
+  await waitFor(() => h.emitted.length > 0, 2000, 'resposta')
+  h.m.playbackIdle()
+  h.emit(responseDone())
+  speakTurn(h, LONG)
+  await waitFor(() => h.emitted.some((u) => u.kind === 'filler'), 2000, 'delay 0 = já')
+  h.m.stop()
+})
+
 test('filler: tools em execução disparam o filler já (sem esperar o limiar)', async () => {
   const h = harness({ fillerDelayMs: 5000 })
-  speakTurn(h, 'algo')
+  speakTurn(h, LONG)
   h.emit(toolRunning(true))
   await waitFor(() => h.emitted.length > 0, 2000, 'filler emitido no tool-running')
   assert.equal(h.emitted[0].kind, 'filler')
@@ -317,14 +338,14 @@ test('filler: tools em execução disparam o filler já (sem esperar o limiar)',
 
 test('filler: fillers desligados não tocam; modo sombra decide mas não toca', async () => {
   const off = harness({ fillers: false, fillerDelayMs: 15 })
-  speakTurn(off, 'a')
+  speakTurn(off, LONG)
   await sleep(80)
   assert.equal(off.emitted.length, 0)
   assert.equal(off.clips.length, 0, 'desligado não carrega clipe')
   off.m.stop()
 
   const shadow = harness({ shadow: true, fillerDelayMs: 15 })
-  speakTurn(shadow, 'a')
+  speakTurn(shadow, LONG)
   await sleep(80)
   assert.equal(shadow.emitted.length, 0, 'sombra: não toca')
   assert.equal(shadow.clips.length, 1, 'sombra: decide (carrega o clipe que tocaria)')
@@ -335,29 +356,46 @@ test('filler: fillers desligados não tocam; modo sombra decide mas não toca', 
   shadow.m.stop()
 })
 
-test('filler: variante sorteada com rotação sem repetir a última entre turnos', async () => {
-  const h = harness({ fillerDelayMs: 15, rng: () => 0.99 }) // sorteio sempre na variante 3
-  speakTurn(h, 'um')
-  await waitFor(() => h.emitted.length > 0, 2000, '1º filler')
-  assert.equal(h.clips[0].n, 3)
-  // resposta termina e o turno seguinte vem: sorteou a última de novo → rotação para a 1
-  h.emit(assistantMsg('ok'))
-  await waitFor(() => h.emitted.some((u) => u.kind === 'sentence'), 2000, 'resposta falada')
-  h.m.playbackIdle() // a fila do renderer esvaziou (fim da reprodução)
-  h.emit(responseDone())
-  speakTurn(h, 'dois')
-  await waitFor(() => h.emitted.filter((u) => u.kind === 'filler').length > 1, 2000, '2º filler')
-  const fillerClips = h.clips.filter((c) => c.cls === 'FILLER')
-  assert.deepEqual(
-    fillerClips.map((c) => c.n),
-    [3, 1]
-  )
+test('filler: frase pelo contexto e sem repetir nenhuma das últimas 4 entre turnos', async () => {
+  const h = harness({ fillerDelayMs: 5, rng: () => 0 })
+  const used: number[] = []
+  const turns = [
+    'Qual é a diferença entre um processo e uma thread?',
+    'Qual é a capital da Austrália hoje em dia?',
+    'Lista os arquivos da pasta src agora.',
+    'Não, espera, eu quis dizer a outra pasta.',
+    'Quanto custa uma assinatura anual disso?',
+    'Quais são as opções de configuração do cache?'
+  ]
+  for (const t of turns) {
+    speakTurn(h, t)
+    await waitFor(
+      () => h.emitted.filter((u) => u.kind === 'filler').length > used.length,
+      2000,
+      `filler de "${t}"`
+    )
+    used.push(h.clips.filter((c) => c.cls === 'FILLER').at(-1)!.n)
+    h.emit(assistantMsg('Certo.'))
+    await waitFor(() => h.emitted.at(-1)?.kind === 'sentence', 2000, 'resposta')
+    h.m.playbackIdle()
+    h.emit(responseDone())
+  }
+  const pool = DEFAULT_FILLER_POOL
+  const ctxOf = (n: number): string[] => pool[n - 1].contexts
+  // pergunta → frase de pergunta; comando → de comando; correção → de correção
+  assert.ok(ctxOf(used[0]).includes('question'), pool[used[0] - 1].text)
+  assert.ok(ctxOf(used[2]).includes('command'), pool[used[2] - 1].text)
+  assert.ok(ctxOf(used[3]).includes('correction'), pool[used[3] - 1].text)
+  // nunca repete nenhuma das 4 anteriores
+  for (let i = 1; i < used.length; i++) {
+    assert.ok(!used.slice(Math.max(0, i - 4), i).includes(used[i]), `turno ${i}: ${used}`)
+  }
   h.m.stop()
 })
 
 test('filler: clipe ausente (não gerado) não toca nem erro; stop cancela filler tocando', async () => {
   const none = harness({ noClips: true, fillerDelayMs: 15 })
-  speakTurn(none, 'a')
+  speakTurn(none, LONG)
   await sleep(80)
   assert.equal(none.emitted.length, 0)
   assert.equal(none.m.state().error, null, 'clip ausente não é erro')
@@ -365,7 +403,7 @@ test('filler: clipe ausente (não gerado) não toca nem erro; stop cancela fille
 
   // stop no meio do filler: o clipe tocando é cancelado
   const h = harness({ fillerDelayMs: 15 })
-  speakTurn(h, 'a')
+  speakTurn(h, LONG)
   await waitFor(() => h.emitted.length > 0, 2000, 'filler emitido')
   h.m.stop()
   assert.deepEqual(h.cancelled, [h.emitted[0].id])
@@ -373,7 +411,7 @@ test('filler: clipe ausente (não gerado) não toca nem erro; stop cancela fille
 
 test('filler: carga de clipe em voo descartada quando a 1ª sentença chega primeiro', async () => {
   const h = harness({ fillerDelayMs: 15, gateClips: true })
-  speakTurn(h, 'a')
+  speakTurn(h, LONG)
   await waitFor(() => h.clips.length > 0, 2000, 'carga do clipe iniciada')
   // resposta chega ANTES do clipe resolver
   h.emit(draft('Cheguei primeiro.'))
@@ -427,11 +465,18 @@ test('UtteranceQueue.drop: cancela só a utterance alvo (tocando ou na fila)', (
 
 // ---------------- política pura: interjeições ----------------
 
-const P: InterjectionPolicy = { ...DEFAULT_INTERJECTION_POLICY }
+// política "legada" (todas as classes, p 0,8, cooldown 2,5 s) para os portões; os padrões novos
+// (backchannel discreto) têm teste próprio abaixo
+const P: InterjectionPolicy = {
+  ...DEFAULT_INTERJECTION_POLICY,
+  classes: ['ACK', 'AGREEMENT', 'ENCOURAGEMENT', 'THINKING'],
+  fireProbability: 0.8,
+  cooldownMs: 2500
+}
 const obs = (over: Partial<InterjectionObservation> = {}): InterjectionObservation => ({
   speechMs: 1000,
   pauseMs: 500,
-  tail: 'sim',
+  tail: 'aí eu fui lá e falei sim',
   observedAt: 1_000,
   ...over
 })
@@ -447,7 +492,7 @@ const rngSeq = (...vals: number[]): (() => number) => {
 }
 
 test('decideInterjection: portões — desligada, observação velha, fala curta, pausa curta, cooldown', () => {
-  // habilitada + tudo ok + rng 0 → dispara a classe da cauda ('sim' → AGREEMENT)
+  // habilitada + tudo ok + rng 0 → dispara a classe da cauda ('… sim' → AGREEMENT)
   const ok = decideInterjection(obs(), P, ctx(), rngSeq(0))
   assert.equal(ok.class, 'AGREEMENT')
   assert.equal(ok.class === 'AGREEMENT' && ok.variant >= 1, true)
@@ -514,7 +559,7 @@ test('decideInterjection/classifyInterjectionTail: cauda "?" evita THINKING; neg
   assert.equal(classifyInterjectionTail(''), 'ACK')
 
   assert.equal(
-    decideInterjection(obs({ tail: 'não sei não' }), P, ctx(), rngSeq(0)).reason,
+    decideInterjection(obs({ tail: 'eu fui e não sei não' }), P, ctx(), rngSeq(0)).reason,
     'tail-skip'
   )
   // `classes` filtra as permitidas: THINKING fora da lista não sai (e não vira outra classe)
@@ -523,7 +568,12 @@ test('decideInterjection/classifyInterjectionTail: cauda "?" evita THINKING; neg
     decideInterjection(obs({ tail: 'hum' }), onlyAgreement, ctx(), rngSeq(0)).reason,
     'class-filtered'
   )
-  const agr = decideInterjection(obs({ tail: 'sim, concordo' }), onlyAgreement, ctx(), rngSeq(0))
+  const agr = decideInterjection(
+    obs({ tail: 'foi bem assim, concordo' }),
+    onlyAgreement,
+    ctx(),
+    rngSeq(0)
+  )
   assert.equal(agr.class, 'AGREEMENT')
 })
 
@@ -724,7 +774,7 @@ test('backchannel: registra na timeline sem cancelar nada nem virar turno', asyn
   h.m.stop()
 })
 
-test('integração: fala com interjeição no meio + fase de resposta com filler (cancelado pela 1ª sentença)', async () => {
+test('integração: fala com interjeição no meio + preâmbulo na resposta (a 1ª sentença espera, sem corte)', async () => {
   const h = harness({ rng: () => 0, fillerDelayMs: 25 })
   // usuário falando: pausa no meio → interjeição ACK toca; depois o turno sai
   h.m.speechBegin()
@@ -734,7 +784,7 @@ test('integração: fala com interjeição no meio + fase de resposta com filler
   h.m.playbackIdle() // o clipe da interjeição terminou
   h.m.speechEnd()
   h.m.turn('então, sobre o relatório')
-  // resposta demora → filler; resposta começa → filler cancelado e a sentença toca
+  // resposta demora → preâmbulo; resposta começa → a sentença entra na fila depois dele
   await waitFor(() => h.emitted.some((u) => u.kind === 'filler'), 2000, 'filler')
   h.emit(draft('Claro. Segue o resumo.'))
   h.emit(assistantMsg('Claro. Segue o resumo.'))
@@ -744,7 +794,8 @@ test('integração: fala com interjeição no meio + fase de resposta com filler
     ['interjection', 'filler', 'sentence', 'sentence'],
     'ordem: interjeição → filler → resposta (2 sentenças)'
   )
-  assert.equal(h.cancelled.length, 1, 'o filler foi cancelado pela 1ª sentença')
+  assert.equal(h.cancelled.length, 0, 'o preâmbulo nunca é cortado pela resposta')
+  assert.equal(h.emitted[0].gain, 0.6, 'interjeição toca mais baixo (volume 0,6)')
   const kinds = h.timeline.map((e) => e.kind)
   assert.equal(
     kinds.filter((k) => k === 'decision').length,
@@ -752,7 +803,7 @@ test('integração: fala com interjeição no meio + fase de resposta com filler
     'decisões do filler e da interjeição'
   )
   assert.equal(kinds.includes('turn-sent'), true)
-  assert.equal(kinds.includes('clip-cancelled'), true)
+  assert.equal(kinds.includes('clip-cancelled'), false)
   assert.equal(kinds.includes('sentence-emitted'), true)
   h.m.stop()
 })

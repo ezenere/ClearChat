@@ -5,6 +5,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  applyVoiceCallChat,
+  resolveVoiceCallConfig,
   DEFAULT_AUDIO_INPUT,
   DEFAULT_INTERJECTION_POLICY,
   DEFAULT_STT_SETTINGS,
@@ -12,7 +14,14 @@ import {
   DEFAULT_TTS_SETTINGS,
   DEFAULT_VOICE_CALL_CONFIG,
   DEFAULT_VOICE_CALL_DEFAULTS,
-  INTERJECTION_CLASSES,
+  DEFAULT_INTERJECTION_CLASSES,
+  DEFAULT_FILLER_POOL,
+  DEFAULT_TURN_TIMING,
+  DEFAULT_VOICE_BASE_PROMPT,
+  FILLER_POOL_MAX,
+  normalizeFillerPool,
+  resolveFillerPool,
+  resolveTurnTiming,
   normalizeAudioInput,
   normalizeInterjectionPolicy,
   normalizeSttSettings,
@@ -171,7 +180,7 @@ test('enabled: null ≠ false (null herda o padrão global)', () => {
   assert.equal(normalizeVoiceCallConfig({ interjections: null }).interjections, null)
   assert.deepEqual(normalizeVoiceCallConfig({ interjections: {} }).interjections, {
     ...DEFAULT_INTERJECTION_POLICY,
-    classes: [...INTERJECTION_CLASSES]
+    classes: [...DEFAULT_INTERJECTION_CLASSES]
   })
 })
 
@@ -215,13 +224,15 @@ test('voiceCallConfig: campos desconhecidos descartados; params preservam as cha
   )
 })
 
-test('interjeições: classes vazias recebem o padrão (todas); valores com significado próprio preservados', () => {
-  assert.deepEqual(normalizeInterjectionPolicy({ classes: [] }).classes, [...INTERJECTION_CLASSES])
+test('interjeições: classes vazias recebem o padrão (só ACK); valores com significado próprio preservados', () => {
+  assert.deepEqual(normalizeInterjectionPolicy({ classes: [] }).classes, [
+    ...DEFAULT_INTERJECTION_CLASSES
+  ])
   assert.deepEqual(normalizeInterjectionPolicy({ classes: ['WAT', 'THINKING'] }).classes, [
     'THINKING'
   ])
   assert.deepEqual(normalizeInterjectionPolicy({ classes: 'wat' }).classes, [
-    ...INTERJECTION_CLASSES
+    ...DEFAULT_INTERJECTION_CLASSES
   ])
   const p = normalizeInterjectionPolicy({
     enabled: true,
@@ -238,13 +249,18 @@ test('interjeições: classes vazias recebem o padrão (todas); valores com sign
     fireProbability: 0,
     minSpeechMs: 0,
     minPauseMs: 250,
-    classes: [...INTERJECTION_CLASSES]
+    classes: [...DEFAULT_INTERJECTION_CLASSES],
+    volume: 0.6
   })
   // fora de [0, 1] é aparado; inválido → padrão
   assert.equal(normalizeInterjectionPolicy({ fireProbability: 1.5 }).fireProbability, 1)
   assert.equal(normalizeInterjectionPolicy({ fireProbability: -1 }).fireProbability, 0)
-  assert.equal(normalizeInterjectionPolicy({ fireProbability: 'x' }).fireProbability, 0.8)
-  assert.equal(normalizeInterjectionPolicy({ cooldownMs: -5 }).cooldownMs, 2500)
+  assert.equal(normalizeInterjectionPolicy({ fireProbability: 'x' }).fireProbability, 0.5)
+  assert.equal(normalizeInterjectionPolicy({ cooldownMs: -5 }).cooldownMs, 5000)
+  // backchannel discreto: só ACK ("Uhum."/"Aham."), cooldown 5 s, probabilidade 0,5, volume 0,6
+  assert.deepEqual(DEFAULT_INTERJECTION_POLICY.classes, ['ACK'])
+  assert.equal(normalizeInterjectionPolicy({ volume: 2 }).volume, 1)
+  assert.equal(normalizeInterjectionPolicy({ volume: 'x' }).volume, 0.6)
 })
 
 test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', () => {
@@ -261,8 +277,19 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
       cooldownMs: 1000,
       classes: ['ACK']
     },
-    fillers: { enabled: true, prompt: 'fale "ãh"' },
-    turn: { silenceStopMs: null }
+    fillers: { enabled: true, prompt: 'fale "ãh"', delayMs: 250, pool: null },
+    turn: {
+      silenceStopMs: null,
+      adaptive: true,
+      speculativeAtMs: 250,
+      completeSilenceMs: 600,
+      statementSilenceMs: 1200,
+      unfinishedSilenceMs: 1500,
+      speculativeApi: false
+    },
+    maxTokens: 120,
+    basePromptEnabled: true,
+    basePrompt: null
   })
   assert.deepEqual(normalizeVoiceCallDefaults({ fillers: null }), DEFAULT_VOICE_CALL_DEFAULTS)
   // false explícito no fillers global vale (não vira o padrão ligado)
@@ -289,7 +316,7 @@ test('PRESET_FIELDS contém voice e sanitizePresetConfig copia voice normalizado
     interjections: {
       ...DEFAULT_INTERJECTION_POLICY,
       enabled: true,
-      classes: [...INTERJECTION_CLASSES]
+      classes: [...DEFAULT_INTERJECTION_CLASSES]
     }
   })
   // voice lixo → config vazia (tudo herda); voice ausente não entra
@@ -305,4 +332,100 @@ test('PRESET_FIELDS contém voice e sanitizePresetConfig copia voice normalizado
     extraction: { auto: false, prompt: null, providerId: null, model: null },
     subagents: false
   })
+})
+
+// ---------------- fim de turno adaptativo / preâmbulos / prompt-base ----------------
+
+test('resolveTurnTiming: padrões e coerência (completa ≤ afirmação ≤ inacabada; fallback no meio)', () => {
+  assert.deepEqual(DEFAULT_TURN_TIMING, {
+    adaptive: true,
+    speculativeAtMs: 250,
+    completeMs: 600,
+    statementMs: 1200,
+    unfinishedMs: 1500,
+    fallbackMs: 1000
+  })
+  // silenceStopMs alto (2 s) puxa o teto; completo nunca passa do fallback
+  const t = resolveTurnTiming({
+    ...DEFAULT_VOICE_CALL_DEFAULTS.turn,
+    silenceStopMs: 2000,
+    completeSilenceMs: 3000
+  })
+  assert.equal(t.fallbackMs, 2000)
+  assert.equal(t.unfinishedMs, 2000)
+  assert.ok(t.completeMs <= t.statementMs && t.statementMs <= t.unfinishedMs)
+  assert.ok(t.speculativeAtMs < t.completeMs)
+  // lixo → padrões
+  assert.deepEqual(resolveTurnTiming(null), DEFAULT_TURN_TIMING)
+  assert.equal(
+    normalizeVoiceCallDefaults({ turn: { completeSilenceMs: -1, adaptive: 'x' } }).turn
+      .completeSilenceMs,
+    600
+  )
+  assert.equal(normalizeVoiceCallDefaults({ turn: { adaptive: false } }).turn.adaptive, false)
+})
+
+test('pool de preâmbulos: normalização (texto aparado, contextos filtrados, teto), null = padrão', () => {
+  assert.equal(normalizeFillerPool(null), null)
+  assert.equal(normalizeFillerPool([]), null)
+  assert.equal(normalizeFillerPool([{ text: '  ' }]), null)
+  assert.deepEqual(
+    normalizeFillerPool([{ text: ' Hum,  deixa eu ver. ', contexts: ['question', 'wat'] }, 7]),
+    [{ text: 'Hum, deixa eu ver.', contexts: ['question'] }]
+  )
+  const many = Array.from({ length: 40 }, (_, i) => ({ text: `Frase ${i}.`, contexts: [] }))
+  assert.equal(normalizeFillerPool(many)?.length, FILLER_POOL_MAX)
+  assert.deepEqual(
+    resolveFillerPool(null).map((f) => f.text),
+    DEFAULT_FILLER_POOL.map((f) => f.text)
+  )
+  // padrão: frases por extenso (nada de "Hmm"/"Hum..." soltos), todos os contextos cobertos
+  for (const f of DEFAULT_FILLER_POOL) {
+    assert.ok(!/\bhmm\b/i.test(f.text) && !/\.\.\.|…/.test(f.text), f.text)
+    assert.ok(f.text.split(/\s+/).length <= 6, `curta: ${f.text}`)
+  }
+  for (const c of ['question', 'command', 'correction', 'complex', 'generic'])
+    assert.ok(
+      DEFAULT_FILLER_POOL.some((f) => f.contexts.includes(c as never)),
+      c
+    )
+  // pool global normalizado nos padrões; 0 de espera é válido
+  const d = normalizeVoiceCallDefaults({ fillers: { delayMs: 0, pool: [{ text: 'Tá.' }] } })
+  assert.equal(d.fillers.delayMs, 0)
+  assert.deepEqual(d.fillers.pool, [{ text: 'Tá.', contexts: [] }])
+})
+
+test('applyVoiceCallChat: prompt-base do modo voz + voicePrompt; max_tokens só sem teto/raciocínio', () => {
+  const chat = {
+    id: 'c1',
+    config: { systemPrompt: 'Você é útil.', params: {} }
+  } as unknown as Parameters<typeof applyVoiceCallChat>[0]
+  const base = resolveVoiceCallConfig({ voicePrompt: 'Fale como pirata.' } as never, null)
+  const out = applyVoiceCallChat(chat, base)
+  assert.equal(
+    out.config.systemPrompt,
+    `Você é útil.\n\n${DEFAULT_VOICE_BASE_PROMPT}\n\nFale como pirata.`
+  )
+  assert.match(DEFAULT_VOICE_BASE_PROMPT, /SRC/)
+  assert.equal(out.config.params?.max_tokens, 120)
+  // raciocínio ligado ou max_tokens próprio: o teto não entra
+  const withEffort = applyVoiceCallChat(
+    { ...chat, config: { ...chat.config, params: { reasoning_effort: 'low' } } } as never,
+    base
+  )
+  assert.equal(withEffort.config.params?.max_tokens, undefined)
+  const own = applyVoiceCallChat(
+    { ...chat, config: { ...chat.config, params: { max_tokens: 500 } } } as never,
+    base
+  )
+  assert.equal(own.config.params?.max_tokens, 500)
+  // prompt-base desligado e teto 0 → só o voicePrompt, sem max_tokens
+  const off = resolveVoiceCallConfig({ voicePrompt: 'X.' } as never, {
+    ...DEFAULT_VOICE_CALL_DEFAULTS,
+    basePromptEnabled: false,
+    maxTokens: 0
+  })
+  const o2 = applyVoiceCallChat(chat, off)
+  assert.equal(o2.config.systemPrompt, 'Você é útil.\n\nX.')
+  assert.equal(o2.config.params?.max_tokens, undefined)
 })

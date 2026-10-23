@@ -19,6 +19,7 @@ import {
   requireString,
   resolveReadPath,
   resolveToolPath,
+  voicePathFallback,
   type ToolContext,
   type ToolResult
 } from './util'
@@ -28,7 +29,9 @@ export async function listDir(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const dir = await resolveToolPath(ctx, args.path)
+  // turno de voz: "SRC" (erro de caixa do STT) acha "src" dentro do diretório raiz
+  const fixed = await voicePathFallback(ctx, await resolveToolPath(ctx, args.path))
+  const dir = fixed.path
   const dirents = await fs.readdir(dir, { withFileTypes: true })
   const entries = await Promise.all(
     dirents.map(async (d) => {
@@ -53,7 +56,7 @@ export async function listDir(
       : `${e.name}${e.link ? ' (link)' : ''}  (${fmtSize(e.size)})`
   )
   const nDirs = entries.filter((e) => e.isDir).length
-  let out = `${dir}  [${fmtNum(nDirs)} pastas, ${fmtNum(entries.length - nDirs)} arquivos]\n${lines.length ? lines.join('\n') : '(vazio)'}`
+  let out = `${fixed.note}${dir}  [${fmtNum(nDirs)} pastas, ${fmtNum(entries.length - nDirs)} arquivos]\n${lines.length ? lines.join('\n') : '(vazio)'}`
   if (entries.length > shown.length)
     out += `\n[… mais ${fmtNum(entries.length - shown.length)} entradas omitidas (limite ${max}). Use find_files ou search_files para localizar arquivos em pastas grandes.]`
   return ok(out)
@@ -155,12 +158,22 @@ export async function readFile(
   args: Record<string, unknown>,
   ctx: ToolContext
 ): Promise<ToolResult> {
-  const r = await readFileImpl(args, ctx)
+  // turno de voz: caminho com a caixa errada pelo STT ("SRC/Main.ts") acha a grafia real no root
+  const fixed = await voicePathFallback(
+    ctx,
+    await resolveReadPath(ctx, requireString(args, 'path'))
+  )
+  const r = await readFileImpl(args, ctx, fixed.path)
+  if (fixed.note && typeof r.content === 'string')
+    return { ...r, content: fixed.note + r.content, noSpill: true }
   return { ...r, noSpill: true }
 }
 
-async function readFileImpl(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-  const path = await resolveReadPath(ctx, requireString(args, 'path'))
+async function readFileImpl(
+  args: Record<string, unknown>,
+  ctx: ToolContext,
+  path: string
+): Promise<ToolResult> {
   const shown = displayPath(ctx.cwd, path)
   const st = await fs.stat(path)
   if (st.isDirectory()) return fail(`Erro: "${shown}" é um diretório (use list_dir).`)

@@ -53,6 +53,7 @@ import { sessionProviderId } from '@shared/models'
 import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
 import { clampToolOutput, LIMITS, TOOL_SPILL_SETTING } from '@shared/limits'
 import { applyVoiceCallChat } from '@shared/voice'
+import { spokenPrefix } from '@shared/voiceTurn'
 import {
   interChatHeader,
   interChatText,
@@ -1677,6 +1678,8 @@ async function executeTool(
     const r = await runLocalTool(name, args, {
       cwd: root,
       confine: chat.config.confineToRoot !== false,
+      // turno de chamada de voz: list_dir/read_file toleram erro de caixa do STT no caminho
+      ...(call ? { voicePaths: true } : {}),
       maxOutput: toolOutputLimit(chat, session),
       // saída grande → userData/tool-outputs/<chat>/<toolCallId>.txt (setting global do dispositivo)
       spillChars: settingsRepo.get<number>(TOOL_SPILL_SETTING) ?? undefined,
@@ -2946,6 +2949,82 @@ export async function stop(sessionId: string): Promise<void> {
   if (st.forced.length) requeueFront(sessionId, st.forced.splice(0))
   st.controller.abort()
   await waitDone(st)
+}
+
+// ---------------- chamada de voz: turno interrompido (SPEC → "Turno continuado") ----------------
+
+/** Entrada de `amendVoiceTurn`. */
+export interface VoiceTurnAmend {
+  /** Mensagem do usuário que abriu o turno interrompido. */
+  userMessageId: string
+  /**
+   * Turno CONTINUADO (o usuário voltou a falar antes de ouvir qualquer resposta): apaga a mensagem
+   * do usuário e tudo depois dela (o chamador reenviará o texto unido). Ignorado (vira `false`)
+   * quando o turno já executou tools — o histórico das tools fica (efeitos reais aconteceram).
+   */
+  dropUser: boolean
+  /**
+   * Sentenças efetivamente FALADAS por mensagem do assistente (id → sentenças, na ordem). Função =
+   * avaliada depois de parar o turno (a resposta em streaming só vira mensagem no abort).
+   */
+  spoken: Record<string, string[]> | (() => Record<string, string[]>)
+}
+
+/**
+ * Chamada de voz: para o turno em andamento (se rodando) e ajusta o histórico ao que o usuário
+ * OUVIU — nenhuma resposta nunca falada fica no histórico (o modelo "acharia" que disse).
+ * - `dropUser` (turno continuado, sem tools): apaga a mensagem do usuário e tudo depois dela;
+ * - senão, para cada assistente depois dela: sem nada falado e sem tool_calls → apagada; com parte
+ *   falada → conteúdo truncado ao prefixo falado (`spokenPrefix`) com `interrupted: true`; com
+ *   tool_calls → as chamadas ficam (pareadas com os resultados) e o texto é truncado ao falado.
+ * Tools sem resposta ganham o resultado sintético cancelado (`repairTail`). Idempotente.
+ */
+export async function amendVoiceTurn(
+  sessionId: string,
+  input: VoiceTurnAmend
+): Promise<{ removed: number; truncated: number }> {
+  if (runs.has(sessionId)) await stop(sessionId)
+  const spokenBy = typeof input.spoken === 'function' ? input.spoken() : input.spoken
+  const path = messagesRepo.path(sessionId)
+  const idx = path.findIndex((m) => m.id === input.userMessageId)
+  if (idx < 0 || path[idx].message.role !== 'user') return { removed: 0, truncated: 0 }
+  const after = path.slice(idx + 1)
+  const usedTools = after.some(
+    (m) =>
+      m.message.role === 'tool' ||
+      (m.message.role === 'assistant' && (m.message.tool_calls?.length ?? 0) > 0)
+  )
+  let removed = 0
+  let truncated = 0
+  if (input.dropUser && !usedTools) {
+    for (const m of [...after].reverse()) {
+      await deleteMessage(m.id)
+      removed++
+    }
+    await deleteMessage(input.userMessageId)
+    return { removed: removed + 1, truncated }
+  }
+  for (const m of after) {
+    if (m.message.role !== 'assistant' || isDisplayOnly(m.meta)) continue
+    const content = typeof m.message.content === 'string' ? m.message.content : ''
+    const spoken = spokenPrefix(content, spokenBy[m.id] ?? [])
+    const hasCalls = (m.message.tool_calls?.length ?? 0) > 0
+    if (!spoken.trim() && !hasCalls) {
+      await deleteMessage(m.id)
+      removed++
+      continue
+    }
+    if (spoken === content) continue
+    const updated = messagesRepo.update(
+      m.id,
+      { ...m.message, content: hasCalls && !spoken ? null : spoken },
+      { ...m.meta, interrupted: true }
+    )
+    emit({ type: 'message-updated', message: updated })
+    truncated++
+  }
+  repairTail(sessionId)
+  return { removed, truncated }
 }
 
 // ---------------- versões da conversa (ramos — src/shared/branches.ts) ----------------

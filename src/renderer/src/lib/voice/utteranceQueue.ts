@@ -1,8 +1,10 @@
 // Fila de utterances da chamada de voz (renderer): toca os bytes wav/mp3 das sentenças na ordem,
 // SEM sobreposição, com estados `idle`/`playing`. Barge-in = `cancel()` (pausa o atual e descarta
 // a fila). O player é injetável (testes usam fake; a fábrica padrão é `new Audio` com blob URL,
-// liberado ao terminar). Ver SPEC.md → "Áudio → Chamada de voz (meia-duplex)".
-import type { VoiceCallUtteranceEvent } from '@shared/ipc'
+// liberado ao terminar). Utterances em streaming (`streaming: true`, `audio/pcm;rate=N` — TTS de API
+// com PCM progressivo) tocam pela Web Audio conforme os pedaços chegam (`pushChunk`).
+// Ver SPEC.md → "Áudio → Chamada de voz (meia-duplex)" e "Serviço de TTS → Streaming na chamada".
+import type { VoiceCallUtteranceChunkEvent, VoiceCallUtteranceEvent } from '@shared/ipc'
 
 export type UtteranceState = 'idle' | 'playing'
 
@@ -20,8 +22,64 @@ export interface UtterancePlayer {
   dispose?(): void
 }
 
-/** Fábrica de player por utterance (bytes + mime → player pronto para `play`). */
-export type PlayerFactory = (audio: Uint8Array, mime: string) => UtterancePlayer
+/**
+ * Pedaços PCM16 de uma utterance em streaming: o começo (`audio` do evento) + o que chegar por
+ * `voice:call:utterance-chunk`. Quem assina recebe o que já chegou e depois o resto, ao vivo.
+ */
+export class PcmStreamSource {
+  readonly sampleRate: number
+  #chunks: Uint8Array[] = []
+  #ended = false
+  #listener: { chunk: (pcm: Uint8Array) => void; end: () => void } | null = null
+
+  constructor(sampleRate: number, first?: Uint8Array) {
+    this.sampleRate = sampleRate
+    if (first?.length) this.#chunks.push(first)
+  }
+
+  get ended(): boolean {
+    return this.#ended
+  }
+
+  push(pcm: Uint8Array): void {
+    if (this.#ended || !pcm.length) return
+    this.#chunks.push(pcm)
+    this.#listener?.chunk(pcm)
+  }
+
+  end(): void {
+    if (this.#ended) return
+    this.#ended = true
+    this.#listener?.end()
+  }
+
+  /** Assina (um ouvinte): repassa o que já chegou e segue ao vivo; devolve o cancelamento. */
+  subscribe(chunk: (pcm: Uint8Array) => void, end: () => void): () => void {
+    this.#listener = { chunk, end }
+    for (const c of this.#chunks) chunk(c)
+    if (this.#ended) end()
+    return () => {
+      if (this.#listener?.chunk === chunk) this.#listener = null
+    }
+  }
+}
+
+/** Taxa do `audio/pcm;rate=N` (null = não é PCM cru). */
+export function pcmRateOf(mime: string): number | null {
+  const m = /^audio\/pcm\b.*?\brate=(\d+)/i.exec(mime)
+  const n = m ? Number(m[1]) : NaN
+  return Number.isInteger(n) && n > 0 ? n : null
+}
+
+/**
+ * Fábrica de player por utterance (bytes + mime → player pronto para `play`). Utterance em
+ * streaming chega com o `stream` (PCM16 aos pedaços) — `audio` é só o começo.
+ */
+export type PlayerFactory = (
+  audio: Uint8Array,
+  mime: string,
+  stream?: PcmStreamSource
+) => UtterancePlayer
 
 /** Player padrão: blob URL + `new Audio` (sem dependências; liberado no `dispose`). */
 class DomAudioPlayer implements UtterancePlayer {
@@ -64,7 +122,170 @@ class DomAudioPlayer implements UtterancePlayer {
   }
 }
 
-export function domPlayerFactory(audio: Uint8Array, mime: string): UtterancePlayer {
+/** Antecedência do agendamento na Web Audio (s) — absorve o jitter entre pedaços. */
+const PCM_LEAD_S = 0.03
+
+let sharedAudioContext: AudioContext | null = null
+function audioContext(): AudioContext {
+  if (!sharedAudioContext || sharedAudioContext.state === 'closed')
+    sharedAudioContext = new AudioContext()
+  return sharedAudioContext
+}
+
+/**
+ * Player de PCM16 em streaming pela Web Audio: cada pedaço vira um `AudioBufferSourceNode`
+ * agendado em sequência (sem lacunas enquanto os pedaços chegam antes da hora); termina quando o
+ * stream acabou e o último trecho tocou. Volume por `GainNode`.
+ */
+class WebAudioPcmPlayer implements UtterancePlayer {
+  onended: (() => void) | null = null
+  onerror: (() => void) | null = null
+  readonly #source: PcmStreamSource
+  #ctx: AudioContext | null = null
+  #gain: GainNode | null = null
+  #volume = 1
+  #next = 0
+  #nodes = new Set<AudioBufferSourceNode>()
+  #unsubscribe: (() => void) | null = null
+  #streamEnded = false
+  #finished = false
+  #stopped = false
+
+  constructor(source: PcmStreamSource) {
+    this.#source = source
+  }
+
+  get volume(): number {
+    return this.#volume
+  }
+
+  set volume(v: number) {
+    this.#volume = v
+    if (this.#gain) this.#gain.gain.value = v
+  }
+
+  async play(): Promise<void> {
+    const ctx = audioContext()
+    this.#ctx = ctx
+    const gain = ctx.createGain()
+    gain.gain.value = this.#volume
+    gain.connect(ctx.destination)
+    this.#gain = gain
+    if (ctx.state === 'suspended') await ctx.resume()
+    if (this.#stopped) return
+    this.#unsubscribe = this.#source.subscribe(
+      (pcm) => this.#schedule(pcm),
+      () => {
+        this.#streamEnded = true
+        this.#check()
+      }
+    )
+  }
+
+  #schedule(pcm: Uint8Array): void {
+    const ctx = this.#ctx
+    const gain = this.#gain
+    if (!ctx || !gain || this.#stopped) return
+    const n = pcm.length >> 1
+    if (!n) return
+    const view = new DataView(pcm.buffer, pcm.byteOffset, n * 2)
+    const buffer = ctx.createBuffer(1, n, this.#source.sampleRate)
+    const ch = buffer.getChannelData(0)
+    for (let i = 0; i < n; i++) ch[i] = view.getInt16(i * 2, true) / 0x8000
+    const node = ctx.createBufferSource()
+    node.buffer = buffer
+    node.connect(gain)
+    // contíguo enquanto o próximo pedaço chega antes da hora; atrasou (underrun) → recomeça já
+    const at = Math.max(this.#next, ctx.currentTime + PCM_LEAD_S)
+    node.start(at)
+    this.#next = at + buffer.duration
+    this.#nodes.add(node)
+    node.onended = () => {
+      this.#nodes.delete(node)
+      this.#check()
+    }
+  }
+
+  #check(): void {
+    if (this.#finished || this.#stopped || !this.#streamEnded || this.#nodes.size) return
+    this.#finished = true
+    this.onended?.()
+  }
+
+  pause(): void {
+    this.#stopped = true
+    this.#unsubscribe?.()
+    this.#unsubscribe = null
+    for (const node of this.#nodes) {
+      node.onended = null
+      try {
+        node.stop()
+      } catch {
+        /* ainda não começou / já parou */
+      }
+    }
+    this.#nodes.clear()
+  }
+
+  dispose(): void {
+    this.pause()
+    this.#gain?.disconnect()
+    this.#gain = null
+  }
+}
+
+/** Ganho relativo da utterance (`gain` 0..1; ausente/lixo = 1). */
+function gainOf(u: VoiceCallUtteranceEvent | null): number {
+  const g = u?.gain
+  return typeof g === 'number' && Number.isFinite(g) ? Math.min(1, Math.max(0, g)) : 1
+}
+
+/**
+ * Para um player: na hora (`fadeMs` 0) ou com rampa linear de volume até 0 em `fadeMs` (passos de
+ * ~10 ms) — clipe/frase interrompidos nunca cortam seco no meio da palavra.
+ */
+function stopPlayer(player: UtterancePlayer, fadeMs: number): void {
+  const finish = (): void => {
+    try {
+      player.pause()
+    } catch {
+      /* player já parado */
+    }
+    player.dispose?.()
+  }
+  if (!(fadeMs > 0) || typeof setInterval !== 'function') return finish()
+  const start = player.volume
+  const steps = Math.max(1, Math.round(fadeMs / 10))
+  let i = 0
+  const timer = setInterval(() => {
+    i++
+    try {
+      player.volume = Math.max(0, start * (1 - i / steps))
+    } catch {
+      /* player sem volume ajustável */
+    }
+    if (i >= steps) {
+      clearInterval(timer)
+      finish()
+    }
+  }, fadeMs / steps)
+}
+
+export function domPlayerFactory(
+  audio: Uint8Array,
+  mime: string,
+  stream?: PcmStreamSource
+): UtterancePlayer {
+  const rate = pcmRateOf(mime)
+  if (rate !== null) {
+    // PCM cru: streaming (pedaços chegando) ou um bloco só, fechado
+    let source = stream
+    if (!source) {
+      source = new PcmStreamSource(rate, audio)
+      source.end()
+    }
+    return new WebAudioPcmPlayer(source)
+  }
   return new DomAudioPlayer(audio, mime)
 }
 
@@ -87,6 +308,8 @@ export class UtteranceQueue {
   #onState: ((state: UtteranceState) => void) | undefined
   #onItem: ((e: { item: VoiceCallUtteranceEvent; phase: 'start' | 'end' }) => void) | undefined
   #queue: VoiceCallUtteranceEvent[] = []
+  /** Pedaços das utterances em streaming (por id), da chegada até o fim do stream. */
+  #streams = new Map<string, PcmStreamSource>()
   #current: UtterancePlayer | null = null
   #currentItem: VoiceCallUtteranceEvent | null = null
   #state: UtteranceState = 'idle'
@@ -107,6 +330,16 @@ export class UtteranceQueue {
     return this.#queue.length
   }
 
+  /** A utterance tocando agora (null = nada). */
+  get current(): VoiceCallUtteranceEvent | null {
+    return this.#currentItem
+  }
+
+  /** Ids das utterances aguardando (na ordem; sem a que está tocando). */
+  get queuedIds(): string[] {
+    return this.#queue.map((u) => u.id)
+  }
+
   /** Volume 0..1 (propagado ao player atual e aos seguintes). */
   get volume(): number {
     return this.#volume
@@ -114,29 +347,41 @@ export class UtteranceQueue {
 
   setVolume(volume: number): void {
     this.#volume = Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : 1
-    if (this.#current) this.#current.volume = this.#volume
+    if (this.#current) this.#current.volume = this.#volume * gainOf(this.#currentItem)
   }
 
   /** Enfileira uma utterance (bytes completos) — toca na ordem, sem sobreposição. */
   enqueue(utterance: VoiceCallUtteranceEvent): void {
+    const rate = utterance.streaming ? pcmRateOf(utterance.mime) : null
+    if (rate !== null) this.#streams.set(utterance.id, new PcmStreamSource(rate, utterance.audio))
     this.#queue.push(utterance)
     void this.#pump()
   }
 
-  /** Barge-in/parada: pausa o atual e descarta a fila (nada mais toca até o próximo enqueue). */
-  cancel(): void {
+  /**
+   * Próximo pedaço de uma utterance em streaming (`voice:call:utterance-chunk`): na fila ou
+   * tocando, o áudio é acrescentado; `done` fecha o stream. Id desconhecido (cancelada) = ignorado.
+   */
+  pushChunk(e: VoiceCallUtteranceChunkEvent): void {
+    const source = this.#streams.get(e.id)
+    if (!source) return
+    if (e.pcm?.length) source.push(e.pcm)
+    // a fonte fica no mapa até a utterance terminar de tocar (ou ser descartada): o player dela
+    // pode nem ter começado ainda
+    if (e.done) source.end()
+  }
+
+  /**
+   * Barge-in/parada: pausa o atual e descarta a fila (nada mais toca até o próximo enqueue).
+   * `fadeMs` > 0 = o atual sai com rampa de volume (sem corte seco no meio da palavra).
+   */
+  cancel(fadeMs = 0): void {
     this.#queue = []
+    this.#streams.clear()
     const cur = this.#current
     this.#current = null
     this.#currentItem = null
-    if (cur) {
-      try {
-        cur.pause()
-      } catch {
-        /* player já parado */
-      }
-      cur.dispose?.()
-    }
+    if (cur) stopPlayer(cur, fadeMs)
     this.#setState('idle')
   }
 
@@ -144,20 +389,14 @@ export class UtteranceQueue {
    * Cancela UMA utterance pelo id (ex.: filler interrompido pela 1ª sentença da resposta): na
    * fila → só descarta; tocando → pausa/limpa e avança para a seguinte. Id desconhecido = sem efeito.
    */
-  drop(id: string): void {
+  drop(id: string, fadeMs = 0): void {
     this.#queue = this.#queue.filter((u) => u.id !== id)
+    this.#streams.delete(id)
     if (this.#currentItem?.id !== id) return
     const cur = this.#current
     this.#current = null
     this.#currentItem = null
-    if (cur) {
-      try {
-        cur.pause()
-      } catch {
-        /* player já parado */
-      }
-      cur.dispose?.()
-    }
+    if (cur) stopPlayer(cur, fadeMs)
     if (!this.#queue.length) this.#setState('idle')
     else void this.#pump()
   }
@@ -178,13 +417,14 @@ export class UtteranceQueue {
       if (this.#current !== player) return
       this.#current = null
       this.#currentItem = null
+      this.#streams.delete(next.id)
       player?.dispose?.()
       if (started) this.#onItem?.({ item: next, phase: 'end' })
       if (!this.#queue.length) this.#setState('idle')
       void this.#pump()
     }
     try {
-      player = this.#factory(next.audio, next.mime)
+      player = this.#factory(next.audio, next.mime, this.#streams.get(next.id))
     } catch {
       // bytes ilegíveis: pula para a próxima (player/current continuam null → done avança)
       done()
@@ -192,7 +432,7 @@ export class UtteranceQueue {
     }
     this.#current = player
     this.#currentItem = next
-    player.volume = this.#volume
+    player.volume = this.#volume * gainOf(next)
     player.onended = done
     player.onerror = done
     started = true

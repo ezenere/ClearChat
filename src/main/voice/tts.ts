@@ -8,6 +8,7 @@
 import type { TtsLocalEngine, TtsSettings } from '@shared/voice'
 import { connectionErrorText } from '@shared/network'
 import { abortError } from '../tools/util'
+import { concatBytes, encodeWav, parsePcmContentType, Pcm16MonoAligner } from './wav'
 
 // ---------------- tipos ----------------
 
@@ -203,12 +204,85 @@ async function synthesizeLocal(
   return { ...r, backend: 'local' }
 }
 
-async function synthesizeApi(
+// ---------------- adaptador PCM (endpoints que não aceitam wav) ----------------
+
+/**
+ * `baseUrl`s que já recusaram `response_format: 'wav'` nesta execução (400 "expected one of
+ * mp3|pcm"): as próximas pedem `pcm` direto, sem a request perdida.
+ */
+const pcmOnlyEndpoints = new Set<string>()
+
+/** Zera o aprendizado de endpoints só-pcm (testes). */
+export function resetTtsPcmEndpoints(): void {
+  pcmOnlyEndpoints.clear()
+}
+
+/**
+ * O endpoint só aceita mp3/pcm em `/audio/speech`? OpenRouter (host `openrouter.ai`) sabidamente
+ * recusa wav; outros entram na lista depois do primeiro 400 que cita pcm/mp3.
+ */
+export function ttsEndpointWantsPcm(baseUrl: string): boolean {
+  if (pcmOnlyEndpoints.has(baseUrl)) return true
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'openrouter.ai' || host.endsWith('.openrouter.ai')
+  } catch {
+    return false
+  }
+}
+
+/** 400 de "formato não suportado" que oferece pcm (ex.: OpenRouter: "expected one of mp3|pcm"). */
+function rejectsWavForPcm(status: number, raw: string): boolean {
+  return status === 400 && /\bpcm\b/i.test(raw) && /mp3|format/i.test(raw)
+}
+
+/** Taxa assumida quando o endpoint devolve `audio/pcm` sem `rate` (o padrão do ElevenLabs/OpenAI). */
+const PCM_DEFAULT_RATE = 24_000
+
+/** Resposta 2xx com o corpo ainda não lido (o chamador lê inteiro ou em streaming). */
+interface SpeechResponse {
+  res: Response
+  url: string
+  model: string
+  t0: number
+  signal: AbortSignal
+  timeout: AbortSignal
+  timeoutMs: number
+  /** `response_format` efetivamente pedido. */
+  requested: string
+}
+
+function failure(
+  e: unknown,
+  opts: TtsSynthesizeOptions,
+  r: { timeout: AbortSignal; timeoutMs: number; url: string }
+): unknown {
+  if (opts.signal?.aborted) return abortError()
+  if (e instanceof TtsError) return e
+  if (r.timeout.aborted)
+    return new TtsError(
+      'timeout',
+      `tempo esgotado na síntese de fala (${r.timeoutMs / 1000} s) em ${r.url}`,
+      { backend: 'api', cause: e }
+    )
+  return new TtsError(
+    'network',
+    `erro de rede ao sintetizar fala em ${r.url}: ${connectionErrorText(e)}`,
+    { backend: 'api', cause: e }
+  )
+}
+
+/**
+ * POST `{baseUrl}/audio/speech` até uma resposta 2xx com áudio (corpo não lido). Pedido `wav` em
+ * endpoint só-pcm vira `pcm` (o chamador embrulha em WAV); 400 que recusa wav citando pcm/mp3 →
+ * repete UMA vez com `pcm` e lembra o endpoint. Erros → `TtsError`; abort → `AbortError`.
+ */
+async function requestSpeech(
   text: string,
   settings: TtsSettings,
   format: TtsFormat,
   opts: TtsSynthesizeOptions
-): Promise<TtsSynthesizeResult> {
+): Promise<SpeechResponse> {
   const api = settings.api
   const baseUrl = api.baseUrl.trim().replace(/\/+$/, '')
   const model = api.model.trim()
@@ -223,58 +297,242 @@ async function synthesizeApi(
   const timeoutMs = opts.timeoutMs ?? TTS_DEFAULT_TIMEOUT_MS
   const timeout = AbortSignal.timeout(timeoutMs)
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
-  // JSON `{ model, voice, input, response_format }` (voz ausente = a voz padrão da API)
-  const body: Record<string, string> = {
-    model,
-    input: text,
-    response_format: RESPONSE_FORMAT[format]
-  }
-  const voice = (api.voice ?? '').trim()
-  if (voice) body.voice = voice
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     Accept: 'audio/*'
   }
   if (key) headers.Authorization = `Bearer ${key}`
+  const voice = (api.voice ?? '').trim()
+  const ctx = { timeout, timeoutMs, url }
 
+  let requested = format === 'wav' && ttsEndpointWantsPcm(baseUrl) ? 'pcm' : RESPONSE_FORMAT[format]
   const t0 = Date.now()
-  let res: Response
+  for (let attempt = 0; ; attempt++) {
+    // JSON `{ model, voice, input, response_format }` (voz ausente = a voz padrão da API)
+    const body: Record<string, string> = { model, input: text, response_format: requested }
+    if (voice) body.voice = voice
+    let res: Response
+    try {
+      res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal })
+    } catch (e) {
+      throw failure(e, opts, ctx)
+    }
+    if (res.status >= 200 && res.status < 300) {
+      const contentType = (res.headers.get('content-type') ?? '').toLowerCase()
+      if (contentType.includes('application/json')) {
+        // 2xx sem áudio: corpo JSON é erro legível
+        try {
+          await res.arrayBuffer()
+        } catch {
+          /* corpo ilegível — o erro abaixo já diz o que veio */
+        }
+        throw new TtsError(
+          'http',
+          `resposta da API sem áudio (HTTP ${res.status} veio ${contentType})`,
+          {
+            backend: 'api',
+            status: res.status
+          }
+        )
+      }
+      return { res, url, model, t0, signal, timeout, timeoutMs, requested }
+    }
+    let raw: string
+    try {
+      raw = await res.text()
+    } catch (e) {
+      throw failure(e, opts, ctx)
+    }
+    if (attempt === 0 && requested === 'wav' && rejectsWavForPcm(res.status, raw)) {
+      pcmOnlyEndpoints.add(baseUrl)
+      requested = 'pcm'
+      continue
+    }
+    throw httpError(res.status, raw, url)
+  }
+}
+
+/** O corpo é PCM cru? (content-type `audio/pcm;rate=…`, ou `pcm` pedido sem content-type útil). */
+function pcmFormatOf(sp: SpeechResponse): { sampleRate: number; channels: number } | null {
+  const contentType = sp.res.headers.get('content-type') ?? ''
+  const parsed = parsePcmContentType(contentType)
+  if (parsed) return parsed
+  const ct = contentType.toLowerCase()
+  if (
+    sp.requested === 'pcm' &&
+    (!ct || ct.startsWith('audio/pcm') || ct.startsWith('application/octet-stream'))
+  )
+    return { sampleRate: PCM_DEFAULT_RATE, channels: 1 }
+  return null
+}
+
+async function synthesizeApi(
+  text: string,
+  settings: TtsSettings,
+  format: TtsFormat,
+  opts: TtsSynthesizeOptions
+): Promise<TtsSynthesizeResult> {
+  const sp = await requestSpeech(text, settings, format, opts)
   let raw: Uint8Array
   try {
-    res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal })
     // o corpo também corre sob o timeout/abort: ler fora do try deixava o timeout no meio do
     // download escapar como erro cru (nunca virava `TtsError` 'timeout')
-    raw = new Uint8Array(await res.arrayBuffer())
+    raw = new Uint8Array(await sp.res.arrayBuffer())
   } catch (e) {
-    if (opts.signal?.aborted) throw abortError()
-    if (timeout.aborted)
-      throw new TtsError(
-        'timeout',
-        `tempo esgotado na síntese de fala (${timeoutMs / 1000} s) em ${url}`,
-        { backend: 'api', cause: e }
-      )
-    throw new TtsError(
-      'network',
-      `erro de rede ao sintetizar fala em ${url}: ${connectionErrorText(e)}`,
-      { backend: 'api', cause: e }
-    )
+    throw failure(e, opts, sp)
   }
-  if (res.status < 200 || res.status >= 300) {
-    throw httpError(res.status, new TextDecoder().decode(raw), url)
-  }
-  // 2xx: a resposta é o áudio; corpo vazio/JSON é erro legível
-  const contentType = (res.headers.get('content-type') ?? '').toLowerCase()
-  if (!raw.length || contentType.includes('application/json'))
+  if (!raw.length)
     throw new TtsError(
       'http',
-      `resposta da API sem áudio (HTTP ${res.status}${raw.length ? ` veio ${contentType || 'JSON'}` : ' com corpo vazio'})`,
-      { backend: 'api', status: res.status }
+      `resposta da API sem áudio (HTTP ${sp.res.status} com corpo vazio)`,
+      {
+        backend: 'api',
+        status: sp.res.status
+      }
     )
+  const pcm = pcmFormatOf(sp)
+  if (pcm) {
+    // adaptador: PCM16 cru → WAV (o resto do app — clipes, "Testar voz", chamada — toca wav)
+    const aligner = new Pcm16MonoAligner(pcm.channels)
+    const mono = aligner.push(raw)
+    if (!mono.length)
+      throw new TtsError('http', 'resposta da API sem áudio (PCM vazio)', {
+        backend: 'api',
+        status: sp.res.status
+      })
+    return {
+      audio: encodeWav(mono, pcm.sampleRate),
+      mime: 'audio/wav',
+      model: sp.model,
+      backend: 'api',
+      ms: Date.now() - sp.t0
+    }
+  }
   return {
     audio: raw,
     mime: MIME_BY_FORMAT[format],
-    model,
+    model: sp.model,
     backend: 'api',
-    ms: Date.now() - t0
+    ms: Date.now() - sp.t0
+  }
+}
+
+// ---------------- streaming (PCM progressivo) ----------------
+
+/** Síntese em streaming: PCM16 mono chegando aos pedaços (endpoints que devolvem `audio/pcm`). */
+export interface TtsPcmStream {
+  streaming: true
+  sampleRate: number
+  model: string
+  backend: 'api'
+  /** Início da request (ms epoch) — latência até o 1º áudio = chegada do 1º pedaço − t0. */
+  t0: number
+  /**
+   * Pedaços PCM16 LE **mono** em ordem, alinhados em amostras inteiras (consumidor único). Termina
+   * no fim do corpo; erro de rede/tempo → `TtsError`; abort do `signal` → `AbortError`.
+   */
+  chunks: AsyncIterable<Uint8Array>
+}
+
+/** Resultado de `synthesizeStream`: stream PCM, ou o áudio completo quando não há streaming. */
+export type TtsStreamResult = TtsPcmStream | { streaming: false; result: TtsSynthesizeResult }
+
+/**
+ * Como `synthesize` (wav), mas devolve o áudio aos pedaços quando o endpoint responde PCM cru
+ * (`audio/pcm;rate=N` — ex.: OpenRouter/ElevenLabs, que chega progressivo): o chamador começa a
+ * tocar no 1º pedaço em vez de esperar o corpo inteiro. Motor local e endpoints que devolvem
+ * wav/mp3 → `{ streaming: false, result }` (bytes completos, como `synthesize`).
+ */
+export async function synthesizeStream(
+  input: Omit<TtsSynthesizeInput, 'format'>,
+  opts: TtsSynthesizeOptions = {}
+): Promise<TtsStreamResult> {
+  const text = input.text.trim()
+  if (!text)
+    throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
+  if (input.settings.backend === 'local')
+    return { streaming: false, result: await synthesizeLocal(text, input.settings, 'wav', opts) }
+  const sp = await requestSpeech(text, input.settings, 'wav', opts)
+  const pcm = pcmFormatOf(sp)
+  if (!pcm || !sp.res.body) {
+    let raw: Uint8Array
+    try {
+      raw = new Uint8Array(await sp.res.arrayBuffer())
+    } catch (e) {
+      throw failure(e, opts, sp)
+    }
+    if (!raw.length)
+      throw new TtsError(
+        'http',
+        `resposta da API sem áudio (HTTP ${sp.res.status} com corpo vazio)`,
+        {
+          backend: 'api',
+          status: sp.res.status
+        }
+      )
+    const audio = pcm
+      ? encodeWav(new Pcm16MonoAligner(pcm.channels).push(raw), pcm.sampleRate)
+      : raw
+    return {
+      streaming: false,
+      result: {
+        audio,
+        mime: 'audio/wav',
+        model: sp.model,
+        backend: 'api',
+        ms: Date.now() - sp.t0
+      }
+    }
+  }
+  const body = sp.res.body
+  async function* chunks(): AsyncGenerator<Uint8Array> {
+    const reader = body.getReader()
+    const aligner = new Pcm16MonoAligner(pcm!.channels)
+    let total = 0
+    try {
+      for (;;) {
+        let r: ReadableStreamReadResult<Uint8Array>
+        try {
+          r = await reader.read()
+        } catch (e) {
+          throw failure(e, opts, sp)
+        }
+        if (r.done) break
+        const out = aligner.push(r.value)
+        if (out.length) {
+          total += out.length
+          yield out
+        }
+      }
+      if (!total)
+        throw new TtsError('http', 'resposta da API sem áudio (PCM vazio)', {
+          backend: 'api',
+          status: sp.res.status
+        })
+    } finally {
+      // consumidor parou no meio (barge-in/erro): solta a conexão
+      reader.cancel().catch(() => undefined)
+    }
+  }
+  return {
+    streaming: true,
+    sampleRate: pcm.sampleRate,
+    model: sp.model,
+    backend: 'api',
+    t0: sp.t0,
+    chunks: chunks()
+  }
+}
+
+/** Junta um stream PCM num WAV completo (clipes/"Testar voz" quando só há o stream). */
+export async function collectPcmStream(stream: TtsPcmStream): Promise<TtsSynthesizeResult> {
+  const parts: Uint8Array[] = []
+  for await (const c of stream.chunks) parts.push(c)
+  return {
+    audio: encodeWav(concatBytes(parts), stream.sampleRate),
+    mime: 'audio/wav',
+    model: stream.model,
+    backend: 'api',
+    ms: Date.now() - stream.t0
   }
 }

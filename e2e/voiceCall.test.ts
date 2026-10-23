@@ -6,6 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  DEFAULT_VOICE_BASE_PROMPT,
   DEFAULT_TURN_SILENCE_MS,
   DEFAULT_VOICE_CALL_DEFAULTS,
   applyVoiceCallChat,
@@ -38,7 +39,12 @@ test('resolveVoiceCallConfig: null/ausente herda tudo (enabled/fillers/interject
   assert.equal(r.model, null, 'model null = herda o modelo do chat')
   assert.equal(r.tools, null, 'tools null = as do chat')
   assert.equal(r.voicePrompt, null)
-  assert.deepEqual(r.fillers, DEFAULT_VOICE_CALL_DEFAULTS.fillers)
+  assert.deepEqual(r.fillers, {
+    enabled: DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled,
+    prompt: DEFAULT_VOICE_CALL_DEFAULTS.fillers.prompt
+  })
+  assert.equal(r.basePrompt, DEFAULT_VOICE_BASE_PROMPT)
+  assert.equal(r.maxTokens, 120)
   assert.deepEqual(r.interjections, DEFAULT_VOICE_CALL_DEFAULTS.interjections)
 })
 
@@ -168,11 +174,15 @@ test('applyVoiceCallChat: voicePrompt/params/tools aplicados na CÓPIA; sem over
     DEFAULT_VOICE_CALL_DEFAULTS
   )
   const eff = applyVoiceCallChat(base, r)
-  assert.equal(eff.config.systemPrompt, 'persona\n\nfale em frases curtas')
+  assert.equal(
+    eff.config.systemPrompt,
+    `persona\n\n${DEFAULT_VOICE_BASE_PROMPT}\n\nfale em frases curtas`,
+    'prompt-base do modo voz + voicePrompt, nessa ordem'
+  )
   assert.deepEqual(
     eff.config.params,
-    { temperature: 0.1 },
-    'params do modelo da chamada substituem'
+    { temperature: 0.1, max_tokens: 120 },
+    'params do modelo da chamada substituem (+ teto de tokens do turno de voz)'
   )
   assert.deepEqual(eff.config.enabledTools, [], 'lista vazia = nenhuma tool na chamada')
   assert.equal(eff.config.maxToolOutputChars, 1000)
@@ -183,7 +193,15 @@ test('applyVoiceCallChat: voicePrompt/params/tools aplicados na CÓPIA; sem over
     base,
     resolveVoiceCallConfig(emptyConfig(), DEFAULT_VOICE_CALL_DEFAULTS)
   )
-  assert.deepEqual(plain.config, base.config, 'sem overrides a config é a do chat')
+  assert.deepEqual(
+    plain.config,
+    {
+      ...base.config,
+      systemPrompt: `persona\n\n${DEFAULT_VOICE_BASE_PROMPT}`,
+      params: { ...base.config.params, max_tokens: 120 }
+    },
+    'sem overrides: a config do chat + prompt-base e teto de tokens do modo voz'
+  )
 })
 
 // ---------------- corte de sentença (TTS por sentença) ----------------

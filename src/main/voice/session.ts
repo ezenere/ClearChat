@@ -30,6 +30,7 @@ import {
   isSttEngineRuntimeAvailable,
   resolveSttModelsBaseDir
 } from './sttLocal'
+import { encodeWav } from './wav'
 
 /** PCM16 mono a esta taxa (Hz): o formato do buffer da sessão e do wav enviado à API. */
 export const VOICE_SAMPLE_RATE = 16_000
@@ -40,36 +41,9 @@ const OVERLAP_BYTES = Math.round(STT_PARTIAL_OVERLAP_MS * BYTES_PER_MS)
 
 // ---------------- wav PCM (puro) ----------------
 
-/**
- * WAV RIFF little-endian, PCM 16-bit mono (cabeçalho de 44 bytes) a partir do PCM16 cru.
- * É o formato enviado à API (`transcribeAudio` → `audio/wav`), nas parciais e no final.
- */
-export function encodeWav(pcm16: Uint8Array, sampleRate: number): Uint8Array {
-  if (!(pcm16 instanceof Uint8Array)) throw new Error('encodeWav: pcm16 deve ser Uint8Array.')
-  if (pcm16.length % 2) throw new Error('encodeWav: PCM16 com tamanho ímpar (2 bytes por amostra).')
-  if (!Number.isInteger(sampleRate) || sampleRate <= 0)
-    throw new Error(`encodeWav: sampleRate inválido (${sampleRate}).`)
-  const out = new Uint8Array(44 + pcm16.length)
-  const dv = new DataView(out.buffer)
-  const ascii = (offset: number, s: string): void => {
-    for (let i = 0; i < s.length; i++) out[offset + i] = s.charCodeAt(i)
-  }
-  ascii(0, 'RIFF')
-  dv.setUint32(4, 36 + pcm16.length, true) // tamanho do RIFF
-  ascii(8, 'WAVE')
-  ascii(12, 'fmt ')
-  dv.setUint32(16, 16, true) // tamanho do subchunk fmt
-  dv.setUint16(20, 1, true) // formato PCM
-  dv.setUint16(22, 1, true) // mono
-  dv.setUint32(24, sampleRate, true)
-  dv.setUint32(28, sampleRate * 2, true) // byteRate (blockAlign × sampleRate)
-  dv.setUint16(32, 2, true) // blockAlign (mono × 16 bits)
-  dv.setUint16(34, 16, true) // bits por amostra
-  ascii(36, 'data')
-  dv.setUint32(40, pcm16.length, true)
-  out.set(pcm16, 44)
-  return out
-}
+// `encodeWav` vive em `wav.ts` (sem dependências — usado também pelo processo do motor de TTS);
+// reexportado aqui para os chamadores existentes.
+export { encodeWav }
 
 // ---------------- sessão ----------------
 
@@ -193,10 +167,42 @@ export interface TranscribeSession {
   readonly id: string
   /** Acumula PCM16 mono little-endian a 16 kHz; `sampleRate` informado precisa casar. */
   push(chunk: Uint8Array, sampleRate?: number): void
-  /** Encerra a captura e transcreve o buffer inteiro (final; `purpose: 'final'`). */
-  stop(): Promise<VoiceTranscribeResult>
+  /**
+   * Encerra a captura e transcreve o buffer inteiro (final; `purpose: 'final'`). Com
+   * `reuseSpeculative` (o renderer garante que o usuário não voltou a falar depois da última
+   * especulação) e uma especulação REUSÁVEL (mesmo backend da final), a transcrição especulativa
+   * vira a final — sem 2ª chamada de STT.
+   */
+  stop(opts?: { reuseSpeculative?: boolean }): Promise<VoiceTranscribeResult>
+  /**
+   * Transcrição ESPECULATIVA de tudo o que já foi capturado, sem encerrar (fim de turno adaptativo
+   * da chamada de voz): motor local quando pronto (modo local/híbrido); API só com `allowApi`
+   * (modo api/híbrido sem motor). null = indisponível (o chamador usa o silêncio fixo).
+   */
+  speculate(opts?: { allowApi?: boolean }): Promise<VoiceSpeculativeResult | null>
   /** Descarta tudo sem transcrever (idempotente). */
   cancel(): void
+}
+
+/** Resultado de `speculate()`. */
+export interface VoiceSpeculativeResult {
+  text: string
+  ms: number
+  backend: 'api' | 'local'
+  /** Pode virar a final (`stop({ reuseSpeculative })`) — mesmo backend que a final usaria. */
+  reusable: boolean
+}
+
+interface SpeculationState {
+  /** Bytes de PCM cobertos (o buffer inteiro no momento da especulação). */
+  bytes: number
+  backend: 'api' | 'local'
+  reusable: boolean
+  controller: AbortController
+  promise: Promise<VoiceSpeculativeResult | null>
+  /** Resultado (null = falhou/abortou). */
+  result: VoiceSpeculativeResult | null
+  done: boolean
 }
 
 interface SessionState {
@@ -227,6 +233,8 @@ interface SessionState {
   idleMs: number
   idleTimer: ReturnType<typeof setTimeout> | null
   apiMaxUploadBytes: number
+  /** Última transcrição especulativa (fim de turno adaptativo) — null = nenhuma. */
+  spec: SpeculationState | null
 }
 
 interface SessionInternal {
@@ -385,6 +393,8 @@ function emitPartial(state: SessionState, ms: number, error?: string): void {
  */
 function maybeFirePartial(state: SessionState): void {
   if (state.status !== 'active' || state.partialsOff || state.inFlight) return
+  // especulação em voo usa o mesmo motor: a parcial espera (a especulação é mais urgente)
+  if (state.spec && !state.spec.done) return
   const { settings } = state.opts
   if (!settings.livePartials) return
   // pronto = modelo instalado (hasLocalReady) E motor de inferência disponível (local.ready) — sem
@@ -444,6 +454,73 @@ function maybeFirePartial(state: SessionState): void {
     .finally(() => {
       if (state.inFlight?.seq === seq) state.inFlight = null
     })
+}
+
+/**
+ * Transcrição especulativa do buffer inteiro (fim de turno adaptativo): backend local quando o
+ * motor está pronto (modos local/híbrido), API só com `allowApi` (modo api, ou híbrido sem motor);
+ * senão null. Mesma especulação reaproveitada quando não chegou áudio novo; a anterior em voo é
+ * abortada; a parcial em voo é abortada (mesmo motor — a especulação é mais urgente). Reusável como
+ * final quando o backend é o mesmo que a final usaria (`chooseSttBackend` final). Nunca rejeita por
+ * falha de STT (resolve null — o chamador cai no silêncio fixo).
+ */
+function startSpeculation(
+  state: SessionState,
+  allowApi: boolean
+): Promise<VoiceSpeculativeResult | null> {
+  const { settings } = state.opts
+  const localReady = state.hasLocalReady && state.local?.ready === true
+  let backend: 'local' | 'api' | null = null
+  if (settings.mode === 'local') backend = localReady ? 'local' : null
+  else if (settings.mode === 'hybrid') backend = localReady ? 'local' : allowApi ? 'api' : null
+  else backend = allowApi ? 'api' : null
+  if (!backend) return Promise.resolve(null)
+  const prev = state.spec
+  if (prev && prev.bytes === state.totalBytes && !prev.controller.signal.aborted)
+    return prev.promise
+  prev?.controller.abort()
+  if (backend === 'local') {
+    state.inFlight?.controller.abort()
+    state.inFlight = null
+  }
+  const pcm = trimTrailingSilence(sliceBuffer(state, 0, state.totalBytes))
+  if (!pcm.length || pcm.length + 44 > state.apiMaxUploadBytes) return Promise.resolve(null)
+  const finalBackend = chooseSttBackend(settings, { hasLocalReady: localReady })
+  const controller = new AbortController()
+  const input = {
+    audio: encodeWav(pcm, VOICE_SAMPLE_RATE),
+    mimeType: 'audio/wav',
+    fileName: 'audio'
+  }
+  const run: Promise<{ text: string; ms: number }> =
+    backend === 'local'
+      ? state.local!.transcribe(input, { language: state.opts.language, signal: controller.signal })
+      : transcribeAudio(input, {
+          settings,
+          language: state.opts.language,
+          signal: controller.signal
+        })
+  const spec: SpeculationState = {
+    bytes: state.totalBytes,
+    backend,
+    reusable: finalBackend === backend,
+    controller,
+    promise: Promise.resolve(null),
+    result: null,
+    done: false
+  }
+  spec.promise = run
+    .then((r) => {
+      if (controller.signal.aborted) return null
+      spec.result = { text: r.text.trim(), ms: r.ms, backend, reusable: spec.reusable }
+      return spec.result
+    })
+    .catch(() => null)
+    .finally(() => {
+      spec.done = true
+    })
+  state.spec = spec
+  return spec.promise
 }
 
 function clearIdle(state: SessionState): void {
@@ -554,7 +631,8 @@ export function startTranscribeSession(
     finalController: null,
     idleMs: deps.idleTimeoutMs ?? STT_SESSION_IDLE_MS,
     idleTimer: null,
-    apiMaxUploadBytes: Math.max(1024, deps.apiMaxUploadBytes ?? STT_API_MAX_UPLOAD_BYTES)
+    apiMaxUploadBytes: Math.max(1024, deps.apiMaxUploadBytes ?? STT_API_MAX_UPLOAD_BYTES),
+    spec: null
   }
 
   const end = (): void => {
@@ -600,13 +678,42 @@ export function startTranscribeSession(
       state.totalBytes += chunk.length
       maybeFirePartial(state)
     },
-    async stop(): Promise<VoiceTranscribeResult> {
+    speculate(opts?: { allowApi?: boolean }): Promise<VoiceSpeculativeResult | null> {
+      if (state.status !== 'active') return Promise.reject(notActive())
+      return startSpeculation(state, !!opts?.allowApi)
+    },
+    async stop(opts?: { reuseSpeculative?: boolean }): Promise<VoiceTranscribeResult> {
       if (state.status !== 'active') throw notActive()
       state.status = 'stopping'
       clearIdle(state)
       if (current?.state === state) current = null // a vaga de captura já fica livre
       state.inFlight?.controller.abort()
       state.inFlight = null
+      const spec = state.spec
+      if (opts?.reuseSpeculative && spec?.reusable) {
+        // o usuário não voltou a falar depois da especulação: ela É a final (sem 2ª chamada)
+        const r = await spec.promise.catch(() => null)
+        if (r && (state.status as string) !== 'cancelled') {
+          end()
+          const local = state.opts.settings.local
+          return {
+            text: r.text,
+            model:
+              r.backend === 'local'
+                ? local?.model || local?.engine || 'local'
+                : state.opts.settings.api.model,
+            baseUrl:
+              r.backend === 'local'
+                ? 'local'
+                : state.opts.settings.api.baseUrl.trim().replace(/\/+$/, ''),
+            ms: r.ms,
+            backend: r.backend,
+            fellBack: false,
+            speculative: true
+          }
+        }
+      }
+      spec?.controller.abort()
       try {
         const pcm = trimTrailingSilence(sliceBuffer(state, 0, state.totalBytes))
         if (!pcm.length) {
@@ -667,6 +774,7 @@ export function startTranscribeSession(
     cancel(): void {
       if (state.status === 'ended' || state.status === 'cancelled') return
       state.finalController?.abort()
+      state.spec?.controller.abort()
       state.inFlight?.controller.abort()
       state.inFlight = null
       state.chunks = []

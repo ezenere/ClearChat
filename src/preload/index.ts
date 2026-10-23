@@ -6,6 +6,7 @@ import {
   VOICE_CALL_TIMELINE_CHANNEL,
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CHUNK_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
@@ -13,6 +14,7 @@ import {
   type TtsClipProgressEvent,
   type VoiceCallTimelineEvent,
   type VoiceCallUtteranceCancelEvent,
+  type VoiceCallUtteranceChunkEvent,
   type VoiceCallUtteranceEvent,
   type VoiceModelProgressEvent,
   type VoicePartialEvent
@@ -167,8 +169,9 @@ const api: FullClearApi = {
       start: (language) => invoke(IPC.voice.transcribeStart, language),
       push: (sessionId, pcm16, sampleRate) =>
         invoke(IPC.voice.transcribePush, sessionId, pcm16, sampleRate),
-      stop: (sessionId) => invoke(IPC.voice.transcribeStop, sessionId),
-      cancel: (sessionId) => invoke(IPC.voice.transcribeCancel, sessionId)
+      stop: (sessionId, opts) => invoke(IPC.voice.transcribeStop, sessionId, opts),
+      cancel: (sessionId) => invoke(IPC.voice.transcribeCancel, sessionId),
+      speculate: (sessionId) => invoke(IPC.voice.transcribeSpeculate, sessionId)
     },
     models: {
       list: () => invoke(IPC.voice.modelsList),
@@ -189,11 +192,11 @@ const api: FullClearApi = {
       start: (input) => invoke(IPC.voice.callStart, input),
       stop: () => invoke(IPC.voice.callStop),
       mute: (input) => invoke(IPC.voice.callMute, input),
-      speechBegin: () => invoke(IPC.voice.callSpeechBegin),
+      speechBegin: (input) => invoke(IPC.voice.callSpeechBegin, input),
       speechEnd: () => invoke(IPC.voice.callSpeechEnd),
       turn: (input) => invoke(IPC.voice.callTurn, input),
       playbackIdle: () => invoke(IPC.voice.callPlaybackIdle),
-      bargeIn: () => invoke(IPC.voice.callBargeIn),
+      bargeIn: (input) => invoke(IPC.voice.callBargeIn, input),
       interjectionObserved: (input) => invoke(IPC.voice.callInterjectionObserved, input),
       backchannel: (input) => invoke(IPC.voice.callBackchannel, input),
       getState: () => invoke(IPC.voice.callGetState)
@@ -290,6 +293,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, listener)
+    }
+  },
+  onVoiceCallUtteranceChunk: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: VoiceCallUtteranceChunkEvent): void => cb(event)
+    ipcRenderer.on(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, listener)
     }
   },
   onVoiceCallTimeline: (cb) => {

@@ -8,6 +8,7 @@ import {
   VOICE_CALL_TIMELINE_CHANNEL,
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
+  VOICE_CALL_UTTERANCE_CHUNK_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
@@ -122,8 +123,9 @@ import {
 import {
   clipVoiceId,
   generateClips,
-  loadClipAudio,
   loadClips,
+  loadCurrentClipAudio,
+  loadCurrentClips,
   type ClipsManifest
 } from './voice/clips'
 import { createEvalLogger } from './voice/evalLog'
@@ -147,7 +149,8 @@ import {
   releaseSttModel,
   sttEngineUnavailableReason
 } from './voice/sttLocal'
-import { synthesize, TTS_TEST_PHRASE } from './voice/tts'
+import { synthesize, synthesizeStream, TTS_TEST_PHRASE } from './voice/tts'
+import { TtsStreamRelay } from './voice/ttsStreamRelay'
 import {
   createKokoroEngine,
   espeakMissingError,
@@ -195,6 +198,8 @@ let ipcSenderId: number | null = null
 
 /** Chamada de voz e dono dela (o webContents que entrou) — limpos quando o renderer some. */
 let voiceCallsRef: VoiceCallManager | null = null
+/** Streaming do TTS da chamada (PCM progressivo da API → renderer); abortado no barge-in/parar. */
+let ttsRelayRef: TtsStreamRelay | null = null
 let voiceCallOwner: number | null = null
 
 /**
@@ -208,6 +213,7 @@ export function resetVoiceForWebContents(webContentsId: number, reason: string):
   let callStopped = false
   if (voiceCallsRef && voiceCallOwner === webContentsId && voiceCallsRef.state().active) {
     voiceCallsRef.stop()
+    ttsRelayRef?.abortAll()
     callStopped = true
   }
   if (voiceCallOwner === webContentsId) voiceCallOwner = null
@@ -372,6 +378,11 @@ export function registerIpc(): void {
   const evalLogger = createEvalLogger(app.getPath('userData'), (e) =>
     console.log('[clearchat] voice-eval:', e)
   )
+  const ttsRelay = new TtsStreamRelay({
+    emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
+    emitChunk: (e) => sendToWindows(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, e)
+  })
+  ttsRelayRef = ttsRelay
   const voiceCalls = new VoiceCallManager({
     sendTurn: (sessionId, text) => {
       // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas)
@@ -379,18 +390,34 @@ export function registerIpc(): void {
         voiceCalls.reportError(e instanceof Error ? e.message : String(e))
       )
     },
+    // TTS por sentença: com endpoint que devolve PCM progressivo (OpenRouter/ElevenLabs) a
+    // sentença começa a tocar com ~200 ms de áudio e o resto segue em `voice:call:utterance-chunk`
+    // (`TtsStreamRelay`); motor local / wav / mp3 → bytes completos, como antes
     synth: (text, signal) =>
-      synthesize(
-        { text, settings: getVoiceSettings().tts, format: 'wav' },
-        { local: ttsLocalEngine(), signal }
+      ttsRelay.synth(signal, (s) =>
+        synthesizeStream(
+          { text, settings: getVoiceSettings().tts },
+          { local: ttsLocalEngine(), signal: s }
+        )
       ),
     emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
-    emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
+    emitUtterance: (u) => ttsRelay.emitUtterance(u),
     emitUtteranceCancel: (id) => sendToWindows(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, { id }),
     emitTimeline: (event) => sendToWindows(VOICE_CALL_TIMELINE_CHANNEL, event),
     logEval: (event) => evalLogger.log(event),
     clip: (cls, n) =>
-      loadClipAudio(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts), cls, n),
+      // só o cache em dia com a definição atual (pool de preâmbulos/frases/voz) — clipe velho não toca
+      loadCurrentClipAudio(
+        app.getPath('userData'),
+        getVoiceSettings().tts,
+        getVoiceSettings().voiceCallDefaults.fillers.pool,
+        cls,
+        n
+      ),
+    // turno continuado/barge-in: para o turno e deixa no histórico só o que foi falado
+    amendTurn: async (sessionId, amend) => {
+      await runner.amendVoiceTurn(sessionId, amend)
+    },
     sessionInfo: (sessionId) => {
       const s = sessionsRepo.get(sessionId)
       return s ? { chatId: s.chatId, depth: s.depth, busy: isBusyStatus(s.status) } : null
@@ -882,7 +909,15 @@ export function registerIpc(): void {
     [IPC.voice.transcribePush]: (sessionId: string, pcm16: Uint8Array, sampleRate?: number) => {
       requireTranscribeSession(sessionId).push(pcm16, sampleRate)
     },
-    [IPC.voice.transcribeStop]: (sessionId: string) => requireTranscribeSession(sessionId).stop(),
+    [IPC.voice.transcribeStop]: (sessionId: string, opts?: { reuseSpeculative?: boolean }) =>
+      requireTranscribeSession(sessionId).stop({
+        reuseSpeculative: opts?.reuseSpeculative === true
+      }),
+    // fim de turno adaptativo: transcrição especulativa (API só com `turn.speculativeApi`)
+    [IPC.voice.transcribeSpeculate]: (sessionId: string) =>
+      requireTranscribeSession(sessionId).speculate({
+        allowApi: getVoiceSettings().voiceCallDefaults.turn.speculativeApi
+      }),
     // cancel é tolerante: encerrar uma sessão que já saiu (corrida com o fim natural) não é erro;
     // vale também para a sessão que está transcrevendo a final (aborta a final)
     [IPC.voice.transcribeCancel]: (sessionId: string) => {
@@ -962,14 +997,23 @@ export function registerIpc(): void {
       const manifest = await generateClips({
         baseDir: app.getPath('userData'),
         settings: getVoiceSettings().tts,
+        fillerPool: getVoiceSettings().voiceCallDefaults.fillers.pool,
         local: ttsLocalEngine(),
         onProgress: (e) => sendToWindows(VOICE_TTS_CLIPS_PROGRESS_CHANNEL, e)
       })
       return toClipsView(manifest)
     },
     [IPC.voice.ttsClipsList]: async (): Promise<TtsClipsView | null> => {
-      const m = await loadClips(app.getPath('userData'), clipVoiceId(getVoiceSettings().tts))
-      return m ? toClipsView(m) : null
+      const v = getVoiceSettings()
+      const m = await loadClips(app.getPath('userData'), clipVoiceId(v.tts))
+      if (!m) return null
+      // cache de uma definição antiga (frases/pool mudaram): "stale" → a UI pede para regerar
+      const current = await loadCurrentClips(
+        app.getPath('userData'),
+        v.tts,
+        v.voiceCallDefaults.fillers.pool
+      )
+      return { ...toClipsView(m), ...(current ? {} : { stale: true }) }
     },
     [IPC.voice.ttsVoices]: async (): Promise<TtsVoicesView> => {
       const v = getVoiceSettings().tts
@@ -996,22 +1040,38 @@ export function registerIpc(): void {
     },
     [IPC.voice.callStop]: () => {
       voiceCallOwner = null
+      ttsRelay.abortAll()
       return voiceCalls.stop()
     },
     [IPC.voice.callGetState]: () => voiceCalls.state(),
     [IPC.voice.runtimeStatus]: () => voiceRuntimeStatus(),
     [IPC.voice.callMute]: (input: { muted: boolean }) => voiceCalls.mute(!!input?.muted),
-    [IPC.voice.callSpeechBegin]: () => voiceCalls.speechBegin(),
+    [IPC.voice.callSpeechBegin]: (input?: { dropped?: unknown }) => {
+      const dropped = Array.isArray(input?.dropped)
+        ? input.dropped.filter((x): x is string => typeof x === 'string')
+        : []
+      // o renderer descartou utterances sem tocar: os streams delas (TTS progressivo) param
+      if (dropped.length) ttsRelay.abortAll()
+      return voiceCalls.speechBegin({ dropped })
+    },
     [IPC.voice.callSpeechEnd]: () => voiceCalls.speechEnd(),
     [IPC.voice.callTurn]: (input: { text: string }) =>
       voiceCalls.turn(input && typeof input.text === 'string' ? input.text : ''),
     [IPC.voice.callPlaybackIdle]: () => voiceCalls.playbackIdle(),
-    [IPC.voice.callBargeIn]: () => voiceCalls.bargeIn(),
+    [IPC.voice.callBargeIn]: (input?: { playedIds?: unknown }) => {
+      ttsRelay.abortAll() // o renderer já descartou a fila: os downloads em curso param
+      return voiceCalls.bargeIn(
+        Array.isArray(input?.playedIds)
+          ? { playedIds: input.playedIds.filter((x): x is string => typeof x === 'string') }
+          : undefined
+      )
+    },
     [IPC.voice.callInterjectionObserved]: (input: {
       speechMs: number
       pauseMs: number
       tail: string
       observedAt: number
+      end?: string | null
     }) =>
       voiceCalls.interjectionObserved(
         input ?? { speechMs: 0, pauseMs: 0, tail: '', observedAt: 0 }

@@ -5,6 +5,7 @@ import icon from '../../resources/icon.png?asset'
 import { closeDb, getDb, getDbPath } from './db'
 import { registerIpc, resetVoiceForWebContents } from './ipc'
 import { shutdownSttWorker } from './voice/sttWorkerHost'
+import { shutdownTtsWorker } from './voice/ttsWorkerHost'
 import { registerEventWindow } from './events'
 import { initSync, shutdownSync, syncEngine } from './sync'
 import { initRunner, shutdownRunner } from './agent/runner'
@@ -222,6 +223,7 @@ app.on('before-quit', () => {
   shutdownSync()
   shutdownRunner()
   shutdownSttWorker()
+  shutdownTtsWorker()
   killAllProcesses()
 })
 // garantia: nenhum process group de process_start fica órfão

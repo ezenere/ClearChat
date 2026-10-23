@@ -184,26 +184,35 @@ export interface InterjectionPolicy {
   enabled: boolean
   /** Modo sombra: o app decide mas não toca áudio (padrão false) — calibra as regras sem interromper. */
   shadow: boolean
-  /** Intervalo mínimo entre interjeições, em ms (padrão 2500). */
+  /** Intervalo mínimo entre interjeições, em ms (padrão 5000 — backchannel discreto). */
   cooldownMs: number
-  /** Probabilidade de disparar quando as regras deixam (0–1; padrão 0.8). */
+  /** Probabilidade de disparar quando as regras deixam (0–1; padrão 0.5). */
   fireProbability: number
   /** Fala do usuário (ms) antes de uma interjeição poder sair (padrão 700). */
   minSpeechMs: number
   /** Pausa do usuário (ms) em que a interjeição pode entrar (padrão 450). */
   minPauseMs: number
-  /** Classes permitidas (padrão: todas). Lista vazia volta ao padrão. */
+  /**
+   * Classes permitidas (padrão: só `ACK` — "Uhum."/"Aham." no meio da fala; as demais ficam
+   * opcionais). Lista vazia volta ao padrão.
+   */
   classes: InterjectionClass[]
+  /** Volume relativo do clipe de interjeição (0–1, multiplica o volume da chamada; padrão 0.6). */
+  volume: number
 }
+
+/** Classes padrão das interjeições: só o backchannel neutro (`ACK` = "Uhum."/"Aham."). */
+export const DEFAULT_INTERJECTION_CLASSES: readonly InterjectionClass[] = ['ACK']
 
 export const DEFAULT_INTERJECTION_POLICY: InterjectionPolicy = {
   enabled: true,
   shadow: false,
-  cooldownMs: 2500,
-  fireProbability: 0.8,
+  cooldownMs: 5000,
+  fireProbability: 0.5,
   minSpeechMs: 700,
   minPauseMs: 450,
-  classes: [...INTERJECTION_CLASSES]
+  classes: [...DEFAULT_INTERJECTION_CLASSES],
+  volume: 0.6
 }
 
 /** Falas preenchidoras ("ãh", "só um minutinho…") enquanto o modelo pensa. */
@@ -213,6 +222,66 @@ export interface VoiceFillers {
   /** Prompt das falas preenchidoras; null = o padrão. */
   prompt: string | null
 }
+
+/**
+ * Contexto do turno do usuário que escolhe o preâmbulo (filler) — `classifyFillerContext` em
+ * `@shared/voicePolicy`: pergunta, comando/tarefa com tool, correção/interrupção ("não", "peraí"),
+ * pedido longo/complexo ou genérico.
+ */
+export type FillerContext = 'question' | 'command' | 'correction' | 'complex' | 'generic'
+export const FILLER_CONTEXTS: readonly FillerContext[] = [
+  'question',
+  'command',
+  'correction',
+  'complex',
+  'generic'
+]
+
+/** Uma frase do pool de preâmbulos (vira o clipe `FILLER_<n>` — n = posição 1-based no pool). */
+export interface FillerPhrase {
+  /** Texto falado (pt-BR por extenso — nada de "Hmm": o TTS soletra/anglicaniza). */
+  text: string
+  /** Contextos em que a frase cabe (lista vazia = `generic`). */
+  contexts: FillerContext[]
+}
+
+/** Máximo de frases no pool de preâmbulos (= máximo de clipes `FILLER_<n>`). */
+export const FILLER_POOL_MAX = 16
+
+/**
+ * Pool padrão de preâmbulos (~0,6–1,4 s cada, pronunciáveis por Kokoro e ElevenLabs — o benchmark
+ * mostrou que "Hum, deixa eu ver." funciona nos dois e "Hum…"/"Hmm" soltos não). A chamada toca UM
+ * logo depois do turno (ponte até a 1ª frase da resposta), escolhido pelo contexto, sem repetir
+ * nenhum dos últimos `FILLER_RECENT_WINDOW` usados.
+ */
+export const DEFAULT_FILLER_POOL: readonly FillerPhrase[] = [
+  { text: 'Hum, deixa eu ver aqui.', contexts: ['question', 'generic'] },
+  { text: 'Boa pergunta, deixa eu pensar.', contexts: ['question'] },
+  { text: 'Hum, deixa eu ver.', contexts: ['question', 'generic'] },
+  { text: 'Beleza, só um minutinho.', contexts: ['command'] },
+  { text: 'Tá, deixa eu ver isso.', contexts: ['command', 'generic'] },
+  { text: 'Certo, já vejo isso.', contexts: ['command'] },
+  { text: 'Ah, tá, peraí.', contexts: ['correction'] },
+  { text: 'Entendi, deixa eu rever.', contexts: ['correction'] },
+  { text: 'Ah, entendi, um instante.', contexts: ['correction'] },
+  { text: 'Deixa eu ver isso com calma.', contexts: ['complex'] },
+  { text: 'Então, deixa eu ver.', contexts: ['complex', 'generic'] },
+  { text: 'Um instante.', contexts: ['command', 'generic'] }
+]
+
+/** Padrões GLOBAIS dos fillers (`voiceCallDefaults.fillers`): o pool e o tempo valem para todos os chats. */
+export interface VoiceFillerDefaults extends VoiceFillers {
+  /**
+   * Espera entre o turno enviado e o preâmbulo (ms; padrão 250, 0 = já): se a 1ª frase da resposta
+   * ficar pronta antes disso, o preâmbulo nem sai.
+   */
+  delayMs: number
+  /** Pool de preâmbulos; null = `DEFAULT_FILLER_POOL` (mudou → os clipes são regerados). */
+  pool: FillerPhrase[] | null
+}
+
+/** Espera padrão do preâmbulo depois do turno enviado (ms). */
+export const DEFAULT_FILLER_DELAY_MS = 250
 
 /** Modelo próprio da chamada de voz (null = herda o modelo do chat). */
 export interface VoiceCallModelConfig {
@@ -262,35 +331,91 @@ export interface VoiceCallDefaults {
   enabled: boolean
   /** Política de interjeições padrão. */
   interjections: InterjectionPolicy
-  /** Falas preenchidoras padrão. */
-  fillers: VoiceFillers
-  /** Turnos da chamada (silêncio que encerra a fala do usuário). */
+  /** Falas preenchidoras padrão (+ pool de preâmbulos e espera — globais). */
+  fillers: VoiceFillerDefaults
+  /** Turnos da chamada (silêncio que encerra a fala do usuário; fim de turno adaptativo). */
   turn: VoiceCallTurnConfig
+  /**
+   * Teto de tokens da resposta nos turnos de voz (`max_tokens`; padrão 120, 0 = sem teto). Só vale
+   * quando o modelo da chamada não define `max_tokens` nem raciocínio (`reasoning_effort`).
+   */
+  maxTokens: number
+  /** Prompt-base do modo voz somado ao system prompt (ligado por padrão). */
+  basePromptEnabled: boolean
+  /** Texto do prompt-base; null = `DEFAULT_VOICE_BASE_PROMPT`. */
+  basePrompt: string | null
 }
 
 /**
  * Turnos da chamada de voz (setting `voiceCallDefaults.turn`). `silenceStopMs: 0` é tratado como
  * `null` (na chamada o turno SEMPRE tem limite de silêncio — sem limite não há turnos).
+ *
+ * **Fim de turno adaptativo** (`adaptive`, padrão ligado): aos `speculativeAtMs` de pausa o app
+ * transcreve o que já foi dito (transcrição especulativa — motor local; API só com
+ * `speculativeApi`) e o silêncio exigido passa a depender de como a fala termina
+ * (`classifyUtteranceEnd` em `@shared/voiceTurn`): completa (pergunta/comando/fecho) →
+ * `completeSilenceMs`; afirmação → `statementSilenceMs`; inacabada (conectivo, vírgula,
+ * hesitação) → `unfinishedSilenceMs`. Sem transcrição especulativa vale `silenceStopMs`. A
+ * transcrição especulativa vira a final quando o usuário não voltou a falar (sem 2ª chamada).
  */
 export interface VoiceCallTurnConfig {
   /**
-   * Ms de silêncio contínuo que ENCERRAM a fala do usuário (turno). `null` = o padrão da chamada
-   * (`DEFAULT_TURN_SILENCE_MS`) — independente do auto-stop do ditado (`audioInput.silenceStopMs`,
-   * 5 s por padrão, longo demais para turno de conversa).
+   * Ms de silêncio contínuo que ENCERRAM a fala do usuário quando NÃO há transcrição especulativa
+   * (adaptativo desligado/indisponível). `null` = o padrão (`DEFAULT_TURN_SILENCE_MS`) —
+   * independente do auto-stop do ditado (`audioInput.silenceStopMs`, 5 s, longo demais para turno).
    */
   silenceStopMs: number | null
+  /** Fim de turno adaptativo com transcrição especulativa (padrão true). */
+  adaptive: boolean
+  /** Pausa (ms) em que a transcrição especulativa dispara (padrão 250). */
+  speculativeAtMs: number
+  /** Silêncio (ms) que fecha uma fala COMPLETA — pergunta, comando, fecho (padrão 600). */
+  completeSilenceMs: number
+  /** Silêncio (ms) que fecha uma AFIRMAÇÃO (ponto final do STT — pode ser história no meio; padrão 1200). */
+  statementSilenceMs: number
+  /** Silêncio (ms) que fecha uma fala INACABADA — conectivo/vírgula/hesitação; é o teto (padrão 1500). */
+  unfinishedSilenceMs: number
+  /** Permite a transcrição especulativa pela API no modo 'api' (custa 1 request por pausa; padrão false). */
+  speculativeApi: boolean
 }
 
-/** Silêncio de turno padrão da chamada (ms) — curto o bastante para conversa natural. */
+/** Silêncio de turno padrão da chamada sem transcrição especulativa (ms). */
 export const DEFAULT_TURN_SILENCE_MS = 1000
 
-export const DEFAULT_VOICE_CALL_TURN: VoiceCallTurnConfig = { silenceStopMs: null }
+export const DEFAULT_VOICE_CALL_TURN: VoiceCallTurnConfig = {
+  silenceStopMs: null,
+  adaptive: true,
+  speculativeAtMs: 250,
+  completeSilenceMs: 600,
+  statementSilenceMs: 1200,
+  unfinishedSilenceMs: 1500,
+  speculativeApi: false
+}
+
+/** Teto padrão de tokens da resposta nos turnos de voz. */
+export const DEFAULT_VOICE_MAX_TOKENS = 120
+
+/**
+ * Prompt-base do modo voz (somado ao system prompt nos turnos da chamada, antes do `voicePrompt`
+ * do chat): respostas curtas, sem markdown, sem narrar falhas internas, e o aviso de que a fala
+ * vem de transcrição automática (maiúsculas/acentos podem estar errados — "SRC" pode ser "src").
+ */
+export const DEFAULT_VOICE_BASE_PROMPT = [
+  'Você está numa conversa por voz: sua resposta será lida em voz alta.',
+  'A primeira frase tem no máximo 10 palavras e vai direto ao ponto. No máximo 3 frases curtas no total.',
+  'Sem markdown, listas, títulos, tabelas, emojis ou blocos de código — escreva como se fala.',
+  'Não narre tentativas internas nem erros de ferramentas em detalhe: se algo falhar, diga em uma frase curta o que houve e o que vai fazer.',
+  'A fala do usuário vem de transcrição automática e pode ter maiúsculas, acentos ou palavras erradas (ex.: "SRC" pode ser a pasta "src"); interprete pela intenção e, em nomes de arquivos e pastas, tente a grafia em minúsculas antes de concluir que não existe.'
+].join(' ')
 
 export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
   enabled: true,
-  interjections: { ...DEFAULT_INTERJECTION_POLICY, classes: [...INTERJECTION_CLASSES] },
-  fillers: { enabled: true, prompt: null },
-  turn: { ...DEFAULT_VOICE_CALL_TURN }
+  interjections: { ...DEFAULT_INTERJECTION_POLICY, classes: [...DEFAULT_INTERJECTION_CLASSES] },
+  fillers: { enabled: true, prompt: null, delayMs: DEFAULT_FILLER_DELAY_MS, pool: null },
+  turn: { ...DEFAULT_VOICE_CALL_TURN },
+  maxTokens: DEFAULT_VOICE_MAX_TOKENS,
+  basePromptEnabled: true,
+  basePrompt: null
 }
 
 /** Config "vazia": tudo null = herda os padrões globais (`voiceCallDefaults`) e o próprio chat. */
@@ -446,8 +571,54 @@ export function normalizeInterjectionPolicy(v: unknown): InterjectionPolicy {
     fireProbability: probabilityOr(src.fireProbability, d.fireProbability),
     minSpeechMs: intOr(src.minSpeechMs, d.minSpeechMs),
     minPauseMs: intOr(src.minPauseMs, d.minPauseMs),
-    // lista vazia (ou só classes desconhecidas) volta ao padrão: todas
-    classes: classes.length ? classes : [...d.classes]
+    // lista vazia (ou só classes desconhecidas) volta ao padrão (só ACK)
+    classes: classes.length ? classes : [...d.classes],
+    volume: probabilityOr(src.volume, d.volume)
+  }
+}
+
+/** Pool de preâmbulos normalizado: frases válidas (texto aparado ≤ 80 chars), no máximo `FILLER_POOL_MAX`; vazio/lixo → null. */
+export function normalizeFillerPool(v: unknown): FillerPhrase[] | null {
+  if (!Array.isArray(v)) return null
+  const out: FillerPhrase[] = []
+  for (const item of v) {
+    const o = asObject(item)
+    const text = typeof o?.text === 'string' ? o.text.replace(/\s+/g, ' ').trim().slice(0, 80) : ''
+    if (!text) continue
+    const contexts = Array.isArray(o?.contexts)
+      ? FILLER_CONTEXTS.filter((c) => (o!.contexts as unknown[]).includes(c))
+      : []
+    out.push({ text, contexts })
+    if (out.length >= FILLER_POOL_MAX) break
+  }
+  return out.length ? out : null
+}
+
+/** Pool efetivo (null → `DEFAULT_FILLER_POOL`). */
+export function resolveFillerPool(pool: FillerPhrase[] | null | undefined): FillerPhrase[] {
+  const p = normalizeFillerPool(pool ?? null)
+  return p ?? DEFAULT_FILLER_POOL.map((f) => ({ text: f.text, contexts: [...f.contexts] }))
+}
+
+/** Turnos completos (ausente/lixo → `DEFAULT_VOICE_CALL_TURN`); 0 em `silenceStopMs` vira null. */
+export function normalizeVoiceCallTurn(v: unknown): VoiceCallTurnConfig {
+  const t = asObject(v)
+  const d = DEFAULT_VOICE_CALL_TURN
+  const turnMs = intOrNull(t?.silenceStopMs)
+  const pos = (x: unknown, def: number): number => {
+    const n = intOr(x, def)
+    return n > 0 ? n : def
+  }
+  return {
+    // null = o padrão da chamada (DEFAULT_TURN_SILENCE_MS); 0 não faz sentido aqui (sem limite =
+    // sem turnos) e vira null
+    silenceStopMs: turnMs && turnMs > 0 ? turnMs : null,
+    adaptive: boolOr(t?.adaptive, d.adaptive),
+    speculativeAtMs: pos(t?.speculativeAtMs, d.speculativeAtMs),
+    completeSilenceMs: pos(t?.completeSilenceMs, d.completeSilenceMs),
+    statementSilenceMs: pos(t?.statementSilenceMs, d.statementSilenceMs),
+    unfinishedSilenceMs: pos(t?.unfinishedSilenceMs, d.unfinishedSilenceMs),
+    speculativeApi: boolOr(t?.speculativeApi, d.speculativeApi)
   }
 }
 
@@ -494,18 +665,22 @@ export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
 export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
   const src = asObject(v)
   const fillers = asObject(src?.fillers)
-  const turn = asObject(src?.turn)
-  const turnMs = intOrNull(turn?.silenceStopMs)
+  const d = DEFAULT_VOICE_CALL_DEFAULTS
   return {
-    enabled: boolOr(src?.enabled, DEFAULT_VOICE_CALL_DEFAULTS.enabled),
+    enabled: boolOr(src?.enabled, d.enabled),
     interjections: normalizeInterjectionPolicy(src?.interjections),
     fillers: {
-      enabled: boolOr(fillers?.enabled, DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled),
-      prompt: promptOrNull(fillers?.prompt)
+      enabled: boolOr(fillers?.enabled, d.fillers.enabled),
+      prompt: promptOrNull(fillers?.prompt),
+      // 0 é válido (preâmbulo já, sem esperar)
+      delayMs: Math.min(5000, intOr(fillers?.delayMs, d.fillers.delayMs)),
+      pool: normalizeFillerPool(fillers?.pool)
     },
-    // null = o padrão da chamada (DEFAULT_TURN_SILENCE_MS); 0 não faz sentido aqui (sem limite =
-    // sem turnos) e vira null
-    turn: { silenceStopMs: turnMs && turnMs > 0 ? turnMs : null }
+    turn: normalizeVoiceCallTurn(src?.turn),
+    // 0 é válido (sem teto)
+    maxTokens: intOr(src?.maxTokens, d.maxTokens),
+    basePromptEnabled: boolOr(src?.basePromptEnabled, d.basePromptEnabled),
+    basePrompt: promptOrNull(src?.basePrompt)
   }
 }
 
@@ -528,6 +703,38 @@ export function resolveTurnSilenceMs(
 }
 
 /**
+ * Tempos efetivos do fim de turno (renderer: `AdaptiveTurnGate`). Coerentes por construção:
+ * `completeMs ≤ statementMs ≤ unfinishedMs` e `fallbackMs` (sem transcrição especulativa) dentro
+ * de `[completeMs, unfinishedMs]`; `speculativeAtMs` < `completeMs`.
+ */
+export interface TurnTiming {
+  adaptive: boolean
+  speculativeAtMs: number
+  completeMs: number
+  statementMs: number
+  unfinishedMs: number
+  fallbackMs: number
+}
+
+export function resolveTurnTiming(turn: VoiceCallTurnConfig | null | undefined): TurnTiming {
+  const t = normalizeVoiceCallTurn(turn ?? null)
+  const fallbackMs = resolveTurnSilenceMs(t)
+  const unfinishedMs = Math.max(t.unfinishedSilenceMs, fallbackMs, t.statementSilenceMs)
+  const completeMs = Math.min(t.completeSilenceMs, fallbackMs, t.statementSilenceMs)
+  const statementMs = Math.min(Math.max(t.statementSilenceMs, completeMs), unfinishedMs)
+  return {
+    adaptive: t.adaptive,
+    speculativeAtMs: Math.min(t.speculativeAtMs, Math.max(1, completeMs - 100)),
+    completeMs,
+    statementMs,
+    unfinishedMs,
+    fallbackMs
+  }
+}
+
+export const DEFAULT_TURN_TIMING: TurnTiming = resolveTurnTiming(DEFAULT_VOICE_CALL_TURN)
+
+/**
  * `VoiceCallConfig` resolvido: campos null herdam o padrão (como `memory`/`skills` — a herança
  * persona→chat é snapshot na criação do chat; aqui resolve-se chat→global). `model`/`tools`
  * continuam `null` quando não há override (o chamador usa o modelo/tools do próprio chat).
@@ -545,6 +752,10 @@ export interface ResolvedVoiceCall {
   fillers: VoiceFillers
   /** Interjeições efetivas (consumidas pela chamada — ver SPEC → "Interjeições (regras)"). */
   interjections: InterjectionPolicy
+  /** Prompt-base do modo voz (global); null = desligado. */
+  basePrompt: string | null
+  /** Teto de tokens da resposta nos turnos de voz (0 = sem teto). */
+  maxTokens: number
 }
 
 /** Resolução completa (aceita lixo/null; `enabled: null` herda o global — null ≠ false). */
@@ -559,8 +770,10 @@ export function resolveVoiceCallConfig(
     model: c.model,
     tools: c.tools,
     voicePrompt: c.voicePrompt,
-    fillers: c.fillers ?? d.fillers,
-    interjections: c.interjections ?? d.interjections
+    fillers: c.fillers ?? { enabled: d.fillers.enabled, prompt: d.fillers.prompt },
+    interjections: c.interjections ?? d.interjections,
+    basePrompt: d.basePromptEnabled ? (d.basePrompt ?? DEFAULT_VOICE_BASE_PROMPT) : null,
+    maxTokens: d.maxTokens
   }
 }
 
@@ -576,10 +789,22 @@ export function applyVoiceCallChat(chat: Chat, call: ResolvedVoiceCall): Chat {
   if (call.model) out.params = { ...call.model.params }
   if (call.tools?.enabledTools != null) out.enabledTools = [...call.tools.enabledTools]
   if (call.tools?.maxToolOutputChars != null) out.maxToolOutputChars = call.tools.maxToolOutputChars
-  if (call.voicePrompt) {
-    out.systemPrompt = cfg.systemPrompt
-      ? `${cfg.systemPrompt}\n\n${call.voicePrompt}`
-      : call.voicePrompt
+  // prompt-base do modo voz (global) + o voicePrompt do chat, nessa ordem, depois do system prompt
+  const extra = [call.basePrompt, call.voicePrompt].filter((x): x is string => !!x?.trim())
+  if (extra.length) {
+    out.systemPrompt = [cfg.systemPrompt, ...extra].filter((x) => !!x?.trim()).join('\n\n')
+  }
+  // teto de tokens do turno de voz: só sem max_tokens/raciocínio definidos (raciocínio conta no
+  // teto em alguns provedores — 120 tokens quebrariam o pedido)
+  const params = out.params ?? {}
+  const effort = params.reasoning_effort
+  if (
+    typeof call.maxTokens === 'number' &&
+    call.maxTokens > 0 &&
+    params.max_tokens == null &&
+    (effort == null || effort === 'none')
+  ) {
+    out.params = { ...params, max_tokens: call.maxTokens }
   }
   return { ...chat, config: out }
 }
@@ -599,8 +824,10 @@ export interface VoiceCallState {
   sessionId: string | null
   phase: VoiceCallPhase
   muted: boolean
-  /** Silêncio que encerra o turno, em ms (resolvido em `voice:call:start`). */
+  /** Silêncio que encerra o turno sem transcrição especulativa, em ms (resolvido em `voice:call:start`). */
   turnSilenceMs: number
+  /** Tempos do fim de turno adaptativo (resolvidos em `voice:call:start`). */
+  turnTiming: TurnTiming
   /** Fala já transcrita aguardando o próximo turno (máx. 1; '' = nenhuma). */
   pendingText: string
   error: string | null
@@ -614,6 +841,7 @@ export const VOICE_CALL_INACTIVE: VoiceCallState = {
   phase: 'listening',
   muted: false,
   turnSilenceMs: DEFAULT_TURN_SILENCE_MS,
+  turnTiming: DEFAULT_TURN_TIMING,
   pendingText: '',
   error: null
 }

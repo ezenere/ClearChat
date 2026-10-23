@@ -22,7 +22,11 @@ import {
   ESPEAK_E2M
 } from '../src/main/voice/ttsLocal.ts'
 import {
+  collectPcmStream,
+  resetTtsPcmEndpoints,
   synthesize,
+  synthesizeStream,
+  ttsEndpointWantsPcm,
   TTS_DEFAULT_TIMEOUT_MS,
   TTS_TEST_PHRASE,
   TtsError,
@@ -442,4 +446,222 @@ test('kokoro: sessão ONNX que falhou ao criar não fica em cache (a próxima s�
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+// ---------------- adaptador PCM → WAV (OpenRouter: "expected one of mp3|pcm") + streaming ----------------
+
+/** PCM16 LE de amostras inteiras. */
+const pcm16 = (...samples: number[]): Uint8Array => {
+  const out = new Uint8Array(samples.length * 2)
+  const dv = new DataView(out.buffer)
+  samples.forEach((v, i) => dv.setInt16(i * 2, v, true))
+  return out
+}
+const wavInfo = (wav: Uint8Array): { riff: string; rate: number; ch: number; data: number[] } => {
+  const dv = new DataView(wav.buffer, wav.byteOffset, wav.byteLength)
+  const data: number[] = []
+  for (let o = 44; o + 1 < wav.length; o += 2) data.push(dv.getInt16(o, true))
+  return {
+    riff: String.fromCharCode(...wav.subarray(0, 4)) + String.fromCharCode(...wav.subarray(8, 12)),
+    rate: dv.getUint32(24, true),
+    ch: dv.getUint16(22, true),
+    data
+  }
+}
+
+test('tts api: OpenRouter pede pcm (nunca wav) e o PCM cru vira WAV com a taxa do content-type', async () => {
+  resetTtsPcmEndpoints()
+  const { calls, fetch } = mockFetch(() => ({
+    body: pcm16(1, -2, 300),
+    contentType: 'audio/pcm;rate=24000;channels=1'
+  }))
+  const r = await withFetch(fetch, () =>
+    synthesize({
+      text: 'Olá',
+      settings: apiSettings({
+        baseUrl: 'https://openrouter.ai/api/v1',
+        model: 'elevenlabs/eleven-flash-v2.5',
+        voice: 'sarah'
+      })
+    })
+  )
+  assert.equal(calls.length, 1)
+  const body = JSON.parse(String(calls[0].init?.body))
+  assert.equal(body.response_format, 'pcm')
+  assert.equal(body.voice, 'sarah', 'voz curta passa como está')
+  assert.equal(r.mime, 'audio/wav')
+  const w = wavInfo(r.audio)
+  assert.equal(w.riff, 'RIFFWAVE')
+  assert.equal(w.rate, 24000)
+  assert.equal(w.ch, 1)
+  assert.deepEqual(w.data, [1, -2, 300])
+  // mp3 pedido segue mp3 (o OpenRouter aceita)
+  const mp3 = mockFetch(() => ({ body: new Uint8Array([7]), contentType: 'audio/mpeg' }))
+  await withFetch(mp3.fetch, () =>
+    synthesize({
+      text: 'oi',
+      settings: apiSettings({ baseUrl: 'https://openrouter.ai/api/v1' }),
+      format: 'mp3'
+    })
+  )
+  assert.equal(JSON.parse(String(mp3.calls[0].init?.body)).response_format, 'mp3')
+})
+
+test('tts api: 400 que recusa wav citando pcm → repete UMA vez com pcm, embrulha e lembra o endpoint', async () => {
+  resetTtsPcmEndpoints()
+  const base = 'https://speech.example/v1'
+  assert.equal(ttsEndpointWantsPcm(base), false)
+  const { calls, fetch } = mockFetch((_url, init) => {
+    const fmt = JSON.parse(String(init?.body)).response_format
+    return fmt === 'wav'
+      ? {
+          status: 400,
+          body: '{"error":{"message":"Invalid option: expected one of \\"mp3\\"|\\"pcm\\""}}',
+          contentType: 'application/json'
+        }
+      : { body: pcm16(5, 6), contentType: 'audio/pcm;rate=44100' }
+  })
+  const r = await withFetch(fetch, () =>
+    synthesize({ text: 'oi', settings: apiSettings({ baseUrl: base }) })
+  )
+  assert.deepEqual(
+    calls.map((c) => JSON.parse(String(c.init?.body)).response_format),
+    ['wav', 'pcm']
+  )
+  assert.equal(wavInfo(r.audio).rate, 44100)
+  assert.deepEqual(wavInfo(r.audio).data, [5, 6])
+  assert.equal(ttsEndpointWantsPcm(base), true)
+  // a próxima já pede pcm (sem a request perdida)
+  await withFetch(fetch, () =>
+    synthesize({ text: 'de novo', settings: apiSettings({ baseUrl: base }) })
+  )
+  assert.equal(calls.length, 3)
+  assert.equal(JSON.parse(String(calls[2].init?.body)).response_format, 'pcm')
+  resetTtsPcmEndpoints()
+})
+
+test('tts api: 400 sem menção a pcm não repete (erro http legível); pcm sempre recusado → 1 retry só', async () => {
+  resetTtsPcmEndpoints()
+  const plain = mockFetch(() => ({
+    status: 400,
+    body: '{"error":{"message":"voice not found"}}',
+    contentType: 'application/json'
+  }))
+  await withFetch(plain.fetch, () =>
+    assert.rejects(synthesize({ text: 'oi', settings: apiSettings() }), (e: unknown) => {
+      assert.ok(e instanceof TtsError)
+      assert.equal(e.kind, 'http')
+      assert.match(e.message, /voice not found/)
+      return true
+    })
+  )
+  assert.equal(plain.calls.length, 1)
+  const always = mockFetch(() => ({
+    status: 400,
+    body: 'expected one of mp3|pcm',
+    contentType: 'text/plain'
+  }))
+  await withFetch(always.fetch, () =>
+    assert.rejects(synthesize({ text: 'oi', settings: apiSettings() }), /HTTP 400/)
+  )
+  assert.equal(always.calls.length, 2, 'repete uma vez, não em laço')
+  resetTtsPcmEndpoints()
+})
+
+test('tts api: PCM estéreo vira mono (média) e byte ímpar sobrando é descartado', async () => {
+  resetTtsPcmEndpoints()
+  const stereo = new Uint8Array([...pcm16(100, 300, -10, -30), 0x7f])
+  const { fetch } = mockFetch(() => ({
+    body: stereo,
+    contentType: 'audio/pcm; rate=16000; channels=2'
+  }))
+  const r = await withFetch(fetch, () =>
+    synthesize({ text: 'oi', settings: apiSettings({ baseUrl: 'https://openrouter.ai/api/v1' }) })
+  )
+  const w = wavInfo(r.audio)
+  assert.equal(w.rate, 16000)
+  assert.deepEqual(w.data, [200, -20])
+})
+
+/** fetch cujo corpo chega em pedaços (ReadableStream) com os cortes dados. */
+function chunkedFetch(parts: Uint8Array[], contentType: string, gapMs = 0): typeof fetch {
+  return (async (_url: unknown, init?: RequestInit) => {
+    const body = new ReadableStream<Uint8Array>({
+      async start(ctrl) {
+        for (const p of parts) {
+          if (gapMs) await new Promise((r) => setTimeout(r, gapMs))
+          if (init?.signal?.aborted) {
+            ctrl.error(new DOMException('aborted', 'AbortError'))
+            return
+          }
+          ctrl.enqueue(p)
+        }
+        ctrl.close()
+      }
+    })
+    return new Response(body, { status: 200, headers: { 'content-type': contentType } })
+  }) as typeof fetch
+}
+
+test('synthesizeStream: PCM progressivo sai em pedaços alinhados (cortes no meio da amostra) + WAV completo', async () => {
+  resetTtsPcmEndpoints()
+  const all = pcm16(1, 2, 3, 4, 5)
+  const parts = [all.subarray(0, 3), all.subarray(3, 4), all.subarray(4, 10)]
+  const settings = apiSettings({ baseUrl: 'https://openrouter.ai/api/v1' })
+  const s = await withFetch(chunkedFetch(parts, 'audio/pcm;rate=24000;channels=1'), () =>
+    synthesizeStream({ text: 'oi', settings })
+  )
+  assert.equal(s.streaming, true)
+  if (!s.streaming) return
+  assert.equal(s.sampleRate, 24000)
+  const got: number[][] = []
+  for await (const c of s.chunks) {
+    assert.equal(c.length % 2, 0, 'pedaço em amostras inteiras')
+    got.push([...new Int16Array(c.slice().buffer)])
+  }
+  assert.deepEqual(got.flat(), [1, 2, 3, 4, 5])
+  assert.ok(got.length >= 2, 'chegou em mais de um pedaço')
+  // collectPcmStream junta num WAV
+  const s2 = await withFetch(chunkedFetch(parts, 'audio/pcm;rate=24000'), () =>
+    synthesizeStream({ text: 'oi', settings })
+  )
+  assert.equal(s2.streaming, true)
+  if (!s2.streaming) return
+  const full = await collectPcmStream(s2)
+  assert.deepEqual(wavInfo(full.audio).data, [1, 2, 3, 4, 5])
+  assert.equal(full.mime, 'audio/wav')
+})
+
+test('synthesizeStream: wav/mp3 e motor local → bytes completos (streaming: false); abort no meio → AbortError', async () => {
+  resetTtsPcmEndpoints()
+  const wav = mockFetch(() => ({ body: new Uint8Array([1, 2]), contentType: 'audio/wav' }))
+  const r = await withFetch(wav.fetch, () =>
+    synthesizeStream({ text: 'oi', settings: apiSettings() })
+  )
+  assert.equal(r.streaming, false)
+  if (!r.streaming) assert.deepEqual([...r.result.audio], [1, 2])
+  const eng = fakeEngine()
+  const loc = await synthesizeStream(
+    { text: 'oi', settings: localSettings() },
+    { local: eng.backend }
+  )
+  assert.equal(loc.streaming, false)
+  assert.equal(eng.calls[0].format, 'wav')
+  // abort depois do 1º pedaço: o iterador rejeita com AbortError (nunca TtsError)
+  const ac = new AbortController()
+  const parts = Array.from({ length: 20 }, (_, i) => pcm16(i))
+  const s = await withFetch(chunkedFetch(parts, 'audio/pcm;rate=24000', 5), () =>
+    synthesizeStream(
+      { text: 'oi', settings: apiSettings({ baseUrl: 'https://openrouter.ai/api/v1' }) },
+      { signal: ac.signal }
+    )
+  )
+  assert.equal(s.streaming, true)
+  if (!s.streaming) return
+  await assert.rejects(
+    (async () => {
+      for await (const c of s.chunks) if (c.length) ac.abort()
+    })(),
+    (e: Error) => e.name === 'AbortError'
+  )
 })

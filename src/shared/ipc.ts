@@ -236,6 +236,7 @@ export const IPC = {
     transcribePush: 'voice:transcribe:push',
     transcribeStop: 'voice:transcribe:stop',
     transcribeCancel: 'voice:transcribe:cancel',
+    transcribeSpeculate: 'voice:transcribe:speculate',
     modelsList: 'voice:models:list',
     modelsDownload: 'voice:models:download',
     modelsCancel: 'voice:models:cancel',
@@ -274,6 +275,11 @@ export const VOICE_CALL_STATE_CHANNEL = 'voice:call:state'
 export const VOICE_CALL_UTTERANCE_CHANNEL = 'voice:call:utterance'
 /** Canal main → renderer com o cancelamento de uma utterance (`VoiceCallUtteranceCancelEvent`). */
 export const VOICE_CALL_UTTERANCE_CANCEL_CHANNEL = 'voice:call:utterance-cancel'
+/**
+ * Canal main → renderer com os pedaços seguintes de uma utterance em streaming
+ * (`VoiceCallUtteranceChunkEvent` — só utterances com `streaming: true`).
+ */
+export const VOICE_CALL_UTTERANCE_CHUNK_CHANNEL = 'voice:call:utterance-chunk'
 /** Canal main → renderer com eventos da timeline da chamada (`VoiceCallTimelineEvent`). */
 export const VOICE_CALL_TIMELINE_CHANNEL = 'voice:call:timeline'
 
@@ -499,6 +505,17 @@ export interface VoiceTranscribeResult {
   fellBack: boolean
   /** Motivo curto (pt-BR) da falha do primário quando `fellBack`. */
   fallbackReason?: string
+  /** A final é a transcrição especulativa reaproveitada (fim de turno adaptativo — sem 2ª chamada). */
+  speculative?: boolean
+}
+
+/** Transcrição especulativa (`voice:transcribe:speculate`) — fim de turno adaptativo da chamada. */
+export interface VoiceSpeculativeView {
+  text: string
+  ms: number
+  backend: 'api' | 'local'
+  /** Pode virar a final com `stop(id, { reuseSpeculative: true })`. */
+  reusable: boolean
 }
 
 /** Uma sessão de transcrição por vez; `start` devolve o id usado em push/stop/cancel. */
@@ -518,8 +535,16 @@ export interface VoiceApi {
     start(language?: string): Promise<string>
     /** Acumula PCM16 mono little-endian (16 kHz; `sampleRate`, se vier, precisa casar). */
     push(sessionId: string, pcm16: Uint8Array, sampleRate?: number): Promise<void>
-    /** Para o loop de parciais e transcreve o buffer inteiro (final, com fallback se houver motor local). */
-    stop(sessionId: string): Promise<VoiceTranscribeResult>
+    /**
+     * Para o loop de parciais e transcreve o buffer inteiro (final, com fallback se houver motor
+     * local). `reuseSpeculative`: o usuário não falou depois da última especulação — ela vira a final.
+     */
+    stop(sessionId: string, opts?: { reuseSpeculative?: boolean }): Promise<VoiceTranscribeResult>
+    /**
+     * Transcrição especulativa do que já foi dito, sem encerrar (fim de turno adaptativo): motor
+     * local quando pronto; API só com `voiceCallDefaults.turn.speculativeApi`. null = indisponível.
+     */
+    speculate(sessionId: string): Promise<VoiceSpeculativeView | null>
     /** Descarta a sessão sem transcrever (id desconhecido = sem efeito). */
     cancel(sessionId: string): Promise<void>
   }
@@ -571,8 +596,12 @@ export interface VoiceApi {
     stop(): Promise<VoiceCallState>
     /** Mudo do microfone (a captura é pausada pelo renderer; aqui só reflete no estado). */
     mute(input: { muted: boolean }): Promise<VoiceCallState>
-    /** O usuário começou a falar (a UI mostra "Ouvindo…"; durante a reprodução = barge-in). */
-    speechBegin(): Promise<VoiceCallState>
+    /**
+     * O usuário começou a falar fora da reprodução de uma frase (a UI mostra "Ouvindo…").
+     * `dropped` = utterances que o renderer descartou sem tocar (clipes/frases na fila) — com a
+     * resposta ainda não ouvida, o main retém a resposta (turno continuado).
+     */
+    speechBegin(input?: { dropped?: string[] }): Promise<VoiceCallState>
     /** Silêncio encerrou a fala: a transcrição final está em andamento ("Transcrevendo…"). */
     speechEnd(): Promise<VoiceCallState>
     /**
@@ -582,8 +611,12 @@ export interface VoiceApi {
     turn(input: { text: string }): Promise<VoiceCallState>
     /** A fila de reprodução do renderer esvaziou (tudo que foi emitido já tocou). */
     playbackIdle(): Promise<VoiceCallState>
-    /** Barge-in: o usuário falou durante a reprodução (a fala do assistente é cancelada). */
-    bargeIn(): Promise<VoiceCallState>
+    /**
+     * Barge-in: o usuário falou durante a reprodução (a fala do assistente é cancelada, o turno do
+     * agente é parado e o histórico fica só com o que foi FALADO). `playedIds` = utterances de
+     * sentença que começaram a tocar (a que estava tocando conta).
+     */
+    bargeIn(input?: { playedIds?: string[] }): Promise<VoiceCallState>
     /**
      * Observação do detector de pausas na fala do usuário (SPEC → "Interjeições (regras)"): a
      * política pura decide e o main toca o clipe (ou não, em modo sombra). `observedAt` = momento
@@ -594,6 +627,8 @@ export interface VoiceApi {
       pauseMs: number
       tail: string
       observedAt: number
+      /** Veredito do fim de turno adaptativo da pausa (`UtteranceEnd`); ausente = sem especulação. */
+      end?: string | null
     }): Promise<void>
     /**
      * Backchannel do usuário durante a reprodução (fala curta ≤ ~800 ms): só registra — NÃO
@@ -731,6 +766,8 @@ export interface TtsClipsView {
   model: string
   generatedAt: string
   clips: TtsClipInfo[]
+  /** Cache de uma definição antiga (frases/pool de preâmbulos mudaram) — precisa regerar. */
+  stale?: boolean
 }
 
 /** Uma utterance falada da chamada de voz (canal `voice:call:utterance`) — bytes completos por sentença. */
@@ -746,6 +783,29 @@ export interface VoiceCallUtteranceEvent {
    * ou interjeição na fala do usuário (clipes `resolveClip` — SPEC → "Chamada de voz").
    */
   kind?: 'sentence' | 'filler' | 'interjection'
+  /**
+   * Ganho relativo da utterance (0–1, multiplica o volume da chamada); ausente = 1. Interjeições
+   * (backchannel) tocam mais baixo (`interjections.volume`, padrão 0.6).
+   */
+  gain?: number
+  /**
+   * Utterance em streaming (TTS de API que devolve PCM progressivo — ex.: OpenRouter/ElevenLabs):
+   * `audio` traz só o começo (PCM16 LE mono cru, ~200 ms) com `mime` `audio/pcm;rate=N`, e o resto
+   * chega por `voice:call:utterance-chunk` até `done`. Ausente/false = bytes completos (wav/mp3).
+   */
+  streaming?: boolean
+}
+
+/** Próximo pedaço de uma utterance em streaming (canal `voice:call:utterance-chunk`). */
+export interface VoiceCallUtteranceChunkEvent {
+  /** Id da utterance (`VoiceCallUtteranceEvent.id`). */
+  id: string
+  /** PCM16 LE mono (mesma taxa do `mime` da utterance); pode vir vazio no `done`. */
+  pcm: Uint8Array
+  /** Último pedaço: depois dele a utterance termina quando o áudio acabar de tocar. */
+  done: boolean
+  /** O stream falhou no meio (o que já chegou toca; a utterance termina aí). */
+  error?: string
 }
 
 /** Cancela uma utterance (canal `voice:call:utterance-cancel`) — filler interrompido pela 1ª sentença. */
@@ -789,6 +849,12 @@ export interface VoiceCallTimelineEvent {
     | 'barge-in'
     /** Fala curta do usuário durante a reprodução (backchannel — só registrou). */
     | 'backchannel'
+    /** Veredito do fim de turno adaptativo numa pausa (renderer — `text` = especulativa, `reason` = veredito). */
+    | 'turn-verdict'
+    /** Turno continuado: o usuário voltou a falar antes da resposta ser ouvida (main — `text` = turno refeito). */
+    | 'turn-continued'
+    /** Turno do agente parado e histórico ajustado ao que foi falado (main — barge-in/continuação). */
+    | 'turn-amended'
   /** Classe do ato ('FILLER'/'ACK'/…); ausente em eventos sem classe. */
   class?: string | null
   /** Id da utterance dona do evento (pareia decisão → áudio). */
@@ -1086,6 +1152,8 @@ export interface ClearApi {
   onVoiceCallUtterance?(cb: (e: VoiceCallUtteranceEvent) => void): () => void
   /** Cancelamento de utterance da chamada (canal `voice:call:utterance-cancel`); unsubscribe como em `onEvent`. */
   onVoiceCallUtteranceCancel?(cb: (e: VoiceCallUtteranceCancelEvent) => void): () => void
+  /** Pedaços das utterances em streaming (canal `voice:call:utterance-chunk`); unsubscribe como em `onEvent`. */
+  onVoiceCallUtteranceChunk?(cb: (e: VoiceCallUtteranceChunkEvent) => void): () => void
   /** Timeline da chamada de voz (canal `voice:call:timeline`); unsubscribe como em `onEvent`. */
   onVoiceCallTimeline?(cb: (e: VoiceCallTimelineEvent) => void): () => void
   /** Sync (conta, servidor, host de execução, divergência) — ver docs/SYNC_PROTOCOL.md. */
