@@ -9,10 +9,12 @@
 // binding nativo carrega de forma preguiçosa. No máximo UMA sessão ONNX carregada.
 // Ver SPEC → "Áudio → Serviço de TTS → Processo do motor local".
 import { readFile } from 'node:fs/promises'
+import { availableParallelism } from 'node:os'
 import type { InferenceSession, Tensor } from 'onnxruntime-node'
 import {
   KokoroCoreError,
   KOKORO_SAMPLE_RATE,
+  kokoroSessionOptions,
   kokoroSynthesizePcm,
   runEspeak,
   voiceStyles,
@@ -114,7 +116,11 @@ async function sessionFor(modelPath: string): Promise<{ session: KokoroSession; 
   const t0 = Date.now()
   let session: InferenceSession
   try {
-    session = await ort.InferenceSession.create(modelPath, { executionProviders: ['cpu'] })
+    // threads limitadas e sem spin (o padrão do onnxruntime ocupava todos os núcleos)
+    session = await ort.InferenceSession.create(
+      modelPath,
+      kokoroSessionOptions(availableParallelism())
+    )
   } catch (e) {
     throw new WorkerError('model', errText(e))
   }

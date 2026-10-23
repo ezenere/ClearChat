@@ -40,6 +40,18 @@ type Distribute<T> = T extends unknown ? Omit<T, 'id'> : never
 /** Pedido sem o `id` (o host numera). */
 export type SttWorkerCommand = Distribute<SttWorkerRequest>
 
+/**
+ * Parcial pulada porque o motor está ocupado com outro pedido (`skipIfBusy`): melhor-esforço — o
+ * chamador só ignora (não é erro de config; a próxima parcial tenta de novo). Ver
+ * `SttWorkerHost.transcribe`.
+ */
+export class SttBusyError extends Error {
+  constructor(message = 'motor local ocupado — parcial pulada') {
+    super(message)
+    this.name = 'SttBusyError'
+  }
+}
+
 /** Desliga o processo ocioso depois deste tempo (libera a RAM do modelo). */
 export const STT_WORKER_IDLE_MS = 10 * 60_000
 
@@ -168,6 +180,8 @@ interface Pending {
   reject: (e: unknown) => void
   /** Pedido abandonado pelo chamador (abort): a resposta é descartada quando chegar. */
   abandoned: boolean
+  /** Pedido de transcrição (conta como "motor ocupado" até a resposta do worker chegar). */
+  transcribe: boolean
 }
 
 export interface SttWorkerHostOptions {
@@ -191,6 +205,12 @@ export class SttWorkerHost {
   #gen = 0
   #seq = 0
   #pending = new Map<number, Pending>()
+  /** Pedidos de transcrição pendentes (o que roda no worker + a fila do host). */
+  #transcribing = 0
+  /** Transcrição em curso no worker (no máximo uma — as outras esperam em `#txQueue`). */
+  #txInFlight: number | null = null
+  /** Transcrições esperando a vez no host (nunca foram ao worker; abort = sai daqui). */
+  #txQueue: { id: number; msg: SttWorkerRequest }[] = []
   #loadedModel: string | null = null
   #idleTimer: ReturnType<typeof setTimeout> | null = null
   /** Quantos processos já foram iniciados (diagnóstico/testes). */
@@ -209,6 +229,11 @@ export class SttWorkerHost {
 
   get running(): boolean {
     return this.#ch !== null
+  }
+
+  /** Transcrições pendentes: a que roda no worker (mesmo abandonada pelo chamador) + a fila do host. */
+  get busy(): number {
+    return this.#transcribing
   }
 
   #ensure(): SttWorkerChannel {
@@ -254,6 +279,12 @@ export class SttWorkerHost {
     const p = this.#pending.get(msg.id)
     if (!p) return
     this.#pending.delete(msg.id)
+    // ocupado até o WORKER responder (um abort rejeita o chamador antes, mas a CPU segue em uso)
+    if (p.transcribe) this.#transcribing = Math.max(0, this.#transcribing - 1)
+    if (msg.id === this.#txInFlight) {
+      this.#txInFlight = null
+      this.#pumpTx()
+    }
     if (!this.#pending.size) this.#ch?.hold?.(false)
     this.#armIdle()
     if (p.abandoned) return
@@ -264,6 +295,9 @@ export class SttWorkerHost {
   #rejectAll(err: unknown): void {
     const all = [...this.#pending.values()]
     this.#pending.clear()
+    this.#transcribing = 0
+    this.#txInFlight = null
+    this.#txQueue = []
     for (const p of all) if (!p.abandoned) p.reject(err)
   }
 
@@ -303,22 +337,62 @@ export class SttWorkerHost {
           signal?.removeEventListener('abort', onAbort)
           reject(e)
         },
-        abandoned: false
+        abandoned: false,
+        transcribe: cmd.type === 'transcribe'
       }
       const onAbort = (): void => {
-        entry.abandoned = true
+        const queued = this.#txQueue.findIndex((q) => q.id === id)
+        if (queued >= 0) {
+          // ainda na fila do HOST (nunca foi ao worker): sai sem custar inferência
+          this.#txQueue.splice(queued, 1)
+          this.#pending.delete(id)
+          this.#transcribing = Math.max(0, this.#transcribing - 1)
+          if (!this.#pending.size) this.#ch?.hold?.(false)
+        } else entry.abandoned = true // já no worker: a resposta é descartada quando chegar
         reject(abortError())
       }
       signal?.addEventListener('abort', onAbort, { once: true })
       this.#pending.set(id, entry)
       ch.hold?.(true)
+      const msg = { ...cmd, id } as SttWorkerRequest
+      if (entry.transcribe) {
+        this.#transcribing++
+        // uma transcrição por vez no worker: as demais esperam AQUI (abortar = sair da fila)
+        if (this.#txInFlight !== null) {
+          this.#txQueue.push({ id, msg })
+          return
+        }
+        this.#txInFlight = id
+      }
       try {
-        ch.post({ ...cmd, id } as SttWorkerRequest)
+        ch.post(msg)
       } catch (e) {
         this.#pending.delete(id)
+        if (entry.transcribe) {
+          this.#transcribing = Math.max(0, this.#transcribing - 1)
+          this.#txInFlight = null
+        }
         entry.reject(e)
       }
     })
+  }
+
+  /** Manda ao worker a próxima transcrição da fila do host (a anterior respondeu). */
+  #pumpTx(): void {
+    if (this.#txInFlight !== null || !this.#ch) return
+    const next = this.#txQueue.shift()
+    if (!next) return
+    this.#txInFlight = next.id
+    try {
+      this.#ch.post(next.msg)
+    } catch (e) {
+      this.#txInFlight = null
+      const p = this.#pending.get(next.id)
+      this.#pending.delete(next.id)
+      this.#transcribing = Math.max(0, this.#transcribing - 1)
+      if (p && !p.abandoned) p.reject(e)
+      this.#pumpTx()
+    }
   }
 
   /** O binding nativo carrega neste processo? (nunca lança — falha vira `available: false`). */
@@ -337,8 +411,23 @@ export class SttWorkerHost {
   async transcribe(
     modelPath: string,
     samples: Float32Array,
-    opts: { language: string | null; nThreads: number; signal?: AbortSignal }
+    opts: {
+      language: string | null
+      nThreads: number
+      signal?: AbortSignal
+      /** Contexto do encoder (quadros de 20 ms) — parciais; ausente = o do modelo. */
+      audioCtx?: number
+      /** Teto de tokens do texto — parciais; ausente = sem teto. */
+      maxTokens?: number
+      /**
+       * Parcial melhor-esforço: com outro pedido de transcrição em voo, NÃO entra na fila —
+       * rejeita na hora com `SttBusyError` (uma inferência por vez; a final/especulação/segmento
+       * nunca espera parcial velha).
+       */
+      skipIfBusy?: boolean
+    }
   ): Promise<SttWorkerTranscribeResult> {
+    if (opts.skipIfBusy && this.#transcribing > 0) throw new SttBusyError()
     if (this.#loadedModel && this.#loadedModel !== modelPath && !this.#pending.size)
       this.terminate()
     this.#loadedModel = modelPath
@@ -349,7 +438,9 @@ export class SttWorkerHost {
           modelPath,
           samples,
           language: opts.language,
-          nThreads: opts.nThreads
+          nThreads: opts.nThreads,
+          ...(opts.audioCtx ? { audioCtx: opts.audioCtx } : {}),
+          ...(opts.maxTokens ? { maxTokens: opts.maxTokens } : {})
         },
         opts.signal
       )

@@ -181,7 +181,7 @@ const api: FullClearApi = {
     },
     tts: {
       synth: (input) => invoke(IPC.voice.ttsSynth, input),
-      test: () => invoke(IPC.voice.ttsTest),
+      test: (input) => invoke(IPC.voice.ttsTest, input),
       clips: {
         generate: () => invoke(IPC.voice.ttsClipsGenerate),
         list: () => invoke(IPC.voice.ttsClipsList)
@@ -200,6 +200,10 @@ const api: FullClearApi = {
       interjectionObserved: (input) => invoke(IPC.voice.callInterjectionObserved, input),
       backchannel: (input) => invoke(IPC.voice.callBackchannel, input),
       getState: () => invoke(IPC.voice.callGetState)
+    },
+    catalog: {
+      list: (input) => invoke(IPC.voice.catalogList, input),
+      preview: (input) => invoke(IPC.voice.catalogPreview, input)
     },
     runtime: {
       status: () => invoke(IPC.voice.runtimeStatus)

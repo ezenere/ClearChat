@@ -158,9 +158,14 @@ export function VoiceCallDock(): React.JSX.Element | null {
           >
             {call.muted ? 'Microfone mudo' : phaseLabel(call.phase)}
           </span>
-          <span className="min-w-0 flex-1 truncate text-[11.5px] text-subtle">
+          <span className="flex min-w-0 flex-1 flex-col">
+            <LiveTranscript />
             {call.pendingText && (
-              <span data-testid="voice-call-pending" title={call.pendingText}>
+              <span
+                data-testid="voice-call-pending"
+                title={call.pendingText}
+                className="truncate text-[11.5px] text-subtle"
+              >
                 Próximo: {call.pendingText}
               </span>
             )}
@@ -290,5 +295,28 @@ function ClipsHint(): React.JSX.Element | null {
         </button>
       )}
     </div>
+  )
+}
+
+/**
+ * O que o usuário está dizendo, ao vivo (parciais da transcrição enquanto fala → a especulativa da
+ * pausa → a final enviada). Parcial em itálico/esmaecida: o texto definitivo pode mudar.
+ */
+function LiveTranscript(): React.JSX.Element | null {
+  const live = useVoiceCallRuntime((s) => s.live)
+  if (!live.text) return null
+  return (
+    <span
+      data-testid="voice-call-live"
+      data-state={live.state ?? undefined}
+      title={live.text}
+      className={cn(
+        'truncate text-[12.5px] leading-5 [direction:rtl] text-left',
+        live.state === 'final' ? 'text-fg/80' : 'text-subtle italic'
+      )}
+    >
+      {/* rtl + bdi: com texto longo, o FIM (o que acabou de ser dito) fica visível */}
+      <bdi>“{live.text}”</bdi>
+    </span>
   )
 }

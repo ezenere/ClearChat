@@ -287,7 +287,7 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
       unfinishedSilenceMs: 1500,
       speculativeApi: false
     },
-    maxTokens: 120,
+    model: null,
     basePromptEnabled: true,
     basePrompt: null
   })
@@ -395,7 +395,7 @@ test('pool de preâmbulos: normalização (texto aparado, contextos filtrados, t
   assert.deepEqual(d.fillers.pool, [{ text: 'Tá.', contexts: [] }])
 })
 
-test('applyVoiceCallChat: prompt-base do modo voz + voicePrompt; max_tokens só sem teto/raciocínio', () => {
+test('applyVoiceCallChat: prompt-base do modo voz + voicePrompt; a chamada não impõe max_tokens', () => {
   const chat = {
     id: 'c1',
     config: { systemPrompt: 'Você é útil.', params: {} }
@@ -407,23 +407,23 @@ test('applyVoiceCallChat: prompt-base do modo voz + voicePrompt; max_tokens só 
     `Você é útil.\n\n${DEFAULT_VOICE_BASE_PROMPT}\n\nFale como pirata.`
   )
   assert.match(DEFAULT_VOICE_BASE_PROMPT, /SRC/)
-  assert.equal(out.config.params?.max_tokens, 120)
-  // raciocínio ligado ou max_tokens próprio: o teto não entra
-  const withEffort = applyVoiceCallChat(
-    { ...chat, config: { ...chat.config, params: { reasoning_effort: 'low' } } } as never,
-    base
-  )
-  assert.equal(withEffort.config.params?.max_tokens, undefined)
+  // sem teto próprio: max_tokens só vem dos params (do modelo da chamada / do chat)
+  assert.equal(out.config.params?.max_tokens, undefined)
   const own = applyVoiceCallChat(
     { ...chat, config: { ...chat.config, params: { max_tokens: 500 } } } as never,
     base
   )
   assert.equal(own.config.params?.max_tokens, 500)
-  // prompt-base desligado e teto 0 → só o voicePrompt, sem max_tokens
+  // `maxTokens` antigo gravado nos padrões é descartado pela normalização
+  assert.equal(
+    'maxTokens' in normalizeVoiceCallDefaults({ maxTokens: 120 } as never),
+    false,
+    'maxTokens saiu dos padrões da chamada'
+  )
+  // prompt-base desligado → só o voicePrompt
   const off = resolveVoiceCallConfig({ voicePrompt: 'X.' } as never, {
     ...DEFAULT_VOICE_CALL_DEFAULTS,
-    basePromptEnabled: false,
-    maxTokens: 0
+    basePromptEnabled: false
   })
   const o2 = applyVoiceCallChat(chat, off)
   assert.equal(o2.config.systemPrompt, 'Você é útil.\n\nX.')

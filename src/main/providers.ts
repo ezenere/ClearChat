@@ -7,6 +7,7 @@ import type { ModelInfo, Provider } from '@shared/types'
 import { adapterFor } from './agent/adapters'
 import { fetchAnthropicModels } from './agent/adapters/anthropic'
 import { readableError } from './agent/llm'
+import { listElevenLabsModels } from './voice/elevenlabs'
 
 const CACHE_MS = 5 * 60_000
 const cache = new Map<string, { at: number; key: string; models: ModelInfo[] }>()
@@ -78,6 +79,15 @@ async function fetchModels(p: ModelsInput): Promise<ModelInfo[]> {
   const base = p.baseUrl.replace(/\/+$/, '')
   if (!/^https?:\/\//i.test(base)) throw new Error('Base URL inválida (use http:// ou https://).')
   const adapter = adapterFor(p)
+  if (adapter.kind === 'elevenlabs') {
+    // provedor de voz: os modelos de TTS da ElevenLabs (GET /v1/models — exige a chave)
+    const models = await listElevenLabsModels({
+      baseUrl: base,
+      apiKey: p.apiKey,
+      headers: p.headers ?? {}
+    })
+    return models.map((m) => ({ id: m.id, name: m.name }))
+  }
   const headers = adapter.getHeaders({ apiKey: p.apiKey, headers: p.headers ?? {} })
   if (adapter.kind === 'anthropic') {
     const models = await fetchAnthropicModels(base, (url) => getJson(url, headers))

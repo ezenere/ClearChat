@@ -27,7 +27,9 @@ import {
   type VoiceCallDefaults
 } from '@shared/voice'
 import { maskKey } from '@shared/webSearchSettings'
+import { linkVoiceEndpointProvider, type VoiceCapability } from '@shared/voiceCatalog'
 import type { Provider } from '@shared/types'
+import { providerKind } from '@shared/providerKinds'
 import type { LocalModelCatalogEntry } from './voice/catalog'
 import { providersRepo, settingsRepo } from './repo'
 
@@ -78,8 +80,72 @@ export function getVoiceSettings(): VoiceSettings {
   return {
     ...v,
     stt: { ...v.stt, api: resolveVoiceEndpoint(v.stt.api, lookup) },
-    tts: { ...v.tts, api: resolveVoiceEndpoint(v.tts.api, lookup) }
+    tts: { ...v.tts, api: withTtsProviderKind(resolveVoiceEndpoint(v.tts.api, lookup), lookup) }
   }
+}
+
+/**
+ * `providerKind` do provedor salvo no endpoint de fala resolvido (só para os serviços do main —
+ * `'elevenlabs'` liga o cliente ElevenLabs direto; ver `voice/elevenlabs.ts`). Sem provedor → igual.
+ */
+export function withTtsProviderKind<T extends { providerId: string | null }>(
+  api: T,
+  lookup: (id: string) => Pick<Provider, 'baseUrl' | 'kind'> | null
+): T & { providerKind?: string } {
+  const id = api.providerId?.trim()
+  const p = id ? lookup(id) : null
+  return p ? { ...api, providerKind: providerKind(p) } : api
+}
+
+/**
+ * Endpoint PERSONALIZADO salvo na setting da capacidade (baseUrl + chave própria, sem resolver o
+ * `providerId`) — a descoberta de modelos (`voice:catalog:list` com `providerId: null`) lista com
+ * ele. A chave nunca sai do main.
+ */
+export function getVoiceCustomEndpoint(capability: VoiceCapability): {
+  baseUrl: string
+  apiKey: string
+} {
+  const v = readVoiceSettings()
+  const api = capability === 'stt' ? v.stt.api : v.tts.api
+  return { baseUrl: api.baseUrl, apiKey: api.apiKey }
+}
+
+/** Flag da migração "endpoint avulso → provedor cadastrado" (uma vez por banco). */
+export const VOICE_PROVIDER_LINK_FLAG = 'migration.voiceProviderLink'
+
+/**
+ * Migração (uma vez) da UI antiga de campos livres para provedor + modelo: liga `sttSettings.api`
+ * / `ttsSettings.api` ao provedor cadastrado com a mesma `baseUrl` (só quando a chave própria está
+ * vazia ou é a do provedor — senão fica "endpoint personalizado") e corrige o modelo sem prefixo
+ * no OpenRouter (`whisper-large-v3-turbo` → `openai/whisper-large-v3-turbo`) — ver
+ * `linkVoiceEndpointProvider`. Grava pelo `setVoiceSetting` (a chave própria é preservada).
+ * Devolve o que mudou (para log).
+ */
+export function migrateVoiceProviderLinks(): string[] {
+  if (settingsRepo.get(VOICE_PROVIDER_LINK_FLAG)) return []
+  const providers = providersRepo.list()
+  const v = readVoiceSettings()
+  const changes: string[] = []
+  const stt = linkVoiceEndpointProvider(v.stt.api, providers, 'stt')
+  if (stt.linked || stt.model) {
+    // chave ausente no `set` = preserva a chave própria salva
+    const { apiKey: _k, ...api } = stt.api
+    void _k
+    setVoiceSetting('sttSettings', { ...v.stt, api })
+    if (stt.linked) changes.push(`stt → provedor ${stt.linked}`)
+    if (stt.model) changes.push(`stt modelo ${stt.model.from} → ${stt.model.to}`)
+  }
+  const tts = linkVoiceEndpointProvider(v.tts.api, providers, 'tts')
+  if (tts.linked || tts.model) {
+    const { apiKey: _k, ...api } = tts.api
+    void _k
+    setVoiceSetting('ttsSettings', { ...v.tts, api })
+    if (tts.linked) changes.push(`tts → provedor ${tts.linked}`)
+    if (tts.model) changes.push(`tts modelo ${tts.model.from} → ${tts.model.to}`)
+  }
+  settingsRepo.set(VOICE_PROVIDER_LINK_FLAG, 1)
+  return changes
 }
 
 // ---------------- visão para a UI (chaves de API mascaradas) ----------------

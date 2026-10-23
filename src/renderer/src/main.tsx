@@ -11,10 +11,18 @@ async function start(): Promise<void> {
   // substituída em tempo de build: no build normal o módulo do mock nem entra no bundle.
   if (import.meta.env.VITE_CLEAR_MOCK === '1') {
     const { createMockApi } = await import('./dev/mockApi')
-    installApi(createMockApi(new URLSearchParams(location.search).get('scenario') ?? 'chat'))
+    const mockApi = createMockApi(new URLSearchParams(location.search).get('scenario') ?? 'chat')
+    installApi(mockApi)
+    // a API simulada acessível aos E2E do mock (ex.: simular um turno de voz)
+    ;(window as unknown as { __clearMockApi?: typeof mockApi }).__clearMockApi = mockApi
     // estado do app acessível aos E2E contra o mock (só neste build)
     const { useStore } = await import('./store')
     ;(window as unknown as { __clearStore?: typeof useStore }).__clearStore = useStore
+    // runtime da chamada de voz (transcrição ao vivo da barra) — E2E do mock
+    const { useVoiceCallRuntime } = await import('./lib/voice/voiceCallRuntime')
+    ;(
+      window as unknown as { __clearVoiceRuntime?: typeof useVoiceCallRuntime }
+    ).__clearVoiceRuntime = useVoiceCallRuntime
   }
   // fonte remota de arquivos (chat em controle remoto: busca do host pelo sync)
   setupRemoteSources()

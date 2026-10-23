@@ -218,6 +218,16 @@ function httpError(status: number, raw: string, url: string): SttError {
  * resumido), `network`, `timeout` (padrão 60 s, `timeoutMs`), `config` (sem chave/modelo/baseUrl).
  * Abort do `signal` propaga como `AbortError`.
  */
+/** Endpoint na própria máquina (localhost/127.0.0.1/::1)? */
+function isLocalEndpoint(url: string): boolean {
+  try {
+    const host = new URL(url).hostname
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]'
+  } catch {
+    return false
+  }
+}
+
 export async function transcribeAudio(
   input: TranscribeAudioInput,
   opts: SttTranscribeOptions
@@ -232,7 +242,8 @@ export async function transcribeAudio(
     })
   if (!model)
     throw new SttError('config', 'modelo de transcrição não configurado', { backend: 'api' })
-  if (!key)
+  // servidor local (localhost) pode rodar sem chave — como o TTS e a checagem da chamada
+  if (!key && !isLocalEndpoint(baseUrl))
     throw new SttError('config', 'chave de API de transcrição não configurada', { backend: 'api' })
 
   const url = `${baseUrl}/audio/transcriptions`
@@ -257,7 +268,7 @@ export async function transcribeAudio(
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { Accept: 'application/json', Authorization: `Bearer ${key}` },
+      headers: { Accept: 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) },
       body,
       signal
     })
@@ -334,6 +345,11 @@ export interface SttLocalTranscribeOptions {
    * whisper.cpp emite parciais por **janelas** na sessão, `STT_PARTIAL_INTERVAL_MS`).
    */
   onPartial?: (text: string) => void
+  /**
+   * Finalidade: 'partial' = parcial ao vivo melhor-esforço (o motor local reduz o custo e pula a
+   * parcial quando está ocupado — `SttBusyError`). Ausente = final/especulação/segmento.
+   */
+  purpose?: 'partial' | 'final'
 }
 
 /** Motor local de transcrição (injetado pela fatia de runtime local — `src/main/voice/sttLocal.ts`). */

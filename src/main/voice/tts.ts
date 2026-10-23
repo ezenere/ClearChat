@@ -9,6 +9,11 @@ import type { TtsLocalEngine, TtsSettings } from '@shared/voice'
 import { connectionErrorText } from '@shared/network'
 import { abortError } from '../tools/util'
 import { concatBytes, encodeWav, parsePcmContentType, Pcm16MonoAligner } from './wav'
+import {
+  isElevenLabsEndpoint,
+  synthesizeElevenLabs,
+  synthesizeElevenLabsStream
+} from './elevenlabs'
 
 // ---------------- tipos ----------------
 
@@ -185,6 +190,9 @@ export async function synthesize(
     throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
   const format: TtsFormat = input.format ?? 'wav'
   if (input.settings.backend === 'local') return synthesizeLocal(text, input.settings, format, opts)
+  // ElevenLabs direta (provedor `elevenlabs` / host elevenlabs.io): REST próprio, sempre WAV 24 kHz
+  if (isElevenLabsEndpoint(input.settings.api))
+    return synthesizeElevenLabs(text, input.settings.api, opts)
   return synthesizeApi(text, input.settings, format, opts)
 }
 
@@ -452,6 +460,8 @@ export async function synthesizeStream(
     throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
   if (input.settings.backend === 'local')
     return { streaming: false, result: await synthesizeLocal(text, input.settings, 'wav', opts) }
+  if (isElevenLabsEndpoint(input.settings.api))
+    return synthesizeElevenLabsStream(text, input.settings.api, opts)
   const sp = await requestSpeech(text, input.settings, 'wav', opts)
   const pcm = pcmFormatOf(sp)
   if (!pcm || !sp.res.body) {

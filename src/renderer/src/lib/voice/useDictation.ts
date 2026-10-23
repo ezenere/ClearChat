@@ -43,8 +43,18 @@ export interface DictationControls {
   state: DictationState
   /** Nível RMS ao vivo (0..1) para o `Waveform`. */
   level: number
-  /** Parcial ao vivo acumulada (melhor-esforço); '' = nenhuma. Nunca entra no texto editável. */
+  /**
+   * Parcial ao vivo acumulada (melhor-esforço); '' = nenhuma. Nunca entra no texto editável. Fica
+   * visível durante o "finalizando…" (o texto nunca some ao parar) até a final substituí-la.
+   */
   partial: string
+  /**
+   * A final falhou mas há texto parcial: o Composer oferece inseri-lo (`insertPartial`) em vez de
+   * perder o que já tinha sido transcrito.
+   */
+  partialRecoverable: boolean
+  /** Insere o texto parcial (final falhou) no rascunho. */
+  insertPartial: () => void
   /** Erro legível (permissão negada, mic indisponível, STT fora do ar); null = sem erro. */
   error: string | null
   /** Dispensa o erro (inclui o da captura) e o aviso. */
@@ -82,6 +92,13 @@ export function useDictation(options: UseDictationOptions): DictationControls {
   const voice: VoiceApi | undefined = api.voice
   const settings = useVoiceSettings((s) => s.view.audioInput)
   const [partial, setPartial] = useState('')
+  const partialRef = useRef('')
+  const [partialRecoverable, setPartialRecoverable] = useState(false)
+  const recoverableRef = useRef(false)
+  useEffect(() => {
+    partialRef.current = partial
+    recoverableRef.current = partialRecoverable
+  }, [partial, partialRecoverable])
   const [errorState, setErrorState] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
   const [finalizing, setFinalizing] = useState(false)
@@ -172,7 +189,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     const off = api.onVoicePartial
     if (!off) return
     return off((e) => {
-      if (e.sessionId !== sessionIdRef.current || e.isFinal) return
+      if (!e.sessionId || e.sessionId !== sessionIdRef.current || e.isFinal) return
       if (e.error) setNotice(e.error)
       if (e.text) setPartial(e.text)
     })
@@ -192,12 +209,17 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     const pending = sessionPromiseRef.current
     sessionPromiseRef.current = null
     const id = pending ? await pending : sessionIdRef.current
-    sessionIdRef.current = null
-    if (mountedRef.current) setPartial('')
+    // a parcial CONTINUA visível ("finalizando…") até a final chegar — nunca some ao parar
     if (reason === 'device-lost' && mountedRef.current) setNotice(MIC_LOST_TEXT)
     const v = voiceRef.current
-    if (!id || !v) return
+    if (!id || !v) {
+      sessionIdRef.current = null
+      if (mountedRef.current) setPartial('')
+      return
+    }
     if (doCancel) {
+      sessionIdRef.current = null
+      if (mountedRef.current) setPartial('')
       await v.transcribe.cancel(id).catch(() => {})
       return
     }
@@ -207,12 +229,23 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     try {
       await pushChainRef.current
       if (token.cancelled) return
+      // segmentos já transcritos em segundo plano: a final é só o trecho depois da última pausa
+      // (ou nenhuma request, quando a parcial já cobre a fala inteira — `reusePartialFinal`)
       const result = await v.transcribe.stop(id)
+      sessionIdRef.current = null
       // "Cancelar" (ou desmontagem/bloqueio) durante o "Transcrevendo…": descarta o texto
       if (token.cancelled || !mountedRef.current) return
+      // a final substitui a parcial no mesmo lugar (sem piscar vazio)
       if (result.text) optionsRef.current.onFinal(result.text)
+      setPartial('')
     } catch (err) {
-      if (!token.cancelled && mountedRef.current) setErrorState(errorMessage(err))
+      sessionIdRef.current = null
+      if (!token.cancelled && mountedRef.current) {
+        setErrorState(errorMessage(err))
+        // o texto parcial fica na tela e pode ser inserido (nada do que foi dito se perde)
+        if (partialRef.current.trim()) setPartialRecoverable(true)
+        else setPartial('')
+      }
     } finally {
       if (finalizeRef.current === token) finalizeRef.current = null
       if (!token.cancelled && mountedRef.current) setFinalizing(false)
@@ -269,6 +302,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     pttClearError()
     setNotice(null)
     setPartial('')
+    setPartialRecoverable(false)
     cancelRef.current = false
     const v = voiceRef.current
     if (!v) {
@@ -320,6 +354,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
   const cancel = useCallback(async (): Promise<void> => {
     genRef.current++
     setPartial('')
+    setPartialRecoverable(false)
     // "Transcrevendo…": o token descarta o texto e a sessão é cancelada no main
     if (abortFinalize()) return
     if (MOCK) {
@@ -375,7 +410,18 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     setErrorState(null)
     pttClearError()
     setNotice(null)
+    // dispensar o erro da final descarta também o texto parcial guardado (só ele — a parcial de
+    // uma gravação em curso continua)
+    if (recoverableRef.current) setPartial('')
+    setPartialRecoverable(false)
   }, [pttClearError])
+  const insertPartial = useCallback(() => {
+    const text = partialRef.current.trim()
+    if (text) optionsRef.current.onFinal(text)
+    setPartial('')
+    setPartialRecoverable(false)
+    setErrorState(null)
+  }, [])
   const clearNotice = useCallback(() => setNotice(null), [])
 
   return useMemo(
@@ -383,6 +429,8 @@ export function useDictation(options: UseDictationOptions): DictationControls {
       state,
       level: ptt.level,
       partial,
+      partialRecoverable,
+      insertPartial,
       error,
       clearError,
       notice,
@@ -399,6 +447,8 @@ export function useDictation(options: UseDictationOptions): DictationControls {
       state,
       ptt.level,
       partial,
+      partialRecoverable,
+      insertPartial,
       error,
       clearError,
       notice,

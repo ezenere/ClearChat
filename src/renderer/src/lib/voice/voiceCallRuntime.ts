@@ -17,6 +17,11 @@ export interface VoiceCallRuntime {
   clips: VoiceClipsState
   /** Progresso da geração de clipes ("Gerar clipes" no dock). */
   clipsProgress: { done: number; total: number } | null
+  /**
+   * Transcrição ao vivo da fala do usuário na barra da chamada: as parciais enquanto fala
+   * (`partial`), a especulativa da pausa (`speculative`) e a final enviada (`final`); '' = nada.
+   */
+  live: { text: string; state: 'partial' | 'speculative' | 'final' | null }
   toggleMute: () => Promise<void>
   setVolume: (volume: number) => void
   clearError: () => void
@@ -29,6 +34,7 @@ export const useVoiceCallRuntime = create<VoiceCallRuntime>(() => ({
   volume: 1,
   clips: 'unknown',
   clipsProgress: null,
+  live: { text: '', state: null },
   toggleMute: async () => {},
   setVolume: () => {},
   clearError: () => {},

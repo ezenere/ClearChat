@@ -11,6 +11,7 @@ import { computeVoiceCallMetrics } from '@shared/voiceTimeline'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { useVoiceCallConfig } from '../../lib/voice/useVoiceCallConfig'
+import { VoiceCallModelEditor } from './VoiceCallModelEditor'
 
 /** Linha Ligado/Desligado com ★ no padrão global (escolher a opção ★ = segue o global). */
 function InheritToggle({
@@ -61,15 +62,48 @@ function InheritToggle({
   )
 }
 
+/** Motivo de um ato de fala curta NÃO tocado → texto do painel (a "leitura de depuração"). */
+const SKIP_LABELS: Record<string, string> = {
+  disabled: 'desligado',
+  stale: 'observação velha (chegou tarde)',
+  'short-speech': 'fala curta demais',
+  'short-pause': 'pausa curta demais',
+  cooldown: 'intervalo mínimo entre interjeições',
+  'turn-end': 'fim de turno provável (pergunta/comando)',
+  'tail-skip': 'cauda de negação/incerteza',
+  'class-filtered': 'tipo não permitido',
+  probability: 'sorteio (probabilidade)',
+  'no-clip': 'clipe ausente — gere os clipes',
+  blocked: 'assistente falando',
+  shadow: 'modo sombra (decidiu, não tocou)',
+  stopped: 'chamada encerrada',
+  spoken: 'a resposta chegou antes',
+  'fast-answer': 'a resposta ficou pronta antes da espera',
+  'no-verdict':
+    'sem veredito a tempo (STT pela API é lento; um motor local de transcrição resolve)',
+  'late-verdict': 'o veredito chegou tarde (pausa já longa)',
+  'assistant-audio': 'áudio do assistente tocando',
+  'answer-speaking': 'a resposta está sendo falada'
+}
+
+/** Motivo (com prefixo `delay/`/`tools/` dos preâmbulos ou `phase-…`) → texto. */
+function skipLabel(reason: string): string {
+  const r = reason.includes('/') ? reason.slice(reason.lastIndexOf('/') + 1) : reason
+  if (r.startsWith('phase-')) return `fase ${r.slice(6)}`
+  return SKIP_LABELS[r] ?? r
+}
+
 /** Descrição curta de um evento da timeline (linha do painel). */
 function describeTimelineEvent(e: VoiceCallTimelineEvent): string {
   switch (e.kind) {
     case 'decision': {
+      if (e.class === 'NONE')
+        return `interjeição não — ${skipLabel(e.reason ?? '?')}${e.text ? ` · "…${e.text.slice(-24)}"` : ''}`
       const state = e.played
         ? 'tocou'
         : e.reason === 'shadow' || (e.reason ?? '').includes('shadow')
           ? 'sombra'
-          : `descartada (${e.reason ?? '?'})`
+          : `não tocou — ${skipLabel(e.reason ?? '?')}`
       return `decisão ${e.class ?? '?'}${e.variant ? ` v${e.variant}` : ''} — ${state}${
         e.text ? ` · "…${e.text.slice(-24)}"` : ''
       }`
@@ -100,6 +134,10 @@ function describeTimelineEvent(e: VoiceCallTimelineEvent): string {
       return 'barge-in (fala do assistente cancelada)'
     case 'backchannel':
       return `backchannel (${e.speechMs ?? 0} ms — não cancelou)`
+    case 'playback-error':
+      return `falha ao tocar ${e.class ?? ''}: ${e.reason ?? '?'}`
+    case 'tts-latency':
+      return `TTS 1º texto→1º áudio: ${e.latencyMs ?? 0} ms${e.reason ? ` (${e.reason})` : ''}`
     default:
       return e.kind
   }
@@ -108,7 +146,12 @@ function describeTimelineEvent(e: VoiceCallTimelineEvent): string {
 /** Painel recolhível acima do dock (no mesmo fluxo da coluna do composer; só com a chamada ativa). */
 export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element | null {
   const timeline = useStore((s) => s.voiceCallTimeline)
-  const { defaults, resolved, setInterjections, setFillers } = useVoiceCallConfig()
+  const { defaults, resolved, voice, persona, setInterjections, setFillers, setVoice } =
+    useVoiceCallConfig()
+  const chatModel = useStore(
+    (s) => s.chats.find((c) => c.id === s.voiceCall.chatId)?.config.model ?? ''
+  )
+  const playbackErrors = timeline.filter((e) => e.kind === 'playback-error').length
   const metrics = useMemo(() => computeVoiceCallMetrics(timeline), [timeline])
   const shadowCount = timeline.filter(
     (e) => e.kind === 'decision' && !e.played && (e.reason ?? '').includes('shadow')
@@ -183,7 +226,36 @@ export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element |
         <span>
           decisões: {metrics.decisions} ({metrics.played} tocadas)
         </span>
+        {playbackErrors > 0 && (
+          <span data-testid="voice-call-playback-errors" className="text-danger">
+            falhas ao tocar: {playbackErrors}
+          </span>
+        )}
       </div>
+      <SkipReadout skipped={metrics.skipped} />
+      <details data-testid="voice-call-panel-model" className="border-t border-border/60 pt-1.5">
+        <summary className="cursor-pointer text-[11px] text-subtle select-none hover:text-fg">
+          Modelo da chamada:{' '}
+          <span className="text-fg/80">
+            {resolved.model ? resolved.model.model : `o do chat (${chatModel || '—'})`}
+          </span>
+        </summary>
+        <div className="mt-2">
+          <VoiceCallModelEditor
+            value={voice.model}
+            onChange={(model) => setVoice({ model })}
+            scope="call"
+            compact
+            inherited={
+              persona?.model
+                ? `o da persona (${persona.model.model})`
+                : defaults.model
+                  ? `o padrão global (${defaults.model.model})`
+                  : `o modelo do chat (${chatModel || '—'})`
+            }
+          />
+        </div>
+      </details>
       <ul
         data-testid="voice-call-timeline"
         className="max-h-[180px] space-y-0.5 overflow-y-auto font-mono text-[10.5px] leading-4 text-subtle"
@@ -198,6 +270,41 @@ export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element |
           </li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+/** Por que os atos de fala curta não tocaram (motivo × vezes) — interjeições e preâmbulos. */
+function SkipReadout({
+  skipped
+}: {
+  skipped: { interjection: Record<string, number>; filler: Record<string, number> }
+}): React.JSX.Element | null {
+  const row = (
+    label: string,
+    counts: Record<string, number>,
+    testId: string
+  ): React.JSX.Element | null => {
+    const entries = Object.entries(counts).sort((a, b) => b[1] - a[1])
+    if (!entries.length) return null
+    return (
+      <div data-testid={testId} className="flex flex-wrap gap-x-2 gap-y-0.5">
+        <span className="text-fg/80">{label} não tocou:</span>
+        {entries.map(([reason, n]) => (
+          <span key={reason} data-reason={reason} title={reason}>
+            {skipLabel(reason)} ×{n}
+          </span>
+        ))}
+      </div>
+    )
+  }
+  const a = row('Interjeição', skipped.interjection, 'voice-call-skips-interjection')
+  const b = row('Preâmbulo', skipped.filler, 'voice-call-skips-filler')
+  if (!a && !b) return null
+  return (
+    <div data-testid="voice-call-skips" className="space-y-0.5 text-[10.5px] text-subtle">
+      {a}
+      {b}
     </div>
   )
 }

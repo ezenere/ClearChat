@@ -26,7 +26,8 @@ const isDefaultUrl = (url: string): boolean => {
 const KIND_NAME: Record<ProviderKind, string> = {
   openai: 'OpenAI',
   openrouter: 'OpenRouter',
-  anthropic: 'Anthropic'
+  anthropic: 'Anthropic',
+  elevenlabs: 'ElevenLabs'
 }
 
 /**

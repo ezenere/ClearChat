@@ -150,7 +150,7 @@ test('kokoro engine: síntese vai para o processo do motor (modelo/voz resolvido
   const dir = join(base, 'models')
   mkdirSync(dir, { recursive: true })
   const manifest: Record<string, unknown> = {}
-  for (const id of ['kokoro-onnx-q8', 'kokoro-voice-pf-dora']) {
+  for (const id of ['kokoro-onnx', 'kokoro-voice-pf-dora']) {
     const file = catalogFileName(findCatalogEntry(id)!)!
     writeFileSync(join(dir, file), new Uint8Array(2048))
     manifest[id] = { version: '1', file, sha256: null, size: 2048, installedAt: '' }
@@ -158,7 +158,7 @@ test('kokoro engine: síntese vai para o processo do motor (modelo/voz resolvido
   writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest))
   const engine = createKokoroEngine({ baseDir: base, host })
   const r = await engine.synthesize({ text: 'olá', voice: 'pf_dora', format: 'wav' })
-  assert.equal(r.model, 'kokoro-onnx-q8')
+  assert.equal(r.model, 'kokoro-onnx')
   assert.equal(r.mime, 'audio/wav')
   assert.match(text(r.audio), /t:olá/)
   assert.notEqual(pidOf(r.audio), String(process.pid))

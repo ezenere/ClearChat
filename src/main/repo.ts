@@ -6,7 +6,7 @@ import { indexMessage } from './searchIndex'
 import { ROOT_PARENT } from './migrateBranches'
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
-import { providerKind } from '@shared/providerKinds'
+import { isChatProvider, providerKind } from '@shared/providerKinds'
 import { migrateConfigTools } from '@shared/toolRename'
 import {
   activeLeaf,
@@ -697,7 +697,10 @@ export const chatsRepo = {
     }
     const inCfg = input?.config ?? {}
     const providerId =
-      inCfg.providerId || s('defaultProviderId') || providersRepo.list()[0]?.id || ''
+      inCfg.providerId ||
+      s('defaultProviderId') ||
+      providersRepo.list().find(isChatProvider)?.id ||
+      ''
     const provider = providerId ? providersRepo.get(providerId) : null
     const base = DEFAULT_CHAT_CONFIG(s('defaultCwd') ?? homedir(), {
       providerId,

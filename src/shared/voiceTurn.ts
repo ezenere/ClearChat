@@ -202,8 +202,8 @@ export type AdaptiveGateEvent = 'start' | 'speculate' | 'resume' | 'end' | null
  * `'speculate'` UMA vez por pausa quando o silêncio contínuo cruza `speculativeAtMs` (o chamador
  * pede a transcrição especulativa e devolve o veredito em `setVerdict`); `'resume'` quando a fala
  * volta depois de um `'speculate'` (a especulação ficou velha); `'end'` quando o silêncio alcança o
- * exigido. Enquanto a especulação está pendente o exigido é o TETO (`unfinishedMs`) — o veredito só
- * encurta; sem adaptativo (ou veredito `unknown`) o exigido é `fallbackMs`.
+ * exigido. Enquanto a especulação está pendente o exigido é o TETO (`unfinishedMs`; `pendingMs`
+ * quando definido — especulação lenta pela API) — o veredito só encurta; sem adaptativo (ou veredito `unknown`) o exigido é `fallbackMs`.
  */
 export class AdaptiveTurnGate {
   readonly threshold: number
@@ -248,7 +248,9 @@ export class AdaptiveTurnGate {
     const t = this.timing
     if (!t.adaptive) return t.fallbackMs
     if (this.#verdict) return turnSilenceFor(this.#verdict, t)
-    if (this.#speculating) return t.unfinishedMs
+    // especulação pendente: o teto — ou `pendingMs` quando ela é lenta (API: não adianta esperar
+    // o teto inteiro; a final reaproveita a especulação em voo)
+    if (this.#speculating) return t.pendingMs ?? t.unfinishedMs
     return t.fallbackMs
   }
 

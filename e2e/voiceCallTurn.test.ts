@@ -188,6 +188,8 @@ let synthMode: 'auto' | 'gated' = 'auto'
 let failSynth = false
 /** Falha de TTS só nas sentenças que contêm este trecho (as demais sintetizam). */
 let failSynthOn: string | null = null
+/** Quantas vezes a sentença `failSynthOn` ainda falha (Infinity = sempre). */
+let failSynthTimes = Infinity
 const synthCalls: string[] = []
 const gates: { open: () => void }[] = []
 const openGate = (i: number): void => gates[i]?.open()
@@ -201,7 +203,11 @@ async function synth(
   signal: AbortSignal
 ): Promise<{ audio: Uint8Array; mime: string }> {
   synthCalls.push(text)
-  if (failSynth || (failSynthOn && text.includes(failSynthOn))) throw new Error('TTS fora do ar')
+  if (failSynth) throw new Error('TTS fora do ar')
+  if (failSynthOn && text.includes(failSynthOn) && failSynthTimes > 0) {
+    failSynthTimes--
+    throw new Error('TTS fora do ar')
+  }
   if (synthMode === 'gated') {
     await Promise.race([new Promise<void>((r) => gates.push({ open: r })), aborted(signal)])
   } else {
@@ -618,7 +624,7 @@ test('overrides do modo voz: voice.model/voice.tools/voicePrompt só nas request
     textOf(req.body.messages[0].content).includes('conversa por voz'),
     'prompt-base do modo voz'
   )
-  assert.equal(req.body.max_tokens, 120, 'teto de tokens do turno de voz')
+  assert.equal(req.body.max_tokens, undefined, 'a chamada não impõe teto de tokens')
   const after = JSON.parse(JSON.stringify(repo.chatsRepo.get(chatId)!.config))
   assert.deepEqual(after, before, 'a config salva do chat não muda')
 })
@@ -631,7 +637,7 @@ test('start com chamada desativada no chat (voice.enabled: false) → erro legí
   assert.equal(m.state().active, false, 'nada de chamada aberta por cima do erro')
 })
 
-test('falha de TTS: erro no estado e a fase não fica "Falando…" (texto segue no histórico)', async () => {
+test('falha de TTS que persiste: 1 nova tentativa e a chamada ENCERRA com o motivo (nada não falado fica)', async () => {
   synthMode = 'auto'
   failSynth = true
   synthCalls.length = 0
@@ -643,26 +649,29 @@ test('falha de TTS: erro no estado e a fase não fica "Falando…" (texto segue 
   m.speechBegin()
   m.speechEnd()
   m.turn('duas')
-  await idle(sid)
-  await waitFor(() => m.state().error != null, 4000, 'erro de TTS no estado')
-  assert.match(m.state().error!, /TTS fora do ar/)
-  await waitFor(() => synthCalls.length === 2, 4000, 'a 2ª sentença também foi tentada')
+  await waitFor(() => !m.state().active, 4000, 'a chamada encerrou')
+  assert.match(m.state().error ?? '', /TTS fora do ar/, 'o motivo fica no estado inativo')
+  assert.deepEqual(synthCalls, ['Primeira frase.', 'Primeira frase.'], 'uma nova tentativa só')
   assert.deepEqual(emitted, [], 'nada foi emitido para tocar')
-  await waitFor(() => m.state().phase !== 'speaking', 4000, 'a fase não fica presa em "Falando…"')
-  const msgs = path(sid)
-  assert.equal(
-    textOf(msgs[1].message.content),
-    'Primeira frase. Segunda frase.',
-    'o texto da resposta segue completo no histórico'
+  await idle(sid)
+  await waitFor(
+    () => !path(sid).some((x) => x.message.role === 'assistant' && !x.meta?.synthetic),
+    4000,
+    'a resposta nunca falada sai do histórico'
   )
+  assert.equal(textOf(path(sid)[0].message.content), 'duas', 'a fala do usuário fica')
   failSynth = false
+  // a próxima chamada começa limpa
+  m.start(sid)
+  assert.equal(m.state().error, null)
   m.stop()
 })
 
-test('falha de TTS numa sentença: ela é pulada e o resto da resposta continua sendo falado', async () => {
+test('falha transitória de TTS numa sentença: nova tentativa dá certo e a resposta continua', async () => {
   synthMode = 'auto'
   failSynth = false
   failSynthOn = 'Primeira'
+  failSynthTimes = 1
   synthCalls.length = 0
   emitted.length = 0
   const { manager: m } = await boot()
@@ -673,10 +682,11 @@ test('falha de TTS numa sentença: ela é pulada e o resto da resposta continua 
   m.speechEnd()
   m.turn('duas')
   await idle(sid)
-  await waitFor(() => emitted.length === 1, 4000, 'a 2ª sentença foi emitida')
-  assert.deepEqual(synthCalls, ['Primeira frase.', 'Segunda frase.'])
-  assert.match(m.state().error ?? '', /TTS fora do ar/, 'o erro da sentença pulada aparece')
+  await waitFor(() => emitted.length === 2, 4000, 'as duas sentenças foram emitidas')
+  assert.deepEqual(synthCalls, ['Primeira frase.', 'Primeira frase.', 'Segunda frase.'])
+  assert.equal(m.state().active, true, 'a chamada segue')
   failSynthOn = null
+  failSynthTimes = Infinity
   m.stop()
 })
 

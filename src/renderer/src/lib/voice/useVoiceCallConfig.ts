@@ -24,6 +24,10 @@ export function useVoiceCallConfig(): {
   resolved: ResolvedVoiceCall
   setInterjections: (patch: Partial<InterjectionPolicy> | 'inherit') => void
   setFillers: (patch: Partial<VoiceFillers> | 'inherit') => void
+  /** Patch livre do `ChatConfig.voice` do chat da chamada (ex.: modelo da chamada). */
+  setVoice: (patch: Partial<VoiceCallConfig>) => void
+  /** Config de voz da persona de origem do chat (camada chat > persona > global). */
+  persona: VoiceCallConfig | null
 } {
   const chatId = useStore((s) => s.voiceCall.chatId)
   const chat = useStore((s) => s.chats.find((c) => c.id === s.voiceCall.chatId) ?? null)
@@ -34,8 +38,15 @@ export function useVoiceCallConfig(): {
   useEffect(() => {
     if (chatId) void loadVoiceSettings()
   }, [chatId])
+  const presetId = chat?.config.presetId ?? null
+  const persona = useStore((s) =>
+    presetId ? (s.presets.find((p) => p.id === presetId)?.config.voice ?? null) : null
+  )
   const voice: VoiceCallConfig = chat?.config.voice ?? DEFAULT_VOICE_CALL_CONFIG
-  const resolved = useMemo(() => resolveVoiceCallConfig(voice, defaults), [voice, defaults])
+  const resolved = useMemo(
+    () => resolveVoiceCallConfig(voice, defaults, persona),
+    [voice, defaults, persona]
+  )
   const setInterjections = (patch: Partial<InterjectionPolicy> | 'inherit'): void => {
     if (!chatId) return
     patchConfig(chatId, {
@@ -52,5 +63,9 @@ export function useVoiceCallConfig(): {
       voice: { ...voice, fillers: patch === 'inherit' ? null : { ...resolved.fillers, ...patch } }
     })
   }
-  return { chatId, voice, defaults, resolved, setInterjections, setFillers }
+  const setVoice = (patch: Partial<VoiceCallConfig>): void => {
+    if (!chatId) return
+    patchConfig(chatId, { voice: { ...voice, ...patch } })
+  }
+  return { chatId, voice, defaults, resolved, setInterjections, setFillers, setVoice, persona }
 }

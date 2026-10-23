@@ -364,7 +364,7 @@ export function SettingsModal(): React.JSX.Element {
         <div className="space-y-2.5">
           <p className="mb-3 text-xs text-subtle">
             Endpoints compatíveis com a API da OpenAI (chat/completions), OpenRouter ou a API nativa
-            da Anthropic.
+            da Anthropic — e provedores só de voz (ElevenLabs), usados em Configurações → Áudio.
           </p>
           {providers.map((p) =>
             editing === p.id ? (

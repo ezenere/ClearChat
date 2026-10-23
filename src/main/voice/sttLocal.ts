@@ -10,6 +10,11 @@
 //   para engines de streaming). A inferência roda num PROCESSO à parte (`sttWorker.ts` via
 //   `sttWorkerHost.ts` — `utilityProcess` no app): `Whisper.full()` é síncrono e, no main,
 //   congelava o app inteiro durante a transcrição.
+//   Custo das parciais limitado (medido — antes ~2,2 núcleos contínuos com o base): contexto do
+//   encoder ~ duração da janela + teto de tokens (`partialAudioCtx`/`partialMaxTokens`), menos
+//   threads (`sttPartialThreads`), uma inferência por vez (`skipIfBusy` — motor ocupado pula a
+//   parcial), cadência adaptativa (`STT_PARTIAL_IDLE_FACTOR`), janela só de silêncio pulada e
+//   pedidos abortados saem da fila do worker sem rodar.
 // - `vosk`: extração do `.zip` em `models/<id>/` implementada e verificada (`zip.ts`), executada
 //   na primeira transcrição; o motor de inferência (libvosk) ainda NÃO está plugado nesta versão —
 //   erro legível por engine. A abordagem medida no spike (vosk-koffi, streaming real) fica
@@ -19,7 +24,11 @@ import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { availableParallelism } from 'node:os'
 import { join } from 'node:path'
-import type { SttLocalConfig, SttLocalEngine } from '@shared/voice'
+import {
+  STT_LOCAL_PARTIAL_MAX_MODEL_BYTES,
+  type SttLocalConfig,
+  type SttLocalEngine
+} from '@shared/voice'
 import { abortError } from '../tools/util'
 import {
   catalogFileName,
@@ -35,7 +44,7 @@ import {
   type TranscribeAudioInput,
   type TranscribeResult
 } from './stt'
-import { sharedSttWorkerHost, type SttWorkerHost } from './sttWorkerHost'
+import { SttBusyError, sharedSttWorkerHost, type SttWorkerHost } from './sttWorkerHost'
 import { extractZipToDir } from './zip'
 
 // ---------------- engines suportadas ----------------
@@ -207,6 +216,11 @@ export function decodeWavToMonoFloat32(wav: Uint8Array): DecodedWav {
 
 export interface SttEngineTranscribeOptions {
   language?: string
+  /**
+   * Parcial ao vivo (melhor-esforço): contexto do encoder reduzido à janela, teto de tokens, menos
+   * threads e **nunca na fila** — motor ocupado → `SttBusyError` na hora.
+   */
+  partial?: boolean
   /** Cancelamento (o worker descarta o resultado; o chamador recebe `AbortError` na hora). */
   signal?: AbortSignal
   /** Texto incremental enquanto o engine consome o áudio (engines de streaming). */
@@ -215,21 +229,58 @@ export interface SttEngineTranscribeOptions {
 
 /** Motor de inferência carregado para um modelo (o binding real fica atrás deste formato). */
 export interface LoadedSttEngine {
-  transcribe(samples: Float32Array, opts: SttEngineTranscribeOptions): Promise<{ text: string }>
+  transcribe(
+    samples: Float32Array,
+    opts: SttEngineTranscribeOptions
+  ): Promise<{ text: string; inferMs?: number }>
 }
 
 /** Carrega o engine para o modelo (caminho do arquivo do catálogo); assíncrono e cacheável. */
 export type SttEngineLoader = (modelPath: string) => Promise<LoadedSttEngine>
 
-/** Threads da inferência local (deixa um núcleo para o resto do app; teto de 8 — medido). */
-export function sttLocalThreads(): number {
-  return Math.max(1, Math.min(8, availableParallelism() - 1))
+/**
+ * Threads da inferência local da final/especulação/segmentos: metade dos núcleos lógicos (≈ os
+ * físicos — o whisper.cpp não ganha com SMT e com todos os núcleos o app inteiro disputa CPU), teto
+ * de 8 (medido: 8 → 4 threads custa ~1,6× mais tempo de parede e ~20% menos CPU total).
+ */
+export function sttLocalThreads(cores: number = availableParallelism()): number {
+  return Math.max(1, Math.min(8, Math.floor(cores / 2)))
+}
+
+/** Threads das parciais ao vivo: um quarto dos núcleos, teto de 4 (a parcial é contínua). */
+export function sttPartialThreads(cores: number = availableParallelism()): number {
+  return Math.max(1, Math.min(4, Math.floor(cores / 4)))
+}
+
+/** Taxa das amostras do motor local (whisper: 16 kHz mono). */
+const WHISPER_RATE = 16_000
+/** Contexto completo do encoder do whisper (30 s em quadros de 20 ms). */
+export const WHISPER_FULL_AUDIO_CTX = 1500
+/**
+ * Margem (quadros de 20 ms) somada à duração da janela no contexto do encoder das parciais. Medido
+ * nas falas pt-BR gravadas (tiny/base, 4 threads): margem 384 → WER idêntico ao contexto cheio e ~3×
+ * menos CPU; margens menores (64–256) aceleram mais mas o tiny entra em laço de repetição.
+ */
+export const STT_PARTIAL_AUDIO_CTX_MARGIN = 384
+
+/** Contexto do encoder (quadros de 20 ms) para uma parcial de `samples` amostras a 16 kHz. */
+export function partialAudioCtx(samples: number): number {
+  return Math.min(
+    WHISPER_FULL_AUDIO_CTX,
+    Math.ceil((samples / WHISPER_RATE) * 50) + STT_PARTIAL_AUDIO_CTX_MARGIN
+  )
+}
+
+/** Teto de tokens de uma parcial (~12 tokens/s de fala + folga) — corta laço de repetição. */
+export function partialMaxTokens(samples: number): number {
+  return Math.ceil((samples / WHISPER_RATE) * 12) + 16
 }
 
 /**
  * Loader padrão: o whisper.cpp roda no processo do worker (`sttWorkerHost.ts`) — o main só
  * despacha as amostras e espera a resposta (o event loop nunca bloqueia na inferência). A carga do
- * modelo acontece no worker, no primeiro `transcribe` (cache lá dentro, um modelo por vez).
+ * modelo acontece no worker, no primeiro `transcribe` (cache lá dentro, um modelo por vez). Parcial
+ * → contexto reduzido, teto de tokens, `sttPartialThreads` e `skipIfBusy` (uma inferência por vez).
  */
 export async function loadWhisperEngine(
   modelPath: string,
@@ -239,10 +290,17 @@ export async function loadWhisperEngine(
     async transcribe(samples, opts) {
       const r = await host.transcribe(modelPath, samples, {
         language: languageParam(opts.language),
-        nThreads: sttLocalThreads(),
-        signal: opts.signal
+        nThreads: opts.partial ? sttPartialThreads() : sttLocalThreads(),
+        signal: opts.signal,
+        ...(opts.partial
+          ? {
+              audioCtx: partialAudioCtx(samples.length),
+              maxTokens: partialMaxTokens(samples.length),
+              skipIfBusy: true
+            }
+          : {})
       })
-      return { text: r.text }
+      return { text: r.text, inferMs: r.inferMs }
     }
   }
 }
@@ -361,16 +419,47 @@ export interface CreateSttLocalBackendOptions {
    * o modelo não recarrega entre sessões de ditado. Testes passam um mapa novo para isolar.
    */
   engineCache?: Map<string, Promise<LoadedSttEngine>>
+  /** Relógio da cadência adaptativa das parciais (testes); padrão `Date.now`. */
+  now?: () => number
 }
 
 const sharedEngineCache = new Map<string, Promise<LoadedSttEngine>>()
 
+// Teto de tamanho do modelo para parciais locais por janelas (até o `ggml-base`): mora em
+// `@shared/voice` porque a UI também avisa "parciais desligadas para este modelo".
+export { STT_LOCAL_PARTIAL_MAX_MODEL_BYTES }
+
 /**
- * Teto de tamanho do modelo para parciais locais por janelas: até o `ggml-base` (~148 MB) a
- * janela volta em centenas de ms; do `small` para cima cada parcial custa segundos de CPU e
- * atrasaria a final (o worker é serial) — a sessão então só faz a transcrição final.
+ * Cadência adaptativa das parciais locais: depois de uma parcial que levou `inferMs`, a próxima só
+ * sai quando o motor ficou ocioso por pelo menos `inferMs × STT_PARTIAL_IDLE_FACTOR` (CPU das
+ * parciais ≤ ~50% de `sttPartialThreads` núcleos em máquina lenta; em máquina rápida a sessão
+ * segue no intervalo de ~1 s). Antes disso a parcial é pulada (`SttBusyError`).
  */
-export const STT_LOCAL_PARTIAL_MAX_MODEL_BYTES = 160_000_000
+export const STT_PARTIAL_IDLE_FACTOR = 1
+
+/**
+ * Nível (amplitude RMS, escala [-1, 1]) a partir do qual um quadro de 20 ms conta como fala nas
+ * parciais locais (≈ −40 dBFS — o mesmo limiar da sessão). Janela sem nenhum quadro acima disto é
+ * silêncio: a parcial local é pulada (o whisper só alucinaria "[MÚSICA DE FUNDO]" gastando CPU).
+ */
+export const STT_PARTIAL_SPEECH_RMS = 328 / 32768
+
+/** A janela tem algum quadro de 20 ms com fala (RMS ≥ `STT_PARTIAL_SPEECH_RMS`)? Puro. */
+export function hasSpeech(samples: Float32Array, rate = WHISPER_RATE): boolean {
+  const frame = Math.max(1, Math.round(rate / 50))
+  const min = STT_PARTIAL_SPEECH_RMS * STT_PARTIAL_SPEECH_RMS
+  for (let start = 0; start < samples.length; start += frame) {
+    const end = Math.min(samples.length, start + frame)
+    let acc = 0
+    for (let i = start; i < end; i++) acc += samples[i] * samples[i]
+    if (acc / (end - start) >= min) return true
+  }
+  return false
+}
+
+/** Parcial (`purpose`) pedida pela sessão? (a sessão manda `fileName: 'partial'` no input). */
+const isPartialRequest = (input: TranscribeAudioInput, purpose?: string): boolean =>
+  purpose === 'partial' || input.fileName === 'partial'
 
 /**
  * `SttLocalBackend` para os modelos do catálogo: `ready` = engine com runtime + arquivo do modelo
@@ -383,6 +472,9 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
   const catalog = opts.catalog ?? LOCAL_MODEL_CATALOG
   const cache = opts.engineCache ?? sharedEngineCache
   const loadEngine = opts.loadEngine ?? loadWhisperEngine
+  const now = opts.now ?? Date.now
+  /** Última parcial: fim (relógio) e custo — base da cadência adaptativa. */
+  let lastPartial: { endAt: number; inferMs: number } | null = null
 
   const modelFileExists = (): boolean => {
     if (!baseDir || !opts.selection) return false
@@ -422,9 +514,16 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
         timeoutMs?: number
         signal?: AbortSignal
         onPartial?: (text: string) => void
+        purpose?: 'partial' | 'final'
       }
     ): Promise<TranscribeResult> {
       if (callOpts.signal?.aborted) throw abortError()
+      const partial = isPartialRequest(input, callOpts.purpose)
+      if (partial && lastPartial) {
+        const idle = now() - lastPartial.endAt
+        if (idle < lastPartial.inferMs * STT_PARTIAL_IDLE_FACTOR)
+          throw new SttBusyError('parcial local pulada — cadência adaptativa (motor lento)')
+      }
       const t0 = Date.now()
       if (!baseDir)
         throw new SttError(
@@ -463,8 +562,10 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
           `motor local de transcrição não está pronto — modelo ${entry.id} não instalado (baixe em Configurações → Áudio)`,
           { backend: 'local' }
         )
-      const { samples } = decodeWavToMonoFloat32(input.audio)
+      const { samples, sampleRate } = decodeWavToMonoFloat32(input.audio)
       if (callOpts.signal?.aborted) throw abortError()
+      if (partial && !hasSpeech(samples, sampleRate))
+        throw new SttBusyError('parcial local pulada — janela só com silêncio')
       let pending = cache.get(modelPath)
       if (!pending) {
         pending = loadEngine(modelPath)
@@ -473,11 +574,13 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
       }
       const engine = await pending
       if (callOpts.signal?.aborted) throw abortError()
-      const { text } = await engine.transcribe(samples, {
+      const { text, inferMs } = await engine.transcribe(samples, {
         language: languageParam(callOpts.language) ?? undefined,
         signal: callOpts.signal,
-        onPartial: callOpts.onPartial
+        onPartial: callOpts.onPartial,
+        ...(partial ? { partial: true } : {})
       })
+      if (partial) lastPartial = { endAt: now(), inferMs: inferMs ?? Date.now() - t0 }
       return { text, model: entry.id, baseUrl: 'local', ms: Date.now() - t0 }
     }
   }

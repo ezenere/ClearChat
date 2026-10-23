@@ -41,7 +41,25 @@ const ADAPTERS: Record<ProviderKind, ProviderAdapter> = {
     chatUrl: messagesUrl,
     headers: anthropicHeaders,
     getHeaders: (p) => withoutContentType(anthropicHeaders(p))
+  },
+  // provedor só de VOZ (TTS/STT — `voice/elevenlabs*.ts`): nunca serve de chat; os headers servem
+  // para os GETs da API dela (`xi-api-key`)
+  elevenlabs: {
+    kind: 'elevenlabs',
+    chatUrl: () => {
+      throw new Error(
+        'A ElevenLabs é um provedor de voz (fala/transcrição), não de chat — escolha outro provedor para o modelo.'
+      )
+    },
+    headers: (p) => elevenLabsAuthHeaders(p),
+    getHeaders: (p) => elevenLabsAuthHeaders(p)
   }
+}
+
+function elevenLabsAuthHeaders(p: Pick<Provider, 'apiKey' | 'headers'>): Record<string, string> {
+  const h: Record<string, string> = { ...(p.headers ?? {}) }
+  if (p.apiKey) h['xi-api-key'] = p.apiKey
+  return h
 }
 
 export function adapterFor(

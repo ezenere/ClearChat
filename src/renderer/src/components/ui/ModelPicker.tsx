@@ -21,7 +21,7 @@ import {
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { ModelRef } from '@shared/models'
 import { compatLabel, compatReason, modelCompat, type ChatCapability } from '@shared/modelCompat'
-import { providerKind } from '@shared/providerKinds'
+import { isChatProvider, providerKind } from '@shared/providerKinds'
 import type { ModelInfo } from '@shared/types'
 import { cn, formatTokens, pricePerMillion } from '../../lib/format'
 import {
@@ -85,7 +85,9 @@ export function ModelPicker({
   /** Capacidades exigidas pelo histórico do chat (vazio/ausente = sem restrição). */
   requires?: readonly ChatCapability[]
 }): React.JSX.Element {
-  const providers = useStore((s) => s.providers)
+  // só provedores de chat (os de voz — ElevenLabs — não têm modelos de LLM)
+  const allProviders = useStore((s) => s.providers)
+  const providers = useMemo(() => allProviders.filter(isChatProvider), [allProviders])
   const models = useStore((s) => s.models)
   const loadModels = useStore((s) => s.loadModels)
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)

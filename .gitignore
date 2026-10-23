@@ -10,3 +10,11 @@ dist
 test-results
 playwright-report
 .claude/
+
+# chaves locais de teste (nunca commitar)
+.clearchat-voice-test.env
+*.env
+.env*
+
+# laboratório local de TTS/STT em GPU (venv, modelos, áudios) — nunca commitar
+gpu-tts-lab/

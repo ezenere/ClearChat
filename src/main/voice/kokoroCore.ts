@@ -225,6 +225,36 @@ export interface KokoroSession {
   release?(): Promise<void>
 }
 
+/**
+ * Threads da inferência do Kokoro (onnxruntime `intraOpNumThreads`): metade dos núcleos lógicos,
+ * teto de 4. Medido (Ryzen 9 9950X, fp32, frase de 56 chars): padrão do onnxruntime (todos os
+ * núcleos, com spin) 359 ms de parede e 10,8 s de CPU; 4 threads sem spin 331 ms e 0,95 s de CPU;
+ * 8 threads só ~13% mais rápido com ~30% mais CPU. No int8 o padrão chegava a 39 s de CPU por frase.
+ */
+export function kokoroThreads(cores: number): number {
+  return Math.max(1, Math.min(4, Math.floor(cores / 2)))
+}
+
+/**
+ * Opções da `InferenceSession` do Kokoro: CPU, `kokoroThreads` intra-op, 1 inter-op e SEM spin
+ * das threads ociosas (o spin queimava núcleos inteiros entre as frases da chamada).
+ */
+export function kokoroSessionOptions(cores: number): {
+  executionProviders: string[]
+  intraOpNumThreads: number
+  interOpNumThreads: number
+  graphOptimizationLevel: 'all'
+  extra: { session: Record<string, string> }
+} {
+  return {
+    executionProviders: ['cpu'],
+    intraOpNumThreads: kokoroThreads(cores),
+    interOpNumThreads: 1,
+    graphOptimizationLevel: 'all',
+    extra: { session: { 'intra_op.allow_spinning': '0', 'inter_op.allow_spinning': '0' } }
+  }
+}
+
 // ---------------- espeak-ng ----------------
 
 /** Como instalar o espeak-ng nesta plataforma (texto da mensagem de erro). */

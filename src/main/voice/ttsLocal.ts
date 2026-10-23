@@ -54,8 +54,23 @@ export const KOKORO_VOICES: readonly KokoroVoiceInfo[] = [
   { id: 'pm_santa', label: 'Santa (pt-BR, masculina)', catalogId: 'kokoro-voice-pm-santa' }
 ]
 
-/** Modelos do motor no catálogo, em ordem de preferência (fp32 é o mais rápido em CPU). */
-export const KOKORO_MODEL_IDS: readonly string[] = ['kokoro-onnx', 'kokoro-onnx-q8']
+/**
+ * Modelos do motor no catálogo, em ordem de preferência. Só a fp32: a int8 (`kokoro-onnx-q8`) foi
+ * aposentada — ~3× mais lenta em CPU, a 1ª frase de 60 caracteres passava de 1 s mesmo num desktop
+ * rápido (lenta demais para conversa; SPEC → "Áudio → Componentes locais").
+ */
+export const KOKORO_MODEL_IDS: readonly string[] = ['kokoro-onnx']
+
+/** Modelo do Kokoro aposentado que ainda pode estar instalado (aviso + troca para a fp32). */
+export const KOKORO_RETIRED_MODEL_ID = 'kokoro-onnx-q8'
+
+/**
+ * Aviso legível (pt-BR) para quem só tem o Kokoro int8 aposentado instalado: o app passou a usar a
+ * fp32 — baixar o fp32 resolve e o arquivo int8 pode ser removido (fica em disco até o usuário
+ * remover em Configurações → Áudio).
+ */
+export const KOKORO_RETIRED_MODEL_NOTE =
+  'o Kokoro int8 instalado foi aposentado (lento demais para conversa em tempo real) — o app agora usa o Kokoro ONNX fp32: baixe-o em Configurações → Áudio (310 MB) e, se quiser, remova o int8 (88 MB)'
 
 // ---------------- motor ----------------
 
@@ -170,11 +185,11 @@ export function resetTtsRuntimeProbes(): void {
 
 /** Id do catálogo pelo arquivo do modelo (fp32 `model.onnx` / q8 `model_quantized.onnx`). */
 const modelIdOf = (modelPath: string): string =>
-  modelPath.endsWith('model_quantized.onnx') ? 'kokoro-onnx-q8' : 'kokoro-onnx'
+  modelPath.endsWith('model_quantized.onnx') ? KOKORO_RETIRED_MODEL_ID : 'kokoro-onnx'
 
 /**
- * Motor local Kokoro sobre os pesos do catálogo (`<userData>/models`): modelo `kokoro-onnx`
- * (fp32 — preferida por ser a mais rápida em CPU) ou `kokoro-onnx-q8`, voz `voices/<id>.bin`.
+ * Motor local Kokoro sobre os pesos do catálogo (`<userData>/models`): modelo `kokoro-onnx` (fp32
+ * — a int8 foi aposentada; com só ela instalada, o erro diz para baixar a fp32), voz `<id>.bin`.
  * `synthesize` devolve wav 24 kHz mono (mp3 é do backend de API — erro legível aqui). A inferência
  * vai para o processo do motor (`deps.host`); com `createSession` injetado roda em processo.
  */
@@ -203,9 +218,12 @@ export function createKokoroEngine(deps: KokoroEngineDeps): KokoroEngine {
       const m = models.find((x) => x.entry.id === id)
       if (m?.state === 'installed') return resolveLocalModelPath(deps.baseDir, id)
     }
+    const retired = models.find((x) => x.entry.id === KOKORO_RETIRED_MODEL_ID)
     throw new TtsError(
       'config',
-      'modelo do Kokoro não instalado — baixe o motor local em Configurações → Áudio',
+      retired?.state === 'installed'
+        ? `modelo do Kokoro não instalado — ${KOKORO_RETIRED_MODEL_NOTE}`
+        : 'modelo do Kokoro não instalado — baixe o motor local em Configurações → Áudio',
       { backend: 'local' }
     )
   }
@@ -322,7 +340,12 @@ export async function kokoroReadiness(
   if (!espeak.available) missing.push(espeakMissingError().message)
   const installed = (id: string): boolean =>
     models.some((m) => m.entry.id === id && m.state === 'installed')
-  if (!KOKORO_MODEL_IDS.some(installed)) missing.push('modelo do Kokoro não instalado')
+  if (!KOKORO_MODEL_IDS.some(installed))
+    missing.push(
+      installed(KOKORO_RETIRED_MODEL_ID)
+        ? KOKORO_RETIRED_MODEL_NOTE
+        : 'modelo do Kokoro não instalado'
+    )
   const voice = KOKORO_VOICES.find((v) => v.id === voiceId)
   if (!voice) missing.push(`voz "${voiceId ?? ''}" desconhecida para o Kokoro`)
   else if (!installed(voice.catalogId)) missing.push(`voz ${voice.id} não instalada`)

@@ -115,11 +115,15 @@ import type {
   MemoryPatch
 } from '@shared/memory'
 import {
+  getVoiceCustomEndpoint,
   getVoiceSettings,
   getVoiceSettingsView,
+  migrateVoiceProviderLinks,
   setVoiceSetting,
   syncLocalModelInstalled
 } from './voice'
+import { fetchVoicePreview, listVoiceCatalog } from './voice/voiceCatalog'
+import type { VoiceCatalogRequest } from '@shared/voiceCatalog'
 import {
   clipVoiceId,
   generateClips,
@@ -132,6 +136,7 @@ import { createEvalLogger } from './voice/evalLog'
 import { findCatalogEntry } from './voice/catalog'
 import {
   downloadLocalModel,
+  isListedLocalModel,
   listLocalModels,
   removeLocalModel,
   type LocalModelInfo
@@ -151,6 +156,8 @@ import {
 } from './voice/sttLocal'
 import { synthesize, synthesizeStream, TTS_TEST_PHRASE } from './voice/tts'
 import { TtsStreamRelay } from './voice/ttsStreamRelay'
+import { classifyVoiceError, voiceProviderLabel } from './voice/callErrors'
+import { ElevenLabsCallTts, elevenLabsCallOptions } from './voice/elevenlabsStream'
 import {
   createKokoroEngine,
   espeakMissingError,
@@ -200,6 +207,8 @@ let ipcSenderId: number | null = null
 let voiceCallsRef: VoiceCallManager | null = null
 /** Streaming do TTS da chamada (PCM progressivo da API → renderer); abortado no barge-in/parar. */
 let ttsRelayRef: TtsStreamRelay | null = null
+/** [tts-feed] WebSocket da ElevenLabs da chamada (fechado quando o renderer some). */
+let elevenCallRef: ElevenLabsCallTts | null = null
 let voiceCallOwner: number | null = null
 
 /**
@@ -214,6 +223,7 @@ export function resetVoiceForWebContents(webContentsId: number, reason: string):
   if (voiceCallsRef && voiceCallOwner === webContentsId && voiceCallsRef.state().active) {
     voiceCallsRef.stop()
     ttsRelayRef?.abortAll()
+    elevenCallRef?.close()
     callStopped = true
   }
   if (voiceCallOwner === webContentsId) voiceCallOwner = null
@@ -248,7 +258,7 @@ const toModelView = (info: LocalModelInfo): VoiceModelInfo => ({
   languages: [...info.entry.languages],
   version: info.entry.version,
   sizeBytes: info.entry.sizeBytes,
-  hasDownload: !!info.entry.url,
+  hasDownload: !!info.entry.url && !info.entry.retired,
   state: info.state,
   installedBytes: info.installedBytes
 })
@@ -372,6 +382,13 @@ function runDeps(): RunDeps {
 
 export function registerIpc(): void {
   presetsRepo.seed()
+  // Áudio: endpoint avulso de STT/TTS → provedor cadastrado (uma vez; SPEC → "Áudio → Provedor…")
+  try {
+    const changed = migrateVoiceProviderLinks()
+    if (changed.length) console.log('[clearchat] áudio: settings ligadas a provedores:', changed)
+  } catch (e) {
+    console.warn('[clearchat] áudio: migração de provedores falhou:', e)
+  }
   // ---- chamada de voz meia-duplex: o dono do turno no main + os overrides de request ----
   // (o renderer é o "sensor": captura/silêncio/reprodução — SPEC → "Chamada de voz (meia-duplex)")
   // decisões de filler/interjeição também viram linhas no log de avaliação (modo sombra/calibração)
@@ -380,9 +397,41 @@ export function registerIpc(): void {
   )
   const ttsRelay = new TtsStreamRelay({
     emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
-    emitChunk: (e) => sendToWindows(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, e)
+    emitChunk: (e) => sendToWindows(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, e),
+    // stream de TTS que caiu no meio da sentença: a chamada decide (fatal encerra)
+    onStreamError: (e) => void voiceCallsRef?.voiceApiError('tts', e)
   })
   ttsRelayRef = ttsRelay
+  // ---- [tts-feed] ElevenLabs direta na chamada: WebSocket multi-contexto (texto em streaming) ----
+  // opções lidas das settings com um cache curto (o feed é consultado a cada delta do LLM)
+  let elevenOptsCache: { at: number; v: ReturnType<typeof elevenLabsCallOptions> } | null = null
+  const elevenOpts = (): ReturnType<typeof elevenLabsCallOptions> => {
+    const now = Date.now()
+    if (!elevenOptsCache || now - elevenOptsCache.at > 1000)
+      elevenOptsCache = { at: now, v: elevenLabsCallOptions(getVoiceSettings().tts) }
+    return elevenOptsCache.v
+  }
+  const elevenCall = new ElevenLabsCallTts({
+    config: elevenOpts,
+    // instrumentação: 1º texto entregue → 1º áudio (log + timeline do painel da chamada)
+    onLatency: (l) => {
+      console.log(
+        `[clearchat] tts elevenlabs-ws: ${l.contextId} 1º texto→1º áudio ${l.firstTextToAudioMs} ms` +
+          (l.flushToAudioMs != null ? ` (flush→áudio ${l.flushToAudioMs} ms)` : '') +
+          (l.turnMs != null ? ` · turno ${l.turnMs} ms` : '') +
+          ` · ${l.chars} chars`
+      )
+      if (voiceCallsRef?.state().active)
+        sendToWindows(VOICE_CALL_TIMELINE_CHANNEL, {
+          ts: Date.now(),
+          kind: 'tts-latency',
+          latencyMs: l.turnMs ?? l.firstTextToAudioMs,
+          reason: `elevenlabs-ws ${l.turnMs != null ? 'turno' : l.contextId}`
+        })
+    }
+  })
+  elevenCallRef = elevenCall
+  // ---- [/tts-feed] ----
   const voiceCalls = new VoiceCallManager({
     sendTurn: (sessionId, text) => {
       // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas)
@@ -393,13 +442,17 @@ export function registerIpc(): void {
     // TTS por sentença: com endpoint que devolve PCM progressivo (OpenRouter/ElevenLabs) a
     // sentença começa a tocar com ~200 ms de áudio e o resto segue em `voice:call:utterance-chunk`
     // (`TtsStreamRelay`); motor local / wav / mp3 → bytes completos, como antes
+    // [tts-feed] ElevenLabs direta com modelo de WebSocket → o contexto da sentença no socket
     synth: (text, signal) =>
-      ttsRelay.synth(signal, (s) =>
-        synthesizeStream(
-          { text, settings: getVoiceSettings().tts },
-          { local: ttsLocalEngine(), signal: s }
-        )
+      ttsRelay.synth(signal, async (s) =>
+        elevenOpts()
+          ? elevenCall.synth(text, s)
+          : synthesizeStream(
+              { text, settings: getVoiceSettings().tts },
+              { local: ttsLocalEngine(), signal: s }
+            )
       ),
+    ttsFeed: () => (elevenOpts() ? elevenCall : null),
     emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
     emitUtterance: (u) => ttsRelay.emitUtterance(u),
     emitUtteranceCancel: (id) => sendToWindows(VOICE_CALL_UTTERANCE_CANCEL_CHANNEL, { id }),
@@ -423,6 +476,24 @@ export function registerIpc(): void {
       return s ? { chatId: s.chatId, depth: s.depth, busy: isBusyStatus(s.status) } : null
     },
     chatConfig: (chatId) => chatsRepo.get(chatId)?.config ?? null,
+    // camada da persona de origem (lida ao vivo): chat > persona > global
+    personaVoice: (chatId) => {
+      const presetId = chatsRepo.get(chatId)?.config.presetId
+      return presetId ? (presetsRepo.get(presetId)?.config.voice ?? null) : null
+    },
+    // falhas de STT/TTS: fatal encerra a chamada com motivo legível (provedor pelo endpoint)
+    classifyError: (e, source) => {
+      const v = getVoiceSettings()
+      const local = source === 'stt' ? v.stt.mode === 'local' : v.tts.backend === 'local'
+      const base = source === 'stt' ? v.stt.api.baseUrl : v.tts.api.baseUrl
+      return classifyVoiceError(e, source, voiceProviderLabel(base, local))
+    },
+    onCallEnded: () => ttsRelay.abortAll(),
+    // sem motor local configurado, o veredito do fim de turno sai pela API (lento)
+    slowSpeculation: () => {
+      const stt = getVoiceSettings().stt
+      return stt.mode !== 'local' && !stt.local
+    },
     settings: () => {
       const v = getVoiceSettings()
       return { defaults: v.voiceCallDefaults, audioInput: v.audioInput, stt: v.stt, tts: v.tts }
@@ -902,6 +973,11 @@ export function registerIpc(): void {
           // coerência installed/hasLocalReady: a presença real de modelo instalado vem do disco
           hasLocalReady: deriveHasLocalReady(v.stt.local, models),
           onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e),
+          // erro fatal de parcial/segmento/especulação na chamada: encerra já (a final falharia)
+          onError: (e) => {
+            if (voiceCalls.state().active && owner !== null && owner === voiceCallOwner)
+              voiceCalls.voiceApiError('stt', e)
+          },
           ownerId: owner ?? undefined
         }
       ).id
@@ -909,14 +985,37 @@ export function registerIpc(): void {
     [IPC.voice.transcribePush]: (sessionId: string, pcm16: Uint8Array, sampleRate?: number) => {
       requireTranscribeSession(sessionId).push(pcm16, sampleRate)
     },
-    [IPC.voice.transcribeStop]: (sessionId: string, opts?: { reuseSpeculative?: boolean }) =>
-      requireTranscribeSession(sessionId).stop({
-        reuseSpeculative: opts?.reuseSpeculative === true
-      }),
+    [IPC.voice.transcribeStop]: (
+      sessionId: string,
+      opts?: { reuseSpeculative?: boolean; reusePartial?: boolean }
+    ) => {
+      const owner = ipcSenderId
+      return requireTranscribeSession(sessionId)
+        .stop({
+          reuseSpeculative: opts?.reuseSpeculative === true,
+          // a chamada sempre pede; o ditado segue a setting (padrão ligado)
+          reusePartial:
+            typeof opts?.reusePartial === 'boolean'
+              ? opts.reusePartial
+              : getVoiceSettings().stt.reusePartialFinal !== false
+        })
+        .catch((e: unknown) => {
+          // a final da chamada falhou (a sessão já repetiu a transitória uma vez): encerra
+          if (voiceCalls.state().active && owner !== null && owner === voiceCallOwner)
+            voiceCalls.voiceApiError('stt', e, { retried: true })
+          throw e
+        })
+    },
     // fim de turno adaptativo: transcrição especulativa (API só com `turn.speculativeApi`)
     [IPC.voice.transcribeSpeculate]: (sessionId: string) =>
       requireTranscribeSession(sessionId).speculate({
-        allowApi: getVoiceSettings().voiceCallDefaults.turn.speculativeApi
+        // pela API com a opção explícita OU com as parciais ao vivo ligadas (já sobem o áudio a
+        // cada ~1 s; a especulação reaproveitada vira a final — no caso comum não custa nada a
+        // mais e a transcrição sai ~1 s antes)
+        allowApi: (() => {
+          const v = getVoiceSettings()
+          return v.voiceCallDefaults.turn.speculativeApi || v.stt.livePartials
+        })()
       }),
     // cancel é tolerante: encerrar uma sessão que já saiu (corrida com o fim natural) não é erro;
     // vale também para a sessão que está transcrevendo a final (aborta a final)
@@ -925,7 +1024,8 @@ export function registerIpc(): void {
     },
     // ---- modelos locais (catálogo + download/estado em disco) ----
     [IPC.voice.modelsList]: async (): Promise<VoiceModelInfo[]> =>
-      (await listLocalModels(localModelsBaseDir())).map(toModelView),
+      // aposentados (voz lenta demais para chamada) só aparecem enquanto há arquivo para remover
+      (await listLocalModels(localModelsBaseDir())).filter(isListedLocalModel).map(toModelView),
     [IPC.voice.modelsDownload]: async (input: { id: string }): Promise<VoiceModelInfo | null> => {
       const id = requireModelId(input)
       if (localDownloads.has(id)) throw new Error(`download já em andamento para ${id}`)
@@ -988,11 +1088,43 @@ export function registerIpc(): void {
         { local: ttsLocalEngine() }
       )
     },
-    [IPC.voice.ttsTest]: () =>
-      synthesize(
-        { text: TTS_TEST_PHRASE, settings: getVoiceSettings().tts, format: 'wav' },
+    [IPC.voice.ttsTest]: (input?: { voice?: unknown; model?: unknown; text?: unknown }) => {
+      // overrides só deste teste (▶ prévia de uma voz/modelo ainda não escolhidos no seletor)
+      const clip = (v: unknown): string | null =>
+        typeof v === 'string' && v.trim() ? v.trim().slice(0, 200) : null
+      const saved = getVoiceSettings().tts
+      const voice = clip(input?.voice)
+      const model = clip(input?.model)
+      const settings =
+        saved.backend === 'api'
+          ? {
+              ...saved,
+              api: {
+                ...saved.api,
+                voice: voice ?? saved.api.voice,
+                model: model ?? saved.api.model
+              }
+            }
+          : saved.local && voice
+            ? { ...saved, local: { ...saved.local, voice } }
+            : saved
+      return synthesize(
+        { text: clip(input?.text) ?? TTS_TEST_PHRASE, settings, format: 'wav' },
         { local: ttsLocalEngine() }
+      )
+    },
+    // descoberta de modelos/vozes por provedor (a chave fica no main — nunca na visão)
+    [IPC.voice.catalogList]: (input: VoiceCatalogRequest) =>
+      listVoiceCatalog(
+        {
+          capability: input?.capability === 'stt' ? 'stt' : 'tts',
+          providerId: typeof input?.providerId === 'string' ? input.providerId : null,
+          refresh: input?.refresh === true
+        },
+        { provider: (id) => providersRepo.get(id), customEndpoint: getVoiceCustomEndpoint }
       ),
+    [IPC.voice.catalogPreview]: (input: { url: string }) =>
+      fetchVoicePreview(typeof input?.url === 'string' ? input.url : ''),
     [IPC.voice.ttsClipsGenerate]: async (): Promise<TtsClipsView> => {
       const manifest = await generateClips({
         baseDir: app.getPath('userData'),
@@ -1036,6 +1168,15 @@ export function registerIpc(): void {
       if (voiceCalls.state().active && owner !== null && voiceCallOwner === owner) voiceCalls.stop()
       const state = voiceCalls.start(sessionId)
       voiceCallOwner = owner
+      // o /models do provedor do chat e do modelo da chamada em cache: a política de raciocínio do
+      // turno de voz (desligar/mínimo) depende dos metadados do modelo
+      const session = sessionsRepo.get(sessionId)
+      const chat = session ? chatsRepo.get(session.chatId) : null
+      const call = chat ? voiceCalls.callContextFor(chat, { id: sessionId, depth: 0 }) : null
+      for (const pid of new Set([chat?.config.providerId, call?.model?.providerId])) {
+        const p = pid ? providersRepo.get(pid) : null
+        if (p) void listModels(p).catch(() => undefined)
+      }
       return state
     },
     [IPC.voice.callStop]: () => {

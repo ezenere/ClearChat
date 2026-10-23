@@ -18,6 +18,15 @@ export type SttWorkerRequest =
       /** ISO-639-1 ('pt'); null = detecção automática. */
       language: string | null
       nThreads: number
+      /**
+       * Contexto do encoder em quadros de 20 ms (ausente/0 = o do modelo, 1500 = 30 s). As parciais
+       * mandam ~duração + margem: o whisper sempre codifica 30 s de mel e, com o contexto reduzido,
+       * a janela de 1–10 s custa ~3× menos CPU sem perder qualidade (medido — SPEC → "Runtime local
+       * de STT"). O worker limita ao contexto do modelo.
+       */
+      audioCtx?: number
+      /** Teto de tokens do texto (ausente/0 = sem teto) — corta laços de repetição nas parciais. */
+      maxTokens?: number
     }
   /** Descarta o modelo carregado (libera a referência; o processo segue vivo). */
   | { id: number; type: 'unload' }

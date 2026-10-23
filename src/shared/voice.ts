@@ -11,6 +11,7 @@ import {
   type ChatParams,
   type ToolName
 } from './types'
+import { planVoiceReasoning, type VoiceReasoningRules } from './voiceCallParams'
 
 // ---------------- settings keys (tabela `settings`, JSON; ver SPEC → Banco) ----------------
 
@@ -89,6 +90,13 @@ export interface SttSettings {
   local: SttLocalConfig | null
   /** Transcrição ao vivo melhor-esforço enquanto o usuário fala (padrão true). */
   livePartials: boolean
+  /**
+   * Ditado: quando a última parcial já cobre a fala inteira (uma transcrição só do trecho final,
+   * sem áudio falado depois dela), ela vira a final na hora — sem a request final (padrão true;
+   * desligado = a final sempre transcreve o trecho de novo, um pouco mais preciso). A chamada de
+   * voz sempre reaproveita (latência).
+   */
+  reusePartialFinal?: boolean
 }
 
 export const DEFAULT_STT_API: SttEndpointConfig = {
@@ -98,11 +106,24 @@ export const DEFAULT_STT_API: SttEndpointConfig = {
   model: 'whisper-large-v3-turbo'
 }
 
+/**
+ * Teto de tamanho do modelo local (whisper.cpp) para as parciais ao vivo por janelas: até o
+ * `ggml-base` (~148 MB) cada janela volta em centenas de ms; do `small` para cima cada parcial custa
+ * segundos de CPU e atrasaria a final — o runtime desliga as parciais e a UI avisa ("parciais
+ * desligadas para este modelo"). SPEC → "Áudio → Runtime local de STT".
+ */
+export const STT_LOCAL_PARTIAL_MAX_MODEL_BYTES = 160_000_000
+
+/** Aviso (pt-BR) de parciais locais desligadas para o modelo escolhido (sessão → UI). */
+export const STT_LOCAL_PARTIALS_OFF_NOTICE =
+  'Parciais ao vivo desligadas para este modelo local (grande demais para transcrever enquanto você fala) — o texto aparece nas pausas e quando você parar. Para ver o texto ao vivo, use o ggml-base ou o ggml-tiny.'
+
 export const DEFAULT_STT_SETTINGS: SttSettings = {
   mode: 'api',
   api: { ...DEFAULT_STT_API },
   local: null,
-  livePartials: true
+  livePartials: true,
+  reusePartialFinal: true
 }
 
 // ---------------- fala (settings `ttsSettings`) ----------------
@@ -123,6 +144,12 @@ export interface TtsEndpointConfig {
   model: string
   /** Voz pedida à API; null = a voz padrão da API. */
   voice: string | null
+  /**
+   * Tipo do provedor salvo (`providerId`), preenchido SÓ pelo main ao resolver o endpoint
+   * (`getVoiceSettings`) — nunca gravado nem enviado ao renderer. `'elevenlabs'` = ElevenLabs
+   * direta (REST `/v1/text-to-speech` + WebSocket na chamada — `voice/elevenlabs*.ts`).
+   */
+  providerKind?: string
 }
 
 export interface TtsLocalConfig {
@@ -313,13 +340,29 @@ export interface VoiceCallConfig {
   model: VoiceCallModelConfig | null
   /** Tools próprias da chamada de voz; null = igual ao chat. */
   tools: VoiceCallToolsConfig | null
-  /** Acréscimo ao system prompt no modo voz (fala, estilo…); null = sem acréscimo. */
+  /** Prompt do modo voz (fala, estilo…); null = sem prompt próprio (o modo diz como compõe). */
   voicePrompt: string | null
+  /**
+   * Como o prompt do modo voz compõe com o system prompt do chat/persona nos turnos da chamada;
+   * null/ausente = herda (persona → `'append'`). Ver `VoiceCallPromptMode`.
+   */
+  promptMode?: VoiceCallPromptMode | null
   /** Falas preenchidoras; null = segue o padrão global. */
   fillers: VoiceFillers | null
   /** Política de interjeições; null = segue o padrão global. */
   interjections: InterjectionPolicy | null
 }
+
+/**
+ * Composição do prompt nos turnos de voz (o prompt-base global entra em `append` e `replace`,
+ * salvo desligado em Configurações → Áudio; nunca em `none`):
+ * - `append` (complementar, padrão): system prompt do chat + prompt-base + prompt do modo voz;
+ * - `replace` (substituto): prompt-base + prompt do modo voz NO LUGAR do system prompt do chat
+ *   (prompt do modo voz vazio → nada a pôr no lugar: vale como `append`);
+ * - `none` (nenhum): só o system prompt do chat — sem prompt-base nem prompt do modo voz.
+ */
+export type VoiceCallPromptMode = 'append' | 'replace' | 'none'
+export const VOICE_CALL_PROMPT_MODES: readonly VoiceCallPromptMode[] = ['append', 'replace', 'none']
 
 /**
  * Padrões GLOBAIS da chamada de voz (setting `voiceCallDefaults`). Por padrão a chamada está
@@ -336,10 +379,11 @@ export interface VoiceCallDefaults {
   /** Turnos da chamada (silêncio que encerra a fala do usuário; fim de turno adaptativo). */
   turn: VoiceCallTurnConfig
   /**
-   * Teto de tokens da resposta nos turnos de voz (`max_tokens`; padrão 120, 0 = sem teto). Só vale
-   * quando o modelo da chamada não define `max_tokens` nem raciocínio (`reasoning_effort`).
+   * Modelo da chamada padrão (provider/model/params) para chats/personas sem modelo próprio na
+   * chamada; null = o modelo do próprio chat. O `max_tokens` dos turnos de voz só existe aqui (nos
+   * params), como qualquer parâmetro do modelo — a chamada não impõe teto próprio.
    */
-  maxTokens: number
+  model: VoiceCallModelConfig | null
   /** Prompt-base do modo voz somado ao system prompt (ligado por padrão). */
   basePromptEnabled: boolean
   /** Texto do prompt-base; null = `DEFAULT_VOICE_BASE_PROMPT`. */
@@ -392,9 +436,6 @@ export const DEFAULT_VOICE_CALL_TURN: VoiceCallTurnConfig = {
   speculativeApi: false
 }
 
-/** Teto padrão de tokens da resposta nos turnos de voz. */
-export const DEFAULT_VOICE_MAX_TOKENS = 120
-
 /**
  * Prompt-base do modo voz (somado ao system prompt nos turnos da chamada, antes do `voicePrompt`
  * do chat): respostas curtas, sem markdown, sem narrar falhas internas, e o aviso de que a fala
@@ -413,7 +454,7 @@ export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
   interjections: { ...DEFAULT_INTERJECTION_POLICY, classes: [...DEFAULT_INTERJECTION_CLASSES] },
   fillers: { enabled: true, prompt: null, delayMs: DEFAULT_FILLER_DELAY_MS, pool: null },
   turn: { ...DEFAULT_VOICE_CALL_TURN },
-  maxTokens: DEFAULT_VOICE_MAX_TOKENS,
+  model: null,
   basePromptEnabled: true,
   basePrompt: null
 }
@@ -519,7 +560,8 @@ export function normalizeSttSettings(v: unknown): SttSettings {
           installed: local.installed === true
         }
       : null,
-    livePartials: boolOr(src?.livePartials, DEFAULT_STT_SETTINGS.livePartials)
+    livePartials: boolOr(src?.livePartials, DEFAULT_STT_SETTINGS.livePartials),
+    reusePartialFinal: boolOr(src?.reusePartialFinal, true)
   }
 }
 
@@ -628,21 +670,29 @@ export function normalizeVoiceCallTurn(v: unknown): VoiceCallTurnConfig {
  * herda o padrão global); chaves desconhecidas são descartadas (como nos demais normalizadores) e
  * `model.params` preserva as chaves que não conhece (como `cleanParams` em presets.ts).
  */
+/** Modelo da chamada (provider + model + params) ou null (sem provider/model válidos). */
+export function normalizeVoiceCallModel(v: unknown): VoiceCallModelConfig | null {
+  const model = asObject(v)
+  const providerId = strOrNull(model?.providerId)
+  const modelName = strOrNull(model?.model)
+  return model && providerId && modelName
+    ? { providerId, model: modelName, params: cleanParams(model.params) }
+    : null
+}
+
+const promptModeOrNull = (v: unknown): VoiceCallPromptMode | null =>
+  VOICE_CALL_PROMPT_MODES.includes(v as VoiceCallPromptMode) ? (v as VoiceCallPromptMode) : null
+
 export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
   const src = asObject(v)
   if (!src) return { ...DEFAULT_VOICE_CALL_CONFIG }
-  const model = asObject(src.model)
   const tools = asObject(src.tools)
   const fillers = asObject(src.fillers)
   const interjections = asObject(src.interjections)
-  const providerId = strOrNull(model?.providerId)
-  const modelName = strOrNull(model?.model)
+  const promptMode = promptModeOrNull(src.promptMode)
   return {
     enabled: typeof src.enabled === 'boolean' ? src.enabled : null,
-    model:
-      model && providerId && modelName
-        ? { providerId, model: modelName, params: cleanParams(model.params) }
-        : null,
+    model: normalizeVoiceCallModel(src.model),
     tools: tools
       ? {
           enabledTools: normalizeToolList(tools.enabledTools) ?? null,
@@ -650,6 +700,8 @@ export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
         }
       : null,
     voicePrompt: promptOrNull(src.voicePrompt),
+    // aditivo: só gravado quando escolhido (ausente = herda → complementar)
+    ...(promptMode ? { promptMode } : {}),
     // objeto presente = override do global; `enabled` ausente completa com o padrão (ligado)
     fillers: fillers
       ? {
@@ -677,8 +729,9 @@ export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
       pool: normalizeFillerPool(fillers?.pool)
     },
     turn: normalizeVoiceCallTurn(src?.turn),
-    // 0 é válido (sem teto)
-    maxTokens: intOr(src?.maxTokens, d.maxTokens),
+    // `maxTokens` (teto antigo dos turnos de voz) saiu: o max_tokens vive nos params do modelo da
+    // chamada — um valor gravado é descartado aqui
+    model: normalizeVoiceCallModel(src?.model),
     basePromptEnabled: boolOr(src?.basePromptEnabled, d.basePromptEnabled),
     basePrompt: promptOrNull(src?.basePrompt)
   }
@@ -714,6 +767,12 @@ export interface TurnTiming {
   statementMs: number
   unfinishedMs: number
   fallbackMs: number
+  /**
+   * Silêncio exigido enquanto a especulação está pendente; ausente = `unfinishedMs` (o teto). A
+   * chamada põe `fallbackMs` quando a especulação vai pela API (lenta: 1–3 s no OpenRouter) — o
+   * turno fecha no silêncio fixo e a final reaproveita a especulação em voo.
+   */
+  pendingMs?: number
 }
 
 export function resolveTurnTiming(turn: VoiceCallTurnConfig | null | undefined): TurnTiming {
@@ -735,9 +794,53 @@ export function resolveTurnTiming(turn: VoiceCallTurnConfig | null | undefined):
 export const DEFAULT_TURN_TIMING: TurnTiming = resolveTurnTiming(DEFAULT_VOICE_CALL_TURN)
 
 /**
- * `VoiceCallConfig` resolvido: campos null herdam o padrão (como `memory`/`skills` — a herança
- * persona→chat é snapshot na criação do chat; aqui resolve-se chat→global). `model`/`tools`
- * continuam `null` quando não há override (o chamador usa o modelo/tools do próprio chat).
+ * Camadas chat → persona da chamada de voz: cada campo `null`/ausente do chat herda o da persona
+ * de origem (`ChatConfig.presetId`, lida AO VIVO). A persona também entra por snapshot na criação
+ * do chat (`applyPreset`), então os dois coincidem até alguém mudar um dos lados; um campo que o
+ * chat devolveu a "★ padrão" (null) segue a persona atual. Persona ausente → o próprio chat.
+ */
+export function layerVoiceCallConfig(
+  chat: VoiceCallConfig | null | undefined,
+  persona: VoiceCallConfig | null | undefined
+): VoiceCallConfig {
+  const c = normalizeVoiceCallConfig(chat ?? null)
+  if (!persona) return c
+  const p = normalizeVoiceCallConfig(persona)
+  const mode = c.promptMode ?? p.promptMode ?? null
+  return {
+    enabled: c.enabled ?? p.enabled,
+    model: c.model ?? p.model,
+    tools: c.tools ?? p.tools,
+    voicePrompt: c.voicePrompt ?? p.voicePrompt,
+    ...(mode ? { promptMode: mode } : {}),
+    fillers: c.fillers ?? p.fillers,
+    interjections: c.interjections ?? p.interjections
+  }
+}
+
+/** De onde vem o `enabled` efetivo (o tooltip do telefone explica quem desligou). */
+export type VoiceCallSource = 'chat' | 'persona' | 'global'
+
+/**
+ * Chamada liberada? Precedência chat > persona > global. Com o snapshot da persona o chat costuma
+ * ter o mesmo valor dela — valor igual ao da persona conta como "da persona" (o motivo exibido).
+ */
+export function resolveVoiceCallEnabled(
+  chat: VoiceCallConfig | null | undefined,
+  persona: VoiceCallConfig | null | undefined,
+  defaults: VoiceCallDefaults | null | undefined
+): { enabled: boolean; source: VoiceCallSource } {
+  const c = normalizeVoiceCallConfig(chat ?? null).enabled
+  const p = persona ? normalizeVoiceCallConfig(persona).enabled : null
+  if (c !== null) return { enabled: c, source: p === c ? 'persona' : 'chat' }
+  if (p !== null) return { enabled: p, source: 'persona' }
+  return { enabled: normalizeVoiceCallDefaults(defaults ?? null).enabled, source: 'global' }
+}
+
+/**
+ * `VoiceCallConfig` resolvido: campos null herdam o padrão (chat → persona via
+ * `layerVoiceCallConfig`; aqui → global). `model` = chat > persona > global (`voiceCallDefaults
+ * .model`) > null (o modelo do próprio chat); `tools` continua `null` sem override.
  */
 export interface ResolvedVoiceCall {
   /** Chamada de voz liberada (para UI/envio). */
@@ -746,65 +849,91 @@ export interface ResolvedVoiceCall {
   model: VoiceCallModelConfig | null
   /** Tools próprias (campos null = os do chat); null = igual ao chat. */
   tools: VoiceCallToolsConfig | null
-  /** Acréscimo ao system prompt no modo voz; null = sem acréscimo. */
+  /** Prompt do modo voz; null = sem prompt próprio. */
   voicePrompt: string | null
+  /** Composição do prompt nos turnos de voz (padrão `'append'`). */
+  promptMode: VoiceCallPromptMode
   /** Falas preenchidoras efetivas (consumidas pela chamada — ver SPEC → "Fillers"). */
   fillers: VoiceFillers
   /** Interjeições efetivas (consumidas pela chamada — ver SPEC → "Interjeições (regras)"). */
   interjections: InterjectionPolicy
   /** Prompt-base do modo voz (global); null = desligado. */
   basePrompt: string | null
-  /** Teto de tokens da resposta nos turnos de voz (0 = sem teto). */
-  maxTokens: number
 }
 
-/** Resolução completa (aceita lixo/null; `enabled: null` herda o global — null ≠ false). */
+/**
+ * Resolução completa (aceita lixo/null; `enabled: null` herda o global — null ≠ false). `persona`
+ * (opcional) = a config de voz da persona de origem do chat (`presetId`), lida ao vivo.
+ */
 export function resolveVoiceCallConfig(
   config: VoiceCallConfig | null | undefined,
-  defaults: VoiceCallDefaults | null | undefined
+  defaults: VoiceCallDefaults | null | undefined,
+  persona?: VoiceCallConfig | null
 ): ResolvedVoiceCall {
-  const c = normalizeVoiceCallConfig(config ?? null)
+  const c = layerVoiceCallConfig(config ?? null, persona ?? null)
   const d = normalizeVoiceCallDefaults(defaults ?? null)
   return {
     enabled: c.enabled ?? d.enabled,
-    model: c.model,
+    model: c.model ?? d.model,
     tools: c.tools,
     voicePrompt: c.voicePrompt,
+    promptMode: c.promptMode ?? 'append',
     fillers: c.fillers ?? { enabled: d.fillers.enabled, prompt: d.fillers.prompt },
     interjections: c.interjections ?? d.interjections,
-    basePrompt: d.basePromptEnabled ? (d.basePrompt ?? DEFAULT_VOICE_BASE_PROMPT) : null,
-    maxTokens: d.maxTokens
+    basePrompt: d.basePromptEnabled ? (d.basePrompt ?? DEFAULT_VOICE_BASE_PROMPT) : null
   }
 }
 
 /**
- * Chat efetivo de um turno de voz (cópia): a config do chat com os overrides da chamada aplicados
- * (`voice.model` → params; `voice.tools` → enabledTools/maxToolOutputChars; `voicePrompt` →
- * acréscimo ao system prompt). Função pura — o runner usa a cópia só nas requests/tools do turno;
- * o chat salvo nunca muda (o histórico de um turno de voz é idêntico ao de um turno de texto).
+ * System prompt dos turnos de voz pelo modo (ver `VoiceCallPromptMode`): `append` = system +
+ * prompt-base + prompt do modo voz; `replace` = prompt-base + prompt do modo voz no lugar do system
+ * (sem prompt do modo voz → como `append`); `none` = só o system. Separados por linha em branco.
  */
-export function applyVoiceCallChat(chat: Chat, call: ResolvedVoiceCall): Chat {
+export function voiceSystemPrompt(
+  systemPrompt: string,
+  call: Pick<ResolvedVoiceCall, 'basePrompt' | 'voicePrompt' | 'promptMode'>
+): string {
+  const join = (parts: (string | null | undefined)[]): string =>
+    parts.filter((x): x is string => !!x?.trim()).join('\n\n')
+  const mode = call.promptMode ?? 'append'
+  if (mode === 'none') return systemPrompt
+  if (mode === 'replace' && call.voicePrompt?.trim())
+    return join([call.basePrompt, call.voicePrompt])
+  return join([systemPrompt, call.basePrompt, call.voicePrompt])
+}
+
+/**
+ * Chat efetivo de um turno de voz (cópia): a config do chat com os overrides da chamada aplicados
+ * (`model` → params; `tools` → enabledTools/maxToolOutputChars; prompt pelo `promptMode`) e o
+ * raciocínio do modelo da chamada desligado/mínimo quando os params da chamada não o definem
+ * (`planVoiceReasoning` — com `rules`, que o runner passa com o tipo do provedor e o /models). Sem
+ * teto de tokens próprio (o `max_tokens` só vem dos params). Função pura — o chat salvo nunca muda
+ * (o histórico de um turno de voz é idêntico ao de um turno de texto).
+ */
+export function applyVoiceCallChat(
+  chat: Chat,
+  call: ResolvedVoiceCall,
+  rules?: VoiceReasoningRules
+): Chat {
   const cfg = chat.config
   const out: ChatConfig = { ...cfg }
   if (call.model) out.params = { ...call.model.params }
   if (call.tools?.enabledTools != null) out.enabledTools = [...call.tools.enabledTools]
   if (call.tools?.maxToolOutputChars != null) out.maxToolOutputChars = call.tools.maxToolOutputChars
-  // prompt-base do modo voz (global) + o voicePrompt do chat, nessa ordem, depois do system prompt
-  const extra = [call.basePrompt, call.voicePrompt].filter((x): x is string => !!x?.trim())
-  if (extra.length) {
-    out.systemPrompt = [cfg.systemPrompt, ...extra].filter((x) => !!x?.trim()).join('\n\n')
-  }
-  // teto de tokens do turno de voz: só sem max_tokens/raciocínio definidos (raciocínio conta no
-  // teto em alguns provedores — 120 tokens quebrariam o pedido)
-  const params = out.params ?? {}
-  const effort = params.reasoning_effort
-  if (
-    typeof call.maxTokens === 'number' &&
-    call.maxTokens > 0 &&
-    params.max_tokens == null &&
-    (effort == null || effort === 'none')
-  ) {
-    out.params = { ...params, max_tokens: call.maxTokens }
+  const sys = voiceSystemPrompt(cfg.systemPrompt ?? '', call)
+  if (sys !== (cfg.systemPrompt ?? '')) out.systemPrompt = sys
+  if (rules) {
+    const model = call.model?.model ?? cfg.model
+    // "configurado no modelo da chamada" = reasoning_effort nos params da chamada; os params do
+    // chat (texto) não contam — a chamada sem modelo próprio usa o raciocínio desligado/mínimo
+    const explicit = call.model?.params.reasoning_effort != null
+    out.params = planVoiceReasoning({
+      params: out.params ?? {},
+      explicit,
+      kind: rules.kind,
+      model,
+      info: rules.info
+    }).params
   }
   return { ...chat, config: out }
 }

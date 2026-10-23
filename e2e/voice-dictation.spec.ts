@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 // E2E do ditado por voz (Feature A) na UI real (Playwright `_electron`), determinístico e sem
-// rede externa: microfone FALSO do Chromium (`--use-fake-device-for-media-capture
-// --use-fake-ui-for-media-capture` — gera áudio sintético sem hardware) + servidor FALSO de STT
+// rede externa: microfone INJETADO (getUserMedia/enumerateDevices trocados por um stream
+// sintético — o microfone real nunca é aberto; as flags de fake device do Chromium são ignoradas
+// neste Electron/Linux) + servidor FALSO de STT
 // (`e2e/fakes/sttServer.ts`) respondendo `/audio/transcriptions` com transcrição fixa (o
 // `sttSettings` é apontado para ele). userData isolado (`CLEARCHAT_USER_DATA`); nenhuma chave real.
 //
@@ -12,11 +13,11 @@
 //   (ou: npm run test:e2e:voice)
 //
 // Cobre: botão de microfone no composer (clique inicia/para), chevron com menu de microfone
-// (Padrão do sistema + dispositivos do fake device), gravação com áudio do fake device → parciais
+// (Padrão do sistema + dispositivo injetado), gravação com o áudio injetado → parciais
 // (no fantasma `voice-partial`, FORA da textarea) → Parar gravação → texto final no rascunho
 // editável (envio SEMPRE manual — a mensagem não sai sozinha), Esc cancela descartando, o request
 // multipart chega ao servidor falso (file/model/language/response_format + Authorization da chave
-// salva) e o microfone salvo inexistente cai no padrão com aviso (captura real, OverconstrainedError).
+// salva) e o microfone salvo inexistente cai no padrão com aviso (OverconstrainedError simulado).
 import {
   _electron as electron,
   type ElectronApplication,
@@ -152,20 +153,56 @@ async function main(): Promise<void> {
   for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v
   delete env.ELECTRON_RUN_AS_NODE
   env.CLEARCHAT_USER_DATA = USER_DATA
-  app = await electron.launch({
-    args: [
-      // microfone falso do Chromium: áudio sintético + permissão concedida sem diálogo
-      '--use-fake-device-for-media-capture',
-      '--use-fake-ui-for-media-capture',
-      ROOT
-    ],
-    env,
-    timeout: 60_000
-  })
+  // Microfone INJETADO (nunca o hardware): neste Electron/Linux as flags de fake device do
+  // Chromium são ignoradas — listariam e abririam o microfone REAL do usuário. getUserMedia vira
+  // um MediaStream sintético (rajadas de tom com pausas, para o VAD ver fala e silêncio) e
+  // enumerateDevices devolve um dispositivo falso; deviceId exato desconhecido →
+  // OverconstrainedError, como o Chromium real.
+  app = await electron.launch({ args: [ROOT], env, timeout: 60_000 })
   const log = createWriteStream(join(BASE, 'main.log'), { flags: 'a' })
   app.process().stdout?.pipe(log)
   app.process().stderr?.pipe(log)
   page = await app.firstWindow()
+  await page.addInitScript(() => {
+    const md = navigator.mediaDevices
+    const FAKE = {
+      deviceId: 'fake-mic-1',
+      groupId: 'fake',
+      kind: 'audioinput',
+      label: 'Microfone falso (e2e)'
+    }
+    md.enumerateDevices = async () => [
+      { ...FAKE, toJSON: () => FAKE } as unknown as MediaDeviceInfo
+    ]
+    md.getUserMedia = async (c?: MediaStreamConstraints) => {
+      const a = c?.audio
+      const dev = a && typeof a === 'object' ? (a as MediaTrackConstraints).deviceId : undefined
+      const exact =
+        dev && typeof dev === 'object' ? (dev as ConstrainDOMStringParameters).exact : undefined
+      if (exact && exact !== FAKE.deviceId && exact !== 'default') {
+        const err = new Error('') as Error & { constraint?: string }
+        err.name = 'OverconstrainedError'
+        err.constraint = 'deviceId'
+        throw err
+      }
+      const ctx = new AudioContext({ sampleRate: 48000 })
+      const osc = ctx.createOscillator()
+      osc.frequency.value = 220
+      const gain = ctx.createGain()
+      // 1,2 s de "fala", 0,6 s de pausa, repetindo (~3 min)
+      const t0 = ctx.currentTime
+      for (let i = 0; i < 100; i++) {
+        const s = t0 + i * 1.8
+        gain.gain.setValueAtTime(0.3, s)
+        gain.gain.setValueAtTime(0, s + 1.2)
+      }
+      const dest = ctx.createMediaStreamDestination()
+      osc.connect(gain).connect(dest)
+      osc.start()
+      return dest.stream
+    }
+  })
+  await page.reload()
   await page.waitForLoadState('domcontentloaded')
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1280, 900))
   await app.evaluate(({ dialog }, dir) => {
@@ -242,7 +279,7 @@ async function main(): Promise<void> {
     }
   )
 
-  await step('menu de microfone: Padrão do sistema + dispositivos do fake device', async () => {
+  await step('menu de microfone: Padrão do sistema + dispositivo injetado', async () => {
     await page.getByTestId('voice-mic-menu-button').click()
     await page.getByTestId('voice-mic-menu').waitFor()
     await page.getByTestId('voice-mic-option-system').waitFor()
@@ -262,7 +299,7 @@ async function main(): Promise<void> {
   })
 
   await step(
-    'clicar mic → grava (fake device) → parciais no rascunho → parar → texto final',
+    'clicar mic → grava (microfone injetado) → parciais no rascunho → parar → texto final',
     async () => {
       await micButton().click()
       // estado real "gravando" (depois do start assíncrono da captura)
@@ -309,7 +346,9 @@ async function main(): Promise<void> {
     'request multipart chega ao servidor falso (file/model/language + Bearer)',
     async () => {
       const posts = stt!.hits.filter((h) => h.path.endsWith('/audio/transcriptions'))
-      assert(posts.length >= 2, `requests: ${posts.length} (parciais + final)`)
+      // ≥ 1: com a "final rápida" (sttSettings.reusePartialFinal, padrão ligado) a parcial que já
+      // transcreveu a fala inteira vira a final sem outra request
+      assert(posts.length >= 1, `requests: ${posts.length} (parciais/final)`)
       const last = posts[posts.length - 1]
       assert(last.method === 'POST', last.method)
       assert(

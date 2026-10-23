@@ -266,8 +266,15 @@ function useEffort(cfg: ChatConfig): {
 export function ReasoningField({
   cfg,
   patch,
-  scope
-}: CfgProps & { scope: string }): React.JSX.Element | null {
+  scope,
+  defaultLabel = 'padrão',
+  defaultTitle = 'Não envia reasoning_effort — o modelo usa o padrão dele'
+}: CfgProps & {
+  scope: string
+  /** Rótulo/tooltip da opção "não envia" (a chamada de voz: "auto" = desligado/mínimo). */
+  defaultLabel?: string
+  defaultTitle?: string
+}): React.JSX.Element | null {
   const setParam = useSetParam(cfg, patch, scope)
   const { kind, support, effort, levels } = useEffort(cfg)
   if (support && !support.supported.includes('reasoning_effort')) return null
@@ -294,16 +301,14 @@ export function ReasoningField({
             key={e ?? 'default'}
             type="button"
             aria-pressed={value === e}
-            title={
-              e == null ? 'Não envia reasoning_effort — o modelo usa o padrão dele' : undefined
-            }
+            title={e == null ? defaultTitle : undefined}
             onClick={() => setParam('reasoning_effort', e ?? undefined)}
             className={cn(
               'min-w-0 flex-1 truncate rounded-md px-0.5 py-1 text-[11px] transition-colors',
               value === e ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
             )}
           >
-            {e ?? 'padrão'}
+            {e ?? defaultLabel}
           </button>
         ))}
       </div>
@@ -319,8 +324,17 @@ export function ReasoningField({
 export function ParamsSection({
   cfg,
   patch,
-  scope
-}: CfgProps & { scope: string }): React.JSX.Element {
+  scope,
+  sectionId = 'params',
+  title = 'Parâmetros',
+  help = 'Só os parâmetros ligados entram na request. O raciocínio fica na seção Modelo.'
+}: CfgProps & {
+  scope: string
+  /** Id da seção recolhível (estado lembrado) e título — a chamada de voz usa os próprios. */
+  sectionId?: string
+  title?: string
+  help?: string
+}): React.JSX.Element {
   const kind = useProviderKind(cfg.providerId)
   const openRouter = kind === 'openrouter'
   const setParam = useSetParam(cfg, patch, scope)
@@ -340,10 +354,10 @@ export function ParamsSection({
   }
   return (
     <CollapsibleSection
-      id="params"
-      title="Parâmetros"
+      id={sectionId}
+      title={title}
       summary={paramsSummary(cfg.params)}
-      help="Só os parâmetros ligados entram na request. O raciocínio fica na seção Modelo."
+      help={help}
     >
       {hiddenSome && (
         <p className="-mt-1 text-[11.5px] text-subtle">Os que o modelo não aceita ficam ocultos.</p>

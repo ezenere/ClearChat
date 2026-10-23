@@ -42,6 +42,11 @@ export interface TtsStreamRelayDeps {
   prebufferMs?: number
   /** Diagnóstico: latência até o 1º áudio de cada sentença (ms desde o início da request). */
   onFirstAudio?(ms: number, streaming: boolean): void
+  /**
+   * O stream de uma sentença JÁ emitida falhou no meio (o que chegou termina de tocar): a chamada
+   * decide (fatal → encerra; transitória → uma falta) — nunca calado.
+   */
+  onStreamError?(e: unknown): void
 }
 
 export class TtsStreamRelay {
@@ -152,6 +157,11 @@ export class TtsStreamRelay {
     } catch (e) {
       if (!this.#live.has(entry)) return // abortado de propósito
       entry.error = e instanceof Error ? e.message : String(e)
+      try {
+        this.#deps.onStreamError?.(e)
+      } catch {
+        /* o aviso nunca derruba a ponte */
+      }
     }
     entry.ended = true
     if (entry.id !== null) this.#finish(entry)

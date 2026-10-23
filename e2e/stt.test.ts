@@ -134,6 +134,17 @@ test('transcribeAudio: multipart correto (file/model/language/response_format) e
   assert.deepEqual([...new Uint8Array(await file.arrayBuffer())], [0, 1, 2])
 })
 
+test('transcribeAudio: endpoint local (localhost) sem chave → request sem Authorization', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'ok local' }))
+  t.after(m.restore)
+  const r = await transcribeAudio(INPUT, {
+    settings: sttSettings({}, { baseUrl: 'http://127.0.0.1:8765/v1', apiKey: '' })
+  })
+  assert.equal(r.text, 'ok local')
+  const headers = m.calls[0].init.headers as Record<string, string>
+  assert.equal(headers.Authorization, undefined)
+})
+
 test('transcribeAudio: language vira ISO-639-1; ausente não envia o campo; baseUrl com barra final', async (t) => {
   const m = mockFetch(async () => jsonRes(200, { text: '' }))
   t.after(m.restore)

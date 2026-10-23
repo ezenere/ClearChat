@@ -277,6 +277,14 @@ export async function listLocalModels(
 }
 
 /**
+ * Entra nas listas da UI? Entradas aposentadas (`retired`) só aparecem enquanto ainda há arquivo/
+ * registro em disco — para o usuário ver o aviso e remover; sem nada em disco, somem.
+ */
+export function isListedLocalModel(info: LocalModelInfo): boolean {
+  return !info.entry.retired || info.state !== 'notInstalled'
+}
+
+/**
  * Caminho absoluto do arquivo do modelo em `<baseDir>/models/` (nome do manifest quando instalado,
  * senão o basename da URL). Id desconhecido ou placeholder sem download sem instalação → erro
  * legível. Idempotente (só leitura).
@@ -395,6 +403,7 @@ export async function downloadLocalModel(
   const entry = findCatalogEntry(id, opts.catalog ?? LOCAL_MODEL_CATALOG)
   if (!entry) throw new Error(`modelo desconhecido: ${id}`)
   if (!entry.url) throw new Error(`modelo ${id} ainda não tem download disponível`)
+  if (entry.retired) throw new Error(`modelo ${id} não está mais disponível: ${entry.retired}`)
   const key = downloadKey(baseDir, id)
   if (activeDownloads.has(key)) throw new Error(`download já em andamento para ${id}`)
   const fileName = catalogFileName(entry)!

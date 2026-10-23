@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // E2E contra o MOCK de UI (Playwright `_electron`, sem backend, sem chave, sem microfone) da UX de
 // áudio: ditado (cancelar durante o "Transcrevendo…" não insere; texto final no cursor do início
 // com desfazer; digitar durante a gravação não corrompe o rascunho; parcial fora da textarea),
@@ -509,6 +510,209 @@ app.on('window-all-closed', () => app.quit())
       await page.keyboard.press('Escape')
       await dialog().waitFor({ state: 'detached' })
       return 'Esc → só a captura; "k" recusada; F8 salva'
+    }
+  )
+
+  // ---------------- correções de uso real (callfix) ----------------
+
+  await step(
+    'ditado: ao parar, o texto já transcrito continua visível ("finalizando…") até a final',
+    async () => {
+      await open('chat', 'Ideias de nomes para o app')
+      await composer().fill('')
+      await page.getByTestId('voice-mic-button').click()
+      await recording().waitFor()
+      await page.waitForFunction(
+        () => document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
+        undefined,
+        { timeout: 4000 }
+      )
+      await page.getByTestId('voice-stop-button').click()
+      // o mock leva ~700 ms para a final: nesse meio a parcial NÃO some
+      await page.getByTestId('voice-partial-finalizing').waitFor({ timeout: 1500 })
+      const ghost = await page.getByTestId('voice-partial').innerText()
+      assert(ghost.includes('Olá'), `parcial sumiu ao parar: "${ghost}"`)
+      assert(!/Transcrevendo/.test(ghost), 'mostrou "Transcrevendo…" no lugar do texto')
+      await shot('after-dictation-finalizing')
+      await page.waitForFunction(
+        (t) =>
+          (
+            document.querySelector(
+              '[data-testid="composer-column"] textarea'
+            ) as HTMLTextAreaElement
+          )?.value.includes(t),
+        MOCK_FINAL,
+        { timeout: 4000 }
+      )
+      await page.getByTestId('voice-partial').waitFor({ state: 'detached', timeout: 2000 })
+      return 'parcial esmaecida + "finalizando…" → final no lugar'
+    }
+  )
+
+  await step('chamada: transcrição ao vivo do usuário na barra (parcial → final)', async () => {
+    await open('chat', 'Ideias de nomes para o app')
+    await page.getByTestId('voice-call-button').click()
+    await page.getByTestId('voice-call-dock').waitFor()
+    await page.evaluate(() =>
+      (window as any).__clearVoiceRuntime.setState({
+        live: { text: 'eu queria saber se dá pra mudar o tema', state: 'partial' }
+      })
+    )
+    const live = page.getByTestId('voice-call-live')
+    await live.waitFor()
+    assert.equal(await live.getAttribute('data-state'), 'partial')
+    assert.match(await live.innerText(), /mudar o tema/)
+    await page.evaluate(() =>
+      (window as any).__clearVoiceRuntime.setState({
+        live: { text: 'Eu queria saber se dá pra mudar o tema do aplicativo.', state: 'final' }
+      })
+    )
+    await page.waitForFunction(
+      () =>
+        document.querySelector('[data-testid=voice-call-live]')?.getAttribute('data-state') ===
+        'final'
+    )
+    await shot('after-call-live-transcript')
+    return 'voice-call-live na linha 1 da barra'
+  })
+
+  await step(
+    'chamada: painel → "Modelo da chamada" (opcional) com raciocínio auto e parâmetros',
+    async () => {
+      // continua na chamada do passo anterior
+      await page.getByTestId('voice-call-panel-toggle').click()
+      await page.getByTestId('voice-call-panel').waitFor()
+      await page.getByTestId('voice-call-panel-model').locator('summary').click()
+      const ed = page.getByTestId('voice-call-model-call')
+      await ed.waitFor()
+      await ed.getByTestId('voice-call-model-inherit-call').waitFor()
+      await ed.getByTestId('model-picker').click()
+      const opt = page
+        .getByRole('listbox', { name: 'Modelos' })
+        .locator('[role=option][data-model]')
+        .first()
+      await opt.waitFor({ timeout: 8000 })
+      const picked = await opt.getAttribute('data-model')
+      await opt.click()
+      await ed.getByTestId('voice-call-model-clear-call').waitFor()
+      // o chat salvo ganhou o override (voice.model) — só a chamada usa
+      const voice = await page.evaluate(() => {
+        const st = (window as any).__clearStore.getState()
+        return st.chats.find((c: any) => c.id === st.voiceCall.chatId)?.config.voice
+      })
+      assert.equal(voice?.model?.model, picked)
+      await shot('after-call-panel-model')
+      await ed.getByTestId('voice-call-model-clear-call').click()
+      await ed.getByTestId('voice-call-model-inherit-call').waitFor()
+      await page.getByTestId('voice-call-end').click()
+      await page.getByTestId('voice-call-dock').waitFor({ state: 'detached' })
+      return `modelo da chamada: ${picked} → herdar`
+    }
+  )
+
+  await step('chamada: sem violação de CSP ao tocar a fala (WAV por blob)', async () => {
+    const violations: string[] = []
+    const onConsole = (m: { text(): string }): void => {
+      if (/Content Security Policy|media-src/i.test(m.text())) violations.push(m.text())
+    }
+    page.on('console', onConsole)
+    await open('chat', 'Ideias de nomes para o app')
+    await page.evaluate(() => {
+      ;(window as any).__csp = []
+      document.addEventListener('securitypolicyviolation', (e) =>
+        (window as any).__csp.push(`${e.violatedDirective} ${e.blockedURI}`)
+      )
+    })
+    await page.getByTestId('voice-call-button').click()
+    await page.getByTestId('voice-call-dock').waitFor()
+    // turno simulado: o mock fala 2 utterances WAV (DomAudioPlayer → blob:)
+    await page.evaluate(() => (window as any).__clearMockApi.voice.call.turn({ text: 'oi' }))
+    await page.waitForTimeout(3200)
+    const csp = await page.evaluate(() => (window as any).__csp as string[])
+    page.off('console', onConsole)
+    await page.getByTestId('voice-call-end').click()
+    await page.getByTestId('voice-call-dock').waitFor({ state: 'detached' })
+    assert.deepEqual([...csp, ...violations], [], 'violação de CSP ao tocar áudio')
+    return 'blob: liberado em media-src'
+  })
+
+  await step(
+    'chamada: falha da API de voz encerra a chamada com o motivo e o composer volta',
+    async () => {
+      await open('voice-call-api-error', 'Ideias de nomes para o app')
+      await composer().fill('rascunho guardado')
+      await page.getByTestId('voice-call-button').click()
+      await page.getByTestId('voice-call-dock').waitFor()
+      await page.getByTestId('voice-call-dock').waitFor({ state: 'detached', timeout: 5000 })
+      await page
+        .getByText(/Chamada encerrada: créditos da ElevenLabs esgotados/)
+        .waitFor({ timeout: 3000 })
+      assert.equal(await composer().inputValue(), 'rascunho guardado', 'rascunho intacto')
+      await shot('after-call-api-error')
+      return 'toast "Chamada encerrada: …" + composer com o rascunho'
+    }
+  )
+
+  await step(
+    'persona: chamada desligada + modo do prompt no editor; chat da persona → telefone desabilitado com o motivo',
+    async () => {
+      await open('chat', 'Ideias de nomes para o app')
+      await page.getByRole('button', { name: /^Configurações/ }).click()
+      await dialog().getByRole('button', { name: 'Personas', exact: true }).click()
+      const row = dialog().getByTestId('preset-row').filter({ hasText: 'Revisor de código' })
+      await row.getByRole('button', { name: /Editar/ }).click()
+      await dialog().getByTestId('preset-editor').waitFor()
+      await dialog().getByRole('tab', { name: 'Chat' }).click()
+      // a seção "Chamada de voz" (recolhida por padrão) abre pelo cabeçalho
+      if (
+        !(await dialog()
+          .getByTestId('voice-call-enabled')
+          .isVisible()
+          .catch(() => false))
+      )
+        await dialog().getByText('Chamada de voz', { exact: true }).click()
+      await dialog().getByTestId('voice-call-enabled').waitFor()
+      // modo do prompt (com a chamada ligada) e depois desligar a chamada nesta persona
+      const modes = dialog().getByTestId('voice-call-prompt-mode')
+      await modes.locator('[data-value=replace]').click()
+      assert.equal(await modes.getAttribute('data-effective'), 'replace')
+      await dialog().getByTestId('voice-call-enabled').locator('[data-value=off]').click()
+      await dialog().getByTestId('voice-call-disabled-note').waitFor()
+      await shot('after-persona-voice-off')
+      await dialog().getByRole('button', { name: 'Salvar persona' }).click()
+      await page.waitForTimeout(300)
+      await page.keyboard.press('Escape')
+      await dialog().waitFor({ state: 'detached' })
+      // o chat atual passa a vir desta persona (presetId) e herda (voice.enabled null)
+      const presetId = await page.evaluate(() => {
+        const st = (window as any).__clearStore.getState()
+        const p = st.presets.find((x: any) => x.name === 'Revisor de código')
+        const chat =
+          st.chats.find((c: any) => c.id === st.activeChatId) ??
+          st.chats.find((c: any) => c.title === 'Ideias de nomes para o app')
+        st.patchConfig(chat.id, {
+          presetId: p.id,
+          voice: { ...(chat.config.voice ?? {}), enabled: null }
+        })
+        return p.id
+      })
+      const btn = page.getByTestId('voice-call-button')
+      await page.waitForFunction(
+        () =>
+          document.querySelector('[data-testid=voice-call-button]')?.getAttribute('data-off') ===
+          'persona'
+      )
+      assert(await btn.isDisabled(), 'telefone habilitado com a persona desligando a chamada')
+      // override do chat religa
+      await page.evaluate(() => {
+        const st = (window as any).__clearStore.getState()
+        const chat = st.chats.find((c: any) => c.title === 'Ideias de nomes para o app')
+        st.patchConfig(chat.id, { voice: { ...(chat.config.voice ?? {}), enabled: true } })
+      })
+      await page.waitForFunction(
+        () => !document.querySelector('[data-testid=voice-call-button]')?.hasAttribute('disabled')
+      )
+      return `persona ${presetId}: desligada → telefone desabilitado; chat religa`
     }
   )
 

@@ -542,6 +542,16 @@ export function Composer({
                 >
                   <TriangleAlert className="size-3.5 shrink-0" />
                   <span className="min-w-0 flex-1">{dictation.error}</span>
+                  {dictation.partialRecoverable && (
+                    <button
+                      type="button"
+                      data-testid="voice-insert-partial"
+                      onClick={dictation.insertPartial}
+                      className="shrink-0 rounded-md border border-danger/30 px-2 py-0.5 text-[11.5px] font-medium transition-colors hover:bg-danger/15"
+                    >
+                      Inserir o texto parcial
+                    </button>
+                  )}
                   <button
                     type="button"
                     aria-label="Dispensar erro de voz"
@@ -587,18 +597,35 @@ export function Composer({
                   className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
                 />
               )}
-              {!blocked && dictating && (
+              {!blocked && (dictating || (dictation.partialRecoverable && !!dictation.partial)) && (
                 // parcial ao vivo FORA do texto editável (digitar durante a gravação é seguro)
                 <div
                   data-testid="voice-partial"
+                  data-state={dictation.state}
                   aria-live="polite"
                   className="mx-4 mb-1 flex items-start gap-1.5 text-[13px] leading-6 text-subtle italic"
                 >
                   <Mic className="mt-1 size-3.5 shrink-0 animate-pulse-soft text-accent-strong" />
-                  <span className="min-w-0 break-words">
+                  <span
+                    className={cn(
+                      'min-w-0 break-words',
+                      dictation.state === 'stopping' && dictation.partial && 'opacity-70'
+                    )}
+                  >
                     {dictation.partial ||
                       (dictation.state === 'stopping' ? 'Transcrevendo…' : 'Ouvindo…')}
-                    <span className="text-accent-strong not-italic">{DICTATION_CURSOR}</span>
+                    {/* parando: o texto já transcrito fica (esmaecido) até a final substituí-lo */}
+                    {dictation.state === 'stopping' && dictation.partial && (
+                      <span
+                        data-testid="voice-partial-finalizing"
+                        className="ml-1.5 text-faint not-italic"
+                      >
+                        · finalizando…
+                      </span>
+                    )}
+                    {dictating && (
+                      <span className="text-accent-strong not-italic">{DICTATION_CURSOR}</span>
+                    )}
                   </span>
                 </div>
               )}

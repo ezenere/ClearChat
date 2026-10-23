@@ -967,6 +967,10 @@ export const useStore = create<Store>()((set, get) => ({
       voiceCall: state,
       voiceCallTimeline: fresh || !state.active ? [] : get().voiceCallTimeline
     })
+    // a chamada terminou por falha (API de voz/modelo): o motivo vira toast — a barra some e o
+    // composer volta com o rascunho
+    if (prev.active && !state.active && state.error)
+      get().toast(`Chamada encerrada: ${state.error}`, 'error')
   },
 
   pushVoiceCallTimeline(event) {

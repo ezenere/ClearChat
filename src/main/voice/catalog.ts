@@ -57,6 +57,14 @@ export interface LocalModelCatalogEntry {
   url: string | null
   license: string
   notes?: string
+  /**
+   * Aposentada (motivo pt-BR): lenta demais para uma chamada em tempo real ou sem motor — some das
+   * listas (só aparece enquanto ainda há arquivo em disco, para o usuário remover), não baixa e o
+   * motor não a usa. Regra (decisão do usuário, 2026-10-23): voz local só fica no catálogo se dá
+   * para conversar com ela — 1º áudio ≤ ~0,8 s para uma frase de ~60 chars e RTF ≤ ~0,5 num
+   * notebook comum. Ver SPEC → "Áudio → Componentes locais".
+   */
+  retired?: string
 }
 
 /** URL-base dos modelos ggml do whisper.cpp (fonte usada pelo script oficial). */
@@ -108,7 +116,8 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     kind: 'stt',
     engine: 'whisper.cpp',
     name: 'Whisper small (ggml)',
-    description: 'Whisper small convertido para ggml (whisper.cpp) — mais preciso, mais lento.',
+    description:
+      'Whisper small convertido para ggml (whisper.cpp) — mais preciso, mais lento; sem parciais ao vivo (o texto aparece nas pausas e ao parar).',
     languages: ['mul'],
     version: '1',
     sizeBytes: 487_601_967,
@@ -123,7 +132,7 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     engine: 'whisper.cpp',
     name: 'Whisper large-v3-turbo (ggml)',
     description:
-      'Whisper large-v3-turbo convertido para ggml (whisper.cpp) — o mais preciso; pesado para CPU fraca.',
+      'Whisper large-v3-turbo convertido para ggml (whisper.cpp) — o mais preciso; pesado para CPU fraca e sem parciais ao vivo (o texto aparece nas pausas e ao parar).',
     languages: ['mul'],
     version: '1',
     sizeBytes: 1_624_555_275,
@@ -174,7 +183,7 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     engine: 'kokoro',
     name: 'Kokoro ONNX fp32 (modelo)',
     description:
-      'Kokoro-82M v1.0 convertido para ONNX fp32 — motor local padrão do app; a fp32 é a mais rápida em CPU (spike: ~0,2 s por frase curta, RTF ~0,1).',
+      'Kokoro-82M v1.0 convertido para ONNX fp32 — o motor local de fala do app (a fp32 é a mais rápida em CPU: ~0,33 s para uma frase de 60 caracteres, RTF ~0,09 com 4 threads — medido num Ryzen 9 9950X; num notebook comum, ~2–3× isso, ainda em tempo real).',
     languages: ['mul'],
     version: '1.0',
     sizeBytes: 325_532_232,
@@ -188,9 +197,11 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     id: 'kokoro-onnx-q8',
     kind: 'tts',
     engine: 'kokoro',
-    name: 'Kokoro ONNX int8 (modelo leve)',
+    name: 'Kokoro ONNX int8 (aposentado)',
     description:
-      'Kokoro-82M v1.0 quantizado int8 — download e disco muito menores; síntese ~4× mais lenta que a fp32 em CPU (spike: ~0,85 s por frase curta, RTF ~0,5) mas ainda em tempo real.',
+      'Kokoro-82M v1.0 quantizado int8 — aposentado: lento demais para conversa (~1,1 s para a 1ª frase de 60 caracteres e RTF ~0,31 mesmo num Ryzen 9 9950X; num notebook, 2–3 s). O app usa o Kokoro fp32; remova este arquivo para liberar 88 MB.',
+    retired:
+      'o Kokoro int8 foi aposentado — lento demais para conversa em tempo real (~3× mais lento que a fp32 em CPU); o app usa o Kokoro ONNX fp32',
     languages: ['mul'],
     version: '1.0',
     sizeBytes: 92_361_116,
@@ -251,7 +262,9 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     id: 'chatterbox-pt-br-t3',
     kind: 'tts',
     engine: 'chatterbox',
-    name: 'Chatterbox pt-BR — T3 (fine-tune)',
+    name: 'Chatterbox pt-BR — T3 (fine-tune) (aposentado)',
+    retired:
+      'o Chatterbox foi aposentado — não há motor de síntese para ele nesta versão e ele fica longe do tempo real em CPU (3,2 GB de pesos); use o Kokoro',
     description:
       'Fine-tune pt-BR do Chatterbox Multilingual v3 (pack single-language da Resemble AI) — pesos T3 (texto→tokens de fala).',
     languages: ['pt-BR'],
@@ -267,7 +280,9 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     id: 'chatterbox-pt-br-s3gen',
     kind: 'tts',
     engine: 'chatterbox',
-    name: 'Chatterbox v3 — S3GEN (tokens→áudio)',
+    name: 'Chatterbox v3 — S3GEN (tokens→áudio) (aposentado)',
+    retired:
+      'o Chatterbox foi aposentado — não há motor de síntese para ele nesta versão e ele fica longe do tempo real em CPU (3,2 GB de pesos); use o Kokoro',
     description:
       'S3GEN v3 do pack pt-BR do Chatterbox — gerador de áudio (compartilhado com o Chatterbox Multilingual v3).',
     languages: ['pt-BR'],
@@ -280,6 +295,11 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
       'Fonte: HF ResembleAI/Chatterbox-Multilingual-pt-br, lfs.oid (2026-10-22). O mesmo repositório publica s3gen_v3.pt (mesmos pesos em formato torch).'
   }
 ]
+
+/** A entrada está aposentada (fora das listas/downloads/motor — ver `retired`)? */
+export function isRetiredEntry(entry: LocalModelCatalogEntry): boolean {
+  return !!entry.retired
+}
 
 /** Acha a entrada do catálogo por id (null quando não existe). */
 export function findCatalogEntry(

@@ -30,7 +30,12 @@ import {
   type TurnTiming,
   type InterjectionPolicy
 } from '@shared/voice'
-import { INTERJECTION_TAIL_CHARS, InterjectionWatcher, PlaybackHold } from '@shared/voicePolicy'
+import {
+  INTERJECTION_MAX_AGE_MS,
+  INTERJECTION_TAIL_CHARS,
+  InterjectionWatcher,
+  PlaybackHold
+} from '@shared/voicePolicy'
 import { AdaptiveTurnGate, classifyUtteranceEnd, type UtteranceEnd } from '@shared/voiceTurn'
 import { DEFAULT_SILENCE_THRESHOLD } from '../audio/silence'
 import { AudioCapture } from '../audio/capture'
@@ -38,7 +43,7 @@ import { api, errorMessage } from '../api'
 import { useStore } from '../../store'
 import { captureErrorText, MIC_FALLBACK_NOTICE } from './dictation'
 import { UtteranceQueue } from './utteranceQueue'
-import { useVoiceCallRuntime } from './voiceCallRuntime'
+import { useVoiceCallRuntime, type VoiceCallRuntime } from './voiceCallRuntime'
 import { loadVoiceSettings } from './voiceSettings'
 
 const MOCK = import.meta.env.VITE_CLEAR_MOCK === '1'
@@ -52,6 +57,26 @@ const INTERJECTION_FADE_MS = 40
 
 const setLevel = (level: number): void => useVoiceCallRuntime.setState({ level })
 const setError = (error: string | null): void => useVoiceCallRuntime.setState({ error })
+const setLive = (text: string, state: VoiceCallRuntime['live']['state']): void =>
+  useVoiceCallRuntime.setState({ live: { text: text.trim(), state: text.trim() ? state : null } })
+/** PCM16 mono 16 kHz: bytes → ms de áudio. */
+const BYTES_PER_MS = 32
+/** Parcial "em dia": cobre a fala até (quase) o começo da pausa — a cauda serve de veredito. */
+const FRESH_PARTIAL_SLACK_MS = 250
+
+/** Motivo de um ato de fala curta não tocado, decidido no renderer (vai à timeline do painel). */
+function pushSkip(reason: string, speechMs: number, pauseMs: number, text: string): void {
+  useStore.getState().pushVoiceCallTimeline({
+    ts: Date.now(),
+    kind: 'decision',
+    class: 'NONE',
+    played: false,
+    speechMs,
+    pauseMs,
+    text: text.slice(-80),
+    reason
+  })
+}
 
 /** Mock de UI: falha simulada do microfone (`window.__clearMockMic`, definido pelo cenário). */
 function mockMicMode(): string {
@@ -98,8 +123,12 @@ export function useVoiceCall(): void {
   const watcherRef = useRef<InterjectionWatcher | null>(null)
   /** Fala do usuário durante a reprodução: backchannel (curta) × barge-in (longa). */
   const holdRef = useRef<PlaybackHold | null>(null)
-  /** Cauda da transcrição parcial ao vivo (escolhe a classe da interjeição). */
+  /** Cauda da transcrição parcial ao vivo DA FALA ATUAL (escolhe a classe da interjeição). */
   const partialRef = useRef('')
+  /** Áudio coberto pela última parcial da fala atual (ms desde o início da sessão; null = nenhuma). */
+  const partialCoveredRef = useRef<number | null>(null)
+  /** Áudio já enviado à sessão da fala atual (ms) — compara com a cobertura da parcial. */
+  const pushedMsRef = useRef(0)
   /** Especulação da pausa atual (geração do gate + texto + veredito; null = nenhuma válida). */
   const specRef = useRef<{ seq: number; text: string; end: UtteranceEnd } | null>(null)
   /** Frases da resposta atual que começaram a tocar (barge-in: o histórico fica só com elas). */
@@ -126,6 +155,7 @@ export function useVoiceCall(): void {
 
   const pushChunk = useCallback(
     (bytes: Uint8Array): void => {
+      pushedMsRef.current += bytes.length / BYTES_PER_MS
       chainRef.current = chainRef.current
         .then(async () => {
           const v = api.voice
@@ -160,7 +190,10 @@ export function useVoiceCall(): void {
           return
         }
         try {
-          const result = await v.transcribe.stop(id, { reuseSpeculative })
+          // a parcial que já cobre a fala inteira vira a final (latência: sem request)
+          const result = await v.transcribe.stop(id, { reuseSpeculative, reusePartial: true })
+          // a barra mostra o texto que foi enviado (até a próxima fala)
+          setLive(result.text, 'final')
           await v.call.turn({ text: result.text })
         } catch (err) {
           setError(errorMessage(err))
@@ -198,7 +231,13 @@ export function useVoiceCall(): void {
   // parciais ao vivo: a cauda do texto escolhe a classe da interjeição (SPEC → "Interjeições")
   useEffect(() => {
     const off = api.onVoicePartial?.((e) => {
+      // só a sessão da fala ATUAL (o ditado e falas anteriores têm outras sessões)
+      if (!e.sessionId || e.sessionId !== sessionRef.current) return
+      if (e.error && !e.text) return
       partialRef.current = typeof e.text === 'string' ? e.text : ''
+      partialCoveredRef.current = typeof e.coveredMs === 'number' ? e.coveredMs : null
+      if (useStore.getState().voiceCall.active && speakingRef.current)
+        setLive(partialRef.current, 'partial')
     })
     return () => off?.()
   }, [])
@@ -221,6 +260,32 @@ export function useVoiceCall(): void {
               ? 'clip-start'
               : 'clip-end'
         useStore.getState().pushVoiceCallTimeline({ ts: Date.now(), kind, id: item.id })
+      },
+      // utterance que não tocou (CSP/codec/autoplay): na timeline e no erro da barra — nunca calada
+      onError: ({ item, reason }) => {
+        useStore.getState().pushVoiceCallTimeline({
+          ts: Date.now(),
+          kind: 'playback-error',
+          id: item.id,
+          class: item.kind ?? 'sentence',
+          reason
+        })
+        const what =
+          item.kind === 'filler'
+            ? 'o preâmbulo'
+            : item.kind === 'interjection'
+              ? 'a interjeição'
+              : 'uma frase da resposta'
+        // clipe (preâmbulo/interjeição) não é essencial: pula com o registro no painel; frase da
+        // resposta que não toca encerra a chamada (nunca uma resposta muda)
+        if (item.kind === 'filler' || item.kind === 'interjection') {
+          setError(`Não foi possível tocar ${what}: ${reason}`)
+          return
+        }
+        useStore
+          .getState()
+          .toast(`Chamada encerrada: não foi possível tocar ${what} (${reason})`, 'error')
+        void useStore.getState().stopVoiceCall()
       }
     })
     queueRef.current = queue
@@ -274,22 +339,55 @@ export function useVoiceCall(): void {
     void loadVoiceSettings()
       .then((all) => {
         if (disposed) return
-        const chatCfg =
-          useStore.getState().chats.find((c) => c.id === useStore.getState().voiceCall.chatId)
-            ?.config.voice ?? null
-        const resolved = resolveVoiceCallConfig(chatCfg, all.voiceCallDefaults)
+        const st = useStore.getState()
+        const chat = st.chats.find((c) => c.id === st.voiceCall.chatId)
+        const presetId = chat?.config.presetId
+        const persona = presetId
+          ? (st.presets.find((p) => p.id === presetId)?.config.voice ?? null)
+          : null
+        const resolved = resolveVoiceCallConfig(
+          chat?.config.voice ?? null,
+          all.voiceCallDefaults,
+          persona
+        )
         policyRef.current = resolved.interjections
         watcherRef.current = new InterjectionWatcher(resolved.interjections.minPauseMs)
       })
       .catch(() => void 0)
 
+    /** Geração da especulação pedida na pausa atual (-1 = nenhuma válida — a fala voltou). */
+    let askedSeq = -1
     /** Observação de pausa esperando o veredito da especulação (backchannel só depois dele). */
     let pendingObs: { speechMs: number } | null = null
+
+    /**
+     * Veredito pela parcial ao vivo, só quando ela está EM DIA com a fala (cobre até ~o começo da
+     * pausa) — sem request; null = a parcial está atrasada (não dá para saber se a fala acabou).
+     */
+    const freshPartialEnd = (): UtteranceEnd | null => {
+      const covered = partialCoveredRef.current
+      const pauseStart = pushedMsRef.current - gate.pauseMs
+      const fresh =
+        !!partialRef.current.trim() &&
+        covered != null &&
+        covered >= pauseStart - FRESH_PARTIAL_SLACK_MS
+      return fresh ? classifyUtteranceEnd(partialRef.current) : null
+    }
 
     /** Manda a observação de interjeição ao main (com o veredito, quando há). */
     const sendObservation = (speechMs: number, end: UtteranceEnd | null): void => {
       if (!policyRef.current.enabled) return
-      const tail = (specRef.current?.text || partialRef.current).slice(-INTERJECTION_TAIL_CHARS)
+      const spec = specRef.current?.text
+      const tail = (spec || partialRef.current).slice(-INTERJECTION_TAIL_CHARS)
+      if (!end && !spec) {
+        // sem veredito (especulação pela API ainda não voltou) e sem parcial em dia: não há como
+        // saber se a fala acabou — um "Aham." aqui sairia no fim da pergunta, antes da resposta
+        end = freshPartialEnd()
+        if (!end) {
+          pushSkip('no-verdict', speechMs, gate.pauseMs, tail)
+          return
+        }
+      }
       void api.voice?.call
         .interjectionObserved({
           speechMs,
@@ -308,7 +406,6 @@ export function useVoiceCall(): void {
       pendingObs = null
       const holdMs = hold.speechMs
       const kind = hold.end()
-      const spec = specRef.current
       specRef.current = null
       if (kind === 'backchannel') {
         // backchannel do usuário ("uhum", "sim"): NÃO cancela a resposta nem vira turno
@@ -316,13 +413,17 @@ export function useVoiceCall(): void {
         void api.voice?.call.backchannel({ ms: holdMs }).catch(() => {})
       } else {
         // a especulação da pausa que fechou o turno cobre toda a fala: vira a final
-        endUtterance(!!spec && spec.seq === gate.specSeq && gate.verdict != null)
+        // a especulação pedida nesta pausa cobre toda a fala (o usuário não voltou a falar): ela
+        // vira a final — MESMO ainda em voo (especulação pela API é lenta: o turno fecha no
+        // silêncio fixo e a final espera a especulação em vez de subir o áudio de novo)
+        endUtterance(askedSeq === gate.specSeq && askedSeq > 0)
       }
       watcherRef.current?.reset()
     }
 
     /** Pausa cruzou ~250 ms: transcrição especulativa (na ordem dos pushes) → veredito. */
     const speculate = (seq: number): void => {
+      askedSeq = seq
       chainRef.current = chainRef.current
         .then(async () => {
           const v = api.voice
@@ -344,7 +445,10 @@ export function useVoiceCall(): void {
     const onVerdict = (seq: number, text: string | null): void => {
       if (disposed || gateRef.current !== gate || seq !== gate.specSeq || !gate.speaking) return
       const end: UtteranceEnd = text == null ? 'unknown' : classifyUtteranceEnd(text)
-      if (text != null) specRef.current = { seq, text, end }
+      if (text != null) {
+        specRef.current = { seq, text, end }
+        setLive(text, 'speculative')
+      }
       useStore.getState().pushVoiceCallTimeline({
         ts: Date.now(),
         kind: 'turn-verdict',
@@ -352,11 +456,14 @@ export function useVoiceCall(): void {
         text: (text ?? '').slice(-80),
         reason: end
       })
-      // observação de pausa que esperava o veredito: pergunta/comando não ganham backchannel
+      // observação de pausa que esperava o veredito: pergunta/comando não ganham backchannel; o
+      // veredito que chega tarde demais (pausa já longa — API lenta) não vira "Aham." atrasado
       if (pendingObs && !hold.open) {
         const o = pendingObs
         pendingObs = null
-        sendObservation(o.speechMs, text == null ? null : end)
+        if (gate.pauseMs > policyRef.current.minPauseMs + INTERJECTION_MAX_AGE_MS)
+          pushSkip('late-verdict', o.speechMs, gate.pauseMs, text ?? '')
+        else sendObservation(o.speechMs, text == null ? null : end)
       }
       if (gate.setVerdict(seq, end) === 'end') closeUtterance()
     }
@@ -372,6 +479,10 @@ export function useVoiceCall(): void {
       }
       if (ev === 'resume') {
         specRef.current = null // a especulação ficou velha (a fala continuou)
+        askedSeq = -1
+        // a observação da pausa esperava um veredito que não chegou a tempo: registra o motivo
+        if (pendingObs && policyRef.current.enabled)
+          pushSkip('no-verdict', pendingObs.speechMs, 0, partialRef.current)
         pendingObs = null
       }
       if (ev === 'start') {
@@ -391,6 +502,13 @@ export function useVoiceCall(): void {
           if (dropped.length) queue?.cancel(FADE_MS)
           void api.voice?.call.speechBegin({ dropped }).catch(() => {})
         }
+        // fala nova: a parcial/cobertura da fala anterior não vale mais (cauda velha escolhia a
+        // classe errada ou barrava o backchannel como "pergunta")
+        partialRef.current = ''
+        partialCoveredRef.current = null
+        pushedMsRef.current = 0
+        askedSeq = -1
+        setLive('', null)
         speakingRef.current = true
         specRef.current = null
         pendingObs = null
@@ -416,6 +534,10 @@ export function useVoiceCall(): void {
           queueRef.current?.cancel(FADE_MS)
           const playedIds = [...startedRef.current]
           void api.voice?.call.bargeIn({ playedIds }).catch(() => {})
+          // daqui em diante é uma fala normal do usuário: fim de turno adaptativo (especulação) e
+          // observações de pausa voltam a valer (antes a fala inteira seguia "retida" — silêncio
+          // fixo e nenhuma interjeição até o fim dela)
+          hold.reset()
         }
         return
       }
@@ -431,7 +553,9 @@ export function useVoiceCall(): void {
         })
         // backchannel só depois do veredito da pausa (pergunta/comando não ganham "Aham.")
         const verdict = gate.verdict
+        const partialEnd = verdict && verdict !== 'unknown' ? null : freshPartialEnd()
         if (verdict && verdict !== 'unknown') sendObservation(obs.speechMs, verdict)
+        else if (partialEnd) sendObservation(obs.speechMs, partialEnd)
         else if (verdict === 'unknown' || !timing.adaptive) sendObservation(obs.speechMs, null)
         else pendingObs = { speechMs: obs.speechMs }
       }

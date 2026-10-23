@@ -184,14 +184,14 @@ test('parciais: disparam no intervalo, pedaço com sobreposição e evento { tex
   s.push(D, VOICE_SAMPLE_RATE)
   await sleep(0)
   assert.equal(m.calls.length, 2)
-  // 2ª parcial: recua STT_PARTIAL_OVERLAP_MS (300 ms = 9600 bytes) do fim da anterior
+  // 2ª parcial: o trecho inteiro (≤ 10 s desde o início/último segmento) é transcrito de novo —
+  // texto sem emendas, que pode virar a final (as janelas com sobreposição ficam para > 10 s)
   const total = new Uint8Array([...A, ...B, ...C, ...D])
-  const expected = total.subarray(A.length + B.length - 9_600)
-  assert.ok(sameBytes(wavPcm(await fileBytes(m.calls[1].init)), expected))
+  assert.ok(sameBytes(wavPcm(await fileBytes(m.calls[1].init)), total))
 
   assert.equal(events.length, 2)
   assert.equal(events[0].text, 'parcial um')
-  assert.equal(events[1].text, 'parcial um parcial dois')
+  assert.equal(events[1].text, 'parcial dois', 'a parcial do trecho inteiro substitui a anterior')
   for (const e of events) {
     assert.equal(e.isFinal, false)
     assert.equal(e.sessionId, s.id)
@@ -233,14 +233,14 @@ test('parciais: nunca dispara com outra em voo (sem fila e sem abortar-e-reenvia
   release!()
   await sleep(0)
   assert.deepEqual(events, ['primeira'])
-  // a próxima recobre tudo desde o fim da 1ª (menos a sobreposição de 300 ms = 9600 bytes)
+  // a próxima transcreve o trecho inteiro de novo (≤ 10 s — texto sem emendas)
   c.advance(STT_PARTIAL_INTERVAL_MS)
   s.push(bytes(16_000), VOICE_SAMPLE_RATE)
   assert.equal(m.calls.length, 2)
   const sent = wavPcm(await fileBytes(m.calls[1].init))
-  assert.equal(sent.length, 16_000 * 4 + 9_600, 'pedaço = o que a 1ª não cobriu + sobreposição')
+  assert.equal(sent.length, 16_000 * 6, 'pedaço = o trecho inteiro')
   await sleep(0)
-  assert.deepEqual(events, ['primeira', 'primeira segunda'])
+  assert.deepEqual(events, ['primeira', 'segunda'])
 })
 
 test('parciais: janela máxima de ~10 s (o pedaço nunca cresce com a gravação)', async (t) => {
@@ -633,22 +633,13 @@ test('parciais locais: modo "local" com motor pronto emite parciais por janelas 
 
   const C = bytes(8_000, 9)
   c.advance(STT_PARTIAL_INTERVAL_MS)
-  s.push(C, VOICE_SAMPLE_RATE) // 2ª janela: [16000 − sobreposição, 24000)
+  s.push(C, VOICE_SAMPLE_RATE) // 2ª: o trecho inteiro [0, 24000) (≤ 10 s)
   await sleep(0)
-  assert.deepEqual(events, ['UM', 'UM DOIS'], 'parciais acumuladas como na API')
+  assert.deepEqual(events, ['UM', 'DOIS'], 'a parcial do trecho inteiro substitui (como na API)')
   assert.equal(local.calls.length, 2)
-  const overlap = Math.round(300 * ((VOICE_SAMPLE_RATE * 2) / 1000)) // 300 ms de PCM = 9600 bytes
-  const pieceStart = 16_000 - overlap // recua da fronteira já coberta (A+B)
   assert.ok(
-    sameBytes(
-      wavPcm(local.calls[1]),
-      new Uint8Array([
-        ...bytes(8_000 - pieceStart, 7), // resto de A
-        ...bytes(8_000, 8), // B inteiro
-        ...bytes(8_000, 9) // C inteiro
-      ])
-    ),
-    '2ª janela recua a sobreposição de 300 ms'
+    sameBytes(wavPcm(local.calls[1]), new Uint8Array([...A, ...B, ...C])),
+    '2ª = o trecho inteiro'
   )
   assert.equal(m.calls.length, 0, 'modo local nunca vaza para a API (nem nas parciais)')
 })

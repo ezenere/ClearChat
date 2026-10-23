@@ -20,6 +20,11 @@ export interface VoiceCallMetrics {
   interjectionsPerMin: number
   /** Latência decisão→início do áudio da utterance decidida (p50/p95). */
   decisionToAudioMs: DecisionLatency | null
+  /**
+   * Por que NÃO tocou (motivo → vezes), separado em interjeições (inclui as observações que a
+   * política recusou — `class: 'NONE'`) e preâmbulos — o painel "Atos de fala curta" explica.
+   */
+  skipped: { interjection: Record<string, number>; filler: Record<string, number> }
 }
 
 /** Percentil por ordem (p em [0,1]; lista não vazia e já ordenada). */
@@ -41,7 +46,16 @@ export function computeVoiceCallMetrics(
   const first = list[0]?.ts ?? 0
   const last = now ?? list[list.length - 1]?.ts ?? first
   const elapsedMs = Math.max(0, last - first)
-  const decisions = list.filter((e) => e.kind === 'decision' && e.class !== 'FILLER')
+  const decisions = list.filter(
+    (e) => e.kind === 'decision' && e.class !== 'FILLER' && e.class !== 'NONE'
+  )
+  const skipped: VoiceCallMetrics['skipped'] = { interjection: {}, filler: {} }
+  for (const e of list) {
+    if (e.kind !== 'decision' || e.played) continue
+    const bucket = e.class === 'FILLER' ? skipped.filler : skipped.interjection
+    const reason = e.reason || '?'
+    bucket[reason] = (bucket[reason] ?? 0) + 1
+  }
   const played = decisions.filter((e) => e.played)
   const minutes = elapsedMs / 60_000
   // pares decisão → início do áudio (mesma utterance; o primeiro início vence)
@@ -63,6 +77,7 @@ export function computeVoiceCallMetrics(
     interjectionsPerMin: minutes > 0 ? Math.round((decisions.length / minutes) * 10) / 10 : 0,
     decisionToAudioMs: latencies.length
       ? { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95) }
-      : null
+      : null,
+    skipped
   }
 }

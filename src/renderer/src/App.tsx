@@ -1,5 +1,6 @@
 import { CircleAlert, CircleCheck, Info, X } from 'lucide-react'
 import { useEffect, useSyncExternalStore } from 'react'
+import { isChatProvider } from '@shared/providerKinds'
 import { ChatHeader, ChatView } from './components/chat/ChatView'
 import { NewChat } from './components/NewChat'
 import { Onboarding } from './components/Onboarding'
@@ -113,7 +114,8 @@ function Main(): React.JSX.Element {
 
 function App(): React.JSX.Element {
   const booted = useStore((s) => s.booted)
-  const hasProviders = useStore((s) => s.providers.length > 0)
+  // só provedores de chat contam (um provedor só de voz — ElevenLabs — não abre o app)
+  const hasProviders = useStore((s) => s.providers.some(isChatProvider))
   const boot = useStore((s) => s.boot)
 
   useEffect(() => {
@@ -125,7 +127,7 @@ function App(): React.JSX.Element {
       const mod = e.ctrlKey || e.metaKey
       if (!mod || e.altKey) return
       const s = useStore.getState()
-      if (s.providers.length === 0) return
+      if (!s.providers.some(isChatProvider)) return
       if (e.key.toLowerCase() === 'n' && !e.shiftKey) {
         e.preventDefault()
         s.setSettingsOpen(false)

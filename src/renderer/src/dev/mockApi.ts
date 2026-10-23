@@ -1,6 +1,7 @@
 // SOMENTE DESENVOLVIMENTO: window.api simulado para validar o design sem backend.
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
+import { createMockVoiceCatalog } from './mockVoiceCatalog'
 import { providerKind } from '@shared/providerKinds'
 import {
   defaultSkillsSettings,
@@ -191,7 +192,21 @@ export function createMockApi(scenario: string): ClearApi {
             apiKey: '',
             headers: {},
             createdAt: now
-          }
+          },
+          // provedor só de voz (ElevenLabs direto) — cenário da descoberta de vozes
+          ...(scenario === 'voice-elevenlabs'
+            ? [
+                {
+                  id: 'p3',
+                  name: 'ElevenLabs',
+                  kind: 'elevenlabs' as const,
+                  baseUrl: 'https://api.elevenlabs.io',
+                  apiKey: 'xi-mock-0000000000000000',
+                  headers: {},
+                  createdAt: now
+                }
+              ]
+            : [])
         ]
 
   const models: ModelInfo[] = [
@@ -2304,6 +2319,11 @@ export function createMockApi(scenario: string): ClearApi {
       //   ?scenario=voice-call-fail   → `voice.call.start` recusa (erro legível)
       //   ?scenario=voice-not-ready   → STT sem chave e Kokoro não instalado (pré-checagem da chamada)
       //   ?scenario=voice-no-espeak   → `runtime.status` sem espeak-ng (TTS local não pronto)
+      //   ?scenario=voice-tts-fail    → "Testar voz" falha (401 legível)
+      //   ?scenario=voice-alias       → STT no OpenRouter com o id sem prefixo (corrigido na UI)
+      //   ?scenario=voice-api         → TTS pela API do OpenRouter (ElevenLabs Flash · sarah)
+      //   ?scenario=voice-elevenlabs  → + provedor ElevenLabs direto (vozes com prévia)
+      //   ?scenario=voice-slow-model  → TTS salvo num modelo fora da lista curada (Eleven v4 Turbo)
       const micMode =
         scenario === 'voice-mic-missing'
           ? 'missing'
@@ -2321,10 +2341,29 @@ export function createMockApi(scenario: string): ClearApi {
       // pronto para a chamada por padrão (chave de STT fake + Kokoro "instalado")
       let stt: SttSettings = {
         ...DEFAULT_STT_SETTINGS,
-        api: { ...DEFAULT_STT_SETTINGS.api, apiKey: ready ? 'gsk_mock_0000000000000000abcd' : '' }
+        api:
+          scenario === 'voice-alias'
+            ? { ...DEFAULT_STT_SETTINGS.api, providerId: 'p1', model: 'whisper-large-v3-turbo' }
+            : { ...DEFAULT_STT_SETTINGS.api, apiKey: ready ? 'gsk_mock_0000000000000000abcd' : '' }
       }
       let tts: TtsSettings = {
         ...DEFAULT_TTS_SETTINGS,
+        ...(scenario === 'voice-api' ||
+        scenario === 'voice-elevenlabs' ||
+        scenario === 'voice-slow-model'
+          ? {
+              backend: 'api' as const,
+              api: {
+                ...DEFAULT_TTS_SETTINGS.api,
+                providerId: 'p1',
+                model:
+                  scenario === 'voice-slow-model'
+                    ? 'elevenlabs/eleven-v4-turbo'
+                    : 'elevenlabs/eleven-flash-v2.5',
+                voice: 'sarah'
+              }
+            }
+          : {}),
         local: DEFAULT_TTS_SETTINGS.local
           ? { ...DEFAULT_TTS_SETTINGS.local, installed: ready }
           : null
@@ -2612,7 +2651,16 @@ export function createMockApi(scenario: string): ClearApi {
           let clips: TtsClipsView | null = null
           return {
             synth: ({ format }) => fakeSynth(format),
-            test: () => fakeSynth('wav'),
+            test: async (input) => {
+              if (scenario === 'voice-tts-fail') {
+                await delay(undefined, 300)
+                throw new Error(
+                  'chave de API inválida ou sem permissão (HTTP 401) — No auth credentials found'
+                )
+              }
+              void input
+              return fakeSynth('wav')
+            },
             clips: {
               generate: async () => {
                 const voiceId =
@@ -2755,6 +2803,19 @@ export function createMockApi(scenario: string): ClearApi {
                 turnSilenceMs: resolveTurnSilenceMs(voiceCallDefaults.turn, audioInput)
               }
               voiceCallStateListeners.forEach((l) => l({ ...state }))
+              // ?scenario=voice-call-api-error → os créditos da voz acabam no meio da chamada: o main
+              // encerra a chamada com o motivo (estado inativo + error)
+              if (scenario === 'voice-call-api-error')
+                timers.push(
+                  setTimeout(() => {
+                    clearTimers()
+                    state = {
+                      ...VOICE_CALL_INACTIVE,
+                      error: 'créditos da ElevenLabs esgotados (voz)'
+                    }
+                    voiceCallStateListeners.forEach((l) => l({ ...state }))
+                  }, 1200)
+                )
               return { ...state }
             },
             stop: async () => {
@@ -2788,6 +2849,12 @@ export function createMockApi(scenario: string): ClearApi {
             getState: async () => ({ ...state })
           }
         })(),
+        // descoberta de modelos/vozes (dados reais do OpenRouter recortados — `mockVoiceCatalog.ts`)
+        catalog: createMockVoiceCatalog(
+          () => providers,
+          (cap) => (cap === 'stt' ? stt.api.baseUrl : tts.api.baseUrl),
+          delay
+        ),
         // probe dos runtimes locais (mock): tudo carregável, salvo ?scenario=voice-no-espeak
         runtime: {
           status: async (): Promise<VoiceRuntimeStatus> => {

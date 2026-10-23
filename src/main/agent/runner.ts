@@ -114,7 +114,7 @@ import {
 } from '@shared/siblings'
 import { listModels } from '../providers'
 import { contentText, isAppPart } from '@shared/attachments'
-import { providerKind } from '@shared/providerKinds'
+import { isChatProvider, providerKind } from '@shared/providerKinds'
 import {
   accToDraft,
   finalizeToolCalls,
@@ -129,6 +129,7 @@ import {
   availableTools,
   buildRequest,
   maskRequest,
+  modelInfoFor,
   setProviderNamesSource,
   setSiblingsSource,
   voiceCallContextFor
@@ -583,7 +584,7 @@ function finish(st: RunState, status: SessionStatus): void {
 
 /** Provedor da sessão: principal = o do chat (atual); subsessão = o fixado ao criá-la. */
 // definições de tools com `provider` ajustado aos provedores configurados (request/preview/estimativa)
-setProviderNamesSource(() => providersRepo.list().map((p) => p.name))
+setProviderNamesSource(() => chatProviders().map((p) => p.name))
 // subagente com irmãos recebe check_subagents + message_subagent (ver availableTools)
 setSiblingsSource(({ id, parentSessionId }) =>
   sessionsRepo.children(parentSessionId).some((s) => s.id !== id)
@@ -926,7 +927,6 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   // Chamada de voz ativa: os overrides do turno (modelo/params, tools, voicePrompt) valem só nas
   // requests/tools deste turno — o chat salvo e o histórico não mudam (SPEC → "Chamada de voz").
   const call = voiceCallContextFor(chat, session)
-  const reqChat = call ? applyVoiceCallChat(chat, call) : chat
   const reqSession = call?.model ? { ...session, model: call.model.model } : session
   let provider: Provider | null
   if (call?.model) {
@@ -942,6 +942,14 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
   if (!provider) return { kind: 'error', error: 'Nenhum provider configurado para este chat.' }
   if (!reqSession.model)
     return { kind: 'error', error: 'Nenhum modelo selecionado para este chat.' }
+  // turno de voz: o raciocínio do modelo da chamada sai/fica mínimo salvo se os params da chamada
+  // o definem (precisa do tipo do provedor e do /models — SPEC → "Chamada de voz → raciocínio")
+  const reqChat = call
+    ? applyVoiceCallChat(chat, call, {
+        kind: providerKind(provider),
+        info: modelInfoFor(provider.id, reqSession.model)
+      })
+    : chat
 
   const history = messagesRepo.path(session.id)
   // memória: o índice vai congelado por sessão (snapshot no 1º request; ver memory/service.ts)
@@ -1744,10 +1752,15 @@ async function executeTool(
   }
 }
 
+/** Provedores de chat (os de voz — ElevenLabs — ficam fora das tools de modelos/subagente). */
+function chatProviders(): ReturnType<typeof providersRepo.list> {
+  return providersRepo.list().filter(isChatProvider)
+}
+
 /** Todos os provedores configurados como fontes de modelos (o da sessão primeiro, marcado). */
 function modelSources(chat: Chat, session: Session): ModelSource[] {
   const own = sessionProviderId(chat.config, session)
-  const list = providersRepo.list().map((p): ModelSource => ({
+  const list = chatProviders().map((p): ModelSource => ({
     id: p.id,
     name: p.name,
     isSession: p.id === own,
@@ -1763,7 +1776,7 @@ function resolveSubagent(
   args: Record<string, unknown>
 ): ReturnType<typeof resolveSubagentTarget> {
   return resolveSubagentTarget({
-    providers: providersRepo.list().map((p) => ({ id: p.id, name: p.name })),
+    providers: chatProviders().map((p) => ({ id: p.id, name: p.name })),
     callerProviderId: sessionProviderId(chat.config, session),
     callerModel: session.model,
     provider: args.provider,

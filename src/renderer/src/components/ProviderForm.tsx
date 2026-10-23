@@ -11,10 +11,26 @@ import { ApiInfo, C } from './ui/Tooltip'
 const KIND_DESCRIPTION: Record<ProviderKind, string> = {
   openai: 'Qualquer API compatível com /chat/completions da OpenAI',
   openrouter: 'OpenAI-compatible + extras (custo, reasoning, cache, PDF em qualquer modelo)',
-  anthropic: 'POST /messages nativo: PDF, prompt caching, x-api-key'
+  anthropic: 'POST /messages nativo: PDF, prompt caching, x-api-key',
+  elevenlabs:
+    'Só voz: fala (TTS, WebSocket em streaming na chamada) — não aparece nos modelos de chat'
 }
 
 function BaseUrlHelp({ kind }: { kind: ProviderKind }): React.JSX.Element {
+  if (kind === 'elevenlabs')
+    return (
+      <p>
+        ElevenLabs direta (provedor de <b>voz</b>, não de chat): a fala vai para{' '}
+        <C>
+          POST {'{baseUrl}'}/v1/text-to-speech/{'{voice_id}'}
+        </C>{' '}
+        (clipes e “Testar voz”) e, na chamada de voz, para o WebSocket{' '}
+        <C>/v1/text-to-speech/{'{voice_id}'}/multi-stream-input</C> (o texto da resposta entra em
+        streaming). Base padrão <C>https://api.elevenlabs.io</C>. O “Testar conexão” lista{' '}
+        <C>GET {'{baseUrl}'}/v1/models</C>. Para usar, escolha este provedor em Configurações →
+        Áudio → Fala.
+      </p>
+    )
   if (kind === 'anthropic')
     return (
       <p>
@@ -175,6 +191,8 @@ export function ProviderFields({
                 Enviada no header{' '}
                 {draft.kind === 'anthropic' ? (
                   <C>x-api-key: {'<chave>'}</C>
+                ) : draft.kind === 'elevenlabs' ? (
+                  <C>xi-api-key: {'<chave>'}</C>
                 ) : (
                   <C>Authorization: Bearer {'<chave>'}</C>
                 )}{' '}
@@ -189,7 +207,9 @@ export function ProviderFields({
         <SecretInput
           value={draft.apiKey}
           autoFocus={autoFocusKey}
-          placeholder={draft.kind === 'anthropic' ? 'sk-ant-…' : 'sk-…'}
+          placeholder={
+            draft.kind === 'anthropic' ? 'sk-ant-…' : draft.kind === 'elevenlabs' ? 'sk_…' : 'sk-…'
+          }
           onChange={(apiKey) => onChange({ ...draft, apiKey })}
         />
       </div>

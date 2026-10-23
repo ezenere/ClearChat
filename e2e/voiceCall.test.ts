@@ -44,7 +44,7 @@ test('resolveVoiceCallConfig: null/ausente herda tudo (enabled/fillers/interject
     prompt: DEFAULT_VOICE_CALL_DEFAULTS.fillers.prompt
   })
   assert.equal(r.basePrompt, DEFAULT_VOICE_BASE_PROMPT)
-  assert.equal(r.maxTokens, 120)
+  assert.equal(r.promptMode, 'append', 'prompt do modo voz complementar por padrão')
   assert.deepEqual(r.interjections, DEFAULT_VOICE_CALL_DEFAULTS.interjections)
 })
 
@@ -181,8 +181,8 @@ test('applyVoiceCallChat: voicePrompt/params/tools aplicados na CÓPIA; sem over
   )
   assert.deepEqual(
     eff.config.params,
-    { temperature: 0.1, max_tokens: 120 },
-    'params do modelo da chamada substituem (+ teto de tokens do turno de voz)'
+    { temperature: 0.1 },
+    'params do modelo da chamada substituem (a chamada não impõe teto de tokens)'
   )
   assert.deepEqual(eff.config.enabledTools, [], 'lista vazia = nenhuma tool na chamada')
   assert.equal(eff.config.maxToolOutputChars, 1000)
@@ -197,10 +197,9 @@ test('applyVoiceCallChat: voicePrompt/params/tools aplicados na CÓPIA; sem over
     plain.config,
     {
       ...base.config,
-      systemPrompt: `persona\n\n${DEFAULT_VOICE_BASE_PROMPT}`,
-      params: { ...base.config.params, max_tokens: 120 }
+      systemPrompt: `persona\n\n${DEFAULT_VOICE_BASE_PROMPT}`
     },
-    'sem overrides: a config do chat + prompt-base e teto de tokens do modo voz'
+    'sem overrides: a config do chat + prompt-base do modo voz (sem teto de tokens)'
   )
 })
 

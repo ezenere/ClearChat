@@ -9,7 +9,7 @@ import {
 import { useMemo, useState } from 'react'
 import { normalizeAppSignatureId } from '@shared/appSignatures'
 import { supportsCacheControl } from '@shared/defaults'
-import { providerKind } from '@shared/providerKinds'
+import { isChatProvider, providerKind } from '@shared/providerKinds'
 import { sameValue, sanitizePresetConfig, withoutCwd, type PresetConfig } from '@shared/presets'
 import type { ChatConfig, Preset } from '@shared/types'
 import { AppSignatureField, AppSignatureInfo } from './AppSignatureField'
@@ -68,7 +68,9 @@ function changedFields(form: Form, resolved: ChatConfig, preset: Preset | null):
 }
 
 export function NewChat(): React.JSX.Element {
-  const providers = useStore((s) => s.providers)
+  // só provedores de chat (o de voz — ElevenLabs — nunca vira o provedor do chat)
+  const allProviders = useStore((s) => s.providers)
+  const providers = useMemo(() => allProviders.filter(isChatProvider), [allProviders])
   const settings = useStore((s) => s.settings)
   const homeDir = useStore((s) => s.homeDir)
   const presets = useStore((s) => s.presets)

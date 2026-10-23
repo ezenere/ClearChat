@@ -10,6 +10,7 @@ import type {
   VoiceCallDefaults,
   VoiceCallState
 } from './voice'
+import type { VoiceCatalogRequest, VoiceCatalogView } from './voiceCatalog'
 import type {
   ChatHostInfo,
   CloudSkill,
@@ -246,6 +247,8 @@ export const IPC = {
     ttsClipsGenerate: 'voice:tts:clips:generate',
     ttsClipsList: 'voice:tts:clips:list',
     ttsVoices: 'voice:tts:voices',
+    catalogList: 'voice:catalog:list',
+    catalogPreview: 'voice:catalog:preview',
     callStart: 'voice:call:start',
     callStop: 'voice:call:stop',
     callMute: 'voice:call:mute',
@@ -482,6 +485,8 @@ export interface VoicePartialEvent {
   isFinal: boolean
   /** Duração da chamada que gerou a parcial, em ms. */
   ms: number
+  /** Áudio coberto pelo texto, em ms desde o início da sessão (ausente = desconhecido). */
+  coveredMs?: number
   /**
    * Aviso legível (uma vez por sessão) quando as parciais foram desligadas (chave/cota/config) ou
    * a gravação atingiu o teto de duração. Ausente = parcial normal. A final segue valendo.
@@ -507,6 +512,8 @@ export interface VoiceTranscribeResult {
   fallbackReason?: string
   /** A final é a transcrição especulativa reaproveitada (fim de turno adaptativo — sem 2ª chamada). */
   speculative?: boolean
+  /** A final é a última parcial (cobria a fala inteira do trecho final — sem request). */
+  partialReused?: boolean
 }
 
 /** Transcrição especulativa (`voice:transcribe:speculate`) — fim de turno adaptativo da chamada. */
@@ -539,7 +546,14 @@ export interface VoiceApi {
      * Para o loop de parciais e transcreve o buffer inteiro (final, com fallback se houver motor
      * local). `reuseSpeculative`: o usuário não falou depois da última especulação — ela vira a final.
      */
-    stop(sessionId: string, opts?: { reuseSpeculative?: boolean }): Promise<VoiceTranscribeResult>
+    stop(
+      sessionId: string,
+      opts?: {
+        reuseSpeculative?: boolean
+        /** A parcial que cobre a fala inteira vira a final (ausente = `sttSettings.reusePartialFinal`). */
+        reusePartial?: boolean
+      }
+    ): Promise<VoiceTranscribeResult>
     /**
      * Transcrição especulativa do que já foi dito, sem encerrar (fim de turno adaptativo): motor
      * local quando pronto; API só com `voiceCallDefaults.turn.speculativeApi`. null = indisponível.
@@ -568,8 +582,12 @@ export interface VoiceApi {
      * local). Devolve os bytes do áudio + modelo/backend/ms; a chave de API nunca sai do main.
      */
     synth(input: { text: string; format?: 'wav' | 'mp3' }): Promise<TtsSynthResult>
-    /** Frase curta de demonstração ("Testar voz" — Configurações → Áudio). */
-    test(): Promise<TtsSynthResult>
+    /**
+     * Frase curta de demonstração ("Testar voz" — Configurações → Áudio). Sem argumento = as
+     * settings salvas e `TTS_TEST_PHRASE`; `voice`/`model` sobrescrevem só neste teste (▶ prévia de
+     * uma voz ainda não escolhida) e `text` troca a frase (até 200 caracteres).
+     */
+    test(input?: { voice?: string | null; model?: string; text?: string }): Promise<TtsSynthResult>
     clips: {
       /**
        * Gera os clipes de interjeição/filler da voz atual (cache em `userData/voice-clips`),
@@ -641,6 +659,15 @@ export interface VoiceApi {
      * interface só para não quebrar implementações antigas (o preload sempre expõe).
      */
     getState?(): Promise<VoiceCallState>
+  }
+  /**
+   * Descoberta de modelos/vozes de STT e TTS nos provedores cadastrados (canal `voice:catalog:list`,
+   * cache de 10 min no main) e prévias de voz publicadas pelo provedor (`voice:catalog:preview` —
+   * só URLs devolvidas por uma listagem). Opcional como `runtime` (implementações antigas).
+   */
+  catalog?: {
+    list(input: VoiceCatalogRequest): Promise<VoiceCatalogView>
+    preview(input: { url: string }): Promise<{ audio: Uint8Array; mime: string }>
   }
   /** Prontidão dos runtimes locais (canal `voice:runtime:status`) — opcional como `call.getState`. */
   runtime?: {
@@ -855,6 +882,16 @@ export interface VoiceCallTimelineEvent {
     | 'turn-continued'
     /** Turno do agente parado e histórico ajustado ao que foi falado (main — barge-in/continuação). */
     | 'turn-amended'
+    /**
+     * Latência do TTS em streaming (main — ElevenLabs WebSocket): `latencyMs` = 1º texto entregue →
+     * 1º áudio (do turno, na 1ª sentença; senão da sentença), `reason` = backend/contexto.
+     */
+    | 'tts-latency'
+    /**
+     * Falha ao TOCAR uma utterance no renderer (`play()` rejeitado, erro de mídia/CSP/codec —
+     * `reason` = mensagem, `id`/`class` = a utterance): nunca mais calada (painel + erro do dock).
+     */
+    | 'playback-error'
   /** Classe do ato ('FILLER'/'ACK'/…); ausente em eventos sem classe. */
   class?: string | null
   /** Id da utterance dona do evento (pareia decisão → áudio). */

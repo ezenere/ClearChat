@@ -36,6 +36,7 @@ import {
   type SttSettings,
   type TtsSettings,
   type TurnTiming,
+  type VoiceCallConfig,
   type VoiceCallDefaults,
   type VoiceCallState
 } from '@shared/voice'
@@ -55,6 +56,8 @@ import {
 import { isBackchannelText, type UtteranceEnd } from '@shared/voiceTurn'
 import { CLIP_PHRASES, type ClipClass } from './clips'
 import type { VoiceEvalEvent } from './evalLog'
+import { classifyVoiceError, type VoiceFailure, type VoiceFailureSource } from './callErrors'
+import type { TtsTextFeed } from './elevenlabsStream'
 import { FIRST_CHUNK_COMMA_MIN, splitSentences } from './sentences'
 import { VoiceTurnMachine, isBusyStatus } from './turnMachine'
 
@@ -128,6 +131,24 @@ export interface VoiceCallDeps {
   sessionInfo(sessionId: string): VoiceCallSessionInfo | null
   /** Config do chat para resolver os overrides de request (persona snapshot já aplicada). */
   chatConfig(chatId: string): ChatConfig | null
+  /**
+   * Config de voz da persona de origem do chat (`presetId`, lida ao vivo): campos null do chat a
+   * herdam (chat > persona > global). Ausente = sem camada de persona.
+   */
+  personaVoice?(chatId: string): VoiceCallConfig | null
+  /**
+   * A transcrição especulativa vai pela API (lenta — sem motor local para o veredito)? Então o
+   * turno não espera o teto com ela pendente (`TurnTiming.pendingMs` = silêncio fixo) e a final
+   * reaproveita a especulação em voo. Ausente = false.
+   */
+  slowSpeculation?(): boolean
+  /**
+   * Classifica uma falha de STT/TTS da chamada (fatal × transitória, motivo legível). Ausente =
+   * `classifyVoiceError` com um rótulo genérico. null = cancelamento (não é falha).
+   */
+  classifyError?(e: unknown, source: VoiceFailureSource): VoiceFailure | null
+  /** A chamada terminou (por qualquer motivo): o IPC derruba os streams de TTS em curso. */
+  onCallEnded?(): void
   /** Settings de voz completas (lidas a cada uso — a tela de Configurações pode mudá-las). */
   settings(): {
     defaults: VoiceCallDefaults
@@ -148,6 +169,13 @@ export interface VoiceCallDeps {
   rng?: () => number
   /** Espera do preâmbulo depois do turno (padrão `voiceCallDefaults.fillers.delayMs` — 250 ms). */
   fillerDelayMs?: number
+  /**
+   * [tts-feed] TTS de entrada em streaming (ElevenLabs WebSocket — `elevenlabsStream.ts`), lido a
+   * cada uso; null/ausente = só o `synth` por sentença (os demais backends). Ganchos best-effort:
+   * o texto da sentença incompleta vai ao TTS antes do corte e o corte já faz o flush; o `synth`
+   * da sentença continua sendo chamado na ordem (ele pega o que o feed preparou).
+   */
+  ttsFeed?: () => TtsTextFeed | null
 }
 
 /** Turno do usuário em andamento (o que o histórico tem dele). */
@@ -166,13 +194,17 @@ export class VoiceCallManager {
   #turnSilenceMs: number = DEFAULT_TURN_SILENCE_MS
   #turnTiming: TurnTiming = DEFAULT_TURN_TIMING
   #error: string | null = null
+  /** Motivo do fim da chamada por falha (fica no estado inativo até a próxima chamada). */
+  #endedReason: string | null = null
+  /** Uma falha transitória no meio de um stream já aconteceu (a segunda encerra a chamada). */
+  #transientStrike = false
   // ---- feed do texto do assistente (por passo do loop; monotônico contra rewinds de retry) ----
   #lastContent = ''
   #feed = ''
   /** A resposta em andamento não é mais falada (barge-in/turno continuado). */
   #speakCancelled = false
   // ---- pipeline de síntese (serial; sentenças na ordem, sem sobreposição) ----
-  #synthQueue: { text: string; gen: number; key: number }[] = []
+  #synthQueue: { text: string; gen: number; key: number; attempt: number }[] = []
   #synthGen = 0
   #synthRunning = false
   #synthAbort: AbortController | null = null
@@ -259,8 +291,13 @@ export class VoiceCallManager {
     this.#chatId = info.chatId
     this.#muted = false
     this.#error = null
+    this.#endedReason = null
+    this.#transientStrike = false
     this.#turnSilenceMs = resolveTurnSilenceMs(defaults.turn, audioInput)
-    this.#turnTiming = resolveTurnTiming(defaults.turn)
+    const timing = resolveTurnTiming(defaults.turn)
+    this.#turnTiming = this.#deps.slowSpeculation?.()
+      ? { ...timing, pendingMs: timing.fallbackMs }
+      : timing
     this.#turn = null
     this.#carry = null
     this.#resetResponse()
@@ -269,11 +306,16 @@ export class VoiceCallManager {
     return this.state()
   }
 
-  /** Sai da chamada (descarta fala pendente e para a fala do assistente). */
-  stop(): VoiceCallState {
+  /**
+   * Sai da chamada (descarta fala pendente e para a fala do assistente). `reason` = fim por falha
+   * (fica em `state().error` com a chamada inativa — o renderer mostra "Chamada encerrada: …").
+   */
+  stop(reason?: string): VoiceCallState {
     if (!this.#sessionId) return this.state()
+    this.#endedReason = typeof reason === 'string' && reason ? reason : null
     this.#speakCancelled = true
     this.#clearSynth()
+    this.#ttsFeedCall((f) => f.close()) // [tts-feed] fim da chamada: fecha a conexão
     this.#resetFiller(true)
     this.#cancelInterject()
     this.#machine.stop()
@@ -283,8 +325,55 @@ export class VoiceCallManager {
     this.#error = null
     this.#turn = null
     this.#carry = null
+    try {
+      this.#deps.onCallEnded?.()
+    } catch {
+      /* derrubar streams nunca impede o fim da chamada */
+    }
     this.#emitState()
     return this.state()
+  }
+
+  /**
+   * Falha de STT/TTS fora do pipeline de síntese (transcrição final que falhou mesmo depois da
+   * nova tentativa, parcial/segmento com erro fatal, stream de TTS que caiu no meio): fatal →
+   * encerra; transitória → uma "falta" (`retried: true` = a nova tentativa já falhou → encerra;
+   * senão a 2ª falta seguida encerra). Devolve true quando a chamada foi encerrada.
+   */
+  voiceApiError(source: VoiceFailureSource, e: unknown, opts?: { retried?: boolean }): boolean {
+    if (!this.#sessionId) return false
+    const f = this.#classify(e, source)
+    if (!f) return false
+    if (f.fatal || opts?.retried || this.#transientStrike) {
+      this.#endWithError(f)
+      return true
+    }
+    this.#transientStrike = true
+    this.#error = f.reason
+    this.#emitTimeline({ ts: this.#now(), kind: 'playback-error', class: source, reason: f.detail })
+    this.#emitState()
+    return false
+  }
+
+  #classify(e: unknown, source: VoiceFailureSource): VoiceFailure | null {
+    return this.#deps.classifyError
+      ? this.#deps.classifyError(e, source)
+      : classifyVoiceError(e, source, 'provedor de voz')
+  }
+
+  /**
+   * Encerra a chamada por falha: para o turno do agente (o histórico fica só com o que foi
+   * emitido para tocar — as regras de sempre), descarta a síntese/streams e deixa o motivo no
+   * estado inativo.
+   */
+  #endWithError(f: VoiceFailure): void {
+    if (!this.#sessionId) return
+    console.warn(`[clearchat] chamada de voz encerrada: ${f.reason} — ${f.detail}`)
+    const emitted = [...this.#uttKey.keys()]
+    const unheard = this.#synthQueue.length > 0 || this.#keyText.size > emitted.length
+    if (this.#turn?.userMessageId && (this.#machine.responseInFlight || unheard))
+      this.#interruptAnswer(emitted)
+    this.stop(f.reason)
   }
 
   /** Mudo do microfone (a captura é pausada no renderer; aqui só reflete no estado). */
@@ -427,11 +516,26 @@ export class VoiceCallManager {
     end?: string | null
   }): void {
     if (!this.#sessionId) return
-    // assistente calado: sem interjeição sobre a fala do assistente ou sobre a resposta em curso
-    if (this.#playbackActive || this.#agentSpoke) return
-    if (this.#machine.phase !== 'listening') return
-    const resolved = this.#resolved()
     const now = this.#now()
+    const skip = (reason: string): void =>
+      this.#emitTimeline({
+        ts: now,
+        kind: 'decision',
+        class: 'NONE',
+        played: false,
+        speechMs: finiteMs(input?.speechMs),
+        pauseMs: finiteMs(input?.pauseMs),
+        text: typeof input?.tail === 'string' ? input.tail.slice(-EVAL_TAIL_MAX_CHARS) : '',
+        reason
+      })
+    // assistente calado: sem interjeição sobre a fala do assistente ou sobre a resposta em curso.
+    // `#agentSpoke` só vale com a resposta EM VOO: depois que ela terminou, a próxima fala do
+    // usuário volta a poder ganhar backchannel (antes ele ficava preso até a próxima mensagem do
+    // usuário entrar no histórico — nenhuma interjeição depois da 1ª resposta)
+    if (this.#playbackActive) return skip('assistant-audio')
+    if (this.#agentSpoke && this.#machine.responseInFlight) return skip('answer-speaking')
+    if (this.#machine.phase !== 'listening') return skip(`phase-${this.#machine.phase}`)
+    const resolved = this.#resolved()
     const end = UTTERANCE_ENDS.includes(input?.end as UtteranceEnd)
       ? (input.end as UtteranceEnd)
       : null
@@ -454,19 +558,8 @@ export class VoiceCallManager {
       () => this.#rng()
     )
     if (decision.class === 'NONE') {
-      if (decision.reason === 'turn-end') {
-        // registro do "não interrompe a pergunta" (calibração)
-        this.#emitTimeline({
-          ts: now,
-          kind: 'decision',
-          class: 'NONE',
-          played: false,
-          speechMs: obs.speechMs,
-          pauseMs: obs.pauseMs,
-          text: obs.tail,
-          reason: 'turn-end'
-        })
-      }
+      // todo "não" vai à timeline com o motivo (o painel explica por que nada tocou)
+      skip(decision.reason)
       return
     }
     this.#lastInterjectAt = decision.decidedAt
@@ -509,7 +602,7 @@ export class VoiceCallManager {
       turnSilenceMs: this.#turnSilenceMs,
       turnTiming: this.#turnTiming,
       pendingText: this.#machine.pendingText,
-      error: this.#error
+      error: this.#sessionId ? this.#error : this.#endedReason
     }
   }
 
@@ -532,7 +625,8 @@ export class VoiceCallManager {
 
   #resolvedFor(chatId: string | null): ResolvedVoiceCall {
     const cfg = chatId ? this.#deps.chatConfig(chatId) : null
-    return resolveVoiceCallConfig(cfg?.voice ?? null, this.#deps.settings().defaults)
+    const persona = chatId ? (this.#deps.personaVoice?.(chatId) ?? null) : null
+    return resolveVoiceCallConfig(cfg?.voice ?? null, this.#deps.settings().defaults, persona)
   }
 
   // ---------------- turno continuado / barge-in (histórico só com o ouvido) ----------------
@@ -650,7 +744,10 @@ export class VoiceCallManager {
     const sessionId = this.#sessionId
     if (!sessionId) return
     if (e.type === 'draft') {
-      if (e.sessionId === sessionId && e.draft) this.#feedContent(e.draft.content)
+      if (e.sessionId === sessionId && e.draft) {
+        this.#feedContent(e.draft.content)
+        this.#ttsFeedPartial() // [tts-feed] a sentença incompleta segue para o TTS
+      }
       return
     }
     if (e.type === 'message-added') {
@@ -673,6 +770,16 @@ export class VoiceCallManager {
       }
       if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) {
         this.#flushMessage(typeof m.message.content === 'string' ? m.message.content : '', m.id)
+      } else if (m.message.role === 'assistant' && m.meta?.kind === 'error') {
+        // o turno do agente falhou de vez (erro persistido — o card de nova tentativa, quando há,
+        // já foi dispensado): a chamada não fica "ativa" sem resposta
+        const why =
+          typeof m.meta.error === 'string' ? m.meta.error : String(m.message.content ?? '')
+        this.#endWithError({
+          fatal: true,
+          reason: `o modelo falhou: ${why.slice(0, 160)}`,
+          detail: why
+        })
       }
       return
     }
@@ -767,12 +874,14 @@ export class VoiceCallManager {
   }
 
   #enqueueSynth(text: string, key: number): void {
+    this.#ttsFeedCall((f) => f.cut(text)) // [tts-feed] corte → flush já (antes do synth na fila)
     this.#machine.synthEnqueued()
-    this.#synthQueue.push({ text, gen: this.#synthGen, key })
+    this.#synthQueue.push({ text, gen: this.#synthGen, key, attempt: 0 })
     void this.#pumpSynth()
   }
 
   #clearSynth(): void {
+    this.#ttsFeedCall((f) => f.reset()) // [tts-feed] barge-in/parar/retenção: descarta o preparado
     this.#synthGen++
     this.#synthQueue = []
     this.#synthAbort?.abort()
@@ -797,15 +906,28 @@ export class VoiceCallManager {
           mime = r.mime
         } catch (e) {
           if (abort.signal.aborted) continue // descartada (barge-in/stop): segue a fila
-          // falha de TTS numa sentença: mostra o erro na UI e PULA só ela — o resto da resposta
-          // continua sendo falado (o texto inteiro segue no histórico)
-          this.#error = e instanceof Error ? e.message : String(e)
+          // falha de TTS numa sentença: nunca calada — transitória (rede, 5xx, 429 sem cota) tenta
+          // de novo UMA vez; fatal (chave, créditos, voz/modelo inválido) ou a 2ª falha encerram a
+          // chamada com o motivo (o histórico fica só com o que foi emitido para tocar)
+          const f = this.#classify(e, 'tts')
+          if (!f) continue
+          if (!f.fatal && item.attempt === 0 && item.gen === this.#synthGen) {
+            this.#emitTimeline({
+              ts: this.#now(),
+              kind: 'playback-error',
+              class: 'tts-retry',
+              reason: f.detail
+            })
+            this.#synthQueue.unshift({ ...item, attempt: 1 })
+            continue
+          }
           this.#machine.synthSkipped()
-          this.#emitState()
-          continue
+          this.#endWithError(f)
+          return
         }
         if (this.#synthAbort === abort) this.#synthAbort = null
         if (item.gen !== this.#synthGen) continue // descartada enquanto sintetizava
+        this.#transientStrike = false // sentença sintetizada: a falta transitória anterior caduca
         this.#uttSeq++
         // 1ª frase pronta: o preâmbulo não sai mais (se já está tocando, a frase ESPERA ele terminar
         // na fila do renderer — nunca corta no meio da palavra)
@@ -813,6 +935,14 @@ export class VoiceCallManager {
         if (this.#fillerTimer) {
           clearTimeout(this.#fillerTimer)
           this.#fillerTimer = null
+          // a resposta ficou pronta antes da espera do preâmbulo: dispensado
+          this.#emitTimeline({
+            ts: this.#now(),
+            kind: 'decision',
+            class: 'FILLER',
+            played: false,
+            reason: 'fast-answer'
+          })
         }
         this.#agentSpoke = true
         this.#playbackActive = true
@@ -834,7 +964,29 @@ export class VoiceCallManager {
     }
   }
 
+  // ---------------- [tts-feed] ganchos do TTS de entrada em streaming ----------------
+
+  /** Chama o feed (se houver) sem nunca derrubar a chamada. */
+  #ttsFeedCall(fn: (feed: TtsTextFeed) => void): void {
+    try {
+      const feed = this.#deps.ttsFeed?.() ?? null
+      if (feed) fn(feed)
+    } catch (e) {
+      console.warn('[clearchat] voz: tts-feed falhou:', e instanceof Error ? e.message : e)
+    }
+  }
+
+  /** Sentença ainda incompleta → TTS (só com a resposta sendo falada). */
+  #ttsFeedPartial(): void {
+    if (this.#speakCancelled || this.#holdAnswer || !this.#feed.trim()) return
+    const rest = this.#feed
+    this.#ttsFeedCall((f) => f.partial(rest))
+  }
+
+  // ---------------- [/tts-feed] ----------------
+
   #resetResponse(): void {
+    this.#ttsFeedCall((f) => f.begin()) // [tts-feed] turno novo: pré-abre a conexão
     this.#lastContent = ''
     this.#feed = ''
     this.#speakCancelled = false
@@ -877,7 +1029,17 @@ export class VoiceCallManager {
       responseInFlight: true,
       enabled: resolved.fillers.enabled
     }
-    if (short || !resolved.fillers.enabled) return
+    if (short || !resolved.fillers.enabled) {
+      // o painel explica por que não houve preâmbulo neste turno
+      this.#emitTimeline({
+        ts: this.#now(),
+        kind: 'decision',
+        class: 'FILLER',
+        played: false,
+        reason: !resolved.fillers.enabled ? 'disabled' : 'short-speech'
+      })
+      return
+    }
     const delay = this.#fillerDelay()
     this.#fillerTimer = setTimeout(() => this.#onFillerTimer(), delay)
   }
@@ -987,7 +1149,10 @@ export class VoiceCallManager {
     const latencyMs = Math.max(0, now - decidedAt)
     const stale = latencyMs > INTERJECTION_MAX_AGE_MS
     const shadow = resolved.interjections.shadow
-    const blocked = this.#playbackActive || this.#agentSpoke || this.#machine.phase !== 'listening'
+    const blocked =
+      this.#playbackActive ||
+      (this.#agentSpoke && this.#machine.responseInFlight) ||
+      this.#machine.phase !== 'listening'
     const played = !!clip && !shadow && !stale && !blocked && !!this.#sessionId
     const reason = played
       ? 'ok'

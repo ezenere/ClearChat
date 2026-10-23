@@ -14,8 +14,8 @@ export interface UtterancePlayer {
   pause(): void
   /** O áudio terminou (toque completo). */
   onended: (() => void) | null
-  /** Falha ao carregar/tocar (a fila segue para a próxima). */
-  onerror: (() => void) | null
+  /** Falha ao carregar/tocar (a fila segue para a próxima); `reason` legível quando conhecido. */
+  onerror: ((reason?: string) => void) | null
   /** Volume 0..1 (a fila propaga `setVolume`). */
   volume: number
   /** Libera recursos (blob URL etc.) — chamado ao terminar/cancelar. */
@@ -84,7 +84,7 @@ export type PlayerFactory = (
 /** Player padrão: blob URL + `new Audio` (sem dependências; liberado no `dispose`). */
 class DomAudioPlayer implements UtterancePlayer {
   onended: (() => void) | null = null
-  onerror: (() => void) | null = null
+  onerror: ((reason?: string) => void) | null = null
   readonly #el: HTMLAudioElement
   readonly #url: string
 
@@ -94,7 +94,12 @@ class DomAudioPlayer implements UtterancePlayer {
     this.#url = URL.createObjectURL(new Blob([copy], { type: mime }))
     this.#el = new Audio(this.#url)
     this.#el.onended = () => this.onended?.()
-    this.#el.onerror = () => this.onerror?.()
+    this.#el.onerror = () => {
+      const err = this.#el.error
+      this.onerror?.(
+        err ? `erro de mídia ${err.code}${err.message ? `: ${err.message}` : ''}` : 'erro de mídia'
+      )
+    }
   }
 
   get volume(): number {
@@ -124,35 +129,147 @@ class DomAudioPlayer implements UtterancePlayer {
 
 /** Antecedência do agendamento na Web Audio (s) — absorve o jitter entre pedaços. */
 const PCM_LEAD_S = 0.03
+/** Rampa de entrada (ms) no começo da utterance e depois de um buraco (underrun) — sem estalo. */
+export const PCM_FADE_IN_MS = 5
 
-let sharedAudioContext: AudioContext | null = null
-function audioContext(): AudioContext {
-  if (!sharedAudioContext || sharedAudioContext.state === 'closed')
-    sharedAudioContext = new AudioContext()
-  return sharedAudioContext
+// ---------------- partes puras do player PCM (testadas em e2e/voiceCallFix.test.ts) ----------------
+
+/** PCM16 LE (bytes, tamanho par) → amostras float −1..1. */
+export function pcm16ToFloat(pcm: Uint8Array): Float32Array {
+  const n = pcm.length >> 1
+  const view = new DataView(pcm.buffer, pcm.byteOffset, n * 2)
+  const out = new Float32Array(n)
+  for (let i = 0; i < n; i++) out[i] = view.getInt16(i * 2, true) / 0x8000
+  return out
+}
+
+/** Rampa linear de entrada nas primeiras `frames` amostras (no lugar). */
+export function applyFadeIn(samples: Float32Array, frames: number): void {
+  const n = Math.min(samples.length, Math.max(0, Math.floor(frames)))
+  for (let i = 0; i < n; i++) samples[i] *= (i + 1) / (n + 1)
+}
+
+/**
+ * Reamostrador linear CONTÍNUO entre pedaços (só usado quando o AudioContext não pôde abrir na
+ * taxa do stream): guarda a última amostra e a fase, então reamostrar pedaço a pedaço dá
+ * exatamente o mesmo que reamostrar o stream inteiro — sem costura nas fronteiras.
+ */
+export class PcmStreamResampler {
+  readonly #step: number
+  #pos = 0
+  #prev: number | null = null
+
+  constructor(fromRate: number, toRate: number) {
+    this.#step = fromRate / toRate
+  }
+
+  push(input: Float32Array): Float32Array {
+    const n = input.length
+    if (!n) return new Float32Array(0)
+    // sequência virtual [prev, ...input]: o índice -1 é a última amostra do pedaço anterior
+    const at = (i: number): number => (i < 0 ? (this.#prev ?? input[0]) : input[i])
+    const out: number[] = []
+    let p = this.#pos
+    for (;;) {
+      const i0 = Math.floor(p)
+      const frac = p - i0
+      if (frac === 0) {
+        if (i0 > n - 1) break
+        out.push(at(i0))
+      } else {
+        if (i0 + 1 > n - 1) break
+        out.push(at(i0) + (at(i0 + 1) - at(i0)) * frac)
+      }
+      p += this.#step
+    }
+    this.#pos = p - n
+    this.#prev = input[n - 1]
+    return Float32Array.from(out)
+  }
+}
+
+/**
+ * Relógio de agendamento em QUADROS inteiros da taxa do contexto: cada pedaço começa exatamente
+ * onde o anterior terminou (sem lacuna nem sobreposição); atrasou (underrun) → recomeça
+ * `leadS` à frente do relógio, avisando (`gap`) para o chamador suavizar a entrada.
+ */
+export class PcmScheduleClock {
+  readonly rate: number
+  #next: number | null = null
+
+  constructor(rate: number) {
+    this.rate = rate
+  }
+
+  place(frames: number, nowS: number, leadS = PCM_LEAD_S): { startFrame: number; gap: boolean } {
+    const earliest = Math.ceil((nowS + leadS) * this.rate)
+    const first = this.#next == null
+    const gap = !first && (this.#next as number) < Math.ceil(nowS * this.rate)
+    const startFrame = first || gap ? earliest : (this.#next as number)
+    this.#next = startFrame + frames
+    return { startFrame, gap }
+  }
+
+  get nextFrame(): number | null {
+    return this.#next
+  }
+}
+
+/**
+ * Um AudioContext por taxa do stream (`new AudioContext({ sampleRate })`): o PCM de 24 kHz do TTS
+ * agendado em pedaços num contexto de 48 kHz era reamostrado NÓ A NÓ e cada fronteira de pedaço
+ * (~28 ms) ganhava um degrau de até ~0,6 da escala cheia — o "pzzz/rrrr" na fala da chamada. Na
+ * taxa do stream os pedaços se emendam amostra a amostra; o navegador reamostra a saída inteira
+ * de uma vez para o dispositivo. Taxa recusada → o contexto padrão + `PcmStreamResampler`.
+ */
+const audioContexts = new Map<number, AudioContext>()
+function audioContextFor(rate: number): AudioContext {
+  let ctx = audioContexts.get(rate)
+  if (!ctx || ctx.state === 'closed') {
+    try {
+      ctx = new AudioContext({ sampleRate: rate, latencyHint: 'interactive' })
+    } catch {
+      ctx = audioContexts.get(0)
+      if (!ctx || ctx.state === 'closed') {
+        ctx = new AudioContext({ latencyHint: 'interactive' })
+        audioContexts.set(0, ctx)
+      }
+    }
+    audioContexts.set(rate, ctx)
+  }
+  return ctx
 }
 
 /**
  * Player de PCM16 em streaming pela Web Audio: cada pedaço vira um `AudioBufferSourceNode`
- * agendado em sequência (sem lacunas enquanto os pedaços chegam antes da hora); termina quando o
- * stream acabou e o último trecho tocou. Volume por `GainNode`.
+ * agendado em quadros inteiros, emendado no anterior (`PcmScheduleClock`), num contexto na taxa do
+ * stream (sem reamostragem por nó — ver `audioContextFor`); rampa de 5 ms no começo e depois de um
+ * underrun; termina quando o stream acabou e o último trecho tocou. Volume por `GainNode`.
  */
-class WebAudioPcmPlayer implements UtterancePlayer {
+export class WebAudioPcmPlayer implements UtterancePlayer {
   onended: (() => void) | null = null
-  onerror: (() => void) | null = null
+  onerror: ((reason?: string) => void) | null = null
   readonly #source: PcmStreamSource
   #ctx: AudioContext | null = null
   #gain: GainNode | null = null
   #volume = 1
-  #next = 0
+  #clock: PcmScheduleClock | null = null
+  #resampler: PcmStreamResampler | null = null
   #nodes = new Set<AudioBufferSourceNode>()
   #unsubscribe: (() => void) | null = null
   #streamEnded = false
   #finished = false
   #stopped = false
 
-  constructor(source: PcmStreamSource) {
+  readonly #contextFor: (rate: number) => AudioContext
+
+  /** `contextFor` injetável (testes renderizam o agendamento num contexto falso). */
+  constructor(
+    source: PcmStreamSource,
+    contextFor: (rate: number) => AudioContext = audioContextFor
+  ) {
     this.#source = source
+    this.#contextFor = contextFor
   }
 
   get volume(): number {
@@ -165,8 +282,13 @@ class WebAudioPcmPlayer implements UtterancePlayer {
   }
 
   async play(): Promise<void> {
-    const ctx = audioContext()
+    const ctx = this.#contextFor(this.#source.sampleRate)
     this.#ctx = ctx
+    this.#clock = new PcmScheduleClock(ctx.sampleRate)
+    this.#resampler =
+      ctx.sampleRate === this.#source.sampleRate
+        ? null
+        : new PcmStreamResampler(this.#source.sampleRate, ctx.sampleRate)
     const gain = ctx.createGain()
     gain.gain.value = this.#volume
     gain.connect(ctx.destination)
@@ -185,20 +307,22 @@ class WebAudioPcmPlayer implements UtterancePlayer {
   #schedule(pcm: Uint8Array): void {
     const ctx = this.#ctx
     const gain = this.#gain
-    if (!ctx || !gain || this.#stopped) return
-    const n = pcm.length >> 1
-    if (!n) return
-    const view = new DataView(pcm.buffer, pcm.byteOffset, n * 2)
-    const buffer = ctx.createBuffer(1, n, this.#source.sampleRate)
-    const ch = buffer.getChannelData(0)
-    for (let i = 0; i < n; i++) ch[i] = view.getInt16(i * 2, true) / 0x8000
+    const clock = this.#clock
+    if (!ctx || !gain || !clock || this.#stopped) return
+    let samples = pcm16ToFloat(pcm)
+    if (this.#resampler) samples = this.#resampler.push(samples)
+    if (!samples.length) return
+    // contíguo em quadros inteiros enquanto o próximo pedaço chega antes da hora; atrasou
+    // (underrun) → recomeça um pouco à frente, com rampa de entrada (sem estalo)
+    const first = clock.nextFrame == null
+    const { startFrame, gap } = clock.place(samples.length, ctx.currentTime)
+    if (first || gap) applyFadeIn(samples, (PCM_FADE_IN_MS / 1000) * ctx.sampleRate)
+    const buffer = ctx.createBuffer(1, samples.length, ctx.sampleRate)
+    buffer.getChannelData(0).set(samples)
     const node = ctx.createBufferSource()
     node.buffer = buffer
     node.connect(gain)
-    // contíguo enquanto o próximo pedaço chega antes da hora; atrasou (underrun) → recomeça já
-    const at = Math.max(this.#next, ctx.currentTime + PCM_LEAD_S)
-    node.start(at)
-    this.#next = at + buffer.duration
+    node.start(startFrame / ctx.sampleRate)
     this.#nodes.add(node)
     node.onended = () => {
       this.#nodes.delete(node)
@@ -296,6 +420,11 @@ export interface UtteranceQueueOptions {
   onState?: (state: UtteranceState) => void
   /** Início/fim da reprodução de cada utterance (timeline da chamada — cancelas não emitem 'end'). */
   onItem?: (e: { item: VoiceCallUtteranceEvent; phase: 'start' | 'end' }) => void
+  /**
+   * A utterance NÃO tocou (bytes ilegíveis, `play()` rejeitado — autoplay/CSP/codec —, erro de
+   * mídia): a fila segue para a próxima, mas o motivo chega aqui (nunca falha calada).
+   */
+  onError?: (e: { item: VoiceCallUtteranceEvent; reason: string }) => void
 }
 
 /**
@@ -307,6 +436,7 @@ export class UtteranceQueue {
   #factory: PlayerFactory
   #onState: ((state: UtteranceState) => void) | undefined
   #onItem: ((e: { item: VoiceCallUtteranceEvent; phase: 'start' | 'end' }) => void) | undefined
+  #onError: ((e: { item: VoiceCallUtteranceEvent; reason: string }) => void) | undefined
   #queue: VoiceCallUtteranceEvent[] = []
   /** Pedaços das utterances em streaming (por id), da chegada até o fim do stream. */
   #streams = new Map<string, PcmStreamSource>()
@@ -319,6 +449,7 @@ export class UtteranceQueue {
     this.#factory = options.playerFactory ?? domPlayerFactory
     this.#onState = options.onState
     this.#onItem = options.onItem
+    this.#onError = options.onError
   }
 
   get state(): UtteranceState {
@@ -423,10 +554,19 @@ export class UtteranceQueue {
       if (!this.#queue.length) this.#setState('idle')
       void this.#pump()
     }
+    const fail = (reason: string): void => {
+      // só se ainda é a utterance atual (play() interrompido por cancel/drop não é falha)
+      if (!settled && this.#current === player) this.#onError?.({ item: next, reason })
+      done()
+    }
     try {
       player = this.#factory(next.audio, next.mime, this.#streams.get(next.id))
-    } catch {
+    } catch (e) {
       // bytes ilegíveis: pula para a próxima (player/current continuam null → done avança)
+      this.#onError?.({
+        item: next,
+        reason: `áudio ilegível: ${e instanceof Error ? e.message : String(e)}`
+      })
       done()
       return
     }
@@ -434,13 +574,13 @@ export class UtteranceQueue {
     this.#currentItem = next
     player.volume = this.#volume * gainOf(next)
     player.onended = done
-    player.onerror = done
+    player.onerror = (reason?: string) => fail(reason || 'erro ao tocar')
     started = true
     this.#onItem?.({ item: next, phase: 'start' })
     try {
       await player.play()
-    } catch {
-      done()
+    } catch (e) {
+      fail(`play() recusado: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`)
     }
   }
 
