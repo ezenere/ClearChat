@@ -47,8 +47,9 @@ class DomAudioPlayer implements UtterancePlayer {
     this.#el.volume = v
   }
 
-  play(): void {
-    void this.#el.play()
+  /** Devolve a promise do `<audio>`: rejeição (autoplay/decodificação) chega à fila, que avança. */
+  play(): Promise<void> {
+    return this.#el.play()
   }
 
   pause(): void {

@@ -31,7 +31,8 @@ import {
   merge3,
   rowMessage,
   sameJson,
-  sameRecordPlain
+  sameRecordPlain,
+  usesLocalTools
 } from '../src/main/sync/records'
 import { outdatedHosts, SyncEngine } from '../src/main/sync/engine'
 import { EDIT_NEEDS_UPDATE, type RunnerAdapter } from '../src/main/sync/host'
@@ -272,6 +273,81 @@ const seedDefaultPreset = (conn: Database.Database): string => {
 }
 
 // ---------------- testes ----------------
+
+test('voice (chamada de voz) é LOCAL: não sai no chat/persona e sobrevive ao registro recebido', () => {
+  const a = newDb()
+  const b = newDb()
+  const voiceA = { enabled: true, tools: { enabledTools: ['read_file'], maxToolOutputChars: null } }
+  const voiceB = { enabled: false, model: 'local-b' }
+  const { chatId } = addChat(a, 'Com voz')
+  const cfgA = JSON.parse(
+    (a.prepare('SELECT config_json FROM chats WHERE id = ?').get(chatId) as any).config_json
+  )
+  a.prepare('UPDATE chats SET config_json = ? WHERE id = ?').run(
+    JSON.stringify({ ...cfgA, voice: voiceA }),
+    chatId
+  )
+  a.prepare(
+    'INSERT INTO presets (id, name, description, icon, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run('prv', 'Voz', '', 'mic', JSON.stringify({ model: 'x', voice: voiceA }), 1, 2)
+  // o lado B já tem os mesmos registros com a SUA config de voz local
+  addChat(b, 'Com voz', chatId)
+  const cfgB = JSON.parse(
+    (b.prepare('SELECT config_json FROM chats WHERE id = ?').get(chatId) as any).config_json
+  )
+  b.prepare('UPDATE chats SET config_json = ? WHERE id = ?').run(
+    JSON.stringify({ ...cfgB, voice: voiceB }),
+    chatId
+  )
+  b.prepare(
+    'INSERT INTO presets (id, name, description, icon, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ).run('prv', 'Voz', '', 'mic', JSON.stringify({ voice: voiceB }), 1, 1)
+
+  for (const [type, id] of [
+    ['chat', chatId],
+    ['preset', 'prv']
+  ] as const) {
+    const out = buildLocal(a, type, id)!
+    assert.equal((out.plain.config as any).voice, undefined, `${type}: voice não é enviado`)
+    // registro recebido (até de um cliente antigo que mandava voice): o local de B fica
+    const incoming = JSON.parse(JSON.stringify(out.plain))
+    incoming.config.voice = { enabled: true, model: 'de-fora' }
+    applyRemote(b, type, id, incoming, { defaultCwd: () => '/padrao' })
+    const table = type === 'chat' ? 'chats' : 'presets'
+    const cfg = JSON.parse(
+      (b.prepare(`SELECT config_json FROM ${table} WHERE id = ?`).get(id) as any).config_json
+    )
+    assert.deepEqual(cfg.voice, voiceB, `${type}: voice local de B preservado`)
+    assert.equal((cfg as any).model, (out.plain.config as any).model, `${type}: resto aplicado`)
+  }
+  // sem voice local: o de fora é descartado (nunca entra pelo sync)
+  const c = newDb()
+  applyRemote(
+    c,
+    'preset',
+    'prv',
+    { ...buildLocal(a, 'preset', 'prv')!.plain, config: { model: 'x', voice: voiceA } },
+    {}
+  )
+  const cfgC = JSON.parse(
+    (c.prepare('SELECT config_json FROM presets WHERE id = ?').get('prv') as any).config_json
+  )
+  assert.equal(cfgC.voice, undefined)
+})
+
+test('usesLocalTools: tools liberadas só na chamada de voz (voice.tools.enabledTools) contam', () => {
+  assert.equal(usesLocalTools({ enabledTools: [] }), false)
+  assert.equal(
+    usesLocalTools({ enabledTools: [], voice: { tools: { enabledTools: ['shell'] } } }),
+    true
+  )
+  assert.equal(
+    usesLocalTools({ enabledTools: [], voice: { tools: { enabledTools: ['web_search'] } } }),
+    false
+  )
+  assert.equal(usesLocalTools({ voice: { tools: null } }), false)
+  assert.equal(usesLocalTools({ voice: 'lixo' }), false)
+})
 
 test('mapeamento: ida e volta de cada entidade (campos locais preservados)', () => {
   const a = newDb()

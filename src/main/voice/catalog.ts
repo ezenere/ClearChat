@@ -139,7 +139,7 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     engine: 'vosk',
     name: 'Vosk small pt-BR 0.3',
     description:
-      'Vosk small pt-BR (Kaldi) — modelo leve em português do Brasil; artefato é um .zip (a extração é da fatia de runtime).',
+      'Vosk small pt-BR (Kaldi) — modelo leve em português do Brasil; baixado como .zip e extraído na instalação.',
     languages: ['pt-BR'],
     version: '0.3',
     sizeBytes: 32_453_112,
@@ -261,7 +261,7 @@ export const LOCAL_MODEL_CATALOG: readonly LocalModelCatalogEntry[] = [
     url: `${CHATTERBOX_PTBR_HF_BASE}/t3_pt_br.safetensors`,
     license: 'MIT',
     notes:
-      'Fonte: HF ResembleAI/Chatterbox-Multilingual-pt-br, lfs.oid (2026-10-22). O runtime do Chatterbox (e o grapheme_mtl_merged_expanded_v1.json do mesmo repositório) são de outra fatia — aqui só os arquivos.'
+      'Fonte: HF ResembleAI/Chatterbox-Multilingual-pt-br, lfs.oid (2026-10-22). O runtime do Chatterbox (e o grapheme_mtl_merged_expanded_v1.json do mesmo repositório) ainda não estão no app — aqui só os arquivos.'
   },
   {
     id: 'chatterbox-pt-br-s3gen',

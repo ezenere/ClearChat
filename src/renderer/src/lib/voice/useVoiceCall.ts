@@ -10,8 +10,13 @@
 // nem vira turno); longa = barge-in (cancela a fala do assistente, como sempre). Pausas na fala
 // do usuário viram observações de interjeição (`interjectionObserved` — a política decide no main).
 // Mudo = captura pausada (microfone liberado). Build de dev com `VITE_CLEAR_MOCK=1`: sem captura
-// (o mock `voice` emite os estados/utterances e o `Waveform` simula os níveis).
-import { useCallback, useEffect, useRef, useState } from 'react'
+// (o mock `voice` emite os estados/utterances e o `Waveform` simula os níveis; `__clearMockMic`
+// simula falhas do microfone).
+//
+// O estado de runtime (nível, erro, volume, clipes) é publicado em `useVoiceCallRuntime` — o dock
+// vive na coluna do composer e só lê de lá. Falha ao abrir o microfone ENCERRA a chamada; como o
+// dock some junto, o motivo vai para um toast (visível em qualquer tela).
+import { useCallback, useEffect, useRef } from 'react'
 import type { VoiceCallTimelineEvent } from '@shared/ipc'
 import {
   DEFAULT_INTERJECTION_POLICY,
@@ -23,9 +28,11 @@ import { DEFAULT_SILENCE_THRESHOLD } from '../audio/silence'
 import { AudioCapture } from '../audio/capture'
 import { api, errorMessage } from '../api'
 import { useStore } from '../../store'
-import { captureErrorText } from './dictation'
+import { captureErrorText, MIC_FALLBACK_NOTICE } from './dictation'
 import { UtteranceGate } from './utteranceGate'
 import { UtteranceQueue } from './utteranceQueue'
+import { useVoiceCallRuntime } from './voiceCallRuntime'
+import { loadVoiceSettings } from './voiceSettings'
 
 const MOCK = import.meta.env.VITE_CLEAR_MOCK === '1'
 /** Duração do quadro de nível RMS (ms) — `AudioCapture` emite ~30 Hz (`DEFAULT_LEVEL_MS`). */
@@ -33,26 +40,35 @@ const FRAME_MS = 33
 /** Pre-roll da fala (chunks PCM mantidos antes do início) — não corta o onset (~300 ms). */
 const PREROLL_MAX = 3
 
-export interface VoiceCallControls {
-  /** Nível RMS ao vivo (0..1) para o `Waveform`. */
-  level: number
-  /** Erro legível (permissão negada, microfone indisponível, transcrição falhou). */
-  error: string | null
-  clearError: () => void
-  /** Volume da reprodução (0..1). */
-  volume: number
-  setVolume: (volume: number) => void
-  /** Mudo do microfone (captura pausada) — espelha/aplica `voiceCall.muted`. */
-  toggleMute: () => Promise<void>
+const setLevel = (level: number): void => useVoiceCallRuntime.setState({ level })
+const setError = (error: string | null): void => useVoiceCallRuntime.setState({ error })
+
+/** Mock de UI: falha simulada do microfone (`window.__clearMockMic`, definido pelo cenário). */
+function mockMicMode(): string {
+  return (window as unknown as { __clearMockMic?: string }).__clearMockMic ?? 'ok'
 }
 
-export function useVoiceCall(): VoiceCallControls {
+/** Recarrega o estado dos clipes de interjeição/filler da voz atual. */
+async function refreshClips(): Promise<void> {
+  const v = api.voice
+  if (!v) return
+  try {
+    const m = await v.tts.clips.list()
+    useVoiceCallRuntime.setState({ clips: m && m.clips.length > 0 ? 'ok' : 'missing' })
+  } catch {
+    useVoiceCallRuntime.setState({ clips: 'unknown' })
+  }
+}
+
+/**
+ * Controller da chamada (montado UMA vez — `VoiceCallController` em `App`): captura, porta de fala,
+ * transcrição e reprodução. Publica nível/erro/volume/clipes e as ações em `useVoiceCallRuntime`.
+ */
+export function useVoiceCall(): void {
   const active = useStore((s) => s.voiceCall.active)
   const turnSilenceMs = useStore((s) => s.voiceCall.turnSilenceMs)
   const muted = useStore((s) => s.voiceCall.muted)
-  const [level, setLevel] = useState(0)
-  const [error, setError] = useState<string | null>(null)
-  const [volume, setVolumeState] = useState(1)
+  const volume = useVoiceCallRuntime((s) => s.volume)
 
   const queueRef = useRef<UtteranceQueue | null>(null)
   const gateRef = useRef<UtteranceGate | null>(null)
@@ -148,6 +164,13 @@ export function useVoiceCall(): VoiceCallControls {
       .catch(() => {})
   }, [])
 
+  // ---- chamada nova: limpa o erro anterior e confere os clipes (CTA "Gerar clipes" no dock) ----
+  useEffect(() => {
+    if (!active) return
+    setError(null)
+    void refreshClips()
+  }, [active])
+
   // ---- reprodução das utterances (na ordem; `idle` → playback-idle ao main) ----
   const volumeRef = useRef(volume)
   useEffect(() => {
@@ -208,9 +231,10 @@ export function useVoiceCall(): VoiceCallControls {
     watcherRef.current = watcher
     holdRef.current = hold
     // política resolvida do chat da chamada (persona→chat→global) — habilita e define minPauseMs
-    void voice.settings
-      .get()
+    let disposed = false
+    void loadVoiceSettings()
       .then((all) => {
+        if (disposed) return
         const chatCfg =
           useStore.getState().chats.find((c) => c.id === useStore.getState().voiceCall.chatId)
             ?.config.voice ?? null
@@ -295,37 +319,64 @@ export function useVoiceCall(): VoiceCallControls {
       if (preroll.length > PREROLL_MAX) preroll.shift()
     }
 
+    /** A chamada acabou porque o microfone falhou: o dock some junto, então o motivo vira toast. */
+    const failCall = (message: string): void => {
+      setError(message)
+      useStore.getState().toast(`Chamada de voz encerrada: ${message}`, 'error')
+      void useStore.getState().stopVoiceCall()
+    }
+
     if (MOCK) {
       // sem microfone no mock: os estados/utterances vêm do binding `voice` simulado
+      const mode = mockMicMode()
+      if (!muted && (mode === 'denied' || mode === 'none' || mode === 'busy')) {
+        const name =
+          mode === 'denied'
+            ? 'NotAllowedError'
+            : mode === 'none'
+              ? 'NotFoundError'
+              : 'NotReadableError'
+        failCall(captureErrorText({ name, message: '' }))
+      }
       return () => {
+        disposed = true
         gateRef.current = null
       }
     }
 
     const startCapture = async (): Promise<void> => {
+      // settings frescas (microfone) ANTES de abrir — a limpeza do efeito pode chegar no meio
+      const all = await loadVoiceSettings()
+      if (disposed) return
       const capture = new AudioCapture({ silence: false })
       captureRef.current = capture
       capture.on('level', onLevel)
       capture.on('pcm', onPcm)
-      capture.on('error', (e) => setError(captureErrorText(e.message)))
+      capture.on('error', (e) => setError(captureErrorText(e)))
       capture.on('ended', () => {
-        // microfone desconhecido/encerrado: encerra a chamada (o main volta ao repouso)
-        if (captureRef.current === capture) captureRef.current = null
-        void useStore.getState().stopVoiceCall()
+        // microfone desconectado: encerra a chamada (o main volta ao repouso) e avisa
+        if (captureRef.current !== capture) return
+        captureRef.current = null
+        failCall('o microfone foi desconectado.')
       })
       try {
-        const all = await api.voice?.settings.get()
-        await capture.start(all?.audioInput.deviceId ?? null)
+        await capture.start(all.audioInput.deviceId)
+        if (disposed) {
+          void capture.stop().catch(() => {})
+          return
+        }
+        if (capture.fellBack) useStore.getState().toast(MIC_FALLBACK_NOTICE, 'info')
       } catch (cause) {
         if (captureRef.current === capture) captureRef.current = null
-        const msg = cause instanceof Error ? cause.message : String(cause)
-        setError(msg.startsWith('AudioCapture') ? captureErrorText(msg) : msg)
-        void useStore.getState().stopVoiceCall()
+        // limpeza do efeito (mudo, troca de silêncio, fim da chamada) interrompeu o start: normal
+        if (disposed) return
+        failCall(captureErrorText(cause as Error))
       }
     }
     if (!muted) void startCapture()
 
     return () => {
+      disposed = true
       gateRef.current = null
       speakingRef.current = false
       prerollRef.current = []
@@ -360,11 +411,33 @@ export function useVoiceCall(): VoiceCallControls {
 
   const setVolume = useCallback((v: number): void => {
     const value = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 1
-    setVolumeState(value)
+    useVoiceCallRuntime.setState({ volume: value })
     queueRef.current?.setVolume(value)
   }, [])
 
   const clearError = useCallback((): void => setError(null), [])
 
-  return { level, error, clearError, volume, setVolume, toggleMute }
+  /** "Gerar clipes" do dock: mesmos clipes de Configurações → Áudio (voz atual), com progresso. */
+  const generateClips = useCallback(async (): Promise<void> => {
+    const v = api.voice
+    if (!v) return
+    useVoiceCallRuntime.setState({ clips: 'generating', clipsProgress: { done: 0, total: 0 } })
+    const off = api.onVoiceTtsClipsProgress?.((e) =>
+      useVoiceCallRuntime.setState({ clipsProgress: { done: e.done, total: e.total } })
+    )
+    try {
+      const m = await v.tts.clips.generate()
+      useVoiceCallRuntime.setState({ clips: m.clips.length > 0 ? 'ok' : 'missing' })
+    } catch (err) {
+      useVoiceCallRuntime.setState({ clips: 'missing' })
+      setError(`Não foi possível gerar os clipes de voz: ${errorMessage(err)}`)
+    } finally {
+      off?.()
+      useVoiceCallRuntime.setState({ clipsProgress: null })
+    }
+  }, [])
+
+  useEffect(() => {
+    useVoiceCallRuntime.setState({ toggleMute, setVolume, clearError, generateClips })
+  }, [toggleMute, setVolume, clearError, generateClips])
 }

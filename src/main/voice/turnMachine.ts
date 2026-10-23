@@ -154,6 +154,16 @@ export class VoiceTurnMachine {
   }
 
   /**
+   * A síntese de UMA sentença falhou e ela foi pulada (o resto da fila segue). Sem áudio tocando e
+   * sem mais nada na fila, nenhum `playbackIdle` virá do renderer — o próximo turno pendente sai já.
+   */
+  synthSkipped(): void {
+    if (!this.#active) return
+    this.#synthPending = Math.max(0, this.#synthPending - 1)
+    if (!this.#synthPending && !this.#audioActive) this.#flushPending()
+  }
+
+  /**
    * A fila de síntese foi descartada inteira (falha de TTS, barge-in ou stop): as sentenças
    * pendentes nunca viram utterance — sem isso a fase ficaria "Falando…" para sempre.
    */

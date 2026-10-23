@@ -340,6 +340,11 @@ export interface SttLocalTranscribeOptions {
 export interface SttLocalBackend {
   /** Motor instalado/carregado e pronto para transcrever. */
   ready: boolean
+  /**
+   * Parciais por janelas valem a pena neste motor/modelo? Ausente = sim. O runtime whisper.cpp
+   * desliga para modelos maiores que o `base` (cada janela custaria segundos de CPU).
+   */
+  partials?: boolean
   /** Transcreve localmente (no resultado, `baseUrl` = 'local' e `model` = motor/modelo local). */
   transcribe(
     input: TranscribeAudioInput,

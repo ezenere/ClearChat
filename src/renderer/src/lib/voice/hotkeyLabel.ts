@@ -25,6 +25,8 @@ const KEY_LABELS: Record<string, string> = {
 /** Nome gravável da tecla (parseável por `parseHotkey`): 'Space', 'F8', 'K', 'Enter'… */
 function keyToken(name: string): string {
   if (/^f\d{1,2}$/.test(name)) return name.toUpperCase()
+  // '+' é o separador do formato — gravado como 'Plus'
+  if (name === '+') return 'Plus'
   if (name.length === 1) return name.toUpperCase()
   const special: Record<string, string> = {
     space: 'Space',
@@ -36,8 +38,8 @@ function keyToken(name: string): string {
     insert: 'Insert',
     home: 'Home',
     end: 'End',
-    pageup: 'Page Up',
-    pagedown: 'Page Down',
+    pageup: 'PageUp',
+    pagedown: 'PageDown',
     arrowup: 'Up',
     arrowdown: 'Down',
     arrowleft: 'Left',
@@ -66,8 +68,9 @@ export function formatHotkeyLabel(hotkey: string | null | undefined): string {
 
 /**
  * Hotkey canônica a partir de um evento de teclado (captura de tecla na Configurações):
- * 'Ctrl+Shift+Space', 'F8', 'Alt+K'… Modificador solto (só Ctrl/Shift/Alt/Meta) → `null`
- * (a captura espera a tecla principal).
+ * 'Ctrl+Shift+Space', 'F8', 'Alt+K', 'Ctrl+Plus', 'Ctrl+PageUp'… Modificador solto (só
+ * Ctrl/Shift/Alt/Meta) → `null` (a captura espera a tecla principal). NÃO valida o uso como
+ * push-to-talk — ver `pttHotkeyProblem` (tecla que digita sem modificador é recusada na captura).
  */
 export function hotkeyFromEvent(event: HotkeyEvent): string | null {
   const raw = event.key ?? ''
@@ -83,16 +86,18 @@ export function hotkeyFromEvent(event: HotkeyEvent): string | null {
   if (/^(control|shift|alt|meta|altgraph|capslock)$/i.test(key)) return null
   const lower = key.toLowerCase()
   const name =
-    lower === ' ' || lower === 'spacebar'
-      ? 'Space'
-      : lower === 'esc'
-        ? 'Esc'
-        : lower === 'return'
-          ? 'Enter'
-          : /^f\d{1,2}$/.test(lower)
-            ? lower.toUpperCase()
-            : key.length === 1
-              ? key.toUpperCase()
-              : keyToken(lower)
+    lower === '+'
+      ? 'Plus'
+      : lower === ' ' || lower === 'spacebar'
+        ? 'Space'
+        : lower === 'esc'
+          ? 'Esc'
+          : lower === 'return'
+            ? 'Enter'
+            : /^f\d{1,2}$/.test(lower)
+              ? lower.toUpperCase()
+              : key.length === 1
+                ? key.toUpperCase()
+                : keyToken(lower)
   return [...mods, name].join('+')
 }

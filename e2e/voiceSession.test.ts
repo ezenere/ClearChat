@@ -10,8 +10,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   activeTranscribeSession,
+  cancelTranscribeSessions,
   encodeWav,
+  findTranscribeSession,
+  splitPcmForUpload,
   startTranscribeSession,
+  STT_PARTIAL_WINDOW_MS,
+  trimTrailingSilence,
   VOICE_SAMPLE_RATE
 } from '../src/main/voice/session.ts'
 import { STT_PARTIAL_INTERVAL_MS, type SttLocalBackend } from '../src/main/voice/stt.ts'
@@ -197,13 +202,12 @@ test('parciais: disparam no intervalo, pedaço com sobreposição e evento { tex
   assert.equal(new DataView(wav.buffer, wav.byteOffset).getUint32(24, true), VOICE_SAMPLE_RATE)
 })
 
-test('parciais: a request em voo é abortada quando a seguinte dispara (nunca há fila)', async (t) => {
-  const m = mockFetch(async (_url, init) => {
+test('parciais: nunca dispara com outra em voo (sem fila e sem abortar-e-reenviar)', async (t) => {
+  let release: (() => void) | null = null
+  const m = mockFetch(async () => {
     if (m.calls.length === 1)
-      return new Promise<Response>((_res, rej) => {
-        const abort = (): void => rej(new DOMException('This operation was aborted', 'AbortError'))
-        if (init.signal?.aborted) return abort()
-        init.signal?.addEventListener('abort', abort, { once: true })
+      return new Promise<Response>((res) => {
+        release = () => res(jsonRes(200, { text: 'primeira' }))
       })
     return jsonRes(200, { text: 'segunda' })
   })
@@ -218,24 +222,44 @@ test('parciais: a request em voo é abortada quando a seguinte dispara (nunca h�
 
   s.push(bytes(16_000), VOICE_SAMPLE_RATE)
   c.advance(STT_PARTIAL_INTERVAL_MS)
-  s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  s.push(bytes(16_000), VOICE_SAMPLE_RATE) // 1ª dispara (fica pendurada)
   assert.equal(m.calls.length, 1)
-  assert.equal(m.calls[0].init.signal?.aborted, false)
-
+  for (let i = 0; i < 3; i++) {
+    c.advance(STT_PARTIAL_INTERVAL_MS)
+    s.push(bytes(16_000), VOICE_SAMPLE_RATE)
+  }
+  assert.equal(m.calls.length, 1, 'com uma em voo, nenhuma outra dispara')
+  assert.equal(m.calls[0].init.signal?.aborted, false, 'a em voo nunca é abortada pela seguinte')
+  release!()
+  await sleep(0)
+  assert.deepEqual(events, ['primeira'])
+  // a próxima recobre tudo desde o fim da 1ª (menos a sobreposição de 300 ms = 9600 bytes)
   c.advance(STT_PARTIAL_INTERVAL_MS)
   s.push(bytes(16_000), VOICE_SAMPLE_RATE)
   assert.equal(m.calls.length, 2)
-  assert.equal(m.calls[0].init.signal?.aborted, true, 'a anterior (em voo) foi abortada')
+  const sent = wavPcm(await fileBytes(m.calls[1].init))
+  assert.equal(sent.length, 16_000 * 4 + 9_600, 'pedaço = o que a 1ª não cobriu + sobreposição')
   await sleep(0)
-  assert.deepEqual(events, ['segunda'])
+  assert.deepEqual(events, ['primeira', 'primeira segunda'])
 })
 
-test('parciais: resultado velho expira (chega depois de outro disparo e é descartado)', async (t) => {
-  let n = 0
-  const m = mockFetch(async () => {
-    n++
-    return n === 1 ? delayedFetch(30, 'VELHO')() : delayedFetch(5, 'NOVO')()
-  })
+test('parciais: janela máxima de ~10 s (o pedaço nunca cresce com a gravação)', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'x' }))
+  t.after(m.restore)
+  const c = clock()
+  const s = startTranscribeSession({ settings: sttSettings() }, { now: c.now })
+  t.after(() => s.cancel())
+  // 30 s de áudio de uma vez antes do 1º disparo
+  s.push(bytes(30 * 32_000), VOICE_SAMPLE_RATE)
+  c.advance(STT_PARTIAL_INTERVAL_MS)
+  s.push(bytes(32), VOICE_SAMPLE_RATE)
+  assert.equal(m.calls.length, 1)
+  const sent = wavPcm(await fileBytes(m.calls[0].init))
+  assert.equal(sent.length, STT_PARTIAL_WINDOW_MS * 32, 'só os últimos 10 s vão na parcial')
+})
+
+test('parciais: resultado que chega depois do fim da sessão é descartado', async (t) => {
+  const m = mockFetch(delayedFetch(30, 'VELHO'))
   t.after(m.restore)
   const c = clock()
   const events: string[] = []
@@ -243,15 +267,60 @@ test('parciais: resultado velho expira (chega depois de outro disparo e é desca
     { settings: sttSettings() },
     { now: c.now, onPartial: (e) => events.push(e.text) }
   )
-  t.after(() => s.cancel())
-
   s.push(bytes(8_000), VOICE_SAMPLE_RATE)
   c.advance(STT_PARTIAL_INTERVAL_MS)
-  s.push(bytes(8_000), VOICE_SAMPLE_RATE) // 1ª dispara (resolve em 30 ms)
-  c.advance(STT_PARTIAL_INTERVAL_MS)
-  s.push(bytes(8_000), VOICE_SAMPLE_RATE) // 2ª dispara e aborta a 1ª (que mesmo assim responde)
+  s.push(bytes(8_000), VOICE_SAMPLE_RATE) // dispara (resolve em 30 ms, ignorando o abort)
+  s.cancel()
   await sleep(60)
-  assert.deepEqual(events, ['NOVO'], 'a parcial velha expirou; nada de "VELHO" no texto')
+  assert.deepEqual(events, [], 'a parcial velha expirou')
+})
+
+test('parciais: auth/cota desligam as parciais no resto da sessão com UM aviso (sem reenvio)', async (t) => {
+  for (const status of [401, 429]) {
+    const m = mockFetch(async () => jsonRes(status, { error: { message: 'nope' } }))
+    const c = clock()
+    const events: { text: string; error?: string }[] = []
+    const s = startTranscribeSession(
+      { settings: sttSettings() },
+      { now: c.now, onPartial: (e) => events.push(e) }
+    )
+    for (let i = 0; i < 4; i++) {
+      c.advance(STT_PARTIAL_INTERVAL_MS)
+      s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+      await sleep(0)
+    }
+    s.cancel()
+    m.restore()
+    assert.equal(m.calls.length, 1, `HTTP ${status}: uma tentativa só`)
+    assert.equal(events.length, 1, 'um aviso')
+    assert.match(events[0].error ?? '', /Parciais ao vivo desligadas/)
+    assert.equal(events[0].text, '')
+  }
+  t.diagnostic('401 e 429 desligam as parciais')
+})
+
+test('parciais locais: motor com partials=false (modelo maior que o base) só faz a final', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'api' }))
+  t.after(m.restore)
+  const local = fakeLocal(() =>
+    Promise.resolve({ text: 'final', model: 'ggml-small', baseUrl: 'local', ms: 1 })
+  )
+  local.backend.partials = false
+  const c = clock()
+  const s = startTranscribeSession(
+    { settings: sttSettings({ mode: 'local' }) },
+    { now: c.now, local: local.backend, hasLocalReady: true }
+  )
+  for (let i = 0; i < 3; i++) {
+    c.advance(STT_PARTIAL_INTERVAL_MS)
+    s.push(bytes(8_000), VOICE_SAMPLE_RATE)
+  }
+  await sleep(0)
+  assert.equal(local.calls.length, 0, 'nenhuma parcial local')
+  const r = await s.stop()
+  assert.equal(r.text, 'final')
+  assert.equal(local.calls.length, 1)
+  assert.equal(m.calls.length, 0)
 })
 
 test('parciais: livePartials false e modo "local" nunca chamam a API', async (t) => {
@@ -371,14 +440,131 @@ test('stop: sem áudio → texto vazio sem rede; cancel nunca transcreve e encer
   assert.equal(activeTranscribeSession(), null)
 })
 
-test('sessão única: iniciar outra com uma ativa é erro legível; cancel/start seguem', () => {
+test('autocura: iniciar outra com uma ativa substitui (a anterior é cancelada)', async () => {
   const s1 = startTranscribeSession({ settings: sttSettings() })
-  assert.throws(() => startTranscribeSession({ settings: sttSettings() }), /Já há uma transcrição/)
-  s1.cancel()
+  s1.push(bytes(100), VOICE_SAMPLE_RATE)
   const s2 = startTranscribeSession({ settings: sttSettings() })
   assert.notEqual(s2.id, s1.id)
+  assert.equal(activeTranscribeSession()?.id, s2.id)
+  assert.throws(() => s1.push(bytes(2), VOICE_SAMPLE_RATE), /não está mais ativa/)
+  assert.equal(findTranscribeSession(s1.id), null, 'a substituída sumiu')
   s2.cancel()
   assert.equal(activeTranscribeSession(), null)
+})
+
+test('autocura: a final em voo da anterior termina mesmo com uma nova sessão aberta', async (t) => {
+  const m = mockFetch(delayedFetch(20, 'final antiga'))
+  t.after(m.restore)
+  const s1 = startTranscribeSession({ settings: sttSettings() })
+  s1.push(bytes(4_000), VOICE_SAMPLE_RATE)
+  const p = s1.stop()
+  assert.equal(activeTranscribeSession(), null, 'o stop libera a vaga de captura na hora')
+  assert.equal(findTranscribeSession(s1.id)?.id, s1.id, 'a que está transcrevendo segue viva')
+  const s2 = startTranscribeSession({ settings: sttSettings() })
+  assert.equal((await p).text, 'final antiga')
+  assert.equal(activeTranscribeSession()?.id, s2.id)
+  s2.cancel()
+})
+
+test('autocura: cancelTranscribeSessions(dono) descarta as do renderer que sumiu (inclusive a final em voo)', async (t) => {
+  const m = mockFetch(
+    (_url, init) =>
+      new Promise<Response>((_res, rej) => {
+        init.signal?.addEventListener(
+          'abort',
+          () => rej(new DOMException('This operation was aborted', 'AbortError')),
+          { once: true }
+        )
+      })
+  )
+  t.after(m.restore)
+  const a = startTranscribeSession({ settings: sttSettings() }, { ownerId: 1 })
+  a.push(bytes(4_000), VOICE_SAMPLE_RATE)
+  const finalA = a.stop() // final pendurada
+  const b = startTranscribeSession({ settings: sttSettings() }, { ownerId: 2 })
+  assert.equal(cancelTranscribeSessions(1), 1, 'só a do dono 1')
+  await assert.rejects(finalA, (e: Error) => e.name === 'AbortError')
+  assert.equal(activeTranscribeSession()?.id, b.id, 'a do outro dono segue')
+  assert.equal(cancelTranscribeSessions(1), 0, 'idempotente')
+  assert.equal(cancelTranscribeSessions(), 1, 'sem dono: todas')
+  assert.equal(activeTranscribeSession(), null)
+})
+
+test('autocura: sem PCM pelo tempo de ociosidade a sessão se cancela sozinha', async () => {
+  const s = startTranscribeSession({ settings: sttSettings() }, { idleTimeoutMs: 30 })
+  await sleep(15)
+  s.push(bytes(100), VOICE_SAMPLE_RATE) // push rearma
+  await sleep(20)
+  assert.equal(activeTranscribeSession()?.id, s.id, 'push recente mantém a sessão')
+  await sleep(40)
+  assert.equal(activeTranscribeSession(), null, 'ociosa → cancelada')
+  assert.throws(() => s.push(bytes(2), VOICE_SAMPLE_RATE), /não está mais ativa/)
+})
+
+test('teto de duração: o excedente é descartado com um aviso e a final usa o que coube', async (t) => {
+  const m = mockFetch(async () => jsonRes(200, { text: 'ok' }))
+  t.after(m.restore)
+  const events: { error?: string }[] = []
+  const s = startTranscribeSession(
+    { settings: sttSettings({ livePartials: false }) },
+    { maxAudioMs: 500, onPartial: (e) => events.push(e) } // 500 ms = 16 000 bytes
+  )
+  s.push(bytes(10_000), VOICE_SAMPLE_RATE)
+  s.push(bytes(10_000), VOICE_SAMPLE_RATE)
+  s.push(bytes(10_000), VOICE_SAMPLE_RATE)
+  assert.equal(events.length, 1)
+  assert.match(events[0].error ?? '', /limite/)
+  await s.stop()
+  assert.equal(wavPcm(await fileBytes(m.calls[0].init)).length, 16_000)
+})
+
+test('final acima do limite de upload: segmentos cortados no silêncio e textos concatenados', async (t) => {
+  const texts = ['um', 'dois', 'três']
+  const m = mockFetch(async () => jsonRes(200, { text: texts.shift() ?? '?' }))
+  t.after(m.restore)
+  const s = startTranscribeSession(
+    { settings: sttSettings({ livePartials: false }) },
+    { apiMaxUploadBytes: 44 + 32_000 } // 1 s por request
+  )
+  // 2,5 s de "fala" com um vale de silêncio perto de 0,9 s
+  const pcm = new Int16Array(40_000).fill(3000)
+  pcm.fill(0, 14_000, 15_600)
+  s.push(new Uint8Array(pcm.buffer), VOICE_SAMPLE_RATE)
+  const r = await s.stop()
+  assert.equal(m.calls.length, 3)
+  assert.equal(r.text, 'um dois três')
+  const sizes = await Promise.all(m.calls.map(async (c) => wavPcm(await fileBytes(c.init)).length))
+  for (const n of sizes) assert.ok(n <= 32_000, `segmento de ${n} bytes cabe no limite`)
+  assert.equal(
+    sizes.reduce((a, b) => a + b, 0),
+    80_000,
+    'nada se perde entre os segmentos'
+  )
+  // o 1º corte caiu dentro do vale de silêncio (amostras 14 000–15 600)
+  assert.ok(sizes[0] / 2 >= 14_000 && sizes[0] / 2 <= 15_600, `corte em ${sizes[0] / 2}`)
+})
+
+test('trimTrailingSilence: apara silêncio final longo (deixa ~400 ms) e mantém o curto', () => {
+  const speech = new Int16Array(16_000).fill(2000)
+  const longSil = new Int16Array(48_000) // 3 s
+  const joined = new Int16Array([...speech, ...longSil])
+  const out = trimTrailingSilence(new Uint8Array(joined.buffer))
+  assert.equal(out.length / 2, 16_000 + 6_400)
+  const shortSil = new Int16Array([...speech, ...new Int16Array(16_000)]) // 1 s
+  assert.equal(trimTrailingSilence(new Uint8Array(shortSil.buffer)).length, shortSil.length * 2)
+  assert.equal(trimTrailingSilence(new Uint8Array(0)).length, 0)
+})
+
+test('splitPcmForUpload: cabe → 1 pedaço; não cabe → pedaços ≤ limite que somam o total', () => {
+  const pcm = new Uint8Array(new Int16Array(10_000).fill(500).buffer)
+  assert.equal(splitPcmForUpload(pcm, 20_000).length, 1)
+  const parts = splitPcmForUpload(pcm, 6_001)
+  assert.ok(parts.length >= 4)
+  for (const p of parts) assert.ok(p.length <= 6_000 && p.length % 2 === 0)
+  assert.equal(
+    parts.reduce((a, p) => a + p.length, 0),
+    pcm.length
+  )
 })
 
 test('push: sampleRate diferente de 16 kHz e tamanho ímpar são erros legíveis', () => {

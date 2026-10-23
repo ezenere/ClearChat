@@ -178,10 +178,29 @@ export function sameRecordPlain(
   return sameJson(l, remote)
 }
 
-const stripCwd = (cfg: Plain): Plain => {
+/**
+ * Campos do config de chat/persona que NUNCA saem no sync: `cwd` (caminho local do dispositivo) e
+ * `voice` (chamada de voz por persona/chat — local até uma versão futura do protocolo incluir o
+ * áudio; enquanto isso não vai ao servidor e o valor local sobrevive aos registros recebidos).
+ */
+const LOCAL_ONLY_CONFIG_KEYS = ['cwd', 'voice'] as const
+
+const stripLocalOnly = (cfg: Plain): Plain => {
   const out = { ...cfg }
-  delete out.cwd
+  for (const k of LOCAL_ONLY_CONFIG_KEYS) delete out[k]
   return out
+}
+
+/**
+ * Config recebido do sync + os campos locais preservados (`cwd` tem regra própria em cada tipo):
+ * o que veio de fora para campos locais é descartado e o valor local (se houver) volta.
+ */
+function withLocalVoice(incoming: Plain, localJson: string | undefined): Plain {
+  const cfg: Plain = { ...incoming }
+  delete cfg.voice
+  const localVoice = localJson ? parse<Plain>(localJson, {}).voice : undefined
+  if (localVoice !== undefined && localVoice !== null) cfg.voice = localVoice
+  return cfg
 }
 
 // ---------------- local → plaintext ----------------
@@ -261,7 +280,7 @@ export function buildLocal(
           name: r.name,
           description: r.description,
           icon: r.icon,
-          config: stripCwd(parse<Plain>(r.config_json, {})),
+          config: stripLocalOnly(parse<Plain>(r.config_json, {})),
           createdAt: r.created_at,
           updatedAt: r.updated_at
         })
@@ -343,7 +362,7 @@ export function buildLocal(
       const plain: Plain = {
         sv: 1,
         title: r.title,
-        config: stripCwd(parse<Plain>(r.config_json, {})),
+        config: stripLocalOnly(parse<Plain>(r.config_json, {})),
         mainSessionId: r.main_session_id ?? '',
         createdAt: r.created_at,
         updatedAt: r.updated_at
@@ -670,7 +689,7 @@ export function applyRemote(
       const cur = conn.prepare('SELECT config_json FROM presets WHERE id = ?').get(id) as
         { config_json: string } | undefined
       const localCwd = cur ? parse<Plain>(cur.config_json, {}).cwd : undefined
-      const cfg: Plain = { ...((p.config ?? {}) as Plain) }
+      const cfg: Plain = withLocalVoice((p.config ?? {}) as Plain, cur?.config_json)
       delete cfg.cwd
       if (typeof localCwd === 'string' && localCwd) cfg.cwd = localCwd
       conn
@@ -770,7 +789,7 @@ export function applyRemote(
       const cur = conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(id) as
         { config_json: string } | undefined
       const localCwd = cur ? parse<Plain>(cur.config_json, {}).cwd : undefined
-      const cfg: Plain = { ...((p.config ?? {}) as Plain) }
+      const cfg: Plain = withLocalVoice((p.config ?? {}) as Plain, cur?.config_json)
       delete cfg.cwd
       cfg.cwd =
         typeof localCwd === 'string' && localCwd ? localCwd : (ctx.defaultCwd?.() ?? homedir())
@@ -987,8 +1006,16 @@ export const LOCAL_TOOLS = [
   'process_list',
   'process_stop'
 ]
-export function usesLocalTools(config: { enabledTools?: unknown; skills?: unknown }): boolean {
-  const tools = Array.isArray(config.enabledTools) ? (config.enabledTools as string[]) : []
+export function usesLocalTools(config: {
+  enabledTools?: unknown
+  skills?: unknown
+  voice?: unknown
+}): boolean {
+  const list = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((t): t is string => typeof t === 'string') : []
+  // a chamada de voz pode liberar tools próprias (`voice.tools.enabledTools`) — contam também
+  const voice = (config.voice ?? {}) as { tools?: { enabledTools?: unknown } | null }
+  const tools = [...list(config.enabledTools), ...list(voice.tools?.enabledTools)]
   const skills = (config.skills ?? {}) as { enabled?: unknown }
   return (
     tools.some((t) => LOCAL_TOOLS.includes(t === 'bash' ? 'shell' : t)) || skills.enabled === true

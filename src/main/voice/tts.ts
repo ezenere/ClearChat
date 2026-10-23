@@ -239,8 +239,12 @@ async function synthesizeApi(
 
   const t0 = Date.now()
   let res: Response
+  let raw: Uint8Array
   try {
     res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal })
+    // o corpo também corre sob o timeout/abort: ler fora do try deixava o timeout no meio do
+    // download escapar como erro cru (nunca virava `TtsError` 'timeout')
+    raw = new Uint8Array(await res.arrayBuffer())
   } catch (e) {
     if (opts.signal?.aborted) throw abortError()
     if (timeout.aborted)
@@ -255,7 +259,6 @@ async function synthesizeApi(
       { backend: 'api', cause: e }
     )
   }
-  const raw = new Uint8Array(await res.arrayBuffer())
   if (res.status < 200 || res.status >= 300) {
     throw httpError(res.status, new TextDecoder().decode(raw), url)
   }

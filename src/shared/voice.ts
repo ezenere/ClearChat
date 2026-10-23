@@ -274,14 +274,15 @@ export interface VoiceCallDefaults {
  */
 export interface VoiceCallTurnConfig {
   /**
-   * Ms de silêncio contínuo que ENCERRAM a fala do usuário (turno). `null` = segue `audioInput`
-   * (`silenceStopMs`, quando `silenceStopEnabled` e > 0; senão `DEFAULT_TURN_SILENCE_MS`).
+   * Ms de silêncio contínuo que ENCERRAM a fala do usuário (turno). `null` = o padrão da chamada
+   * (`DEFAULT_TURN_SILENCE_MS`) — independente do auto-stop do ditado (`audioInput.silenceStopMs`,
+   * 5 s por padrão, longo demais para turno de conversa).
    */
   silenceStopMs: number | null
 }
 
-/** Fallback do silêncio de turno quando `audioInput` está com auto-stop desligado/zerado. */
-export const DEFAULT_TURN_SILENCE_MS = 2000
+/** Silêncio de turno padrão da chamada (ms) — curto o bastante para conversa natural. */
+export const DEFAULT_TURN_SILENCE_MS = 1000
 
 export const DEFAULT_VOICE_CALL_TURN: VoiceCallTurnConfig = { silenceStopMs: null }
 
@@ -502,7 +503,8 @@ export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
       enabled: boolOr(fillers?.enabled, DEFAULT_VOICE_CALL_DEFAULTS.fillers.enabled),
       prompt: promptOrNull(fillers?.prompt)
     },
-    // null = segue `audioInput`; 0 não faz sentido aqui (sem limite = sem turnos) e vira null
+    // null = o padrão da chamada (DEFAULT_TURN_SILENCE_MS); 0 não faz sentido aqui (sem limite =
+    // sem turnos) e vira null
     turn: { silenceStopMs: turnMs && turnMs > 0 ? turnMs : null }
   }
 }
@@ -511,17 +513,17 @@ export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
 
 /**
  * Silêncio que encerra a fala do usuário na chamada (ms): `turn.silenceStopMs` quando definido;
- * senão `audioInput` (`silenceStopMs` com auto-stop ligado e > 0); senão `DEFAULT_TURN_SILENCE_MS`
- * (na chamada o turno SEMPRE tem limite — sem limite não há turnos).
+ * senão `DEFAULT_TURN_SILENCE_MS` (na chamada o turno SEMPRE tem limite — sem limite não há
+ * turnos). O auto-stop do ditado (`audioInput`) NÃO é herdado: o padrão dele (5 s) é longo demais
+ * para turno de conversa. `audioInput` segue aceito por compatibilidade com os chamadores.
  */
 export function resolveTurnSilenceMs(
   turn: VoiceCallTurnConfig | null | undefined,
-  audioInput: Pick<AudioInputSettings, 'silenceStopEnabled' | 'silenceStopMs'>
+  audioInput?: Pick<AudioInputSettings, 'silenceStopEnabled' | 'silenceStopMs'>
 ): number {
+  void audioInput
   const explicit = turn?.silenceStopMs
   if (typeof explicit === 'number' && explicit > 0) return Math.round(explicit)
-  if (audioInput.silenceStopEnabled && audioInput.silenceStopMs > 0)
-    return Math.round(audioInput.silenceStopMs)
   return DEFAULT_TURN_SILENCE_MS
 }
 

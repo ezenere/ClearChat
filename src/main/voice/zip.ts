@@ -213,7 +213,21 @@ async function inflateEntry(buf: Uint8Array, entry: ZipEntry): Promise<Uint8Arra
     throw new Error(`zip inválido: dados truncados em ${JSON.stringify(entry.name)}`)
   const raw = buf.subarray(start, end)
   if (entry.method === 0) return new Uint8Array(raw)
-  if (entry.method === 8) return new Uint8Array(await inflateRawAsync(raw))
+  // teto = tamanho declarado (+1 para detectar excesso): um zip-bomb não consegue inflar além disso
+  if (entry.method === 8) {
+    try {
+      return new Uint8Array(
+        await inflateRawAsync(raw, { maxOutputLength: Math.max(1, entry.uncompressedSize + 1) })
+      )
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE')
+        throw new Error(
+          `zip inválido: ${JSON.stringify(entry.name)} descomprime além do tamanho declarado (${entry.uncompressedSize} bytes)`,
+          { cause: e }
+        )
+      throw e
+    }
+  }
   throw new Error(
     `zip: método de compressão ${entry.method} não suportado em ${JSON.stringify(entry.name)} (esperado store/deflate)`
   )

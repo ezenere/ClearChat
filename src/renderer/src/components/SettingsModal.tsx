@@ -327,7 +327,9 @@ export function SettingsModal(): React.JSX.Element {
         (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
       }
     >
-      <div className="mb-5 flex gap-0.5 overflow-x-auto border-b border-border">
+      {/* 9 abas cabem numa linha no modal de 680 px (sem barra de rolagem); janela estreita quebra a
+          linha em vez de cortar o rótulo */}
+      <div data-testid="settings-tabs" className="mb-5 flex flex-wrap border-b border-border">
         {(
           [
             ['account', 'Conta'],
@@ -344,9 +346,10 @@ export function SettingsModal(): React.JSX.Element {
           <button
             key={id}
             type="button"
+            aria-current={tab === id ? 'page' : undefined}
             onClick={() => setTab(id)}
             className={cn(
-              '-mb-px shrink-0 border-b-2 px-1.5 pb-2 text-[13px] whitespace-nowrap transition-colors',
+              '-mb-px shrink-0 border-b-2 px-[5px] pb-2 text-[12.5px] whitespace-nowrap transition-colors',
               tab === id ? 'border-accent text-fg' : 'border-transparent text-subtle hover:text-fg'
             )}
           >

@@ -7,10 +7,18 @@
 // Rodar: npm run test:unit
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { catalogFileName, findCatalogEntry } from '../src/main/voice/catalog.ts'
 import {
+  createKokoroEngine,
+  espeakInstallHint,
   kokoroInputIds,
   KOKORO_VOCAB,
   mapEspeakPhonemes,
+  phonemizeText,
   ESPEAK_E2M
 } from '../src/main/voice/ttsLocal.ts'
 import {
@@ -324,4 +332,114 @@ test('kokoroInputIds: vocabulário char-level, chars desconhecidos caem, truncam
   assert.deepEqual(kokoroInputIds('a'), [43])
   // truncamento
   assert.equal(kokoroInputIds('a'.repeat(600)).length, 509)
+})
+
+// ---------------- correções: corpo sob timeout, espeak-ng com `--`, sessão que falhou ----------------
+
+test('tts api: timeout DURANTE a leitura do corpo vira TtsError timeout (não erro cru)', async () => {
+  // cabeçalhos chegam na hora; o corpo nunca termina (até o signal abortar)
+  const stalled = ((_url: unknown, init?: RequestInit) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new Uint8Array([1, 2, 3]))
+        init?.signal?.addEventListener('abort', () =>
+          c.error(new DOMException('aborted', 'AbortError'))
+        )
+      }
+    })
+    return Promise.resolve(
+      new Response(body, { status: 200, headers: { 'content-type': 'audio/wav' } })
+    )
+  }) as typeof fetch
+  await withFetch(stalled, () =>
+    assert.rejects(
+      synthesize({ text: 'oi', settings: apiSettings() }, { timeoutMs: 30 }),
+      (e: unknown) => e instanceof TtsError && e.kind === 'timeout'
+    )
+  )
+})
+
+test('phonemizeText: o texto vai depois de `--` (texto com "-" nunca vira opção do espeak-ng)', async () => {
+  const calls: string[][] = []
+  const run = async (cmd: string, args: string[]): Promise<string> => {
+    calls.push([cmd, ...args])
+    return 'ˈite‍ɪŋ'
+  }
+  await phonemizeText('- item um, -f/etc/passwd', run)
+  assert.ok(calls.length >= 2)
+  for (const c of calls) {
+    assert.equal(c[0], 'espeak-ng')
+    const dd = c.indexOf('--')
+    assert.ok(dd > 0 && dd === c.length - 2, `"--" logo antes do texto: ${JSON.stringify(c)}`)
+  }
+  assert.equal(calls[0][calls[0].length - 1], '- item um')
+  assert.equal(calls[1][calls[1].length - 1], ' -f/etc/passwd')
+})
+
+const espeakPresent = ((): boolean => {
+  try {
+    execFileSync('espeak-ng', ['--version'], { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+})()
+
+test(
+  'phonemizeText REAL: "- item", "-f/arquivo" e "-wfile" fonemizam o texto (espeak-ng do sistema)',
+  { skip: espeakPresent ? false : 'espeak-ng não instalado' },
+  async () => {
+    const run = async (cmd: string, args: string[]): Promise<string> =>
+      execFileSync(cmd, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    const dash = await phonemizeText('- item um', run)
+    assert.match(dash, /it/, 'a frase com "- " não é descartada')
+    const f = await phonemizeText('-f/etc/hostname', run)
+    assert.ok(f.length > 0 && !f.includes('\n'), 'não leu o arquivo: fonemizou o texto')
+    const w = await phonemizeText('-wfile', run)
+    assert.ok(w.length > 0, 'não ficou esperando o stdin')
+  }
+)
+
+test('espeak-ng ausente: dica de instalação por plataforma (Linux sem citar só o pacman)', () => {
+  const linux = espeakInstallHint('linux')
+  assert.match(linux, /gerenciador de pacotes/)
+  assert.match(linux, /apt/)
+  assert.match(linux, /dnf/)
+  assert.match(espeakInstallHint('darwin'), /brew install espeak-ng/)
+  assert.match(espeakInstallHint('win32'), /PATH/)
+})
+
+test('kokoro: sessão ONNX que falhou ao criar não fica em cache (a próxima síntese tenta de novo)', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'kokoro-cache-'))
+  try {
+    // modelo + voz "instalados": arquivo + registro no manifest com o mesmo tamanho (a checagem de
+    // lista é barata — tamanho do registro; artefatos de TTS não têm magic)
+    const dir = join(base, 'models')
+    mkdirSync(dir, { recursive: true })
+    const manifest: Record<string, unknown> = {}
+    for (const id of ['kokoro-onnx', 'kokoro-voice-pf-dora']) {
+      const file = catalogFileName(findCatalogEntry(id)!)!
+      writeFileSync(join(dir, file), new Uint8Array(2048))
+      manifest[id] = { version: '1', file, sha256: null, size: 2048, installedAt: '' }
+    }
+    writeFileSync(join(dir, 'manifest.json'), JSON.stringify(manifest))
+    let creates = 0
+    const engine = createKokoroEngine({
+      baseDir: base,
+      run: async () => 'a',
+      createSession: async () => {
+        creates++
+        throw new Error('onnx quebrou')
+      }
+    })
+    for (let i = 0; i < 2; i++)
+      await assert.rejects(
+        engine.synthesize({ text: 'oi', voice: 'pf_dora', format: 'wav' }),
+        /onnx quebrou/
+      )
+    assert.equal(creates, 2, 'a falha não ficou cacheada')
+    await engine.release()
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
 })

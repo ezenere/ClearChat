@@ -22,6 +22,7 @@ import {
   verifyVoskModelDir,
   type LoadedSttEngine
 } from '../src/main/voice/sttLocal.ts'
+import { shutdownSttWorker } from '../src/main/voice/sttWorkerHost.ts'
 import { crc32, extractZipToDir, readZipEntries, safeEntrySegments } from '../src/main/voice/zip.ts'
 
 // ---------------- fixture zip (writer mínimo para o teste) ----------------
@@ -31,6 +32,8 @@ interface ZipFixEntry {
   data?: Uint8Array
   method?: 0 | 8 | 12
   corruptCrc?: boolean
+  /** Tamanho descomprimido DECLARADO (padrão: o real) — para o teste de zip-bomb. */
+  declaredSize?: number
 }
 
 function makeZip(entries: ZipFixEntry[]): Uint8Array {
@@ -49,7 +52,7 @@ function makeZip(entries: ZipFixEntry[]): Uint8Array {
     local.writeUInt16LE(method, 8)
     local.writeUInt32LE(crc >>> 0, 14)
     local.writeUInt32LE(comp.length, 18)
-    local.writeUInt32LE(data.length, 22)
+    local.writeUInt32LE(e.declaredSize ?? data.length, 22)
     local.writeUInt16LE(name.length, 26)
     chunks.push(local, name, Buffer.from(comp))
     const cd = Buffer.alloc(46)
@@ -59,7 +62,7 @@ function makeZip(entries: ZipFixEntry[]): Uint8Array {
     cd.writeUInt16LE(method, 10)
     cd.writeUInt32LE(crc >>> 0, 16)
     cd.writeUInt32LE(comp.length, 20)
-    cd.writeUInt32LE(data.length, 24)
+    cd.writeUInt32LE(e.declaredSize ?? data.length, 24)
     cd.writeUInt16LE(name.length, 28)
     cd.writeUInt32LE(offset, 42)
     central.push(cd, name)
@@ -148,6 +151,21 @@ test('extractZipToDir: expectedRoot, zip-slip, método desconhecido, CRC, vazio 
   )
   // nada escapou do destino
   await assert.rejects(readFile(join(dir, '..', 'evil.txt')))
+})
+
+test('extractZipToDir: entry que infla além do tamanho declarado (zip-bomb) para no teto', async (t) => {
+  const dir = await tmpDir('zip-bomb-')
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const zipPath = join(dir, 'bomb.zip')
+  // 8 MB de zeros declarados como 1 KB: o inflate para em 1 KB + 1 em vez de alocar tudo
+  await writeFile(
+    zipPath,
+    makeZip([{ name: 'm/big.bin', data: new Uint8Array(8 * 1024 * 1024), declaredSize: 1024 }])
+  )
+  await assert.rejects(
+    () => extractZipToDir(zipPath, join(dir, 'out')),
+    /descomprime além do tamanho declarado \(1024 bytes\)/
+  )
 })
 
 test('readZipEntries/safeEntrySegments: campos parseados e nomes perigosos rejeitados', () => {
@@ -477,6 +495,7 @@ test(
     t.after(() => rm(dir, { recursive: true, force: true }))
     await mkdir(modelsDir(dir), { recursive: true })
     await symlink(realModel!, join(modelsDir(dir), entry.url!.split('/').pop()!))
+    t.after(() => shutdownSttWorker())
     const backend = createSttLocalBackend({
       baseDir: dir,
       selection: { engine: 'whisper.cpp', model: entry.id }

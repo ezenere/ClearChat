@@ -298,7 +298,7 @@ interface ClearApi {
   onEvent(cb: (e: AgentEvent) => void): () => void
 }
 ```
-Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`, parciais de voz em `voice:partial`, progresso de modelos locais em `voice:models:progress` e de clipes em `voice:tts:clips:progress`, estado da chamada de voz em `voice:call:state` e utterances faladas em `voice:call:utterance` (os canais de voz são `voice:settings:get|set`, `voice:transcribe:start|push|stop|cancel`, `voice:models:list|download|cancel|remove`, `voice:tts:synth|test|clips:generate|clips:list|voices` e `voice:call:start|stop|mute|speech-begin|speech-end|turn|playback-idle|barge-in` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
+Canais IPC: `domínio:método` (ex.: `chats:create`, `agent:send`), eventos em `agent:event`, parciais de voz em `voice:partial`, progresso de modelos locais em `voice:models:progress` e de clipes em `voice:tts:clips:progress`, estado da chamada de voz em `voice:call:state` e utterances faladas em `voice:call:utterance` (os canais de voz são `voice:settings:get|set`, `voice:transcribe:start|push|stop|cancel`, `voice:models:list|download|cancel|remove`, `voice:tts:synth|test|clips:generate|clips:list|voices` e `voice:call:start|stop|mute|speech-begin|speech-end|turn|playback-idle|barge-in|get-state` e `voice:runtime:status` — ver "Áudio"). Constantes em `src/shared/ipc.ts`.
 
 ## Construção da request (`src/main/agent/request.ts` — função pura `buildRequest(chat, session, history, provider)`, usada pelo runner E pelo preview)
 
@@ -753,7 +753,7 @@ Estética: escura, elegante, minimalista (referência: Linear / Claude desktop /
 - **Contexto**: medidor compacto na barra do composer (e no banner de subsessão) — anel + "38k / 200k · 19%" (recolhido: "19%" → só o anel), cor muda em 70% / limite; tooltip com entrada/resposta/cache/janela; janela desconhecida → "N tokens · definir janela"; clique → seção Contexto da aba Chat (janela desconhecida → já abre "Janela e compactação"). Banner acima do composer no limite com "Compactar conversa" (dispensável). Mensagens antes da fronteira ficam visíveis porém esmaecidas, com divisor "Conversa compactada · N mensagens resumidas · não são mais enviadas à API" (Ocultar/Mostrar); a fronteira é um card "Resumo da conversa" (markdown recolhível, (i) "Enviado como mensagem role:user no início do histórico", N mensagens, tokens antes → depois, custo). Compactação em andamento: card com o resumo ao vivo. Erro de contexto excedido → botão "Compactar e tentar de novo".
 - **Composer**: textarea auto-grow, Enter envia / Shift+Enter quebra linha, botão Parar quando rodando. Mensagens **enfileiradas** aparecem acima do composer como chips com botão ⚡ (forçar) no canto e X (remover). Barra de baixo (`composer-toolbar`): anexar, lâmpada, **ícone do host** (só com sync ativo — ver "Sync → UI"), (i), estado ("Aguardando aprovação"/"Trabalhando…") ou a dica "Enter envia…"; à direita a **pílula do modelo** (`chat/ModelPill.tsx`, saiu do cabeçalho: "<Provedor> · <vendor/>modelo", ícone ✦; tooltip com o endpoint para onde vai o `model`; clique → aba Modelo; na subsessão mostra o par dela), o medidor de contexto, o **gasto do chat** e Parar/Enviar.
 - **Gasto do chat** (`chat/SpendButton.tsx`, soma pura em `lib/chatSpend.ts` → `computeChatSpend`, memoizada; testes `e2e/chatUi.test.ts`): botão ícone `Receipt` + "$0,42" (pt-BR; recolhido só o ícone; some sem nenhuma chamada) → popover "Gasto deste chat" com o total e, por origem: **Respostas** (mensagens `assistant` da principal, todos os ramos — entrada sem cache = promptTokens − cache lido − escrita de cache, entrada do cache, escrita de cache, saída e "dos quais raciocínio", em tokens; custo da origem), **Subagentes** (as mesmas linhas somadas nas subsessões + "Por subagente" recolhido; as mensagens das subsessões não abertas são carregadas em segundo plano), **Smart-Approve (juiz)** (`meta.smartApprove.usage` das mensagens tool; falha HTTP sem usage não conta), **Coleta de contexto** (`capturedContext.main/sessions[*]` → `calls`/`cost` acumulados; `cost` 0 sem `usage.cost` na última chamada = desconhecido), **Título automático** (`meta.autoTitle.usage`) e, quando houver, **Compactação** (`meta.compactUsage`) e **Extração de memória** (`meta.memoryExtraction.usage`). Só o que a API informou: o custo vem por chamada (sem divisão por tipo de token — por isso as linhas de tokens não têm custo próprio); chamada sem `cost` conta os tokens e entra como "custo desconhecido" ("$0,15 + ?" e "N chamadas sem custo informado pelo provedor"). Atualiza ao vivo com os eventos de mensagem.
-- **Recolhimento do cabeçalho e da barra do composer** (`lib/responsiveBar.ts` → `BAR_ITEMS` + `planCollapse`, puro; medida em `lib/useBarCollapse.ts`): cada contêiner mede a própria largura (ResizeObserver + MutationObserver + a cada render, em layout effect) e cada item desce por prioridade — completo → curto → só ícone (o Tip leva o texto inteiro); sobra de espaço devolve degraus (maior prioridade primeiro). O título não é item: os itens recolhem até ele ter até 240 px e só então ele trunca (nunca some). Ordem (maior = legível por mais tempo): aprovações pendentes em outros chats 100 ("2 aprovações pendentes" → ícone + 2) · falha de conexão 96 · pergunta pendente 95 · estado do agente 80 (→ só o ponto) · medidor de contexto 70 · pílula do modelo 65 ("modelo" → ícone) · seletor de sessão 60 ("<sessão> · N sub" → "N sub") · aprovações do chat ("Sempre: …"/Smart-Approve) 50 (→ ícone) · processos 40 ("2 processos" → "2") · gasto 30 (→ ícone) · dica "Enter envia…" 10 (some). O ícone do host (tamanho fixo) não é item. Sem quebra de linha nem overflow (itens `whitespace-nowrap`, contêineres `overflow-x-clip`); E2E `e2e/chat-bars-ui.spec.ts` (1440/1100/900 px, painel e arquivo abertos/fechados).
+- **Recolhimento do cabeçalho e da barra do composer** (`lib/responsiveBar.ts` → `BAR_ITEMS` + `planCollapse`, puro; medida em `lib/useBarCollapse.ts`): cada contêiner mede a própria largura (ResizeObserver + MutationObserver + a cada render, em layout effect) e cada item desce por prioridade — completo → curto → só ícone (o Tip leva o texto inteiro); sobra de espaço devolve degraus (maior prioridade primeiro). O título não é item: os itens recolhem até ele ter até 240 px e só então ele trunca (nunca some). Ordem (maior = legível por mais tempo): aprovações pendentes em outros chats 100 ("2 aprovações pendentes" → ícone + 2) · falha de conexão 96 · pergunta pendente 95 · estado do agente 80 (→ só o ponto) · medidor de contexto 70 · pílula do modelo 65 ("modelo" → ícone) · seletor de sessão 60 ("<sessão> · N sub" → "N sub") · aprovações do chat ("Sempre: …"/Smart-Approve) 50 (→ ícone) · processos 40 ("2 processos" → "2") · gasto 30 (→ ícone) · controles de voz 20 (mic + menu do microfone + telefone → só o mic → some; só com o ditado parado; na chamada a barra da chamada substitui o composer) · dica "Enter envia…" 10 (some). O ícone do host (tamanho fixo) não é item. Sem quebra de linha nem overflow (itens `whitespace-nowrap`, contêineres `overflow-x-clip`); E2E `e2e/chat-bars-ui.spec.ts` (1440/1100/900 px, painel e arquivo abertos/fechados).
 - **Layout** do chat: `[LISTA | CHAT | ARQUIVO | CONFIGS]` — o **painel de arquivo** (ver "Visualizador de arquivos") fica entre a conversa e o painel direito, só quando o chat tem um arquivo ativo.
 - **Painel direito** (colapsável), abas:
   Cabeçalho: abas **Modelo · Chat · Tools · Memória · Arquivos** (a seção Skills fica na aba Tools) (ícone + rótulo; `role="tab"`), botão **"Ver request"** ({ }, de qualquer aba → modal com o JSON exato da próxima request, `previewRequest`) e fechar. A última aba fica em `localStorage` (`clearchat.panelTab`, com try/catch). Em subsessão, as abas de config mostram a nota "Configuração do chat (compartilhada) · esta subsessão usa o modelo X e o system prompt de subagentes". Tudo editável a qualquer momento; salva automaticamente. Os editores (`panel/editors.tsx`) recebem `{cfg, patch}` e são os mesmos no editor de personas.
@@ -1126,7 +1126,7 @@ Gerenciador dos arquivos dos modelos locais de áudio: catálogo versionado, dow
   - TTS **Kokoro** (Apache-2.0) — artefatos da conversão ONNX oficial (`onnx-community/Kokoro-82M-v1.0-ONNX`, Apache-2.0; pesos originais `hexgrad/Kokoro-82M`): `kokoro-onnx` (`onnx/model.onnx`, 325.532.232 B) e `kokoro-onnx-q8` (`onnx/model_quantized.onnx`, 92.361.116 B) + os voice packs pt-BR `kokoro-voice-pf-dora`/`kokoro-voice-pm-alex`/`kokoro-voice-pm-santa` (`voices/<voz>.bin`, 522.240 B cada, tensores de estilos 510×256 fp32). sha256 = `lfs.oid` da API tree do HF (2026-10-22), conferidos também num download real.
   - TTS **Chatterbox** (MIT) — o fine-tune pt-BR do `ResembleAI/Chatterbox-Multilingual-pt-br` (pack single-language do Chatterbox Multilingual v3): `chatterbox-pt-br-t3` (`t3_pt_br.safetensors`, 2.143.990.296 B) e `chatterbox-pt-br-s3gen` (`s3gen_v3.safetensors`, 1.056.381.804 B); o runtime (e o `grapheme_mtl_merged_expanded_v1.json`) entram numa fatia futura — aqui só os arquivos.
 - **Verificação** (regra declarada): tamanho **exato** (`sizeBytes`) + magic bytes sempre (`.bin` → `6c 6d 67 67` = magic ggml 0x67676d6c LE; `.gguf` → `GGUF`; `.zip` → `PK\x03\x04`), e sha256 contra `sha256Oficial` quando o catálogo tem um (o único sem hash oficial é o Vosk). Artefatos de **TTS não têm magic** (`.onnx`, `.safetensors` e os `voices/*.bin` do Kokoro são tensores crus — o `.bin` de voz NÃO é ggml) e são verificados por tamanho exato + sha256. Falhou → o `.part` é apagado e nada é instalado nem registrado.
-- **Layout/manifest**: `<userData>/models/<arquivo>` (nome = basename da URL); o download corre para `<arquivo>.part` com rename atômico no fim; `manifest.json` = `{ [id]: { version, file, sha256 (calculado do arquivo instalado), size, installedAt } }` (conferível depois contra o arquivo). `readManifest`/`writeManifest` são idempotentes: manifest ausente/ilegível/JSON inválido → renomeado para `manifest.json.bak` e tratado como vazio (a instalação regrava por cima); entradas com campos inválidos (inclusive `file` com separadores) são descartadas; a escrita é atômica (`.tmp` + rename, chaves ordenadas).
+- **Layout/manifest**: `<userData>/models/<arquivo>` (nome = basename da URL); o download corre para `<arquivo>.part` com rename atômico no fim; `manifest.json` = `{ [id]: { version, file, sha256 (calculado do arquivo instalado), size, installedAt } }` (conferível depois contra o arquivo). `readManifest`/`writeManifest` são idempotentes: manifest ausente/ilegível/JSON inválido → renomeado para `manifest.json.bak` e tratado como vazio (a instalação regrava por cima); entradas com campos inválidos (inclusive `file` com separadores) são descartadas; a escrita é atômica (`.tmp` **com nome único** + rename, chaves ordenadas). **Concorrência**: todo read-modify-write do manifest (registro do download, remoção) passa por `updateManifest(baseDir, mutate)` — fila por pasta (trava em promise no módulo) que **relê o manifest dentro da trava**; downloads/remoções em paralelo nunca apagam o registro um do outro (antes cada um gravava a cópia lida no começo). O `.part` também tem nome único por download (`<arquivo>.<rand>.part`; órfãos `<arquivo>.part`/`<arquivo>.*.part` são limpos no próximo download e na remoção). `removeLocalModel` de um modelo **Vosk** apaga também a pasta extraída `models/<id>/`. Clipes de voz (`generateClips`): gerações da mesma voz em série (a 2ª reaproveita o cache da 1ª) e `.part`/`.tmp` com nome único.
 - **API** (`src/main/voice/models.ts`): `listLocalModels(baseDir)` → catálogo + estado (`notInstalled` | `downloading` | `installed` | `corrupt`) + caminho e tamanho do instalado; `downloadLocalModel(baseDir, id, { onProgress(bytes, total), signal, fetch? })`; `removeLocalModel` (idempotente — também limpa `.part` órfão e ids fora do catálogo que o manifest registra); `resolveLocalModelPath`; `readManifest`/`writeManifest`; `verifyModelFile` (checagem profunda, devolve o sha256 calculado). Estados: `installed` = registrado no manifest + arquivo com o tamanho do registro + magic ok (a checagem de lista é **barata** — sha256 profundo é `verifyModelFile`); `corrupt` = arquivo sem registro, registro sem arquivo ou divergência de tamanho/magic; `downloading` = download em voo nesta sessão; `.part` órfão (de crash) não muda o estado (limpo no próximo download/remoção). `downloadLocalModel` é idempotente (instalado → devolve sem baixar; corrompido → baixa por cima), aborta via `signal` limpando o `.part` (propaga `AbortError`), falha no meio limpa o `.part`, e dois downloads do mesmo id em paralelo → erro legível. O `.zip` do Vosk fica como está — a extração é da fatia de runtime.
 
 ### Configuração e sessão de transcrição por IPC (`src/main/voice.ts`, `src/main/voice/session.ts`, `voice:*`)
@@ -1139,9 +1139,10 @@ Fiação main+preload para a UI do renderer (SPEC → "API do preload"): setting
 - `audioInput`/`voiceCallDefaults` não têm segredo e continuam acessíveis no `settings:get/set` genérico (o canal tipado é a forma canônica).
 
 **Sessão de transcrição (`voice:transcribe:*`, `src/main/voice/session.ts` — sem Electron)** — buffer PCM16 mono **16 kHz** (`VOICE_SAMPLE_RATE`); o áudio vai para a API como **wav** (`encodeWav`, PCM 16-bit mono, cabeçalho RIFF de 44 bytes) nas parciais e no final:
-- `start(language?)` cria a sessão e devolve o id (canal `voice:transcribe:start`; `language` ausente → `audioInput.language`). **Sessão global única** por janela: iniciar com outra ativa → erro legível; `stop`/`cancel` liberam a vaga (o `stop` libera ao terminar).
+- `start(language?)` cria a sessão e devolve o id (canal `voice:transcribe:start`; `language` ausente → `audioInput.language`). **Uma sessão ATIVA por vez, com autocura** (o main nunca depende do renderer para limpar): iniciar com outra ativa **cancela e substitui** a anterior (o renderer que a abriu desistiu dela — recarregou, caiu, perdeu o id); uma anterior já em `stop` (final em voo) segue até o fim e devolve a final a quem a espera (o `stop` libera a vaga de captura **na hora**). Cada sessão guarda o dono (`ownerId` = `webContents.id` de quem chamou `start`); o main cancela as sessões do dono em `render-process-gone`, `did-start-navigation` (frame principal, reload/navegação) e `closed` da janela (`resetVoiceForWebContents` em `src/main/ipc.ts`, ligado em `createWindow` — `cancelTranscribeSessions(owner)` aborta também a final em voo). **Ociosidade**: sem `push` por 60 s (`STT_SESSION_IDLE_MS`) com a sessão ativa → cancelada sozinha. `push`/`stop`/`cancel` acham a sessão viva pelo id (`findTranscribeSession`): `cancel` vale também para a sessão que está transcrevendo a final (aborta).
 - `push(sessionId, pcm16, sampleRate?)` acumula (sampleRate informado, se vier, precisa ser 16000; tamanho ímpar/bytes inválidos → erro legível).
-- **Parciais melhor-esforço** (evento `voice:partial`, assinado por `onVoicePartial`, payload `VoicePartialEvent = { sessionId, text, isFinal: false, ms }`): a cada `STT_PARTIAL_INTERVAL_MS` (1 s, disparado no `push` seguinte) transcreve-se o pedaço do acumulado desde o fim da parcial aceita anterior menos `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro — palavras na fronteira podem sair reescritas/duplicadas; a final reescreve tudo). Só quando `settings.livePartials` e `chooseSttBackend(settings, { purpose: 'partial', hasLocalReady })` = 'api', com `hasLocalReady` = modelo instalado **e** motor de inferência pronto (nesta fatia o motor não existe → false — ver "Modelos locais por IPC" abaixo; no modo `local` a parcial **nunca** vai para a API; parciais de verdade vêm do motor local em streaming, outra fatia). Regra de latência: a request em voo é **abortada** quando a seguinte dispara, resultados velhos expiram (geração anterior) e nunca há fila; falha de parcial é engolida (melhor-esforço — a sessão segue).
+- **Parciais melhor-esforço** (evento `voice:partial`, assinado por `onVoicePartial`, payload `VoicePartialEvent = { sessionId, text, isFinal: false, ms }`): a cada `STT_PARTIAL_INTERVAL_MS` (1 s, disparado no `push` seguinte) transcreve-se o pedaço do acumulado desde o fim da parcial aceita anterior menos `STT_PARTIAL_OVERLAP_MS` (300 ms; a API transcreve cada pedaço inteiro — palavras na fronteira podem sair reescritas/duplicadas; a final reescreve tudo). Só quando `settings.livePartials` e `chooseSttBackend(settings, { purpose: 'partial', hasLocalReady })` = 'api', com `hasLocalReady` = modelo instalado **e** motor de inferência pronto (nesta fatia o motor não existe → false — ver "Modelos locais por IPC" abaixo; no modo `local` a parcial **nunca** vai para a API; parciais de verdade vêm do motor local em streaming, outra fatia). Regra de latência (substitui o "aborta a request em voo" original): **nunca** dispara uma parcial com outra em voo (sem fila e sem abortar-e-reenviar — a próxima, quando a anterior volta, recobre desde o fim dela); a janela de cada parcial é no máximo **10 s** de áudio (`STT_PARTIAL_WINDOW_MS` — parciais nunca crescem com a gravação); resultado que chega depois do fim da sessão expira; falha de parcial é engolida (melhor-esforço), **exceto** auth/cota/config (`SttError` `auth`/`quota`/`config`): as parciais ficam desligadas no resto da sessão e sai **um** `VoicePartialEvent` com `error` legível ("Parciais ao vivo desligadas nesta gravação: …"; a final segue valendo). Parciais **locais** (whisper.cpp em janelas) só para modelos até o `ggml-base` (`SttLocalBackend.partials` — `STT_LOCAL_PARTIAL_MAX_MODEL_BYTES` = 160 MB; do `small` para cima só a final, para não atrasá-la no worker serial).
+- **Teto e tamanho da final**: a sessão aceita no máximo **30 min** de áudio (`STT_SESSION_MAX_MS`); o excedente é descartado e sai um `VoicePartialEvent.error` ("Gravação atingiu o limite…") — a final transcreve o que coube. Antes da final, silêncio final > 1,5 s é **aparado** (fica ~400 ms; RMS < ≈ −46 dBFS por quadro de 20 ms — `trimTrailingSilence`; o whisper alucina em silêncio longo). Final cujo wav passa do limite de upload das APIs (25 MB; usamos 24 MiB — `STT_API_MAX_UPLOAD_BYTES`, ≈ 13 min a 16 kHz mono 16-bit) vai em **segmentos** sequenciais (`splitPcmForUpload`: cada corte no quadro de 100 ms mais silencioso dos últimos ~20 s antes da fronteira) e os textos são concatenados (`ms` somado, `fellBack` se algum segmento caiu no fallback).
 - `stop(sessionId)` cancela o loop e transcreve o buffer **inteiro** como final (`purpose: 'final'`, via `transcribeWithFallback` com o motor local injetado quando houver) → `{ text, model, baseUrl, ms, backend, fellBack, fallbackReason? }`. Erro de API propaga legível (`SttError` pt-BR). Sem áudio capturado → `{ text: '' }` sem ir à rede.
 - `cancel(sessionId)` descarta tudo sem transcrever (aborta o que estiver em voo; id desconhecido = sem efeito; idempotente). Depois de `stop`/`cancel`, `push`/`stop` na sessão → erro legível.
 
@@ -1162,7 +1163,7 @@ Síntese de fala do main: cliente OpenAI-compatível `/audio/speech` + motor loc
 
 **Motor local Kokoro (`ttsLocal.ts`)** — o pipeline do `hexgrad/kokoro` (`model.py`): fonemas → ids por caractere (chars fora do vocabulário caem) → `[0, *ids, 0]` → estilo `voice[min(nº de tokens, 509)]` → `waveform` 24 kHz → wav PCM16:
 - **Pesos do catálogo** (`<userData>/models`, baixados pelo gerenciador de componentes): modelo `kokoro-onnx` (fp32 — **preferida**, a mais rápida em CPU) ou `kokoro-onnx-q8` + voice pack `kokoro-voice-<voz>` (`pf_dora`/`pm_alex`/`pm_santa`; banco de estilos 510×256 fp32). Modelo/voz não instalados → `TtsError` `config` ("baixe os arquivos do Kokoro em Configurações → Áudio"). A sessão ONNX (`onnxruntime-node`, CPU) fica memoizada por modelo.
-- **Fonemização pt-BR**: `espeak-ng` do **SISTEMA** (CLI `--ipa=3`: estresse + ties) + o pós-processamento do misaki (`EspeakG2P`, `version=None` — `ESPEAK_E2M` colapsa os dífonos: 't^ʃ'→'ʧ', 'e^ɪ'→'A'…; ties/hífens removidos; saída em NFD). A pontuação é preservada (o texto é partido nas marcas e elas voltam entre os fragmentos — o CLI a perde). Validado byte a byte contra o `phonemizer` python que o misaki usa. Sem `espeak-ng` no sistema → `TtsError` `config` com o pacote a instalar (o app **não** embute o espeak-ng, que é GPL — é chamado como ferramenta externa, como o `git`).
+- **Fonemização pt-BR**: `espeak-ng` do **SISTEMA** (CLI `--ipa=3`: estresse + ties) + o pós-processamento do misaki (`EspeakG2P`, `version=None` — `ESPEAK_E2M` colapsa os dífonos: 't^ʃ'→'ʧ', 'e^ɪ'→'A'…; ties/hífens removidos; saída em NFD). A pontuação é preservada (o texto é partido nas marcas e elas voltam entre os fragmentos — o CLI a perde). Validado byte a byte contra o `phonemizer` python que o misaki usa. Sem `espeak-ng` no sistema → `TtsError` `config` com a dica de instalação **da plataforma** (`espeakInstallHint`: Linux = gerenciador de pacotes da distribuição, com exemplos apt/dnf/pacman; macOS = Homebrew; Windows = release oficial no PATH) (o app **não** embute o espeak-ng, que é GPL — é chamado como ferramenta externa, como o `git`). O texto vai **depois de `--`** e o processo roda com **stdin fechado** (`spawn` sem shell, timeout 15 s, teto de 1 MB de saída): texto começando com `-` ("- item", "-f/arquivo", "-w…") nunca vira opção. Sessão ONNX que falhou ao criar não fica em cache; `KokoroEngine.release()` solta as sessões (modelo do Kokoro removido). Leitura do corpo da resposta da API de fala também corre sob o timeout (`TtsError` `timeout`).
 - **`mp3` no motor local** → `TtsError` `config` (só a API devolve mp3; o local gera wav 24 kHz mono).
 - **Spike real (2026-10-22, máquina de dev, CPU — pesos do catálogo baixados pelas URLs acima, sha256 = `lfs.oid` conferido)**: "Olá, isto é um teste." → áudio de 1,68 s. **fp32** (`model.onnx`): síntese **172–183 ms** (RTF ~0,11) + carregamento da sessão ~260 ms; **q8** (`model_quantized.onnx`): 836–903 ms (RTF ~0,5) — a fp32 é ~4,5× mais rápida em CPU (a q8 é download/disco ~3,5× menores). As 3 vozes pt-BR sintetizam com picos ~0,5/rms ~0,07; frases curtas dos clipes (0,75–2,7 s de áudio) saem em 83–271 ms cada. Download único dos pesos: 325,5 MB (fp32) ou 92,4 MB (q8).
 
@@ -1220,9 +1221,10 @@ com sha256 conferido, nesta máquina 32 threads)**:
   cada `STT_PARTIAL_INTERVAL_MS` — melhor-esforço como as parciais de API; `onNewSegment` do
   binding não dispara na 0.0.4). Medido com o runtime real: final de 3,3 s → **~220 ms**, 5,5 s →
   **~250 ms**; janelas < ~1 s voltam em ~1–3 ms (whisper encurta; texto muitas vezes vazio/alucinado
-  — parcial de whisper é melhor-esforço mesmo), janela de 2 s → ~180 ms. **Limitação**: `Whisper.full`
-  é síncrono (bloqueia o main thread durante a inferência — irrelevante para tiny/base, sensível
-  para large-v3-turbo; mitigação futura: worker thread). **Pré-builds só para linux-x64-gnu e
+  — parcial de whisper é melhor-esforço mesmo), janela de 2 s → ~180 ms. **Fora do main**: `Whisper.full`
+  é síncrono — por isso a inferência roda num **processo à parte** (ver "Processo do motor local" abaixo); no
+  main o event loop congelava pelo tempo inteiro da inferência (medido: 24 s de áudio → lag de 544 ms
+  no tiny / 563 ms no base; no worker, ≤ 6 ms). **Pré-builds só para linux-x64-gnu e
   darwin** (win32/arm64 não existem no pacote): sem `.node` na plataforma, `ready`/transcribe falham
   com erro legível ("motor whisper.cpp não pôde ser carregado nesta instalação").
 - **vosk** (`vosk-model-small-pt-0.3`): o `.zip` é **extraído pelo próprio runtime** em
@@ -1232,89 +1234,180 @@ com sha256 conferido, nesta máquina 32 threads)**:
   de inferência (libvosk) ainda não está plugado: `transcribe` extrai/verifica e falha com o erro
   honesto do engine. Plugar `vosk-koffi` (linha aprovada no spike) é uma dependência nova à parte.
 - **nemotron** (GGUF): sem motor nesta versão (exigiria runtime llama.cpp) — erro honesto por engine.
-- **Custo de latência**: parciais locais custam uma transcrição de janela por disparo (a sessão
-  aborta/reusa como nas parciais de API); final = 1 transcrição do buffer inteiro; carga do modelo
-  uma vez (tiny ~30 ms; cresce com o modelo — lazy na primeira transcrição).
+- **Custo de latência**: parciais locais custam uma transcrição de janela por disparo (nunca duas ao
+  mesmo tempo; só até o `base`); final = 1 transcrição do buffer inteiro; carga do modelo uma vez
+  (tiny ~30 ms, base ~40 ms; lazy na primeira transcrição, dentro do worker).
+
+**Processo do motor local (`sttWorker.ts` + `sttWorkerHost.ts` + `sttWorkerProtocol.ts`)** — o
+whisper.cpp roda num processo Node à parte: no app, **`utilityProcess.fork(out/main/sttWorker.js)`**
+(2º entry do build do main — `electron.vite.config.ts`); em Node puro (testes/scripts),
+`child_process.fork` com serialização estruturada. O `SttLocalBackend` é o mesmo — só o loader
+(`loadWhisperEngine`) despacha as amostras Float32 para o worker.
+
+- Protocolo (main → worker, `id` casa a resposta): `probe` (carrega `@napi-rs/whisper` e responde
+  `{ available, reason }`), `transcribe { modelPath, samples: Float32Array, language, nThreads }` →
+  `{ text, inferMs, loadMs }`, `unload`. Erros com código (`runtime` / `model` / `internal`) viram
+  `SttError` `config` legível ("motor whisper.cpp não pôde ser carregado…", "modelo local inválido
+  ou corrompido…", "falha no motor local…").
+- **Lazy** (o processo nasce no primeiro pedido) e **cache no worker**: no máximo UM modelo carregado —
+  pedir outro modelo com o processo ocioso reinicia o processo (devolve a RAM); remover um modelo
+  (`voice:models:remove`) solta o modelo carregado antes de apagar (`releaseSttModel`); ocioso por
+  10 min (`STT_WORKER_IDLE_MS`) → processo encerrado. Encerrado também no `before-quit`.
+- **Crash** (o processo sai/morre — inclusive crash nativo): os pedidos pendentes rejeitam com
+  `SttError` `config` ("o motor local de transcrição parou inesperadamente (código N) — tente de
+  novo…") e o próximo pedido inicia um processo novo. **Cancelamento**: abort do chamador rejeita na
+  hora com `AbortError` (o `full()` não é interrompível — a resposta que chegar depois é descartada).
+- **Prontidão** ("pronto = modelo instalado + runtime carregável", agora de verdade):
+  `probeWhisperRuntime()` sonda o binding **no worker**, uma vez por execução (memoizado; disparado
+  em segundo plano no `registerIpc` e aguardado por `voice:transcribe:start` quando o modo não é
+  `api`); `isSttEngineRuntimeAvailable('whisper.cpp')` = probe não negativo, e o motivo entra nas
+  mensagens (`sttEngineUnavailableReason`). TTS: `probeOnnxRuntime()` (carrega `onnxruntime-node` no
+  main, memoizado) e `probeEspeak()` (`espeak-ng --version`; positivo memoizado, negativo expira em
+  30 s — dá para instalar com o app aberto); `kokoroReadiness(baseDir, voz)` junta os dois + modelo e
+  voz instalados. Canal **`voice:runtime:status`** (preload `voice.runtime.status()`) →
+  `VoiceRuntimeStatus = { whisper, onnxruntime, espeak, sttLocal, ttsLocal }`, cada um
+  `{ available, reason }` (reason pt-BR quando indisponível).
+- **Empacotamento (Linux)**: `onnxruntime-node` e `@napi-rs/whisper-*` em `asarUnpack`; o pacote
+  Linux leva só `onnxruntime-node/bin/napi-v6/linux/${arch}` sem os providers CUDA/TensorRT
+  (`libonnxruntime_providers_*` — a sessão usa só `['cpu']`); win/mac excluem os binários dos outros
+  SOs. `dist/linux-unpacked`: 735 MB → 364 MB (nativos desempacotados 449 → 79 MB). Para nem baixar
+  os providers CUDA no `npm ci`: `ONNXRUNTIME_NODE_INSTALL=skip`. Smoke real no app empacotado:
+  probe ok dos dois nativos, download pelo app, texto → Kokoro → whisper (worker) ida e volta.
+- **Testes**: `e2e/sttWorker.test.ts` (host com worker falso `e2e/fakes/sttWorkerFake.mjs` — resposta,
+  crash + respawn, abort, troca de modelo, erros por código, ociosidade — e o probe do worker REAL;
+  `CLEARCHAT_STT_REAL_MODEL=<ggml>` mede o event loop durante a inferência).
 
 ### Ditado por voz — UX (composer + Configurações → Áudio)
 
 UI da Feature A sobre o contrato acima (captura em `src/renderer/src/lib/audio/`, orquestração em
-`src/renderer/src/lib/voice/useDictation.ts`, rascunho em `lib/voice/dictation.ts`, botão/menu em
-`components/voice/MicControls.tsx`, tela em `components/voice/AudioSettings.tsx`).
+`src/renderer/src/lib/voice/useDictation.ts`, rascunho em `lib/voice/dictation.ts`, espelho das
+settings em `lib/voice/voiceSettings.ts`, botão/menu em `components/voice/MicControls.tsx`, tela em
+`components/voice/AudioSettings.tsx`).
+
+**Settings no renderer** (`useVoiceSettings`/`loadVoiceSettings`/`saveVoiceSetting`): um espelho
+único de `voice:settings:get`; quem grava (Configurações → Áudio, menu do microfone) publica o valor
+normalizado para todos (ditado, botão de telefone, ★ do painel da chamada) — nada de cópia do
+primeiro mount. Relido ao fechar as Configurações e no início de cada gravação/chamada. Falha de
+gravação vira aviso visível (`voice-settings-error` na tela Áudio; card de erro no composer para o
+microfone do menu).
 
 **Composer (`Composer.tsx`)** — botão `Mic` (`data-testid="voice-mic-button"`) + chevron
-(`voice-mic-menu-button`) que abre o menu de microfone (`voice-mic-menu`): "Padrão do sistema"
-(`deviceId: null`, `voice-mic-option-system`) + os dispositivos de `listInputDevices` (marcação do
-atual, atualiza em hotplug, grava `audioInput.deviceId`; itens `voice-mic-option-device`) e o
+(`voice-mic-menu-button`, `aria-haspopup="menu"`/`aria-expanded`, alvo de 20×28 px) que abre o menu
+de microfone (`voice-mic-menu`, `role="menu"`; itens `menuitemradio` com `aria-checked`, foco no item
+marcado ao abrir, ↑/↓/Home/End navegam, Esc fecha e devolve o foco): "Padrão do sistema" (`deviceId:
+null`, `voice-mic-option-system` — com o nome do padrão atual quando o Chromium o expõe) + os
+dispositivos reais (`menuInputDevices` esconde as entradas sintéticas `default`/`communications`;
+itens `voice-mic-option-device`; atualiza em hotplug; grava `audioInput.deviceId`), o microfone
+salvo que sumiu marcado como **"Microfone salvo (desconectado)"** (`voice-mic-option-missing`) e o
 atalho "Configurações → Áudio…" (`voice-settings-link`). Estados do ditado (um por vez):
 `idle → starting → recording → stopping` (`DictationState`); enquanto ≠ `idle`:
-- **Rascunho falado**: as parciais (`onVoicePartial`, melhor-esforço) aparecem no campo de texto como
-  `rascunho + parcial + ▌` (`composeDictationDraft`; a textarea continua controlada e editável — a
-  edição passa por `splitDictationEdit`, que separa o texto do usuário da parcial; mexer na parcial a
-  descarta). No stop, o texto final (`voice:transcribe:stop`) vira **rascunho normal editável**
-  (`mergeDictationDraft`, um espaço de separação) — **o envio é SEMPRE manual**, nada sai sozinho.
-- **Botões**: o de enviar **some** e vira **Parar gravação** (`Square`, estilo do botão de parar de
-  geração, `voice-stop-button`); ao lado, **X** cancelar (`voice-cancel-button`). Clicar no `Mic`
-  de novo também para (clique inicia/para). **Waveform** compacto no toolbar (`voice-waveform`,
-  níveis do `usePushToTalk`; `simulate` no mock).
-- **Teclado**: `Enter` **não envia** durante a gravação (vira quebra de linha; `Shift+Enter` idem);
-  `Esc` com o foco no composer **cancela** a gravação (descarta tudo, nada entra no rascunho).
-- **Erros** (permissão negada, microfone ausente/ocupado, STT fora do ar, sessão indisponível) viram
-  um card `role="alert"` (`voice-error`) no composer, no padrão dos avisos do composer, com X para
-  dispensar — mensagens legíveis em pt-BR (`captureErrorText` para a captura; `SttError`/IPC já vem
-  legível do main).
+- **Parcial ao vivo FORA do texto editável**: as parciais (`onVoicePartial`, melhor-esforço)
+  aparecem num "fantasma" entre a textarea e o toolbar (`voice-partial`, itálico + `▌`;
+  "Ouvindo…/Transcrevendo…" sem parcial). A textarea contém **só** o texto do usuário e continua
+  editável — digitar durante a gravação é seguro (escolhido em vez de read-only: não bloqueia o
+  usuário e elimina a separação frágil parcial/sufixo que corrompia o rascunho). Aviso do main em
+  `VoicePartialEvent.error` (parciais desligadas/teto) vira aviso não bloqueante.
+- **Texto final no cursor**: a seleção da textarea quando o ditado começou é a âncora
+  (`DictationAnchor`); no fim, `rebaseDictationAnchor` a ajusta às edições feitas durante a gravação
+  (antes da âncora → desloca; inserção exatamente na âncora → o falado entra depois do digitado;
+  dentro de uma região editada → fim da edição) e `insertDictationText` insere com espaçamento
+  natural (espaço antes/depois só quando precisa; pontuação de fechamento não ganha espaço; a
+  seleção do início é substituída). A inserção usa `execCommand('insertText')` — **Ctrl+Z desfaz** —
+  com fallback para gravar direto no estado. **O envio é SEMPRE manual.**
+- **Botões**: o de enviar **some**; **Parar gravação** é vermelho com `MicOff`
+  (`voice-stop-button`, tooltip "Parar gravação e transcrever") — distinto do **Parar o agente**
+  (quadrado neutro, `agent-stop-button`, rótulo "Parar o agente" enquanto dita); ao lado, **X**
+  cancelar (`voice-cancel-button`). Clicar no `Mic` de novo também para. **Waveform** compacto no
+  toolbar (`voice-waveform`; `simulate` no mock).
+- **Cancelar sempre descarta**: a finalização tem um token — "Cancelar"/Esc durante o
+  "Transcrevendo…" cancela a sessão no main (`transcribe.cancel`) e o texto **não** entra no
+  rascunho; trocar de chat (desmontar o composer) cancela a gravação/transcrição (motivo `unmount`
+  do `usePushToTalk` — nunca paga uma transcrição sem destino).
+- **Teclado**: `Enter` **não envia** durante a gravação (vira quebra de linha); `Esc` com o foco no
+  composer **cancela**.
+- **Erros e avisos**: falhas (permissão negada, microfone ausente/ocupado, STT fora do ar) viram card
+  `role="alert"` (`voice-error`) dispensável — o X limpa também o erro da captura; avisos não
+  bloqueantes (`voice-notice`): microfone salvo não encontrado → "Microfone salvo não encontrado —
+  usando o padrão do sistema" (a captura cai no padrão em `OverconstrainedError`/`NotFoundError`
+  com `deviceId` explícito — `AudioCapture.fellBack`) e microfone perdido no meio (faixa `ended` →
+  transcreve o que já foi gravado e avisa). `captureErrorText` mapeia pelo `name` do DOMException
+  (`NotAllowedError`/`SecurityError`, `NotFoundError`, `OverconstrainedError` — cuja mensagem vem
+  vazia —, `NotReadableError`) para pt-BR.
+- **Sessão de transcrição preguiçosa**: criada no **primeiro chunk** de áudio (clique e tecla do PTT
+  seguem o mesmo caminho) — captura que falha ao abrir nunca deixa sessão órfã no main; os chunks
+  esperam a sessão numa cadeia e o `stop` espera o push pendente antes de transcrever.
+- **Bloqueios**: com a UI do ditado escondida/bloqueada (chamada de voz ativa, pergunta/retry
+  pendente, host offline, Configurações abertas) a **tecla do PTT fica desligada** e uma gravação em
+  curso é **cancelada**.
 
-**Push-to-talk + auto-stop** (`usePushToTalk` plugarado em `audioInput`): a tecla `pttKey`
-configurada **segura** para falar (só com a janela em foco; soltar = parar e transcrever); o clique
-no `Mic` inicia/para; `silenceStopEnabled` + `silenceStopMs` encerram sozinhos quando o usuário para
-de falar (**`0` = sem limite** — só botão/tecla/Esc encerram). A sessão de transcrição é criada de
-forma preguiçosa no primeiro chunk (a tecla do PTT inicia a captura sem passar pelo clique); os
-chunks esperam a sessão e o `stop` espera o push pendente antes de transcrever o buffer inteiro.
+**Captura** (`AudioCapture`): abre o microfone com o `AudioContext` já a **16 kHz** (o Chromium
+reamostra com filtro próprio — conferido no Electron com microfone de 48 kHz); runtime que recusar
+cai na taxa nativa + `resampleMono` com **passa-baixa sinc janelado** (corte em ~90% da Nyquist de
+saída; tamanho dos chunks exato: 4800 → 1600, 4410 → 1600). Falha em qualquer passo do `start`
+(worklet, `AudioWorkletNode`, `resume`) libera faixa e contexto.
 
-**Configurações → Áudio** (nova aba, espelho de "Pesquisa na web"; cada controle grava na hora via
-`voice:settings:set` e adota o valor normalizado devolvido): *Microfone padrão* (select com hotplug +
-"Padrão do sistema"); *Push-to-talk* (liga/desliga + captura de tecla `ptt-key-capture` com a tecla
-atual em `Kbd` — `formatHotkeyLabel`, ex. 'Ctrl + Shift + Espaço' —, Esc cancela a captura, "Remover
-tecla"); *Parar por silêncio* (liga/desliga + campo ms com "0 = sem limite"); *Idioma do ditado*
-(comuns + "Outro (digitar)…" livre); *Transcrição (STT)*: modo (API/Local/Híbrido), endpoint (`baseUrl`,
-modelo) e **chave de API com máscara ecoada no campo** (`type=password`; escrever por cima da máscara
-preserva a chave real — contrato testado em `e2e/voiceSettings.test.ts`; limpar o campo remove; a
-chave real nunca sai do main), parciais ao vivo (liga/desliga) e a seção do **motor local**
-(`LocalEnginePanel`): seletor de engine + badge "instalado/não instalado" (espelho de
-`sttSettings.local.installed`) e a **lista dos modelos do catálogo agrupados por engine** (nome,
-descrição, idiomas — `formatModelLanguages`, `'mul'` = Multilíngue — e tamanho — `formatModelSize`,
-KB/MB/GB) com ações reais por `voice:models:*`, o mapeamento estado→ação de `modelAction`
-(`notInstalled` → "Baixar" com barra de progresso + "Cancelar" durante o download; `installed` →
-✓ + tamanho + "Remover"; `corrupt` → "Baixar novamente" com aviso) e erros de download/remoção como
-aviso `role="alert"` dispensável (`voice-model-error`, padrão dos avisos do composer, texto vindo de
-`errorMessage`). *Fala (TTS)*: seção completa (ver "Áudio → Serviço de TTS (clipes)" — backend
-API/Local, endpoint com chave mascarada, vozes do motor local, **Testar voz** e **Gerar clipes de
-voz**) + a **mesma lista** de modelos locais com download real dos pesos do Kokoro/Chatterbox
-(`LocalModelList kind="tts"`, ações por `voice:models:*`).
+**Push-to-talk + auto-stop** (`usePushToTalk` plugado em `audioInput`): a tecla `pttKey`
+configurada **segura** para falar (só com a janela em foco; soltar = parar e transcrever); a tecla
+precisa ser **F1–F24/Pause/Scroll Lock/Insert ou ter Ctrl/Alt/Meta** (`pttHotkeyProblem` — tecla
+que digita seria engolida pelo `preventDefault` no app inteiro; Esc nunca; tecla inválida salva
+antes da validação não é ligada); tokens gravados parseáveis (`PageUp`/`PageDown`, `+` = `Plus`;
+`'Page Up'` antigo continua casando). O clique no `Mic` inicia/para; `silenceStopEnabled` +
+`silenceStopMs` encerram sozinhos (**`0` = sem limite**).
+
+**Configurações → Áudio** (aba "Áudio"; a barra de abas cabe numa linha no modal de 680 px — sem
+rolagem horizontal; em janela estreita quebra a linha): ajuda estática nos (?) e `</>` com a request
+exata. *Microfone padrão* (select com hotplug, "Padrão do sistema (nome)", sem entradas sintéticas,
+salvo desconectado marcado com aviso `mic-missing-warning`); *Push-to-talk* (switch só aparece
+**ligado com uma tecla válida** — sem tecla: "inativo — defina uma tecla"; captura `ptt-key-capture`
+com a tecla atual em `Kbd`; **Esc cancela só a captura** — camada própria na pilha de Esc, o modal
+fica; tecla que digita é recusada com o motivo em `ptt-key-problem`; definir a tecla liga o PTT;
+"Remover tecla"); *Parar por silêncio* (liga/desliga + ms, "0 = sem limite"); *Idioma do ditado*;
+*Transcrição (STT)*: modo (API/Local — whisper.cpp/Híbrido), endpoint, modelo, `</>` com o multipart
+de `/audio/transcriptions` (file wav PCM16 16 kHz, model, language ISO-639-1, response_format json,
+Bearer), **chave de API no padrão de "Pesquisa na web"** (campo vazio com a máscara no placeholder;
+"Salvar" explícito/Enter, X remove, olho mostra só o que foi digitado — a chave real nunca sai do
+main; limpar o campo não apaga), parciais ao vivo e o motor local (`LocalEnginePanel`, lista do
+catálogo com download real). *Fala (TTS)*: backend API/Local, `</>` com o JSON de `/audio/speech`
+(model, voice — omitida sem voz —, input, response_format) ou "nada sai do computador" no local,
+aviso do probe `voice.runtime.status()` quando o motor local não está pronto (`tts-runtime-warning`/`stt-runtime-warning` com o motivo — ex.: espeak-ng ausente, whisper não carrega), motor local **só Kokoro** (Chatterbox escondido até funcionar — aparece só se já estiver salvo, com
+aviso; pesos dele só listados se já estiverem em disco), vozes, **Testar voz** (vira **Parar teste**
+durante a reprodução; fechar o modal para o áudio) e **Gerar clipes de voz** (contagem relida ao
+trocar de voz — um cache por voz; "sem clipes para a voz atual" visível). *Chamada de voz*:
+**disponível** (`voiceCallDefaults.enabled` — desligada, o telefone some na hora) e **silêncio que
+encerra a fala** (`voiceCallDefaults.turn.silenceStopMs`, padrão `DEFAULT_TURN_SILENCE_MS` = 1000
+ms). *Interjeições e fillers*: switches, parâmetros e tipos permitidos com rótulos pt-BR
+(Confirmação/Concordância/Incentivo/Pensando + exemplos; id técnico no tooltip). O prompt dos
+fillers fica escondido (ainda não consumido).
 
 **Mock de UI** (`VITE_CLEAR_MOCK=1`, `dev/mockApi.ts`): binding `voice` completo — settings fake com
-a mesma semântica da chave mascarada, `transcribe` que emite parciais em timers e devolve texto
-fixo e `models` com **2 modelos fake** (`mock-whisper-tiny` STT e `mock-kokoro` TTS placeholder):
-download simulado em 10 passos com progresso por `onVoiceModelProgress`, cancelável (resolve
-`null`, como no main), remoção e a mesma sincronia de `installed` nas settings do mock; o `Waveform`
-simula níveis (`simulate`) e a captura é pulada (sem microfone no mock).
-`ClearApi.voice` continua opcional no tipo com `FullClearApi` obrigatório no preload: remover o
-workaround exigiria tocar em `src/preload/index.d.ts` (fora do escopo desta fatia) — mantido e
-documentado.
+a mesma semântica da chave mascarada (pronto para a chamada por padrão: chave STT fake + Kokoro
+"instalado"), `transcribe` que emite parciais em timers e devolve texto fixo (~700 ms de latência na
+final), `models` com 2 modelos fake, `call` simulado (+ `getState`) e `runtime.status`. A captura é
+pulada; `window.__clearMockMic` simula o microfone. Cenários: `?scenario=voice-mic-missing` (salvo
+desconectado → padrão + aviso), `voice-mic-denied`, `voice-mic-lost` (some 1,5 s depois de começar),
+`voice-call-fail` (`call.start` recusa), `voice-not-ready` (sem chave/Kokoro) e `voice-no-espeak`
+(probe sem espeak-ng). Com o agente ocupado (chat "Refatorar o parser") dá para ver os dois
+botões de parar. `ClearApi.voice` continua opcional no tipo com `FullClearApi` obrigatório no preload.
 
 **Testes** — `e2e/voiceDictation.test.ts` (em `npm run test:unit`): `mergeDictationDraft`,
-`composeDictationDraft`/`splitDictationEdit` (round-trip compor→editar→compor),
-`formatHotkeyLabel`/`hotkeyFromEvent` (rótulos pt-BR, ordem canônica, modificador solto, round-trip
-com `matchesHotkey`) e `captureErrorText`. `e2e/voiceModelsUi.test.ts` (idem): `formatModelSize`
-(B/KB/MB/GB, vírgula pt-BR, inválido → '—'), `formatModelLanguages`, `modelAction` (estado → ação,
-incl. placeholder sem URL) e `deriveHasLocalReady` (só `'installed'` do engine escolhido conta).
-**E2E** `e2e/voice-dictation.spec.ts`
-(`npm run test:e2e:voice`): Electron real com microfone falso do Chromium
-(`--use-fake-device-for-media-capture --use-fake-ui-for-media-capture`) + servidor STT falso
-(`e2e/fakes/sttServer.ts`, `sttSettings` apontando para ele): Configurações → Áudio (máscara da
-chave, captura de tecla, silêncio 0) → menu de microfone (Padrão do sistema + dispositivos) → gravar
-com o fake device → parciais com `▌` → Parar → texto final no rascunho sem enviar sozinho → request
-multipart no servidor falso (file/model/language/response_format + Bearer) → Esc cancela descartando.
+`rebaseDictationAnchor` (sem edição, digitação no fim/antes/exatamente no cursor, seleção apagada),
+`insertDictationText` (espaçamento, pontuação, seleção substituída, limites), fluxo cursor-no-meio +
+digitação, `formatHotkeyLabel`/`hotkeyFromEvent` (incl. `PageUp`/`Plus` round-trip e `'Page Up'`
+legado), `pttHotkeyProblem`, `captureErrorText` (por `name`, mensagem vazia) e
+`isMissingDeviceError`. `e2e/audio.test.ts`: `resampleMono` (DC/rampa no miolo, tamanho exato,
+**anti-aliasing**: 1/3 kHz passam, 9/12/20 kHz atenuados) e `menuInputDevices`.
+`e2e/voiceModelsUi.test.ts`: `formatModelSize`, `formatModelLanguages`, `modelAction`,
+`deriveHasLocalReady`. **E2E (mock)** `e2e/voice-ui.spec.ts`: parcial fora da textarea + digitação
+durante a gravação, final no cursor com Ctrl+Z, Cancelar no "Transcrevendo…" não insere, dois
+botões de parar distintos, microfone salvo desconectado (aviso + item no menu), permissão negada
+dispensável, microfone perdido, falha da chamada em toast (start recusado, pré-checagem, espeak-ng
+ausente, microfone negado na chamada), barra da chamada no lugar do composer em 1440/1100/900 ± painel (sem textarea; rascunho e foco de volta ao encerrar; pílula nos outros chats; pergunta clicável acima da barra), CTA de
+clipes, abas das Configurações numa linha (1440/1100), Esc na captura do PTT não fecha o modal e
+telefone some com a chamada desligada. **E2E (real)** `e2e/voice-dictation.spec.ts`
+(`npm run test:e2e:voice`): microfone falso do Chromium + servidor STT falso — Configurações → Áudio
+(chave com Salvar e máscara no placeholder, captura de tecla, silêncio 0) → menu de microfone →
+gravar → parcial no fantasma → Parar → texto final sem enviar sozinho → multipart no servidor falso
+→ Esc cancela → microfone salvo inexistente cai no padrão com aviso (captura real).
 
 ### Chamada de voz — configuração por persona/chat (`ChatConfig.voice`)
 
@@ -1338,15 +1431,16 @@ interface VoiceCallConfig {
   interjections: InterjectionPolicy | null                      // null = segue o padrão global
 }
 ```
+- **Local (fora do sync por enquanto)**: `voice` **não** sai nos registros `chat`/`preset` do sync (`src/main/sync/records.ts` remove `voice` junto com `cwd` ao montar o plaintext) e, ao aplicar um registro recebido, o `voice` que veio de fora é descartado e o **valor local é preservado** — até uma versão futura do protocolo incluir o áudio (`docs/SYNC_PROTOCOL.md` não lista o campo; nada muda no protocolo). `usesLocalTools(config)` (§8.9) também considera `voice.tools.enabledTools` (tools liberadas só na chamada contam para o aviso de host).
 - **Herança persona→chat como `memory`/`skills`**: `voice` entra em `PRESET_FIELDS` (gravado **normalizado** por `sanitizePresetConfig`; chaves desconhecidas descartadas) e `applyPreset` o aplica como os demais campos; o chat herda da persona por snapshot na criação. `voice` ausente = `DEFAULT_VOICE_CALL_CONFIG` = **tudo null** = herda: `enabled`/`fillers`/`interjections` do global, `model`/`tools` do próprio chat (modelo/tools da conversa).
-- Setting global `voiceCallDefaults` = `{ enabled: boolean; interjections: InterjectionPolicy; fillers: { enabled: boolean; prompt: string | null }; turn: { silenceStopMs: number | null } }` — `DEFAULT_VOICE_CALL_DEFAULTS` = **ligado por padrão** (`enabled: true`; `DEFAULT_INTERJECTION_POLICY` ligada, `shadow: false`, todas as classes; fillers ligados; `turn.silenceStopMs: null`): o modo chamada de voz fica disponível e pode ser desligado **globalmente** aqui (ou por **chat/persona** em `VoiceCallConfig.enabled: false`). É o que os nulls de `ChatConfig.voice` herdam; `normalizeVoiceCallDefaults` completa parciais (e `VoiceCallConfig.fillers`/`interjections` presentes porém parciais completam com esses mesmos padrões). `turn.silenceStopMs` = ms de silêncio que **encerram a fala do usuário** na chamada (null = segue `audioInput.silenceStopMs`; 0/lixeira é tratado como null — na chamada SEMPRE há limite de silêncio, senão não há turnos; ver `resolveTurnSilenceMs` em "Chamada de voz (meia-duplex)").
+- Setting global `voiceCallDefaults` = `{ enabled: boolean; interjections: InterjectionPolicy; fillers: { enabled: boolean; prompt: string | null }; turn: { silenceStopMs: number | null } }` — `DEFAULT_VOICE_CALL_DEFAULTS` = **ligado por padrão** (`enabled: true`; `DEFAULT_INTERJECTION_POLICY` ligada, `shadow: false`, todas as classes; fillers ligados; `turn.silenceStopMs: null`): o modo chamada de voz fica disponível e pode ser desligado **globalmente** aqui (ou por **chat/persona** em `VoiceCallConfig.enabled: false`). É o que os nulls de `ChatConfig.voice` herdam; `normalizeVoiceCallDefaults` completa parciais (e `VoiceCallConfig.fillers`/`interjections` presentes porém parciais completam com esses mesmos padrões). `turn.silenceStopMs` = ms de silêncio que **encerram a fala do usuário** na chamada (null = o padrão da chamada, `DEFAULT_TURN_SILENCE_MS` = 1000 ms — **não** herda o auto-stop do ditado, cujo padrão de 5 s é longo demais para turno; editável em Configurações → Áudio → Chamada de voz; 0/lixeira é tratado como null — na chamada SEMPRE há limite de silêncio, senão não há turnos; ver `resolveTurnSilenceMs` em "Chamada de voz (meia-duplex)").
 - `normalizeVoiceCallConfig` (tolerante a null/ausente/lixo; **null preservado** — `enabled: null` ≠ `false`): campos desconhecidos descartados (como os demais normalizadores), mas `model.params` preserva as chaves que não conhece (mesma semântica de `cleanParams` em presets.ts) e zera o que for null/NaN; `model` sem `providerId` **e** `model` não vale (→ null = herda o do chat); `tools.enabledTools` passa por `normalizeToolList` (alias antigos mapeados, sem duplicatas); `maxToolOutputChars` inválido → null (0 válido); prompts sem CR, vazios → null.
 
 ### Chamada de voz (meia-duplex) — turno (`src/main/voice/call.ts`, `turnMachine.ts`, `sentences.ts`; renderer `lib/voice/`, `components/voice/`)
 
 Feature B, primeira parte: o usuário **fala**, o agente **responde por voz**, com turnos por silêncio — reusando o agente existente (mesmo chat, mesmo histórico). A transcrição final vira **mensagem do usuário normal** e a resposta falada é a **mensagem do assistente normal**: o chat fica completo e legível por baixo. Os **atos de fala curta** (fillers, interjeições, backchannel e modo sombra) vivem nas subseções "Fillers", "Interjeições (regras)" e "Modo sombra e timeline"; **áudio por tokens é outra fatia**; sem ecocancelamento ativo além do `echoCancellation: true` das constraints da captura.
 
-**Turno de voz** = fala do usuário → silêncio encerra a fala (`UtteranceGate`, renderer: `'start'` no primeiro quadro acima do limiar, `'end'` após o silêncio contínuo) → transcrição final (uma sessão `voice:transcribe:*` por fala, serializadas) → `voice:call:turn` envia **pelo mesmo caminho do composer** (`gatedSend` → `runner.send`; fila/⚡ respeitadas) → resposta em streaming → **TTS por sentença** (`splitSentences` puro: cortes em `[.!?…]` + fechos + espaço, com guardas de decimal/lista numerada/abreviação pt-BR — ordinais `2.º`/`N.º` não cortam (o ponto não é seguido de espaço) e no fim da resposta o `.` corta mesmo vindo de abreviação — e corte forçado por `maxChars`; bytes completos por sentença, na ordem, síntese serial sem sobreposição) → próxima escuta. Silêncio que encerra a fala: `resolveTurnSilenceMs(turn, audioInput)` = `voiceCallDefaults.turn.silenceStopMs` quando definido (> 0), senão `audioInput.silenceStopMs` (com auto-stop ligado e > 0), senão `DEFAULT_TURN_SILENCE_MS` (2000).
+**Turno de voz** = fala do usuário → silêncio encerra a fala (`UtteranceGate`, renderer: `'start'` no primeiro quadro acima do limiar, `'end'` após o silêncio contínuo) → transcrição final (uma sessão `voice:transcribe:*` por fala, serializadas) → `voice:call:turn` envia **pelo mesmo caminho do composer** (`gatedSend` → `runner.send`; fila/⚡ respeitadas) → resposta em streaming → **TTS por sentença** (`splitSentences` puro: cortes em `[.!?…]` + fechos + espaço, com guardas de decimal/lista numerada/abreviação pt-BR — ordinais `2.º`/`N.º` não cortam (o ponto não é seguido de espaço) e no fim da resposta o `.` corta mesmo vindo de abreviação — e corte forçado por `maxChars`; bytes completos por sentença, na ordem, síntese serial sem sobreposição) → próxima escuta. Silêncio que encerra a fala: `resolveTurnSilenceMs(turn)` = `voiceCallDefaults.turn.silenceStopMs` quando definido (> 0), senão `DEFAULT_TURN_SILENCE_MS` (**1000**) — o auto-stop do ditado (`audioInput`) não é herdado (o parâmetro segue aceito e ignorado, por compatibilidade).
 
 **Estados** (`VoiceCallState.phase`, evento `voice:call:state`; UI no dock `voice-call-*`): `listening` ("Ouvindo…") → `transcribing` ("Transcrevendo…" — o silêncio disparou e a transcrição final está em voo) → `thinking` ("Pensando…" — o agente responde) → `speaking` ("Falando…" — utterances emitidas/tocando; sentenças na síntese contam) → `listening`. **Fila de turnos de voz, máx. 1 pendente**: fala durante a resposta vira o **PRÓXIMO turno** (`pendingText`, enviado quando o agente termina a resposta em andamento; falas seguintes se acumulam no mesmo pendente); com o agente ocioso, a transcrição final envia já. Transcrição vazia não vira turno. `session-updated` não-ocioso (`isBusyStatus`: running/awaiting_*/waiting) mantém "respondendo" — aprovações/ask_user/retry continuam **só na UI** (nada é falado no lugar do agente).
 
@@ -1354,11 +1448,13 @@ Feature B, primeira parte: o usuário **fala**, o agente **responde por voz**, c
 
 **Overrides do modo voz** (`VoiceCallConfig` resolvido por persona→chat→global — persona→chat é snapshot na criação; chat→global com `resolveVoiceCallConfig`, como `memory`/`skills`): nas requests da chamada usam-se `voice.model` (provider/model/**params substituem os do chat**) quando definido, `voice.tools.enabledTools`/`maxToolOutputChars` (tools enviadas e teto de saída das tools na chamada; `[]` = nenhuma tool) e `voicePrompt` (**somado ao system prompt**, separado por linha em branco). O plug no runner é um **call context opcional por turno** (`voiceCallContextFor`, fonte registrada pelo main em `setVoiceCallSource`): `applyVoiceCallChat` gera uma **cópia** do chat usada só nas requests/tools do turno — **o chat salvo nunca muda** e o **histórico de um turno de voz é idêntico ao de um turno de texto** (mesmas roles, mesmas chaves de meta, sem marcadores — `e2e/voiceCallTurn.test.ts` compara os dois). Sem override (campos null), tudo segue o chat. Enquanto a chamada está ativa, **todas as respostas da sessão são faladas** (inclusive as de mensagens digitadas) e os overrides valem para todos os turnos da sessão; subsessões (subagentes) não recebem os overrides. `voice.model.providerId` sem provider configurado → erro legível no turno.
 
-**Reprodução** (`UtteranceQueue`, renderer — `lib/voice/utteranceQueue.ts`): fila de utterances (evento `voice:call:utterance` = `VoiceCallUtteranceEvent { id, audio, mime }`, bytes wav/mp3 completos) tocada **em ordem, sem sobreposição** (`new Audio` com blob URL; player injetável para testes), estados `idle`/`playing`, `cancel()` = barge-in, volume 0..1 (`voice-call-volume`). A síntese é **serial** no main (`VoiceCallManager` → `voice/tts.ts`, backend api/local atual); falha de TTS **para a fala** e mostra o erro no dock (`voice-call-error`) — o texto segue no histórico.
+**Reprodução** (`UtteranceQueue`, renderer — `lib/voice/utteranceQueue.ts`): fila de utterances (evento `voice:call:utterance` = `VoiceCallUtteranceEvent { id, audio, mime }`, bytes wav/mp3 completos) tocada **em ordem, sem sobreposição** (`new Audio` com blob URL; player injetável para testes), estados `idle`/`playing`, `cancel()` = barge-in, volume 0..1 (`voice-call-volume`). A síntese é **serial** no main (`VoiceCallManager` → `voice/tts.ts`, backend api/local atual); falha de TTS numa sentença **pula só ela** (o resto da resposta continua sendo falado; `VoiceTurnMachine.synthSkipped` — sem nada tocando e sem fila, o turno pendente sai na hora) e mostra o erro no dock (`voice-call-error`) — o texto segue no histórico.
+
+**Ciclo de vida no main**: a chamada guarda o dono (o `webContents` que chamou `voice:call:start`); renderer que recarrega/navega/cai ou janela fechada → `voiceCalls.stop()` (com as sessões de transcrição dele — ver "Configuração e sessão de transcrição por IPC"). O mesmo dono chamando `start` com uma chamada ativa reabre (stop + start); outro dono segue recusado. **`voice:call:get-state`** (preload `voice.call.getState()`) devolve o `VoiceCallState` atual (`{ active, chatId, sessionId, phase, muted, turnSilenceMs, pendingText, error }`) para o renderer reidratar depois de recarregar.
 
 **Estado de chamada** (main `VoiceCallManager` + store `voiceCall` + IPC `voice:call:*`): `start { sessionId }` (só sessão principal/depth 0; uma chamada por vez; `enabled` resolvido desligado → erro legível), `stop`, `mute { muted }` (captura pausada no renderer — microfone liberado), `speech-begin`, `speech-end`, `turn { text }`, `playback-idle`, `barge-in`; eventos `voice:call:state` (`VoiceCallState { active, chatId, sessionId, phase, muted, turnSilenceMs, pendingText, error }`) e `voice:call:utterance`. O main é o **dono do turno** (máquina + fila + envio + síntese); o renderer é o **sensor** (captura contínua do `audioInput.deviceId`, silêncio, reprodução).
 
-**UI**: botão de telefone no toolbar do composer (`voice-call-button`, entra/sai; some quando `VoiceCallConfig.enabled` resolve desligado; escondido em subsessões, desabilitado com chamada ativa em outro chat) + **dock fixo** no canto inferior (`voice-call-dock`): estado (`voice-call-status`), waveform do mic (`voice-call-waveform`), mudo (`voice-call-mute`), volume (`voice-call-volume`), painel de timeline/toggles (`voice-call-panel-toggle` → `voice-call-panel` — ver "Modo sombra e timeline"), indicador de sombra (`voice-call-shadow`), encerrar (`voice-call-end`), fala pendente (`voice-call-pending`) e erro (`voice-call-error`). Durante a chamada (em qualquer chat) o botão de ditado some (um microfone de cada vez); o chat continua normal por baixo. **Mock** (`VITE_CLEAR_MOCK=1`, `dev/mockApi.ts`): `voice.call` simula o turno (estados + 2 utterances wav por resposta, tocadas pela `UtteranceQueue` real) e a captura é pulada (`Waveform` simula níveis).
+**UI**: botão de telefone no toolbar do composer (`voice-call-button`, entra/sai; some quando `VoiceCallConfig.enabled` resolve desligado — padrões do espelho reativo `useVoiceSettings`, então desligar em Configurações → Áudio esconde na hora; escondido em subsessões; desabilitado com chamada ativa em outro chat e **em chat executado em outro dispositivo** (host remoto — tooltip explica; o ditado continua)). **Pré-checagem** antes de entrar (`voiceCallReadiness`, pura): STT sem chave/endpoint (endpoint local dispensa chave), motor local sem modelo, Kokoro não instalado/Chatterbox, TTS por API sem endpoint/modelo/chave e — com o probe `voice.runtime.status()` do main — runtime local quebrado (espeak-ng ausente, whisper não carrega) → toast com o que falta e onde resolver, sem entrar na chamada. Falha do `voice:call:start` vira toast (store). **Durante a chamada o chat por texto fica desligado: a barra da chamada SUBSTITUI o composer** do chat da chamada (`VoiceCallDock`, no lugar e na largura do card do composer — linha 1: waveform + fase "Ouvindo…/Transcrevendo…/Pensando…/Falando…" + fala pendente; linha 2: timeline, mudo, volume, sombra e **Encerrar** no lugar do Enviar). Somem textarea, anexar, skills, mic/PTT, pílula do modelo, medidor e enviar (nada é digitado no rascunho por engano; `submit` recusa; não há atalho que alcance o composer escondido). Ficam visíveis acima da barra a fila de mensagens, as aprovações pendentes e — num card próprio (`voice-call-blocking-card`) — pergunta (`ask_user`) e falha de conexão (retry), ainda clicáveis. Ao encerrar, o composer volta com o **rascunho intacto** (o estado vive no Composer; se o usuário trocou de chat no meio, o rascunho fica guardado por sessão até reabrir) e o foco volta ao texto. Em **outros chats** o composer funciona normalmente e mostra a pílula **"Chamada ativa em <chat> · ir para a chamada"** (`voice-call-elsewhere`, leva de volta ao chat da chamada). Não há mais dock flutuante. O controller (`useVoiceCall` dentro de `VoiceCallController`, uma vez por app) publica nível/erro/volume/clipes em `useVoiceCallRuntime` (só o waveform re-renderiza a 30 Hz) e reidrata o estado do main com `voice.call.getState()` quando existe. Barra: estado (`voice-call-status`), waveform (`voice-call-waveform`), mudo (`voice-call-mute`), volume (`voice-call-volume`), painel de timeline/toggles (`voice-call-panel-toggle` → `voice-call-panel`, acima da barra no mesmo fluxo), sombra (`voice-call-shadow`), "Encerrar" (`voice-call-end`), fala pendente (`voice-call-pending`), erro (`voice-call-error`) e, com interjeições/fillers ligados fora do modo sombra mas **sem clipes** para a voz atual, o aviso **"Gerar clipes"** (`voice-call-clips-hint`/`voice-call-clips-generate`, com progresso). Microfone que falha ao abrir ou some no meio **encerra a chamada com toast** (a barra some junto); microfone salvo ausente cai no padrão com aviso; limpeza do efeito no meio do `start` (mudo, troca de silêncio) não encerra a chamada; o erro da chamada anterior é limpo na seguinte. Reprodução: `DomAudioPlayer.play()` devolve a promise do `<audio>` (rejeição avança a fila). Durante a chamada (em qualquer chat) o botão de ditado some e a tecla do PTT fica desligada. **Por persona/chat** (`VoiceCallConfigSection` — painel do chat → aba Chat e editor de personas → aba Chat): disponível (★ padrão global / Ligada / Desligada), modelo próprio (`ModelPicker`), tools próprias (lista de tools; nenhuma = sem tools) e prompt do modo voz (com `</>`). **Mock**: `voice.call` simula o turno (estados + 2 utterances wav por resposta, tocadas pela `UtteranceQueue` real) e a captura é pulada (`Waveform` simula níveis).
 
 **Limitações desta fatia**: sem áudio por tokens (sentença cheia basta), sem ecocancelamento ativo, o onset da fala pode perder ~1 chunk de 100 ms (pre-roll de ~300 ms mitiga), retry de rede pode **sub-falar** o trecho reescrito (a fala nunca duplica) e a resposta suprimida pelo barge-in não volta a ser falada (só no histórico).
 
@@ -1386,7 +1482,7 @@ Decisão positiva → variante 1..3 com rotação sem repetir (`pickClipVariant`
 
 `interjections.shadow` (persona→chat→global): o motor **decide mas não toca** — **fillers inclusos**. Cada decisão "teria tocado" (e também as que tocaram de fato) é registrada em `<userData>/voice-eval/<YYYY-MM-DD>.jsonl` — **uma linha JSON por decisão**, schema `VoiceEvalEvent` (`src/main/voice/evalLog.ts`, validado por `normalizeEvalEvent`): `{ ts, kind: 'interjection' | 'filler', class, variant, played, shadow, speechMs, pauseMs, tail (≤ 80 chars), latencyMs (decisão→tocaria), reason }`. O log existe em todos os modos (`played: true/false`) para calibração futura das regras — é o registro da última chamada (**sem visualização pós-chamada na v1**); falha de disco nunca derruba a chamada.
 
-**Timeline** (canal `voice:call:timeline`, `VoiceCallTimelineEvent` do main + eventos do sensor no renderer, `store.voiceCallTimeline`): fala detectada/fim da fala, pausa virada em observação, decisão+classe (tocada/sombra/descartada, com motivo), clipe emitido/começou/terminou/cancelado, sentença emitida/começou/terminou, turno enviado, barge-in e backchannel — com timestamps (relativos no painel). **UI**: painel recolhível no dock (`voice-call-panel`, botão `voice-call-panel-toggle`) com **toggles rápidos ★** (interjeições/sombra/fillers — gravam `ChatConfig.voice` do chat da chamada via `patchConfig`; a opção ★ = padrão global **remove o override**, e o ★ de "Sombra" reseta o grupo `interjections` inteiro — `enabled`+`shadow` andam juntos na config), o indicador **"modo sombra · N"** (`voice-call-shadow`, N = decisões que não tocaram) e as **métricas** (`computeVoiceCallMetrics` em `src/shared/voiceTimeline.ts`): interjeições/min e **p50/p95 da latência decisão→áudio** (pareamento da `decision` com o `clip-start` da mesma utterance `id`). Configurações → Áudio expõe os parâmetros da política editáveis (`voiceCallDefaults`: cooldown, probabilidade, fala/pausa mínimas, classes permitidas, fillers e o prompt — ainda não consumido).
+**Timeline** (canal `voice:call:timeline`, `VoiceCallTimelineEvent` do main + eventos do sensor no renderer, `store.voiceCallTimeline`): fala detectada/fim da fala, pausa virada em observação, decisão+classe (tocada/sombra/descartada, com motivo), clipe emitido/começou/terminou/cancelado, sentença emitida/começou/terminou, turno enviado, barge-in e backchannel — com timestamps (relativos no painel). **UI**: painel recolhível no dock (`voice-call-panel`, botão `voice-call-panel-toggle`) com **toggles rápidos ★** (interjeições/sombra/fillers — gravam `ChatConfig.voice` do chat da chamada via `patchConfig`; a opção ★ = padrão global **remove o override**, e o ★ de "Sombra" reseta o grupo `interjections` inteiro — `enabled`+`shadow` andam juntos na config), o indicador **"modo sombra · N"** (`voice-call-shadow`, N = decisões que não tocaram) e as **métricas** (`computeVoiceCallMetrics` em `src/shared/voiceTimeline.ts`): interjeições/min e **p50/p95 da latência decisão→áudio** (pareamento da `decision` com o `clip-start` da mesma utterance `id`). Configurações → Áudio expõe os parâmetros da política editáveis (`voiceCallDefaults`: cooldown, probabilidade, fala/pausa mínimas, tipos permitidos e fillers; o prompt dos fillers fica escondido enquanto não é consumido).
 
 ### Testes
 `e2e/voice.test.ts` (em `npm run test:unit`): defaults quando null/ausente/lixo (4 settings + config) e round-trip JSON, defaults de produto (chamada de voz/interjeições/fillers ligados; TTS local = Kokoro não instalado, `local: null` preservado como limpeza explícita), `silenceStopMs: 0` preservado, `enabled: null` ≠ false (e null ≠ objeto em fillers/interjections), campos desconhecidos descartados com `params` preservados, interjeições (classes vazias → padrão, limites aparados, 0 preservado), `voiceCallDefaults` parcial e a ligação com personas (`PRESET_FIELDS` contém `voice`; `sanitizePresetConfig` copia normalizado; `memory`/`skills` inalterados).
@@ -1401,9 +1497,9 @@ Decisão positiva → variante 1..3 com rotação sem repetir (`pickClipVariant`
 
 `e2e/voiceClips.test.ts` (idem, só pastas temporárias e motor fake): `clipFileName` (whitelist de classes × 3 variantes; fora → erro legível), `clipVoiceId` (segmento seguro — voz maliciosa nunca vira caminho), `generateClips` (15 arquivos + manifest com voz/engine/modelo/hash, progresso 1..15, `.part` limpo), cache idempotente (mesmo hash não ressintetiza), regeneração por voz (voiceId novo, os dois caches convivem) e por hash (modelo muda → regenera), `loadClips` (manifest inválido/incompleto → null), `resolveClip` (caminho do wav; classe/variante/voz inválidos → null), `removeClips` e abort no meio (sem manifest).
 
-`e2e/voiceCall.test.ts` (idem, unidades puras): `resolveVoiceCallConfig` (herança persona→chat→global; `enabled: null` ≠ false; `fillers`/`interjections` parciais completam; `model` incompleto → null), `resolveTurnSilenceMs` e `normalizeVoiceCallDefaults.turn` (0/lixeira → null), `applyVoiceCallChat` (overrides só na cópia; sem override a config é a do chat), `splitSentences` (marcas repetidas/fechos, decimais, listas numeradas, abreviações pt-BR, ordinais `2.º`/`N.º`, reticências, `Ex.:`, corte forçado por `maxChars`), `VoiceTurnMachine` (fluxo por silêncio, fila de turnos com máx. 1 pendente, transcrição vazia, "Falando…"/playback-idle, barge-in, `synthCleared` — falha de TTS não fica "Falando…"), `UtteranceQueue` (ordem sem sobreposição com player fake, `cancel` do barge-in, volume, player que falha, `play()` interrompido pelo cancel não derruba a utterance seguinte) e `UtteranceGate` (`start`/`end` por silêncio contínuo, `reset` sem `end`).
+`e2e/voiceCall.test.ts` (idem, unidades puras): `resolveVoiceCallConfig` (herança persona→chat→global; `enabled: null` ≠ false; `fillers`/`interjections` parciais completam; `model` incompleto → null), `resolveTurnSilenceMs` e `normalizeVoiceCallDefaults.turn` (0/lixeira → null), `applyVoiceCallChat` (overrides só na cópia; sem override a config é a do chat), `splitSentences` (marcas repetidas/fechos, decimais, listas numeradas, abreviações pt-BR, ordinais `2.º`/`N.º`, reticências, `Ex.:`, corte forçado por `maxChars`), `VoiceTurnMachine` (fluxo por silêncio, fila de turnos com máx. 1 pendente, transcrição vazia, "Falando…"/playback-idle, barge-in, `synthCleared` — falha de TTS não fica "Falando…"), `UtteranceQueue` (ordem sem sobreposição com player fake, `cancel` do barge-in, volume, player que falha, `play()` interrompido pelo cancel não derruba a utterance seguinte), `UtteranceGate` (`start`/`end` por silêncio contínuo, `reset` sem `end`) e `voiceCallReadiness` (padrões de fábrica, pronta, endpoint local sem chave, modos local/híbrido, Chatterbox, TTS por API, probe de runtime — espeak-ng ausente/whisper quebrado).
 
-`e2e/voiceCallTurn.test.ts` (idem — turno completo sobre o **runner real** com banco temporário e provedor OpenAI-compatible **falso** em 127.0.0.1, `VoiceCallManager` real com síntese mockada e `UtteranceQueue` real com player fake): fala → transcrição mock → envio pelo caminho do composer → stream → 2 sentenças → 2 sínteses na ordem → playback sem sobreposição; fila de turnos (fala durante a resposta vira o PRÓXIMO turno, enviado ao fim); barge-in (cancela a fala pendente, texto completo segue no histórico); histórico de um turno de voz **idêntico** ao de um turno de texto (roles, chaves de meta e chaves de mensagem); overrides do modo voz (`voice.model` com provider/params próprios, `voice.tools`, `voicePrompt` somado ao system prompt — só nas requests, chat salvo intacto; `voice.enabled: false` recusa o `start` com erro legível; `voice.tools.enabledTools` vale no gate de execução — `[]` recusa até tool que o chat tem) e falha de TTS (erro no estado, fase não presa em "Falando…", texto no histórico).
+`e2e/voiceCallTurn.test.ts` (idem — turno completo sobre o **runner real** com banco temporário e provedor OpenAI-compatible **falso** em 127.0.0.1, `VoiceCallManager` real com síntese mockada e `UtteranceQueue` real com player fake): fala → transcrição mock → envio pelo caminho do composer → stream → 2 sentenças → 2 sínteses na ordem → playback sem sobreposição; fila de turnos (fala durante a resposta vira o PRÓXIMO turno, enviado ao fim); barge-in (cancela a fala pendente, texto completo segue no histórico); histórico de um turno de voz **idêntico** ao de um turno de texto (roles, chaves de meta e chaves de mensagem); overrides do modo voz (`voice.model` com provider/params próprios, `voice.tools`, `voicePrompt` somado ao system prompt — só nas requests, chat salvo intacto; `voice.enabled: false` recusa o `start` com erro legível; `voice.tools.enabledTools` vale no gate de execução — `[]` recusa até tool que o chat tem) e falha de TTS (erro no estado, fase não presa em "Falando…", texto no histórico; sentença que falha é pulada e a seguinte ainda é falada).
 
 `e2e/voiceCallActs.test.ts` (idem — unidades puras + **turno mockado** com relógio/PRNG/clipes injetáveis): `fillerShouldFire` (limiar de 1,2 s, tools disparam já, 1 por turno, nunca depois da 1ª fala, desligado) e `pickClipVariant` (uniforme, rotação sem repetir, rng lixo); fillers no turno (atraso toca UM clipe e a 1ª sentença o cancela; resposta rápida não toca; tools disparam já; sombra decide sem tocar; variante por rotação entre turnos; clipe ausente sem erro; stop cancela o tocando; carga de clipe em voo descartada quando a resposta chega primeiro); `decideInterjection` (tabela: desligada, observação velha, fala/pausa curtas, cooldown, probabilidade com PRNG fake, "?" evita THINKING, negação → NONE, hesitação/concordância/progresso, `classes` filtradas, variante com rotação, NONE dominante); `SpeechMeter`/`InterjectionWatcher` (fala/pausa; 1 observação por episódio de pausa); `PlaybackHold` (≤ 800 ms = backchannel não cancela; longa = barge-in na transição, uma única vez); interjeições no turno (toca o clipe da classe; nunca sobre a reprodução nem depois de a resposta falar; sombra decide sem tocar; decisão expirada descartada no áudio; cooldown); backchannel registra sem cancelar nem virar turno; integração (interjeição no meio da fala + filler na fase de resposta, cancelado pela 1ª sentença) e `UtteranceQueue.drop` (cancela só a utterance alvo).
 

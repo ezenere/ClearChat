@@ -1,6 +1,6 @@
 // Fundação de captura de áudio da feature de voz (renderer) — API pública reutilizável.
-// Nesta fatia não há integração com o Composer: os consumidores (Composer, settings, chamada de
-// voz) entram nas fatias futuras. Contrato de configuração: `src/shared/voice.ts` (não alterado).
+// Consumidores: ditado (`lib/voice/useDictation.ts`), chamada de voz (`lib/voice/useVoiceCall.ts`)
+// e Configurações → Áudio. Contrato de configuração: `src/shared/voice.ts`.
 export * from './pcm'
 export * from './silence'
 export * from './hotkey'

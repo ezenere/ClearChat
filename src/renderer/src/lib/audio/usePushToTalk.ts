@@ -1,25 +1,33 @@
 // Push-to-talk + auto-stop por silêncio (React): hook reutilizável sobre a captura (`capture.ts`).
 // Recebe as `AudioInputSettings` do contrato (`src/shared/voice.ts`, sem alterá-lo) e expõe um
 // estado ordeiro — um por vez: 'idle' | 'recording' | 'stopping' — com nível ao vivo para o
-// `Waveform`. Sem integração com o Composer nesta fatia (fundação reutilizável).
+// `Waveform`. Consumido pelo ditado (`lib/voice/useDictation.ts`).
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { AudioInputSettings } from '@shared/voice'
+import { captureErrorText } from '../voice/dictation'
 import { AudioCapture } from './capture'
-import { matchesHotkey } from './hotkey'
+import { matchesHotkey, pttHotkeyProblem } from './hotkey'
 
 export { matchesHotkey, parseHotkey, type Hotkey, type HotkeyEvent } from './hotkey'
 
 /** Estado da captura do push-to-talk (um por vez). */
 export type PushToTalkState = 'idle' | 'recording' | 'stopping'
 
-/** Motivo do fim da captura. */
-export type StopReason = 'manual' | 'ptt-release' | 'silence' | 'device-lost'
+/** Motivo do fim da captura (`unmount` = o componente saiu — quem consome deve DESCARTAR). */
+export type StopReason = 'manual' | 'ptt-release' | 'silence' | 'device-lost' | 'unmount'
 
 export interface UsePushToTalkOptions {
-  /** Recebe os chunks de PCM16 (mono, 16 kHz) — o destino (STT) entra em fatia futura. */
+  /** Recebe os chunks de PCM16 (mono, 16 kHz) — o destino é a sessão de transcrição. */
   onPcmChunk?: (chunk: Int16Array) => void
   /** Chamado quando a captura termina (qualquer motivo). */
   onStopped?: (reason: StopReason) => void
+  /** O microfone salvo não existe mais e a captura caiu no padrão do sistema. */
+  onFallback?: () => void
+  /**
+   * Tecla do PTT suspensa (UI do ditado escondida/bloqueada: chamada de voz, pergunta/retry
+   * pendente, host offline, Configurações abertas) — a tecla volta a ser uma tecla comum.
+   */
+  suspended?: boolean
   /** Limiar de silêncio (RMS); default documentado em `silence.ts` (`DEFAULT_SILENCE_THRESHOLD`). */
   silenceThreshold?: number
   /** Constraints extras do microfone (mescladas sobre `DEFAULT_AUDIO_TRACK_CONSTRAINTS`). */
@@ -32,6 +40,8 @@ export interface PushToTalkControls {
   level: number
   /** Último erro legível (permissão negada etc.); null sem erro. */
   error: string | null
+  /** Dispensa o erro da captura. */
+  clearError: () => void
   /** Inicia a captura (clique). Ignorado se já estiver gravando/parando. `settingsOverride`
    *  usa um valor fresco de `AudioInputSettings` nesta captura (sem esperar o re-render). */
   start: (settingsOverride?: AudioInputSettings) => Promise<void>
@@ -101,7 +111,7 @@ export function usePushToTalk(
       capture.on('level', (rms) => setLevel(rms))
       capture.on('pcm', (chunk) => optionsRef.current.onPcmChunk?.(chunk))
       capture.on('silence', () => void stopRef.current('silence'))
-      capture.on('error', (e) => setError(e.message))
+      capture.on('error', (e) => setError(captureErrorText(e)))
       capture.on('ended', () => {
         if (captureRef.current !== capture) return
         captureRef.current = null
@@ -115,13 +125,14 @@ export function usePushToTalk(
         if (captureRef.current === capture) {
           setLevel(0)
           setState('recording')
+          if (capture.fellBack) optionsRef.current.onFallback?.()
         }
       } catch (cause) {
         if (captureRef.current === capture) {
           captureRef.current = null
           setLevel(0)
           setState('idle')
-          setError(cause instanceof Error ? cause.message : String(cause))
+          setError(captureErrorText(cause as Error))
         }
         // se o captureRef mudou, o stop() já cuidou do estado (start interrompido de propósito)
       } finally {
@@ -145,8 +156,9 @@ export function usePushToTalk(
   }, [startCapture, stopCapture, options])
 
   // Tecla do PTT: segurar para falar (só com a janela em foco; listener no window).
-  const pttEnabled = settings.pttEnabled
-  const pttKey = settings.pttKey
+  // tecla que digita sem modificador (gravada antes da validação) não vira PTT — engoliria a tecla
+  const pttEnabled = settings.pttEnabled && !options.suspended
+  const pttKey = settings.pttKey && !pttHotkeyProblem(settings.pttKey) ? settings.pttKey : null
   useEffect(() => {
     if (!pttEnabled || !pttKey) return
     const release = (): void => {
@@ -185,15 +197,18 @@ export function usePushToTalk(
     }
   }, [pttEnabled, pttKey])
 
-  // Libera o microfone quando o componente desmonta.
+  // Libera o microfone quando o componente desmonta (motivo 'unmount': quem consome descarta).
   useEffect(() => {
-    return () => void stopRef.current('manual')
+    return () => void stopRef.current('unmount')
   }, [])
+
+  const clearError = useCallback(() => setError(null), [])
 
   return {
     state,
     level,
     error,
+    clearError,
     start: startCapture,
     stop: () => stopCapture('manual'),
     toggle

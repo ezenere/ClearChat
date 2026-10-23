@@ -1,18 +1,35 @@
-// Chamada de voz ativa — dock fixo (canto inferior central, acima do composer, visível em qualquer
-// chat): indicador de estado ("Ouvindo…/Transcrevendo…/Pensando…/Falando…"), waveform do microfone,
-// mudo (captura pausada), volume da reprodução, painel de timeline/toggles ("Atos de fala curta"),
-// indicador de modo sombra, "Encerrar" e o card de erro. A captura/reprodução vive em
-// `lib/voice/useVoiceCall` (o controller roda AQUI, uma única vez por app); o chat continua
-// normal por baixo (as mensagens do turno de voz aparecem como quaisquer outras).
+// Chamada de voz ativa — a barra da chamada SUBSTITUI o composer do chat da chamada (mesmo lugar e
+// largura do card do composer; texto, anexos, mic e enviar somem — nada é digitado no rascunho por
+// engano, e o rascunho volta intacto quando a chamada acaba). Mostra a fase ("Ouvindo…/
+// Transcrevendo…/Pensando…/Falando…"), waveform do microfone, mudo (captura pausada), volume,
+// painel de timeline/toggles ("Atos de fala curta"), indicador de modo sombra, "Encerrar", o aviso
+// de clipes ausentes (CTA "Gerar clipes") e o card de erro. Em OUTROS chats o composer funciona e
+// mostra a pílula "Chamada ativa em <chat>" (`VoiceCallElsewhere`) que leva de volta.
+//
+// A captura/reprodução vive em `lib/voice/useVoiceCall`, rodada UMA vez por `VoiceCallController`
+// (em `App`); o estado de runtime vem de `useVoiceCallRuntime`. O chat continua normal por cima.
 // Testids: `voice-call-dock`, `voice-call-status`, `voice-call-waveform`, `voice-call-mute`,
 // `voice-call-volume`, `voice-call-end`, `voice-call-error`, `voice-call-pending`,
-// `voice-call-panel-toggle`, `voice-call-shadow` (painel: `voice-call-panel`).
-import { useState } from 'react'
-import { Activity, Mic, MicOff, PhoneOff, TriangleAlert, Volume2, X } from 'lucide-react'
+// `voice-call-panel-toggle`, `voice-call-shadow`, `voice-call-clips-hint`, `voice-call-elsewhere`
+// (painel: `voice-call-panel`).
+import { useEffect, useState } from 'react'
+import {
+  Activity,
+  Mic,
+  MicOff,
+  Phone,
+  PhoneOff,
+  Sparkles,
+  TriangleAlert,
+  Volume2,
+  X
+} from 'lucide-react'
 import type { VoiceCallPhase } from '@shared/voice'
+import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { useVoiceCall } from '../../lib/voice/useVoiceCall'
+import { useVoiceCallRuntime } from '../../lib/voice/voiceCallRuntime'
 import { Tip } from '../ui/Tooltip'
 import { Waveform } from './Waveform'
 import { VoiceCallPanel } from './VoiceCallPanel'
@@ -34,135 +51,244 @@ function phaseLabel(phase: VoiceCallPhase): string {
   }
 }
 
-/** Dock da chamada de voz (só renderiza com a chamada ativa; o controller roda sempre aqui). */
+/** Controller da chamada (uma vez por app, em `App`): captura/reprodução + reidratação do estado. */
+export function VoiceCallController(): null {
+  useVoiceCall()
+  // reidrata o estado da chamada do main (recarregar o renderer no meio da chamada): o evento
+  // `voice:call:state` só chega em transições
+  useEffect(() => {
+    void api.voice?.call
+      .getState?.()
+      .then((state) => useStore.getState().applyVoiceCallState(state))
+      .catch(() => void 0)
+  }, [])
+  return null
+}
+
+/**
+ * Pílula "Chamada ativa em <chat>" no composer de OUTROS chats (o composer de lá funciona normal):
+ * leva de volta ao chat da chamada, onde a barra da chamada está.
+ */
+export function VoiceCallElsewhere(): React.JSX.Element | null {
+  const call = useStore((s) => s.voiceCall)
+  const title = useStore((s) => s.chats.find((c) => c.id === s.voiceCall.chatId)?.title ?? null)
+  const openChat = useStore((s) => s.openChat)
+  if (!call.active || !call.chatId) return null
+  return (
+    <div className="mb-2 flex" data-stack-extra>
+      <button
+        type="button"
+        data-testid="voice-call-elsewhere"
+        onClick={() => void openChat(call.chatId!, call.sessionId ?? undefined)}
+        className="flex max-w-full min-w-0 items-center gap-1.5 rounded-full border border-accent/30 bg-accent/10 px-2.5 py-1 text-[11.5px] text-accent-strong transition-colors hover:bg-accent/20"
+      >
+        <Phone className="size-3 shrink-0" />
+        <span className="min-w-0 truncate">
+          Chamada ativa em <strong className="font-medium">{title ?? 'outro chat'}</strong>
+        </span>
+        <span className="shrink-0 text-subtle">· ir para a chamada</span>
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Barra da chamada NO LUGAR do composer do chat da chamada (mesma largura/posição do card do
+ * composer; o texto fica desabilitado durante a chamada). Painel, aviso de clipes e erro ficam
+ * logo acima, no mesmo fluxo da pilha.
+ */
 export function VoiceCallDock(): React.JSX.Element | null {
   const call = useStore((s) => s.voiceCall)
   const stopVoiceCall = useStore((s) => s.stopVoiceCall)
   const timeline = useStore((s) => s.voiceCallTimeline)
-  const controls = useVoiceCall()
+  const runtimeError = useVoiceCallRuntime((s) => s.error)
+  const volume = useVoiceCallRuntime((s) => s.volume)
+  const toggleMute = useVoiceCallRuntime((s) => s.toggleMute)
+  const setVolume = useVoiceCallRuntime((s) => s.setVolume)
+  const clearError = useVoiceCallRuntime((s) => s.clearError)
   const [panelOpen, setPanelOpen] = useState(false)
   const { resolved } = useVoiceCallConfig()
   if (!call.active) return null
-  const error = call.error ?? controls.error
+  const error = call.error ?? runtimeError
   const shadowCount = timeline.filter(
     (e) => e.kind === 'decision' && !e.played && (e.reason ?? '').includes('shadow')
   ).length
   return (
-    <>
-      <div
-        data-testid="voice-call-dock"
-        className="pointer-events-auto fixed bottom-4 left-1/2 z-[80] flex -translate-x-1/2 items-center gap-2 rounded-2xl border border-border-strong/70 bg-elevated px-3 py-2 shadow-popover"
-      >
-        <span data-testid="voice-call-waveform" className="flex items-center">
-          <Waveform
-            level={controls.level}
-            recording={!call.muted}
-            simulate={MOCK}
-            className="h-7 w-24 text-accent-strong"
-          />
-        </span>
-        <span
-          data-testid="voice-call-status"
-          aria-live="polite"
-          className={cn('min-w-0 text-[12.5px] text-fg/90', call.muted && 'text-subtle')}
-        >
-          {call.muted ? 'Microfone mudo' : phaseLabel(call.phase)}
-        </span>
-        {call.pendingText && (
-          <span
-            data-testid="voice-call-pending"
-            className="max-w-[220px] truncate text-[11px] text-subtle"
-            title={call.pendingText}
-          >
-            Próximo: {call.pendingText}
-          </span>
-        )}
-        <div className="mx-1 h-5 w-px bg-border" />
-        {resolved.interjections.shadow && (
-          <span
-            data-testid="voice-call-shadow"
-            className="rounded-full border border-warning/40 bg-warning/10 px-1.5 py-px text-[10px] text-warning"
-            title="Modo sombra: os atos de fala curta decidem mas não tocam (decisões no log de avaliação)"
-          >
-            modo sombra · {shadowCount}
-          </span>
-        )}
-        <Tip label={panelOpen ? 'Fechar timeline' : 'Timeline e atos de fala curta'}>
-          <button
-            type="button"
-            data-testid="voice-call-panel-toggle"
-            aria-label="Timeline e atos de fala curta"
-            aria-pressed={panelOpen}
-            onClick={() => setPanelOpen((v) => !v)}
-            className={cn(
-              'flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
-              panelOpen && 'bg-active text-fg'
-            )}
-          >
-            <Activity className="size-4" />
-          </button>
-        </Tip>
-        <Tip label={call.muted ? 'Ativar microfone' : 'Silenciar microfone'}>
-          <button
-            type="button"
-            data-testid="voice-call-mute"
-            aria-label={call.muted ? 'Ativar microfone' : 'Silenciar microfone'}
-            aria-pressed={call.muted}
-            onClick={() => void controls.toggleMute()}
-            className={cn(
-              'flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
-              call.muted && 'bg-danger/15 text-danger hover:bg-danger/25 hover:text-danger'
-            )}
-          >
-            {call.muted ? <MicOff className="size-4" /> : <Mic className="size-4" />}
-          </button>
-        </Tip>
-        <Tip label={`Volume da fala: ${Math.round(controls.volume * 100)}%`}>
-          <label className="flex items-center gap-1.5 text-subtle">
-            <Volume2 className="size-4" />
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={Math.round(controls.volume * 100)}
-              data-testid="voice-call-volume"
-              aria-label="Volume da fala"
-              onChange={(e) => controls.setVolume(Number(e.target.value) / 100)}
-              className="w-16 accent-accent-strong"
-            />
-          </label>
-        </Tip>
-        <Tip label="Encerrar chamada">
-          <button
-            type="button"
-            data-testid="voice-call-end"
-            aria-label="Encerrar chamada"
-            onClick={() => void stopVoiceCall()}
-            className="flex size-7 items-center justify-center rounded-lg bg-danger/15 text-danger transition-colors hover:bg-danger/25"
-          >
-            <PhoneOff className="size-4" />
-          </button>
-        </Tip>
-      </div>
+    <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
       <VoiceCallPanel open={panelOpen} />
+      <ClipsHint />
       {error && (
         <div
           role="alert"
           data-testid="voice-call-error"
-          className="pointer-events-auto fixed bottom-20 left-1/2 z-[80] flex w-[min(420px,90vw)] -translate-x-1/2 items-center gap-2 rounded-xl border border-danger/30 bg-danger/[0.08] px-3 py-2 text-[12px] text-danger shadow-popover"
+          className="flex items-center gap-2 rounded-xl border border-danger/30 bg-danger/[0.08] px-3 py-2 text-[12px] text-danger"
         >
           <TriangleAlert className="size-3.5 shrink-0" />
           <span className="min-w-0 flex-1 break-words">{error}</span>
-          <button
-            type="button"
-            aria-label="Dispensar erro da chamada"
-            onClick={controls.clearError}
-            className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
-          >
-            <X className="size-3.5" />
-          </button>
+          {!call.error && (
+            <button
+              type="button"
+              aria-label="Dispensar erro da chamada"
+              onClick={clearError}
+              className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+            >
+              <X className="size-3.5" />
+            </button>
+          )}
         </div>
       )}
-    </>
+      <div
+        data-testid="voice-call-dock"
+        role="region"
+        aria-label="Chamada de voz"
+        className="rounded-2xl border border-accent/25 bg-surface shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7)]"
+      >
+        {/* linha 1 (lugar do texto): waveform + fase da chamada + fala pendente */}
+        <div className="flex min-w-0 items-center gap-3 px-4 pt-3 pb-1.5">
+          <span data-testid="voice-call-waveform" className="flex shrink-0 items-center">
+            <DockWaveform muted={call.muted} />
+          </span>
+          <span
+            data-testid="voice-call-status"
+            aria-live="polite"
+            className={cn(
+              'shrink-0 text-[14px] whitespace-nowrap text-fg/90',
+              call.muted && 'text-subtle'
+            )}
+          >
+            {call.muted ? 'Microfone mudo' : phaseLabel(call.phase)}
+          </span>
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-subtle">
+            {call.pendingText && (
+              <span data-testid="voice-call-pending" title={call.pendingText}>
+                Próximo: {call.pendingText}
+              </span>
+            )}
+          </span>
+        </div>
+        {/* linha 2 (lugar do toolbar): controles + Encerrar no lugar do Enviar */}
+        <div className="flex min-w-0 items-center gap-2 px-2.5 pb-2.5">
+          <Tip label={panelOpen ? 'Fechar timeline' : 'Timeline e atos de fala curta'}>
+            <button
+              type="button"
+              data-testid="voice-call-panel-toggle"
+              aria-label="Timeline e atos de fala curta"
+              aria-pressed={panelOpen}
+              onClick={() => setPanelOpen((v) => !v)}
+              className={cn(
+                'flex size-7 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
+                panelOpen && 'bg-active text-fg'
+              )}
+            >
+              <Activity className="size-4" />
+            </button>
+          </Tip>
+          <Tip label={call.muted ? 'Ativar microfone' : 'Silenciar microfone'}>
+            <button
+              type="button"
+              data-testid="voice-call-mute"
+              aria-label={call.muted ? 'Ativar microfone' : 'Silenciar microfone'}
+              aria-pressed={call.muted}
+              onClick={() => void toggleMute()}
+              className={cn(
+                'flex size-7 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
+                call.muted && 'bg-danger/15 text-danger hover:bg-danger/25 hover:text-danger'
+              )}
+            >
+              {call.muted ? <MicOff className="size-4" /> : <Mic className="size-4" />}
+            </button>
+          </Tip>
+          <Tip label={`Volume da fala: ${Math.round(volume * 100)}%`}>
+            <label className="flex shrink-0 items-center gap-1.5 text-subtle">
+              <Volume2 className="size-4" />
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={Math.round(volume * 100)}
+                data-testid="voice-call-volume"
+                aria-label="Volume da fala"
+                onChange={(e) => setVolume(Number(e.target.value) / 100)}
+                className="w-16 accent-accent-strong"
+              />
+            </label>
+          </Tip>
+          {resolved.interjections.shadow && (
+            <span
+              data-testid="voice-call-shadow"
+              className="shrink-0 rounded-full border border-warning/40 bg-warning/10 px-1.5 py-px text-[10px] whitespace-nowrap text-warning"
+              title="Modo sombra: os atos de fala curta decidem mas não tocam (decisões no log de avaliação)"
+            >
+              modo sombra · {shadowCount}
+            </span>
+          )}
+          <span className="min-w-0 flex-1 truncate text-[11px] text-faint">
+            Texto desativado durante a chamada
+          </span>
+          <Tip label="Encerrar chamada">
+            <button
+              type="button"
+              data-testid="voice-call-end"
+              aria-label="Encerrar chamada"
+              onClick={() => void stopVoiceCall()}
+              className="flex h-8 shrink-0 items-center gap-1.5 rounded-xl bg-danger px-3 text-[12.5px] font-medium text-white transition-colors hover:bg-danger/85"
+            >
+              <PhoneOff className="size-4" />
+              Encerrar
+            </button>
+          </Tip>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Waveform isolado (o nível muda a ~30 Hz — só este componente re-renderiza). */
+function DockWaveform({ muted }: { muted: boolean }): React.JSX.Element {
+  const level = useVoiceCallRuntime((s) => s.level)
+  return (
+    <Waveform
+      level={level}
+      recording={!muted}
+      simulate={MOCK}
+      className="h-6 w-20 text-accent-strong"
+    />
+  )
+}
+
+/**
+ * Interjeições/fillers ligados (fora do modo sombra) mas sem clipes gerados para a voz atual:
+ * nada tocaria em silêncio — o dock avisa e oferece gerar os clipes ali mesmo.
+ */
+function ClipsHint(): React.JSX.Element | null {
+  const clips = useVoiceCallRuntime((s) => s.clips)
+  const progress = useVoiceCallRuntime((s) => s.clipsProgress)
+  const generate = useVoiceCallRuntime((s) => s.generateClips)
+  const { resolved } = useVoiceCallConfig()
+  const wants =
+    !resolved.interjections.shadow && (resolved.interjections.enabled || resolved.fillers.enabled)
+  if (!wants || (clips !== 'missing' && clips !== 'generating')) return null
+  return (
+    <div
+      data-testid="voice-call-clips-hint"
+      className="flex items-center gap-2 rounded-xl border border-warning/25 bg-warning/[0.06] px-3 py-1.5 text-[11.5px] text-warning"
+    >
+      <Sparkles className="size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1">
+        {clips === 'generating'
+          ? `Gerando clipes de voz… ${progress?.done ?? 0}/${progress?.total || 15}`
+          : 'Interjeições e falas de espera estão ligadas, mas ainda não há clipes para a voz atual — nada vai tocar até gerar.'}
+      </span>
+      {clips === 'missing' && (
+        <button
+          type="button"
+          data-testid="voice-call-clips-generate"
+          onClick={() => void generate()}
+          className="shrink-0 rounded-md border border-warning/30 px-2 py-0.5 text-[11.5px] font-medium transition-colors hover:bg-warning/15"
+        >
+          Gerar clipes
+        </button>
+      )}
+    </div>
   )
 }

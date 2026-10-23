@@ -6,6 +6,7 @@
 // Sem Electron/UI/IPC; síntese via `synthesize` de `tts.ts` (motor local injetado ou API).
 import { createSHA256 } from 'hash-wasm'
 import { existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TtsSettings } from '@shared/voice'
@@ -250,6 +251,25 @@ export async function generateClips(opts: GenerateClipsOptions): Promise<ClipsMa
   const voiceId = clipVoiceId(opts.settings)
   const dir = clipsDir(opts.baseDir, voiceId)
   if (!dir) throw new Error(`id de voz inseguro para clipes: ${voiceId}`)
+  // gerações da MESMA voz em série (dois cliques/janelas): a segunda espera a primeira e reaproveita
+  // o cache dela em vez de disputar os mesmos `.part`/manifest
+  const prev = clipLocks.get(dir) ?? Promise.resolve()
+  const run = prev.catch(() => undefined).then(() => generateClipsLocked(opts, voiceId, dir))
+  clipLocks.set(dir, run)
+  try {
+    return await run
+  } finally {
+    if (clipLocks.get(dir) === run) clipLocks.delete(dir)
+  }
+}
+
+const clipLocks = new Map<string, Promise<unknown>>()
+
+async function generateClipsLocked(
+  opts: GenerateClipsOptions,
+  voiceId: string,
+  dir: string
+): Promise<ClipsManifest> {
   const hash = await clipsHash(opts.settings)
   const existing = await loadClips(opts.baseDir, voiceId)
   if (existing && existing.hash === hash) return existing
@@ -268,7 +288,7 @@ export async function generateClips(opts: GenerateClipsOptions): Promise<ClipsMa
         { local: opts.local, signal: opts.signal }
       )
       // escrita via .part + rename (manifest só sai no fim, com tudo íntegro)
-      const part = join(dir, `${file}.part`)
+      const part = join(dir, `${file}.${randomUUID().slice(0, 8)}.part`)
       await writeFile(part, r.audio)
       await rename(part, join(dir, file))
       entries.push({ id: `${cls}_${n}`, file, class: cls, n, text })
@@ -289,7 +309,7 @@ export async function generateClips(opts: GenerateClipsOptions): Promise<ClipsMa
     generatedAt: new Date().toISOString(),
     clips: entries
   }
-  const tmp = join(dir, `${MANIFEST_FILE}.tmp`)
+  const tmp = join(dir, `${MANIFEST_FILE}.${randomUUID().slice(0, 8)}.tmp`)
   await writeFile(tmp, JSON.stringify(manifest, null, 2))
   await rename(tmp, join(dir, MANIFEST_FILE))
   return manifest

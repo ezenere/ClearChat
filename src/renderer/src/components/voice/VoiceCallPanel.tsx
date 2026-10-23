@@ -105,7 +105,7 @@ function describeTimelineEvent(e: VoiceCallTimelineEvent): string {
   }
 }
 
-/** Painel recolhível acima do dock (só com a chamada ativa). */
+/** Painel recolhível acima do dock (no mesmo fluxo da coluna do composer; só com a chamada ativa). */
 export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element | null {
   const timeline = useStore((s) => s.voiceCallTimeline)
   const { defaults, resolved, setInterjections, setFillers } = useVoiceCallConfig()
@@ -118,7 +118,7 @@ export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element |
   return (
     <div
       data-testid="voice-call-panel"
-      className="pointer-events-auto fixed bottom-[76px] left-1/2 z-[80] flex w-[min(560px,92vw)] -translate-x-1/2 flex-col gap-2 rounded-2xl border border-border-strong/70 bg-elevated px-3 py-2.5 shadow-popover"
+      className="flex w-full flex-col gap-2 rounded-2xl border border-border-strong/70 bg-elevated px-3 py-2.5 shadow-popover"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
         <span className="text-[11.5px] font-medium text-fg/90">Atos de fala curta</span>

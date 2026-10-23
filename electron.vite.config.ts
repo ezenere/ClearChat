@@ -12,7 +12,14 @@ export default defineConfig({
       // Production deps (package.json "dependencies") are externalized by default.
       // better-sqlite3 is a native addon and must never be bundled.
       externalizeDeps: true,
-      rolldownOptions: { external: ['better-sqlite3'] }
+      rolldownOptions: {
+        external: ['better-sqlite3'],
+        // 2º entry: o processo do motor local de STT (utilityProcess — whisper.cpp fora do main)
+        input: {
+          index: resolve('src/main/index.ts'),
+          sttWorker: resolve('src/main/voice/sttWorker.ts')
+        }
+      }
     }
   },
   preload: {

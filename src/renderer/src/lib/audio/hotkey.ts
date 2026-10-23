@@ -45,7 +45,13 @@ const KEY_ALIASES: Record<string, string> = {
   up: 'arrowup',
   down: 'arrowdown',
   left: 'arrowleft',
-  right: 'arrowright'
+  right: 'arrowright',
+  // 'Page Up'/'Page Down' (rótulo antigo gravado como tecla) e '+' literal (token 'Plus')
+  'page up': 'pageup',
+  'page down': 'pagedown',
+  pgup: 'pageup',
+  pgdn: 'pagedown',
+  plus: '+'
 }
 
 /** Normaliza o nome de uma tecla (minúsculas, aliases aplicados). O espaço (' ') não é aparado. */
@@ -96,6 +102,24 @@ export function parseHotkey(hotkey: string | null | undefined): Hotkey | null {
     if (!parsed.key) return null
   }
   return parsed.key ? parsed : null
+}
+
+/** Teclas que podem ser o push-to-talk SEM modificador (não digitam nada nem editam texto). */
+const BARE_PTT_KEYS = new Set(['pause', 'scrolllock', 'insert'])
+
+/**
+ * Valida uma hotkey para o push-to-talk (o `preventDefault` do PTT engole a tecla no app inteiro):
+ * precisa de Ctrl/Alt/Meta (Shift sozinho ainda digita a letra) OU ser uma tecla que não digita
+ * (F1–F24, Pause, Scroll Lock, Insert). Esc nunca vale (cancela a gravação/fecha diálogos).
+ * Devolve `null` quando válida, senão a mensagem pt-BR do motivo. Pura (testada em `e2e/audio.test.ts`).
+ */
+export function pttHotkeyProblem(hotkey: string | null | undefined): string | null {
+  const parsed = parseHotkey(hotkey)
+  if (!parsed) return 'Tecla inválida.'
+  if (parsed.key === 'escape') return 'Esc não pode ser o push-to-talk (ele cancela a gravação).'
+  if (parsed.ctrl || parsed.alt || parsed.meta) return null
+  if (/^f([1-9]|1\d|2[0-4])$/.test(parsed.key) || BARE_PTT_KEYS.has(parsed.key)) return null
+  return 'Use uma tecla F1–F24 ou combine com Ctrl, Alt ou Meta (ex.: Ctrl+Shift+Espaço) — uma tecla que digita deixaria de funcionar no app.'
 }
 
 /**

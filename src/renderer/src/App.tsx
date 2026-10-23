@@ -10,7 +10,7 @@ import { CHAT_MIN_WIDTH, useWidth } from './components/viewer/viewerLayout'
 import { SettingsModal } from './components/SettingsModal'
 import { Sidebar } from './components/Sidebar'
 import { TopBar } from './components/TopBar'
-import { VoiceCallDock } from './components/voice/VoiceCallDock'
+import { VoiceCallController } from './components/voice/VoiceCallDock'
 import { SyncPrompts } from './components/sync/ChatHost'
 import { Spinner } from './components/ui/controls'
 import { TooltipProvider } from './components/ui/Tooltip'
@@ -25,6 +25,9 @@ function Toasts(): React.JSX.Element {
       {toasts.map((t) => (
         <div
           key={t.id}
+          role={t.kind === 'error' ? 'alert' : 'status'}
+          data-testid="toast"
+          data-kind={t.kind}
           className={cn(
             'pointer-events-auto flex animate-slide-up items-start gap-2.5 rounded-xl border bg-elevated px-3.5 py-2.5 text-[12.5px] shadow-popover',
             t.kind === 'error' ? 'border-danger/25' : 'border-border-strong/70'
@@ -158,7 +161,7 @@ function App(): React.JSX.Element {
         </div>
       )}
       <Toasts />
-      <VoiceCallDock />
+      <VoiceCallController />
     </TooltipProvider>
   )
 }

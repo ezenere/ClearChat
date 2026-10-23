@@ -18,6 +18,7 @@ import {
   DEFAULT_SILENCE_THRESHOLD,
   SilenceDetector
 } from '../src/renderer/src/lib/audio/silence.ts'
+import { menuInputDevices } from '../src/renderer/src/lib/audio/devices.ts'
 
 function keyEvent(partial: Partial<HotkeyEvent> & { key: string }): HotkeyEvent {
   return { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, ...partial }
@@ -32,24 +33,43 @@ test('resampleMono: 48 kHz → 16 kHz tem 1/3 das amostras e mantém o sinal con
   for (const v of out) assert.equal(v, 0.5)
 })
 
-test('resampleMono: rampa 48 kHz → 16 kHz pega cada 3ª amostra (interpolação exata)', () => {
+test('resampleMono: rampa 48 kHz → 16 kHz segue a rampa no miolo (filtro simétrico, DC unitário)', () => {
   const input = new Float32Array(480)
   for (let i = 0; i < input.length; i++) input[i] = i
   const out = resampleMono(input, 48000, 16000)
   assert.equal(out.length, 160)
-  assert.equal(out[0], 0)
-  assert.equal(out[10], 30)
-  assert.equal(out[159], 477)
+  // longe das bordas o kernel simétrico normalizado preserva sinais lineares (posição i·3)
+  for (const i of [20, 50, 80, 130])
+    assert.ok(Math.abs(out[i] - i * 3) < 1e-3, `out[${i}]=${out[i]}`)
 })
 
-test('resampleMono: 44,1 kHz → 16 kHz interpola entre as amostras', () => {
-  const input = new Float32Array(441)
+test('resampleMono: 44,1 kHz → 16 kHz tamanho exato e posição fracionária no miolo', () => {
+  const input = new Float32Array(4410)
   for (let i = 0; i < input.length; i++) input[i] = i
   const out = resampleMono(input, 44100, 16000)
-  assert.equal(out.length, 160)
-  // pos = i * 44100/16000 = 2,75625 → entre as amostras 2 e 3
-  assert.ok(Math.abs(out[1] - 2.75625) < 1e-6)
-  assert.equal(out[0], 0)
+  assert.equal(out.length, 1600)
+  // pos = i · 44100/16000 = i · 2,75625
+  assert.ok(Math.abs(out[100] - 275.625) < 1e-2, `out[100]=${out[100]}`)
+})
+
+test('resampleMono: anti-aliasing — tom acima da Nyquist de saída é atenuado, voz passa', () => {
+  const tone = (f: number): Float32Array => {
+    const a = new Float32Array(4800)
+    for (let i = 0; i < a.length; i++) a[i] = 0.5 * Math.sin((2 * Math.PI * f * i) / 48000)
+    return a
+  }
+  const gain = (f: number): number => {
+    const out = resampleMono(tone(f), 48000, 16000)
+    assert.equal(out.length, 1600)
+    return frameRms(out.subarray(100, 1500)) / (0.5 / Math.SQRT2)
+  }
+  // banda de voz intacta
+  assert.ok(Math.abs(gain(1000) - 1) < 0.02, `1 kHz: ${gain(1000)}`)
+  assert.ok(Math.abs(gain(3000) - 1) < 0.02, `3 kHz: ${gain(3000)}`)
+  // acima de 8 kHz (Nyquist de 16 kHz): a decimação linear dobraria 12 kHz para 4 kHz com ganho alto
+  assert.ok(gain(9000) < 0.05, `9 kHz: ${gain(9000)}`)
+  assert.ok(gain(12000) < 0.01, `12 kHz: ${gain(12000)}`)
+  assert.ok(gain(20000) < 0.01, `20 kHz: ${gain(20000)}`)
 })
 
 test('resampleMono: mesma taxa devolve cópia; entrada vazia devolve vazio; taxas inválidas lançam', () => {
@@ -227,4 +247,30 @@ test('SilenceDetector: durações de frame inválidas contam 0', () => {
   assert.equal(d.push(0.05, NaN), false)
   assert.equal(d.push(0.05, -5), false)
   assert.equal(d.silentMs, 0)
+})
+
+// ---------------- dispositivos (devices.ts) ----------------
+
+test('menuInputDevices: esconde Default/Communications e usa o nome do padrão no rótulo', () => {
+  const r = menuInputDevices([
+    { deviceId: 'default', label: 'Default - Microfone USB (1234:abcd)', isDefault: true },
+    { deviceId: 'communications', label: 'Communications - Headset', isDefault: false },
+    { deviceId: 'abc', label: 'Microfone USB (1234:abcd)', isDefault: false },
+    { deviceId: 'def', label: 'Headset', isDefault: false }
+  ])
+  assert.deepEqual(
+    r.devices.map((d) => d.deviceId),
+    ['abc', 'def']
+  )
+  assert.equal(r.systemLabel, 'Microfone USB (1234:abcd)')
+  // "Default" puro (sem nome) não enriquece o rótulo; lista sem sintéticos passa inteira
+  assert.equal(
+    menuInputDevices([{ deviceId: 'default', label: 'Default', isDefault: true }]).systemLabel,
+    null
+  )
+  assert.equal(
+    menuInputDevices([{ deviceId: 'x', label: 'X', isDefault: false }]).devices.length,
+    1
+  )
+  assert.deepEqual(menuInputDevices([]), { systemLabel: null, devices: [] })
 })

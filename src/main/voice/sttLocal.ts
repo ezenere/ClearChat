@@ -7,15 +7,14 @@
 // - `whisper.cpp` (ggml `.bin` do catálogo): `@napi-rs/whisper` (Node-API pré-compilado, MIT) —
 //   transcrição final e parciais em janelas (a sessão dispara a cada `STT_PARTIAL_INTERVAL_MS`;
 //   `onNewSegment` do binding não dispara na 0.0.4 — medido — então parciais por callback ficam
-//   para engines de streaming).
+//   para engines de streaming). A inferência roda num PROCESSO à parte (`sttWorker.ts` via
+//   `sttWorkerHost.ts` — `utilityProcess` no app): `Whisper.full()` é síncrono e, no main,
+//   congelava o app inteiro durante a transcrição.
 // - `vosk`: extração do `.zip` em `models/<id>/` implementada e verificada (`zip.ts`), executada
 //   na primeira transcrição; o motor de inferência (libvosk) ainda NÃO está plugado nesta versão —
 //   erro legível por engine. A abordagem medida no spike (vosk-koffi, streaming real) fica
 //   documentada como recomendação.
 // - `nemotron` (GGUF): sem motor nesta versão (exigiria runtime llama.cpp) — idem.
-//
-// Limitação medida: `Whisper.full()` é síncrono (bloqueia o main thread pelo tempo da inferência —
-// ~170 ms para o tiny em 3 s de áudio; cresce com o modelo). Ver SPEC.
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { availableParallelism } from 'node:os'
@@ -36,16 +35,73 @@ import {
   type TranscribeAudioInput,
   type TranscribeResult
 } from './stt'
+import { sharedSttWorkerHost, type SttWorkerHost } from './sttWorkerHost'
 import { extractZipToDir } from './zip'
 
 // ---------------- engines suportadas ----------------
 
+// ---------------- probe do runtime (binding nativo carregável?) ----------------
+
+/** Resultado do probe do runtime de um engine. */
+export interface SttRuntimeProbe {
+  available: boolean
+  /** Motivo legível quando indisponível. */
+  reason: string | null
+}
+
+let whisperProbe: SttRuntimeProbe | null = null
+let whisperProbing: Promise<SttRuntimeProbe> | null = null
+
 /**
- * O runtime desta versão consegue carregar o engine? Pura — usada por `deriveHasLocalReady`
- * ("pronto = modelo instalado + runtime carregável") e pelo próprio backend.
+ * Confere (uma vez por execução — memoizado) que o binding do whisper.cpp (`@napi-rs/whisper`)
+ * carrega DE VERDADE no processo onde a inferência roda (o worker). Nunca lança: falha vira
+ * `{ available: false, reason }`. Os canais de IPC esperam isto antes de derivar "pronto".
+ */
+export function probeWhisperRuntime(host?: SttWorkerHost): Promise<SttRuntimeProbe> {
+  if (whisperProbe) return Promise.resolve(whisperProbe)
+  if (!whisperProbing) {
+    whisperProbing = (host ?? sharedSttWorkerHost())
+      .probe()
+      .then((r) => {
+        whisperProbe = {
+          available: r.available,
+          reason: r.available
+            ? null
+            : `o motor whisper.cpp não pôde ser carregado nesta instalação (${r.reason ?? 'motivo desconhecido'})`
+        }
+        return whisperProbe
+      })
+      .finally(() => {
+        whisperProbing = null
+      })
+  }
+  return whisperProbing
+}
+
+/** Define/zera o resultado memoizado do probe (testes; null = ainda não sondado). */
+export function setWhisperRuntimeProbe(probe: SttRuntimeProbe | null): void {
+  whisperProbe = probe
+}
+
+/** Último probe do whisper.cpp (null = ainda não sondado). */
+export function whisperRuntimeProbe(): SttRuntimeProbe | null {
+  return whisperProbe
+}
+
+/**
+ * O runtime desta versão consegue carregar o engine? Síncrona — usada por `deriveHasLocalReady`
+ * ("pronto = modelo instalado + runtime carregável") e pelo próprio backend. `whisper.cpp` vale
+ * enquanto o probe (`probeWhisperRuntime`, memoizado) não disser o contrário: os caminhos de IPC
+ * aguardam o probe antes de perguntar, então no app a resposta já reflete o binding real.
  */
 export function isSttEngineRuntimeAvailable(engine: SttLocalEngine): boolean {
-  return engine === 'whisper.cpp'
+  return engine === 'whisper.cpp' && whisperProbe?.available !== false
+}
+
+/** Motivo legível de o runtime do engine estar indisponível (null = disponível/desconhecido). */
+export function sttEngineUnavailableReason(engine: SttLocalEngine): string | null {
+  if (engine !== 'whisper.cpp') return null
+  return whisperProbe?.available === false ? whisperProbe.reason : null
 }
 
 /** Erro por engine quando o runtime de inferência não existe nesta versão (honesto e legível). */
@@ -53,7 +109,9 @@ export function engineUnavailableError(engine: SttLocalEngine): SttError {
   const hint =
     engine === 'vosk'
       ? "o modelo Vosk é extraído e verificado por este runtime, mas o motor de inferência (libvosk) ainda não está plugado nesta versão — use o engine 'whisper.cpp' ou o modo API"
-      : `o engine '${engine}' ainda não tem motor de inferência nesta versão — use o engine 'whisper.cpp' ou o modo API`
+      : engine === 'whisper.cpp'
+        ? `${sttEngineUnavailableReason(engine) ?? 'o motor whisper.cpp não pôde ser carregado nesta instalação'} — use o modo API`
+        : `o engine '${engine}' ainda não tem motor de inferência nesta versão — use o engine 'whisper.cpp' ou o modo API`
   return new SttError('config', `motor local de transcrição não está pronto — ${hint}`, {
     backend: 'local'
   })
@@ -149,6 +207,8 @@ export function decodeWavToMonoFloat32(wav: Uint8Array): DecodedWav {
 
 export interface SttEngineTranscribeOptions {
   language?: string
+  /** Cancelamento (o worker descarta o resultado; o chamador recebe `AbortError` na hora). */
+  signal?: AbortSignal
   /** Texto incremental enquanto o engine consome o áudio (engines de streaming). */
   onPartial?: (text: string) => void
 }
@@ -161,43 +221,40 @@ export interface LoadedSttEngine {
 /** Carrega o engine para o modelo (caminho do arquivo do catálogo); assíncrono e cacheável. */
 export type SttEngineLoader = (modelPath: string) => Promise<LoadedSttEngine>
 
-/** Loader padrão: `@napi-rs/whisper` (Node-API; import lazy para não carregar o .node nos testes). */
-export async function loadWhisperEngine(modelPath: string): Promise<LoadedSttEngine> {
-  type WhisperModule = typeof import('@napi-rs/whisper')
-  let mod: WhisperModule
-  try {
-    mod = await import('@napi-rs/whisper')
-  } catch (e) {
-    throw new SttError(
-      'config',
-      `motor local de transcrição não está pronto — o motor whisper.cpp não pôde ser carregado nesta instalação (${e instanceof Error ? e.message : String(e)})`,
-      { backend: 'local', cause: e }
-    )
-  }
-  let whisper: InstanceType<WhisperModule['Whisper']>
-  try {
-    whisper = new mod.Whisper(modelPath)
-  } catch (e) {
-    throw new SttError(
-      'config',
-      `modelo local inválido ou corrompido (${modelPath}) — baixe novamente em Configurações → Áudio (${e instanceof Error ? e.message : String(e)})`,
-      { backend: 'local', cause: e }
-    )
-  }
+/** Threads da inferência local (deixa um núcleo para o resto do app; teto de 8 — medido). */
+export function sttLocalThreads(): number {
+  return Math.max(1, Math.min(8, availableParallelism() - 1))
+}
+
+/**
+ * Loader padrão: o whisper.cpp roda no processo do worker (`sttWorkerHost.ts`) — o main só
+ * despacha as amostras e espera a resposta (o event loop nunca bloqueia na inferência). A carga do
+ * modelo acontece no worker, no primeiro `transcribe` (cache lá dentro, um modelo por vez).
+ */
+export async function loadWhisperEngine(
+  modelPath: string,
+  host: SttWorkerHost = sharedSttWorkerHost()
+): Promise<LoadedSttEngine> {
   return {
     async transcribe(samples, opts) {
-      const params = new mod.WhisperFullParams(mod.WhisperSamplingStrategy.Greedy)
-      params.nThreads = Math.max(1, Math.min(8, availableParallelism() - 1))
-      params.noTimestamps = true
-      const language = languageParam(opts.language)
-      if (language) params.language = language
-      else params.detectLanguage = true
-      // `full` é síncrono (limitação documentada); `onPartial` não tem fonte neste binding
-      // (`onNewSegment` não dispara — medido na 0.0.4) — parciais por janelas vêm da sessão.
-      const text = whisper.full(params, samples)
-      return { text: text.trim() }
+      const r = await host.transcribe(modelPath, samples, {
+        language: languageParam(opts.language),
+        nThreads: sttLocalThreads(),
+        signal: opts.signal
+      })
+      return { text: r.text }
     }
   }
+}
+
+/**
+ * Libera o modelo `modelPath` (ou qualquer um) do processo do worker e do cache de engines — ao
+ * remover um modelo ou trocar a seleção (no máximo um modelo carregado).
+ */
+export function releaseSttModel(modelPath?: string): void {
+  for (const key of [...sharedEngineCache.keys()])
+    if (!modelPath || key === modelPath) sharedEngineCache.delete(key)
+  sharedSttWorkerHost().unload(modelPath)
 }
 
 // ---------------- resolução do modelo ----------------
@@ -309,6 +366,13 @@ export interface CreateSttLocalBackendOptions {
 const sharedEngineCache = new Map<string, Promise<LoadedSttEngine>>()
 
 /**
+ * Teto de tamanho do modelo para parciais locais por janelas: até o `ggml-base` (~148 MB) a
+ * janela volta em centenas de ms; do `small` para cima cada parcial custa segundos de CPU e
+ * atrasaria a final (o worker é serial) — a sessão então só faz a transcrição final.
+ */
+export const STT_LOCAL_PARTIAL_MAX_MODEL_BYTES = 160_000_000
+
+/**
  * `SttLocalBackend` para os modelos do catálogo: `ready` = engine com runtime + arquivo do modelo
  * em disco (checagem barata e síncrona); `transcribe` decodifica o wav, carrega o modelo uma vez
  * (lazy) e transcreve localmente (baseUrl `'local'`, `model` = id do modelo do catálogo). Erros
@@ -332,9 +396,24 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
     }
   }
 
+  const partialsAllowed = (): boolean => {
+    if (!baseDir || !opts.selection) return false
+    try {
+      return (
+        resolveModelEntry(baseDir, opts.selection, catalog).sizeBytes <=
+        STT_LOCAL_PARTIAL_MAX_MODEL_BYTES
+      )
+    } catch {
+      return false
+    }
+  }
+
   return {
     get ready(): boolean {
       return modelFileExists()
+    },
+    get partials(): boolean {
+      return partialsAllowed()
     },
     async transcribe(
       input: TranscribeAudioInput,
@@ -396,6 +475,7 @@ export function createSttLocalBackend(opts: CreateSttLocalBackendOptions): SttLo
       if (callOpts.signal?.aborted) throw abortError()
       const { text } = await engine.transcribe(samples, {
         language: languageParam(callOpts.language) ?? undefined,
+        signal: callOpts.signal,
         onPartial: callOpts.onPartial
       })
       return { text, model: entry.id, baseUrl: 'local', ms: Date.now() - t0 }

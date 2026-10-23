@@ -21,6 +21,7 @@ import type {
   VoiceCallUtteranceEvent,
   VoiceModelInfo,
   VoiceModelProgressEvent,
+  VoiceRuntimeStatus,
   VoicePartialEvent,
   VoiceSettingKind,
   VoiceSettingsMap,
@@ -2295,9 +2296,39 @@ export function createMockApi(scenario: string): ClearApi {
     // Áudio/voz (mock): settings com a chave ECOADA mascarada (escrever por cima da máscara
     // preserva a chave real — mesmo contrato do main) e transcrição falsa com parciais ao vivo.
     voice: ((): VoiceApi => {
-      let audioInput = { ...DEFAULT_AUDIO_INPUT }
-      let stt: SttSettings = { ...DEFAULT_STT_SETTINGS }
-      let tts: TtsSettings = { ...DEFAULT_TTS_SETTINGS }
+      // Cenários de áudio (falhas simuladas do microfone — a captura é pulada no mock, então o
+      // ditado/chamada consultam `window.__clearMockMic`):
+      //   ?scenario=voice-mic-missing → microfone salvo desconectado (cai no padrão + aviso)
+      //   ?scenario=voice-mic-denied  → permissão negada (NotAllowedError)
+      //   ?scenario=voice-mic-lost    → o microfone some 1,5 s depois de começar a gravar
+      //   ?scenario=voice-call-fail   → `voice.call.start` recusa (erro legível)
+      //   ?scenario=voice-not-ready   → STT sem chave e Kokoro não instalado (pré-checagem da chamada)
+      //   ?scenario=voice-no-espeak   → `runtime.status` sem espeak-ng (TTS local não pronto)
+      const micMode =
+        scenario === 'voice-mic-missing'
+          ? 'missing'
+          : scenario === 'voice-mic-denied'
+            ? 'denied'
+            : scenario === 'voice-mic-lost'
+              ? 'lost'
+              : 'ok'
+      ;(window as unknown as { __clearMockMic?: string }).__clearMockMic = micMode
+      const ready = scenario !== 'voice-not-ready'
+      let audioInput = {
+        ...DEFAULT_AUDIO_INPUT,
+        deviceId: scenario === 'voice-mic-missing' ? 'mic-usb-desconectado' : null
+      }
+      // pronto para a chamada por padrão (chave de STT fake + Kokoro "instalado")
+      let stt: SttSettings = {
+        ...DEFAULT_STT_SETTINGS,
+        api: { ...DEFAULT_STT_SETTINGS.api, apiKey: ready ? 'gsk_mock_0000000000000000abcd' : '' }
+      }
+      let tts: TtsSettings = {
+        ...DEFAULT_TTS_SETTINGS,
+        local: DEFAULT_TTS_SETTINGS.local
+          ? { ...DEFAULT_TTS_SETTINGS.local, installed: ready }
+          : null
+      }
       let voiceCallDefaults = { ...DEFAULT_VOICE_CALL_DEFAULTS }
       const asObj = (v: unknown): Record<string, unknown> | null =>
         v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
@@ -2400,7 +2431,8 @@ export function createMockApi(scenario: string): ClearApi {
                 backend: 'api' as const,
                 fellBack: false
               },
-              250
+              // latência de rede plausível (dá tempo de "Cancelar" durante o "Transcrevendo…")
+              700
             )
           },
           cancel: async (sessionId: string) => {
@@ -2493,11 +2525,7 @@ export function createMockApi(scenario: string): ClearApi {
               const m = mockModels.find((x) => x.id === input?.id)
               if (!m) return Promise.reject(new Error(`modelo desconhecido: ${String(input?.id)}`))
               if (!m.hasDownload)
-                return Promise.reject(
-                  new Error(
-                    `modelo ${m.id} não tem download disponível ainda (preenchido na fatia de TTS)`
-                  )
-                )
+                return Promise.reject(new Error(`modelo ${m.id} não tem download disponível`))
               if (mockDownloads.has(m.id))
                 return Promise.reject(new Error(`download já em andamento para ${m.id}`))
               m.state = 'downloading'
@@ -2713,12 +2741,16 @@ export function createMockApi(scenario: string): ClearApi {
           return {
             start: async ({ sessionId }: { sessionId: string }) => {
               if (state.active) throw new Error('Já existe uma chamada de voz ativa.')
+              if (scenario === 'voice-call-fail')
+                throw new Error(
+                  'Não foi possível iniciar a chamada de voz: espeak-ng não encontrado no sistema (simulado).'
+                )
               state = {
                 ...VOICE_CALL_INACTIVE,
                 active: true,
-                chatId: 'c1',
+                chatId: sessions.find((x) => x.id === sessionId)?.chatId ?? 'c1',
                 sessionId,
-                turnSilenceMs: resolveTurnSilenceMs(null, audioInput)
+                turnSilenceMs: resolveTurnSilenceMs(voiceCallDefaults.turn, audioInput)
               }
               voiceCallStateListeners.forEach((l) => l({ ...state }))
               return { ...state }
@@ -2750,9 +2782,32 @@ export function createMockApi(scenario: string): ClearApi {
             },
             backchannel: async () => {
               // mock sem backchannel: só aceita o registro
-            }
+            },
+            getState: async () => ({ ...state })
           }
-        })()
+        })(),
+        // probe dos runtimes locais (mock): tudo carregável, salvo ?scenario=voice-no-espeak
+        runtime: {
+          status: async (): Promise<VoiceRuntimeStatus> => {
+            const ok = { available: true, reason: null }
+            const noEspeak = scenario === 'voice-no-espeak'
+            const espeak = noEspeak
+              ? {
+                  available: false,
+                  reason: 'espeak-ng não encontrado no sistema (instale o pacote "espeak-ng")'
+                }
+              : ok
+            return delay({
+              whisper: ok,
+              onnxruntime: ok,
+              espeak,
+              sttLocal: stt.local?.installed
+                ? ok
+                : { available: false, reason: 'nenhum modelo local instalado' },
+              ttsLocal: noEspeak ? espeak : ok
+            })
+          }
+        }
       }
     })(),
     onVoicePartial: (cb: (e: VoicePartialEvent) => void) => {

@@ -20,6 +20,7 @@ export type BarItemId =
   | 'context-meter'
   | 'model-pill'
   | 'spend'
+  | 'voice-controls'
   | 'composer-hint'
 
 export interface BarItemSpec {
@@ -62,6 +63,11 @@ export const BAR_ITEMS: Record<BarItemId, BarItemSpec> = {
   },
   processes: { priority: 40, levels: [0, 1], doc: '"2 processos" → ícone + "2"' },
   spend: { priority: 30, levels: [0, 2], doc: 'ícone + "$0,42" → ícone' },
+  'voice-controls': {
+    priority: 20,
+    levels: [0, 1, 2],
+    doc: 'mic + menu do microfone + telefone → só o mic → some (coluna muito estreita)'
+  },
   'composer-hint': {
     priority: 10,
     levels: [0, 2],

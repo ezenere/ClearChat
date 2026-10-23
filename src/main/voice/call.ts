@@ -479,11 +479,12 @@ export class VoiceCallManager {
           mime = r.mime
         } catch (e) {
           if (abort.signal.aborted) continue // descartada (barge-in/stop): segue a fila
-          // falha de TTS: para a fala (o texto segue no histórico) e mostra o erro na UI
+          // falha de TTS numa sentença: mostra o erro na UI e PULA só ela — o resto da resposta
+          // continua sendo falado (o texto inteiro segue no histórico)
           this.#error = e instanceof Error ? e.message : String(e)
-          this.#clearSynth()
+          this.#machine.synthSkipped()
           this.#emitState()
-          return
+          continue
         }
         if (item.gen !== this.#synthGen) continue // descartada enquanto sintetizava
         this.#uttSeq++

@@ -24,7 +24,8 @@
 //   próximo download ou na remoção.
 // - `downloadLocalModel` é idempotente: já `installed` → devolve sem baixar; `corrupt` → baixa de
 //   novo por cima. Download do mesmo id em paralelo → erro legível.
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { basename, join } from 'node:path'
 import { createSHA256 } from 'hash-wasm'
 import { abortError } from '../tools/util'
@@ -150,15 +151,50 @@ export async function readManifest(baseDir: string): Promise<ModelManifest> {
   return out
 }
 
-/** Grava o `manifest.json` de forma atômica (`.tmp` + rename), com as chaves ordenadas. */
+/** Grava o `manifest.json` de forma atômica (`.tmp` único + rename), com as chaves ordenadas. */
 export async function writeManifest(baseDir: string, manifest: ModelManifest): Promise<void> {
   await mkdir(modelsDir(baseDir), { recursive: true })
   const ordered: ModelManifest = {}
   for (const id of Object.keys(manifest).sort()) ordered[id] = manifest[id]
   const path = manifestPath(baseDir)
-  const tmp = path + '.tmp'
-  await writeFile(tmp, JSON.stringify(ordered, null, 2) + '\n', 'utf8')
-  await rename(tmp, path)
+  // nome único por escrita: duas escritas concorrentes nunca disputam o mesmo `.tmp`
+  const tmp = `${path}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
+  try {
+    await writeFile(tmp, JSON.stringify(ordered, null, 2) + '\n', 'utf8')
+    await rename(tmp, path)
+  } catch (e) {
+    await rm(tmp, { force: true }).catch(() => undefined)
+    throw e
+  }
+}
+
+/** Fila do read-modify-write do manifest por pasta (downloads/remoções concorrentes). */
+const manifestLocks = new Map<string, Promise<unknown>>()
+
+/**
+ * Lê, altera e grava o manifest SOB TRAVA (por `baseDir`): o manifest é relido dentro da trava, de
+ * modo que dois downloads/remoções concorrentes nunca apagam o registro um do outro (antes, cada um
+ * gravava a cópia que tinha lido no começo). `mutate` devolve false para não gravar.
+ */
+export async function updateManifest(
+  baseDir: string,
+  mutate: (manifest: ModelManifest) => boolean | void
+): Promise<ModelManifest> {
+  const key = modelsDir(baseDir)
+  const prev = manifestLocks.get(key) ?? Promise.resolve()
+  const run = prev
+    .catch(() => undefined)
+    .then(async () => {
+      const manifest = await readManifest(baseDir)
+      if (mutate(manifest) !== false) await writeManifest(baseDir, manifest)
+      return manifest
+    })
+  manifestLocks.set(key, run)
+  try {
+    return await run
+  } finally {
+    if (manifestLocks.get(key) === run) manifestLocks.delete(key)
+  }
 }
 
 // ---------------- estado ----------------
@@ -359,34 +395,38 @@ export async function downloadLocalModel(
   const entry = findCatalogEntry(id, opts.catalog ?? LOCAL_MODEL_CATALOG)
   if (!entry) throw new Error(`modelo desconhecido: ${id}`)
   if (!entry.url)
-    throw new Error(`modelo ${id} não tem download disponível ainda (preenchido na fatia de TTS)`)
+    throw new Error(`modelo ${id} ainda não tem download disponível`)
   const key = downloadKey(baseDir, id)
   if (activeDownloads.has(key)) throw new Error(`download já em andamento para ${id}`)
   const fileName = catalogFileName(entry)!
   const dir = modelsDir(baseDir)
   await mkdir(dir, { recursive: true })
   const finalPath = join(dir, fileName)
-  const partPath = finalPath + '.part'
+  // `.part` único por download: um download antigo ainda limpando nunca apaga o arquivo do novo
+  const partPath = `${finalPath}.${randomUUID().slice(0, 8)}.part`
   // idempotente: já instalado e íntegro → nada a fazer
   const manifest = await readManifest(baseDir)
   const current = await buildInfo(baseDir, entry, manifest)
   if (current.state === 'installed') return current
 
   activeDownloads.add(key)
+  let finalManifest: ModelManifest
   try {
-    await rm(partPath, { force: true })
+    await removeOrphanParts(dir, fileName)
     await fetchToPart(entry.url, partPath, entry.sizeBytes, opts)
     const digest = await verifyModelFile(partPath, entry)
     const st = await stat(partPath)
     await rename(partPath, finalPath)
-    manifest[entry.id] = {
-      version: entry.version,
-      file: fileName,
-      sha256: digest,
-      size: st.size,
-      installedAt: new Date().toISOString()
-    }
-    await writeManifest(baseDir, manifest)
+    // registro sob a trava do manifest (relido lá dentro — downloads em paralelo não se apagam)
+    finalManifest = await updateManifest(baseDir, (m) => {
+      m[entry.id] = {
+        version: entry.version,
+        file: fileName,
+        sha256: digest,
+        size: st.size,
+        installedAt: new Date().toISOString()
+      }
+    })
   } catch (e) {
     await rm(partPath, { force: true })
     if (opts.signal?.aborted) throw abortError()
@@ -395,7 +435,20 @@ export async function downloadLocalModel(
     activeDownloads.delete(key)
   }
   // fora do registro de downloads em voo: o estado devolvido é o final ('installed')
-  return await buildInfo(baseDir, entry, manifest)
+  return await buildInfo(baseDir, entry, finalManifest)
+}
+
+/** Apaga `.part` órfãos (de crash/versões antigas) do arquivo: `<arquivo>.part` e `<arquivo>.*.part`. */
+async function removeOrphanParts(dir: string, fileName: string): Promise<void> {
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch {
+    return
+  }
+  for (const n of names)
+    if (n === `${fileName}.part` || (n.startsWith(`${fileName}.`) && n.endsWith('.part')))
+      await rm(join(dir, n), { force: true }).catch(() => undefined)
 }
 
 /**
@@ -410,21 +463,26 @@ export async function removeLocalModel(
 ): Promise<void> {
   if (activeDownloads.has(downloadKey(baseDir, id)))
     throw new Error(`download em andamento para ${id} — cancele antes de remover`)
-  const manifest = await readManifest(baseDir)
-  const m = manifest[id] ?? null
   const dir = modelsDir(baseDir)
-  const names = new Set<string>()
-  const fromManifest = safeFileName(m?.file)
-  if (fromManifest) names.add(fromManifest)
   const entry = findCatalogEntry(id, opts.catalog ?? LOCAL_MODEL_CATALOG)
   const fromCatalog = entry ? catalogFileName(entry) : null
+  // registro fora sob a trava (relido lá dentro); os arquivos saem depois
+  let fromManifest: string | null = null
+  await updateManifest(baseDir, (manifest) => {
+    fromManifest = safeFileName(manifest[id]?.file)
+    if (!manifest[id]) return false
+    delete manifest[id]
+    return true
+  })
+  const names = new Set<string>()
+  if (fromManifest) names.add(fromManifest)
   if (fromCatalog) names.add(fromCatalog)
   for (const name of names) {
     await rm(join(dir, name), { force: true })
-    await rm(join(dir, name + '.part'), { force: true })
+    await removeOrphanParts(dir, name)
   }
-  if (m) {
-    delete manifest[id]
-    await writeManifest(baseDir, manifest)
-  }
+  // Vosk: a pasta extraída `models/<id>/` (criada na 1ª transcrição — `ensureVoskModelExtracted`)
+  const safeId = safeFileName(id)
+  if (safeId && entry?.engine === 'vosk')
+    await rm(join(dir, safeId), { recursive: true, force: true })
 }

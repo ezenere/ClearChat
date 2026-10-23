@@ -27,6 +27,7 @@ import {
   type TtsClipsView,
   type TtsVoicesView,
   type VoiceModelInfo,
+  type VoiceRuntimeStatus,
   type VoiceSettingKind
 } from '@shared/ipc'
 import type { ApiMessage, AttachmentInfo, Chat, QuestionAnswer } from '@shared/types'
@@ -134,13 +135,27 @@ import {
   type LocalModelInfo
 } from './voice/models'
 import {
-  activeTranscribeSession,
+  cancelTranscribeSessions,
   deriveHasLocalReady,
+  findTranscribeSession,
   startTranscribeSession,
   type TranscribeSession
 } from './voice/session'
+import {
+  isSttEngineRuntimeAvailable,
+  probeWhisperRuntime,
+  releaseSttModel,
+  sttEngineUnavailableReason
+} from './voice/sttLocal'
 import { synthesize, TTS_TEST_PHRASE } from './voice/tts'
-import { createKokoroEngine, type KokoroEngine } from './voice/ttsLocal'
+import {
+  createKokoroEngine,
+  espeakMissingError,
+  kokoroReadiness,
+  probeEspeak,
+  probeOnnxRuntime,
+  type KokoroEngine
+} from './voice/ttsLocal'
 import { VoiceCallManager } from './voice/call'
 import { isBusyStatus } from './voice/turnMachine'
 
@@ -162,12 +177,44 @@ function remoteProcessGuard(chatId: string): void {
     throw new Error(`Os processos rodam no host (${e.host.hostName(chatId)}) — gerencie-os por lá.`)
 }
 
-/** Sessão de transcrição ativa (global, uma por vez) — erro legível para id desconhecido/encerrado. */
+/** Sessão de transcrição viva pelo id — erro legível para id desconhecido/encerrado/substituído. */
 function requireTranscribeSession(sessionId: string): TranscribeSession {
-  const s = activeTranscribeSession()
-  if (!s || s.id !== sessionId)
+  const s = typeof sessionId === 'string' ? findTranscribeSession(sessionId) : null
+  if (!s)
     throw new Error('Sessão de transcrição não encontrada (encerrada, cancelada ou substituída).')
   return s
+}
+
+// ---- dono das chamadas de IPC (para o ciclo de vida da voz por janela) ----
+
+/**
+ * `webContents.id` de quem invocou o handler em execução (lido no começo SÍNCRONO do handler —
+ * depois de um `await` já pode ser de outra chamada). null fora de um handler.
+ */
+let ipcSenderId: number | null = null
+
+/** Chamada de voz e dono dela (o webContents que entrou) — limpos quando o renderer some. */
+let voiceCallsRef: VoiceCallManager | null = null
+let voiceCallOwner: number | null = null
+
+/**
+ * O renderer `webContentsId` recarregou, navegou, caiu ou a janela fechou: tudo de voz que ele
+ * deixou aberto no main é encerrado — sessões de transcrição dele (a final em voo é abortada) e a
+ * chamada de voz que ele abriu. Sem isso a sessão órfã segurava a vaga ("Já há uma transcrição…")
+ * e a chamada seguia "ativa" sem ninguém ouvindo. Idempotente.
+ */
+export function resetVoiceForWebContents(webContentsId: number, reason: string): void {
+  const n = cancelTranscribeSessions(webContentsId)
+  let callStopped = false
+  if (voiceCallsRef && voiceCallOwner === webContentsId && voiceCallsRef.state().active) {
+    voiceCallsRef.stop()
+    callStopped = true
+  }
+  if (voiceCallOwner === webContentsId) voiceCallOwner = null
+  if (n || callStopped)
+    console.log(
+      `[clearchat] voz: renderer ${webContentsId} ${reason} — ${n} transcrição(ões) cancelada(s)${callStopped ? ', chamada encerrada' : ''}`
+    )
 }
 
 // ---- modelos locais de áudio (SPEC → "Áudio → Componentes locais") ----
@@ -213,6 +260,43 @@ function requireModelId(input: { id: string } | undefined): string {
 let kokoro: KokoroEngine | null = null
 const ttsLocalEngine = (): KokoroEngine =>
   (kokoro ??= createKokoroEngine({ baseDir: app.getPath('userData') }))
+
+/** Prontidão dos runtimes locais (`voice:runtime:status`) — probes memoizados + estado em disco. */
+async function voiceRuntimeStatus(): Promise<VoiceRuntimeStatus> {
+  const v = getVoiceSettings()
+  const [whisper, onnx, espeak, models] = await Promise.all([
+    probeWhisperRuntime(),
+    probeOnnxRuntime(),
+    probeEspeak(),
+    listLocalModels(localModelsBaseDir())
+  ])
+  const sttReady = deriveHasLocalReady(v.stt.local, models)
+  const engine = v.stt.local?.engine
+  const sttReason = sttReady
+    ? null
+    : !v.stt.local
+      ? 'nenhum modelo local de transcrição escolhido'
+      : !isSttEngineRuntimeAvailable(v.stt.local.engine)
+        ? (sttEngineUnavailableReason(v.stt.local.engine) ??
+          `o engine '${engine}' ainda não tem motor de inferência nesta versão`)
+        : `nenhum modelo local instalado para o engine '${engine}'`
+  const ttsLocal =
+    v.tts.local?.engine === 'kokoro'
+      ? await kokoroReadiness(localModelsBaseDir(), v.tts.local.voice)
+      : {
+          available: false,
+          reason: v.tts.local
+            ? `o motor '${v.tts.local.engine}' ainda não tem runtime nesta versão`
+            : 'nenhum motor local de fala escolhido'
+        }
+  return {
+    whisper: { available: whisper.available, reason: whisper.reason },
+    onnxruntime: { available: onnx.available, reason: onnx.reason },
+    espeak: espeak.available ? espeak : { available: false, reason: espeakMissingError().message },
+    sttLocal: { available: sttReady, reason: sttReason },
+    ttsLocal
+  }
+}
 
 /** Sugestões livres de vozes para endpoints OpenAI-compatíveis (o campo aceita qualquer id). */
 const TTS_API_VOICES: TtsVoicesView['api'] = [
@@ -318,7 +402,13 @@ export function registerIpc(): void {
     },
     onEvent: (cb) => onAgentEvent(cb)
   })
+  voiceCallsRef = voiceCalls
   setVoiceCallSource((chat, session) => voiceCalls.callContextFor(chat, session))
+  // sonda o runtime local em segundo plano (processo do worker + onnxruntime + espeak-ng): o
+  // "pronto" dos canais já sai com o binding real; ninguém espera por isto aqui
+  void probeWhisperRuntime().then((r) => {
+    if (!r.available) console.warn(`[clearchat] STT local indisponível: ${r.reason}`)
+  })
   const handlers: Record<string, Handler> = {
     // ---- providers ----
     [IPC.providers.list]: () => providersRepo.list(),
@@ -770,16 +860,22 @@ export function registerIpc(): void {
     [IPC.voice.settingsSet]: (kind: VoiceSettingKind, value: unknown) =>
       setVoiceSetting(kind, value),
     [IPC.voice.transcribeStart]: async (language?: string) => {
+      const owner = ipcSenderId // antes de qualquer await
       const v = getVoiceSettings()
       const lang =
         typeof language === 'string' && language.trim() ? language : v.audioInput.language
-      const models = await listLocalModels(localModelsBaseDir())
+      const [models] = await Promise.all([
+        listLocalModels(localModelsBaseDir()),
+        // "pronto" = modelo instalado + binding que carrega de verdade (probe memoizado)
+        v.stt.mode !== 'api' ? probeWhisperRuntime() : null
+      ])
       return startTranscribeSession(
         { settings: v.stt, language: lang },
         {
           // coerência installed/hasLocalReady: a presença real de modelo instalado vem do disco
           hasLocalReady: deriveHasLocalReady(v.stt.local, models),
-          onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e)
+          onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e),
+          ownerId: owner ?? undefined
         }
       ).id
     },
@@ -787,10 +883,10 @@ export function registerIpc(): void {
       requireTranscribeSession(sessionId).push(pcm16, sampleRate)
     },
     [IPC.voice.transcribeStop]: (sessionId: string) => requireTranscribeSession(sessionId).stop(),
-    // cancel é tolerante: encerrar uma sessão que já saiu (corrida com o fim natural) não é erro
+    // cancel é tolerante: encerrar uma sessão que já saiu (corrida com o fim natural) não é erro;
+    // vale também para a sessão que está transcrevendo a final (aborta a final)
     [IPC.voice.transcribeCancel]: (sessionId: string) => {
-      const s = activeTranscribeSession()
-      if (s && s.id === sessionId) s.cancel()
+      if (typeof sessionId === 'string') findTranscribeSession(sessionId)?.cancel()
     },
     // ---- modelos locais (catálogo + download/estado em disco) ----
     [IPC.voice.modelsList]: async (): Promise<VoiceModelInfo[]> =>
@@ -830,8 +926,16 @@ export function registerIpc(): void {
     },
     [IPC.voice.modelsRemove]: async (input: { id: string }): Promise<void> => {
       const id = requireModelId(input)
-      await removeLocalModel(localModelsBaseDir(), id)
       const entry = findCatalogEntry(id)
+      // solta o modelo carregado antes de apagar o arquivo (RAM de volta; nada lendo o arquivo)
+      const before = (await listLocalModels(localModelsBaseDir())).find((m) => m.entry.id === id)
+      if (entry?.kind === 'stt') releaseSttModel(before?.path ?? undefined)
+      if (entry?.engine === 'kokoro' && kokoro) {
+        const k = kokoro
+        kokoro = null
+        await k.release()
+      }
+      await removeLocalModel(localModelsBaseDir(), id)
       if (entry) syncLocalModelInstalled(entry, false)
     },
 
@@ -882,9 +986,20 @@ export function registerIpc(): void {
     [IPC.voice.callStart]: (input: { sessionId: string }) => {
       const sessionId = input && typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
       if (!sessionId) throw new Error('Sessão não informada (esperado { sessionId }).')
-      return voiceCalls.start(sessionId)
+      const owner = ipcSenderId
+      // chamada órfã de um renderer que sumiu sem avisar (ex.: crash antes do hook): o mesmo dono
+      // pedindo de novo reabre; outro dono ainda vivo segue recusado pelo manager
+      if (voiceCalls.state().active && owner !== null && voiceCallOwner === owner) voiceCalls.stop()
+      const state = voiceCalls.start(sessionId)
+      voiceCallOwner = owner
+      return state
     },
-    [IPC.voice.callStop]: () => voiceCalls.stop(),
+    [IPC.voice.callStop]: () => {
+      voiceCallOwner = null
+      return voiceCalls.stop()
+    },
+    [IPC.voice.callGetState]: () => voiceCalls.state(),
+    [IPC.voice.runtimeStatus]: () => voiceRuntimeStatus(),
     [IPC.voice.callMute]: (input: { muted: boolean }) => voiceCalls.mute(!!input?.muted),
     [IPC.voice.callSpeechBegin]: () => voiceCalls.speechBegin(),
     [IPC.voice.callSpeechEnd]: () => voiceCalls.speechEnd(),
@@ -913,8 +1028,14 @@ export function registerIpc(): void {
 
   for (const [channel, fn] of Object.entries(handlers)) {
     ipcMain.removeHandler(channel)
-    ipcMain.handle(channel, (_e, ...args: unknown[]) =>
-      (fn as (...a: unknown[]) => unknown)(...args)
-    )
+    ipcMain.handle(channel, (e, ...args: unknown[]) => {
+      // o dono da chamada fica visível só durante a parte síncrona do handler
+      ipcSenderId = e.sender.id
+      try {
+        return (fn as (...a: unknown[]) => unknown)(...args)
+      } finally {
+        ipcSenderId = null
+      }
+    })
   }
 }

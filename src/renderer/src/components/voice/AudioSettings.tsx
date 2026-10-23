@@ -2,13 +2,33 @@
 // auto-stop por silêncio, idioma), transcrição (STT — modo, endpoint de API com chave mascarada,
 // motor local com download real dos modelos, parciais ao vivo) e fala (TTS — backend API/local,
 // endpoint com chave mascarada, vozes do Kokoro, "Testar voz" e geração dos clipes de
-// interjeição/filler; os pesos do motor baixam pela mesma lista de modelos locais). Espelha o
-// padrão de "Pesquisa na web" (`WebSearchSettings.tsx`): cada controle grava na hora via
-// `voice:settings:set`; as chaves de API são ECOADAS mascaradas nos campos — escrever por cima da
-// máscara preserva a chave real (contrato do main, testado em `e2e/voiceSettings.test.ts`).
-import { Check, Download, KeyRound, Play, TriangleAlert, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
-import type { TtsSynthResult, TtsVoicesView, VoiceModelInfo } from '@shared/ipc'
+// interjeição/filler; os pesos do motor baixam pela mesma lista de modelos locais) e os padrões da
+// chamada de voz (ligada, silêncio do turno, interjeições/fillers). Espelha o padrão de "Pesquisa
+// na web" (`WebSearchSettings.tsx`): cada controle grava na hora via `saveVoiceSetting` (espelho
+// reativo `useVoiceSettings` — o composer e a chamada acompanham na hora) e falha de gravação vira
+// aviso visível. Chaves de API: campo vazio com a máscara no placeholder, "Salvar"/"Remover"
+// explícitos e olho que mostra só o que foi digitado (a chave real nunca sai do main); limpar o
+// campo NÃO apaga a chave (contrato do main testado em `e2e/voiceSettings.test.ts`).
+import {
+  Check,
+  Download,
+  Eye,
+  EyeOff,
+  KeyRound,
+  Play,
+  Square,
+  TriangleAlert,
+  X
+} from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import type {
+  TtsSynthResult,
+  TtsVoicesView,
+  VoiceModelInfo,
+  VoiceRuntimeStatus,
+  VoiceSettingKind,
+  VoiceSettingsMap
+} from '@shared/ipc'
 import type {
   SttLocalConfig,
   SttMode,
@@ -22,22 +42,27 @@ import {
   DEFAULT_AUDIO_INPUT,
   DEFAULT_STT_SETTINGS,
   DEFAULT_TTS_SETTINGS,
+  DEFAULT_TURN_SILENCE_MS,
   DEFAULT_VOICE_CALL_DEFAULTS,
   INTERJECTION_CLASSES
 } from '@shared/voice'
 import type { AudioInputSettings } from '@shared/voice'
 import { api, errorMessage } from '../../lib/api'
+import { pttHotkeyProblem } from '../../lib/audio/hotkey'
+import { menuInputDevices } from '../../lib/audio/devices'
 import { formatHotkeyLabel, hotkeyFromEvent } from '../../lib/voice/hotkeyLabel'
+import { loadVoiceSettings, saveVoiceSetting } from '../../lib/voice/voiceSettings'
+import { useEscapeLayer } from '../ui/escape'
 import {
   formatModelLanguages,
   formatModelSize,
   modelAction,
   type LocalModelAction
 } from '../../lib/voice/modelList'
-import { Button, Kbd, Label, Switch } from '../ui/controls'
+import { Button, IconButton, Kbd, Label, Switch } from '../ui/controls'
 import { Select } from '../ui/Select'
-import { HelpTip } from '../ui/Tooltip'
-import { useInputDevices } from '../../lib/voice/useInputDevices'
+import { ApiInfo, C, HelpTip } from '../ui/Tooltip'
+import { useInputDeviceList } from '../../lib/voice/useInputDevices'
 
 /** Idiomas comuns do ditado (o campo aceita livre — "Outro…" abre o texto). */
 const LANGUAGES: { value: string; label: string }[] = [
@@ -60,7 +85,7 @@ const STT_MODE_LABELS: Record<SttMode, { label: string; description: string }> =
   api: { label: 'API', description: 'Endpoint remoto OpenAI-compatível (/audio/transcriptions)' },
   local: {
     label: 'Local',
-    description: 'Motor no dispositivo — o áudio nunca sai do computador (motor em outra fatia)'
+    description: 'Motor no dispositivo (whisper.cpp) — o áudio nunca sai do computador'
   },
   hybrid: { label: 'Híbrido', description: 'API com fallback local em falhas de disponibilidade' }
 }
@@ -78,7 +103,15 @@ const TTS_BACKEND_LABELS: Record<TtsSettings['backend'], { label: string; descri
 
 const TTS_ENGINE_LABELS: Record<TtsLocalEngine, string> = {
   kokoro: 'kokoro (Kokoro-82M, ONNX)',
-  chatterbox: 'chatterbox (runtime em outra fatia)'
+  chatterbox: 'chatterbox — ainda não suportado'
+}
+
+/** Rótulos pt-BR das classes de interjeição (o id técnico fica no tooltip). */
+const INTERJECTION_LABELS: Record<InterjectionClass, { label: string; example: string }> = {
+  ACK: { label: 'Confirmação', example: '“uhum”, “sei”' },
+  AGREEMENT: { label: 'Concordância', example: '“isso”, “exato”' },
+  ENCOURAGEMENT: { label: 'Incentivo', example: '“boa!”, “legal”' },
+  THINKING: { label: 'Pensando', example: '“hum…”, “deixa eu ver”' }
 }
 
 export function AudioSettings(): React.JSX.Element | null {
@@ -88,8 +121,10 @@ export function AudioSettings(): React.JSX.Element | null {
   const [tts, setTts] = useState<TtsSettings>(DEFAULT_TTS_SETTINGS)
   /** Padrões globais da chamada de voz (interjeições/fillers — SPEC → "Chamada de voz"). */
   const [callDefaults, setCallDefaults] = useState<VoiceCallDefaults>(DEFAULT_VOICE_CALL_DEFAULTS)
-  const [keyDraft, setKeyDraft] = useState('')
-  const [ttsKeyDraft, setTtsKeyDraft] = useState('')
+  /** Falha ao gravar alguma setting (aviso visível no topo — nada falha em silêncio). */
+  const [saveError, setSaveError] = useState<string | null>(null)
+  /** Prontidão dos runtimes locais (whisper/onnxruntime/espeak-ng); null = sem probe no main. */
+  const [runtime, setRuntime] = useState<VoiceRuntimeStatus | null>(null)
   /** Rascunho do idioma livre ("Outro…") enquanto digita; null = lista comum. */
   const [langDraft, setLangDraft] = useState<string | null>(null)
   /** Vozs de fala (`voice:tts:voices`): engine local + sugestões livres para a API. */
@@ -115,26 +150,30 @@ export function AudioSettings(): React.JSX.Element | null {
   >({})
   /** Erro de download/remoção de modelo (aviso legível no painel). */
   const [modelError, setModelError] = useState<string | null>(null)
-  const devices = useInputDevices()
+  const { devices: allDevices, loaded: devicesLoaded } = useInputDeviceList()
+  const { systemLabel, devices } = menuInputDevices(allDevices)
+  /** `<audio>` do "Testar voz" em reprodução (Parar / fechar o modal interrompe). */
+  const testAudio = useRef<{ el: HTMLAudioElement; url: string } | null>(null)
 
   useEffect(() => {
     let alive = true
-    void voice?.settings
-      .get()
-      .then((all) => {
-        if (!alive) return
-        setInput(all.audioInput)
-        setStt(all.sttSettings)
-        setTts(all.ttsSettings)
-        setCallDefaults(all.voiceCallDefaults)
-        setKeyDraft(all.sttSettings.api.apiKey)
-        setTtsKeyDraft(all.ttsSettings.api.apiKey)
-      })
-      .catch(() => void 0)
+    void loadVoiceSettings().then((all) => {
+      if (!alive) return
+      setInput(all.audioInput)
+      setStt(all.sttSettings)
+      setTts(all.ttsSettings)
+      setCallDefaults(all.voiceCallDefaults)
+    })
     void voice?.models
       .list()
       .then((list) => {
         if (alive) setModels(list)
+      })
+      .catch(() => void 0)
+    void voice?.runtime
+      ?.status()
+      .then((r) => {
+        if (alive) setRuntime(r)
       })
       .catch(() => void 0)
     void voice?.tts
@@ -153,6 +192,19 @@ export function AudioSettings(): React.JSX.Element | null {
       alive = false
     }
   }, [voice])
+
+  // fechar o modal (desmontar) interrompe o "Testar voz"
+  useEffect(
+    () => () => {
+      const t = testAudio.current
+      testAudio.current = null
+      if (t) {
+        t.el.pause()
+        URL.revokeObjectURL(t.url)
+      }
+    },
+    []
+  )
 
   // progresso dos downloads em voo (main → renderer); o estado 'downloading' vem junto
   useEffect(
@@ -181,72 +233,78 @@ export function AudioSettings(): React.JSX.Element | null {
     )
   }
 
+  /** Grava um grupo e devolve o valor normalizado (null = falhou; o aviso fica visível no topo). */
+  const persist = async <K extends VoiceSettingKind>(
+    kind: K,
+    value: unknown
+  ): Promise<VoiceSettingsMap[K] | null> => {
+    try {
+      const saved = await saveVoiceSetting(kind, value)
+      setSaveError(null)
+      return saved
+    } catch (e) {
+      setSaveError(`Não foi possível salvar: ${errorMessage(e)}`)
+      return null
+    }
+  }
+
   const saveInput = (patch: Partial<AudioInputSettings>): void => {
     const next = { ...input, ...patch }
     setInput(next)
-    void voice.settings
-      .set('audioInput', next)
-      .then(setInput)
-      .catch(() => {
-        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
-      })
+    void persist('audioInput', next).then((saved) => saved && setInput(saved))
   }
 
   /** Grava `voiceCallDefaults` (padrões globais da chamada de voz — herdados por persona/chat). */
   const saveCallDefaults = (patch: Partial<VoiceCallDefaults>): void => {
     const next = { ...callDefaults, ...patch }
     setCallDefaults(next)
-    void voice.settings
-      .set('voiceCallDefaults', next)
-      .then(setCallDefaults)
-      .catch(() => {
-        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
-      })
+    void persist('voiceCallDefaults', next).then((saved) => saved && setCallDefaults(saved))
   }
 
-  /** Grava `sttSettings`; `sentKey` é o que foi de fato enviado no campo da chave (para a máscara). */
-  const commitStt = (next: SttSettings, sentKey: string): void => {
+  /** Grava `sttSettings` (a máscara da chave no valor = preserva a chave salva). */
+  const commitStt = async (next: SttSettings): Promise<boolean> => {
     setStt(next)
-    void voice.settings
-      .set('sttSettings', next)
-      .then((saved) => {
-        setStt(saved)
-        // só adota a máscara se o campo da chave não tiver edição em andamento
-        setKeyDraft((d) => (d === sentKey ? saved.api.apiKey : d))
-      })
-      .catch(() => {
-        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
-      })
+    const saved = await persist('sttSettings', next)
+    if (saved) setStt(saved)
+    return !!saved
   }
-
   const saveStt = (patch: Partial<Omit<SttSettings, 'api'>>): void => {
-    commitStt({ ...stt, ...patch }, stt.api.apiKey)
+    void commitStt({ ...stt, ...patch })
   }
   const saveSttApi = (patch: Partial<SttSettings['api']>): void => {
-    commitStt({ ...stt, api: { ...stt.api, ...patch } }, patch.apiKey ?? stt.api.apiKey)
+    void commitStt({ ...stt, api: { ...stt.api, ...patch } })
   }
+  /** "Salvar"/"Remover" da chave de STT: `null` remove; string = chave nova. */
+  const saveSttKey = (key: string | null): Promise<boolean> =>
+    commitStt({ ...stt, api: { ...stt.api, apiKey: key as string } })
 
   // ---- TTS (síntese de fala + clipes) ----
 
-  /** Grava `ttsSettings`; `sentKey` é o que foi de fato enviado no campo da chave (para a máscara). */
-  const commitTts = (next: TtsSettings, sentKey: string): void => {
+  /** Recarrega a contagem de clipes da voz ATUAL (cada voz tem o seu cache). */
+  const refreshClipCount = (): void => {
+    void voice.tts.clips
+      .list()
+      .then((m) => setTtsClips((c) => ({ ...c, count: m ? m.clips.length : 0 })))
+      .catch(() => void 0)
+  }
+
+  /** Grava `ttsSettings` (a máscara da chave no valor = preserva a chave salva). */
+  const commitTts = async (next: TtsSettings): Promise<boolean> => {
     setTts(next)
-    void voice.settings
-      .set('ttsSettings', next)
-      .then((saved) => {
-        setTts(saved)
-        setTtsKeyDraft((d) => (d === sentKey ? saved.api.apiKey : d))
-      })
-      .catch(() => {
-        // erro de gravação: o valor da tela fica; o próximo save tenta de novo
-      })
+    const saved = await persist('ttsSettings', next)
+    if (saved) setTts(saved)
+    // voz/backend/motor mudaram → a contagem de clipes é a do cache da voz nova
+    refreshClipCount()
+    return !!saved
   }
   const saveTts = (patch: Partial<Omit<TtsSettings, 'api'>>): void => {
-    commitTts({ ...tts, ...patch }, tts.api.apiKey)
+    void commitTts({ ...tts, ...patch })
   }
   const saveTtsApi = (patch: Partial<TtsSettings['api']>): void => {
-    commitTts({ ...tts, api: { ...tts.api, ...patch } }, patch.apiKey ?? tts.api.apiKey)
+    void commitTts({ ...tts, api: { ...tts.api, ...patch } })
   }
+  const saveTtsKey = (key: string | null): Promise<boolean> =>
+    commitTts({ ...tts, api: { ...tts.api, apiKey: key as string } })
 
   /** Recarrega as vozes (`voice:tts:voices`) — a lista local muda com o engine escolhido. */
   const refreshTtsVoices = (): void => {
@@ -256,17 +314,38 @@ export function AudioSettings(): React.JSX.Element | null {
       .catch(() => void 0)
   }
 
+  /** Para o áudio do "Testar voz" (botão Parar, novo teste ou modal fechando). */
+  const stopTtsTest = (): void => {
+    const t = testAudio.current
+    testAudio.current = null
+    if (t) {
+      t.el.pause()
+      URL.revokeObjectURL(t.url)
+    }
+    setTtsTest((s) => ({ ...s, state: 'idle' }))
+  }
+
   /** "Testar voz": sintetiza a frase de demonstração e reproduz (bytes → blob → `<audio>`). */
   const runTtsTest = (): void => {
+    if (ttsTest.state === 'playing') {
+      stopTtsTest()
+      return
+    }
     setTtsTest({ state: 'busy', error: null })
     void voice.tts
       .test()
       .then((r) => {
         setTtsTest({ state: 'playing', error: null })
-        playTtsAudio(
+        testAudio.current = playTtsAudio(
           r,
-          () => setTtsTest((s) => ({ ...s, state: 'idle' })),
-          (error) => setTtsTest({ state: 'idle', error })
+          () => {
+            testAudio.current = null
+            setTtsTest((s) => ({ ...s, state: 'idle' }))
+          },
+          (error) => {
+            testAudio.current = null
+            setTtsTest({ state: 'idle', error })
+          }
         )
       })
       .catch((e) => setTtsTest({ state: 'idle', error: errorMessage(e) }))
@@ -306,6 +385,15 @@ export function AudioSettings(): React.JSX.Element | null {
         setStt(all.sttSettings)
         setTts(all.ttsSettings)
       })
+      .catch(() => void 0)
+    refreshRuntime()
+  }
+
+  /** Probe dos runtimes locais (`voice.runtime.status`, quando o main expõe) — "pronto" de verdade. */
+  const refreshRuntime = (): void => {
+    void voice.runtime
+      ?.status()
+      .then(setRuntime)
       .catch(() => void 0)
   }
 
@@ -349,12 +437,40 @@ export function AudioSettings(): React.JSX.Element | null {
   }
 
   const langIsCommon = LANGUAGES.some((l) => l.value === input.language)
+  // microfone salvo fora da lista (desconectado): opção marcada com aviso (a captura usa o padrão)
+  const micMissing =
+    devicesLoaded &&
+    input.deviceId !== null &&
+    allDevices.every((d) => !!d.deviceId) &&
+    !allDevices.some((d) => d.deviceId === input.deviceId)
+  const pttProblem = input.pttKey ? pttHotkeyProblem(input.pttKey) : null
+  /** O PTT só está ATIVO com uma tecla válida — ligado sem tecla aparece desligado. */
+  const pttActive = input.pttEnabled && !!input.pttKey && !pttProblem
+  const ttsEngine = tts.local?.engine ?? 'kokoro'
 
   return (
     <div className="space-y-6" data-testid="audio-settings">
+      {saveError && (
+        <div
+          role="alert"
+          data-testid="voice-settings-error"
+          className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+        >
+          <TriangleAlert className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">{saveError}</span>
+          <button
+            type="button"
+            aria-label="Dispensar erro de gravação"
+            onClick={() => setSaveError(null)}
+            className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      )}
       {/* ---- microfone ---- */}
       <section>
-        <Label help="Microfone usado no ditado por voz (o menu do botão de microfone do composer mostra a mesma lista).">
+        <Label help="Microfone usado no ditado por voz e na chamada de voz (o menu do botão de microfone do composer mostra a mesma lista). Se o microfone escolhido for desconectado, a gravação usa o padrão do sistema e avisa.">
           Microfone padrão
         </Label>
         <Select
@@ -364,14 +480,35 @@ export function AudioSettings(): React.JSX.Element | null {
           menuMinWidth={360}
           onChange={(v) => saveInput({ deviceId: v === '__default__' ? null : v })}
           options={[
-            { value: '__default__', label: 'Padrão do sistema' },
+            {
+              value: '__default__',
+              label: systemLabel ? `Padrão do sistema (${systemLabel})` : 'Padrão do sistema'
+            },
+            ...(micMissing && input.deviceId
+              ? [
+                  {
+                    value: input.deviceId,
+                    label: 'Microfone salvo (desconectado)',
+                    description: 'Não encontrado — a gravação usa o padrão do sistema'
+                  }
+                ]
+              : []),
             ...devices.map((d, i) => ({
               value: d.deviceId,
               label: d.label || `Microfone ${i + 1}`
             }))
           ]}
         />
-        {devices.length === 0 && (
+        {micMissing && (
+          <p
+            className="mt-1.5 flex items-center gap-1 text-[11px] text-warning"
+            data-testid="mic-missing-warning"
+          >
+            <TriangleAlert className="size-3 shrink-0" /> O microfone salvo não está conectado — a
+            gravação usa o padrão do sistema até ele voltar.
+          </p>
+        )}
+        {devicesLoaded && devices.length === 0 && (
           <p className="mt-1.5 text-[11px] text-subtle">
             Nenhum microfone encontrado (ou permissão ainda não concedida).
           </p>
@@ -383,29 +520,47 @@ export function AudioSettings(): React.JSX.Element | null {
         <div className="mb-2 flex items-center gap-2">
           <Label
             className="mb-0"
-            help="Com o push-to-talk ligado, a tecla abaixo segura a gravação (segurar = falar, soltar = parar e transcrever). Sem tecla configurada, use o botão de microfone do composer (clique inicia, clique de novo para)."
+            help={
+              'Segure a tecla para falar e solte para parar e transcrever. Só funciona com a janela do ClearChat em foco e fica desligada enquanto o ditado não está disponível (chamada de voz, pergunta pendente, Configurações abertas).\nA tecla precisa ser F1–F24 ou ter Ctrl/Alt/Meta — uma tecla que digita deixaria de funcionar no app.\nO clique no microfone do composer funciona com ou sem push-to-talk.'
+            }
           >
             Push-to-talk
           </Label>
           <Switch
-            checked={input.pttEnabled}
+            checked={pttActive}
+            disabled={!input.pttKey || !!pttProblem}
             label="Push-to-talk"
             onChange={(v) => saveInput({ pttEnabled: v })}
           />
+          {!input.pttKey && (
+            <span className="text-[11px] text-subtle" data-testid="ptt-inactive-hint">
+              inativo — defina uma tecla
+            </span>
+          )}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Kbd>{input.pttKey ? formatHotkeyLabel(input.pttKey) : 'sem tecla'}</Kbd>
-          <KeyCaptureField value={input.pttKey} onChange={(pttKey) => saveInput({ pttKey })} />
+          <KeyCaptureField
+            value={input.pttKey}
+            // tecla nova liga o push-to-talk (definir a tecla é a intenção de usar)
+            onChange={(pttKey) => saveInput({ pttKey, pttEnabled: true })}
+          />
           {input.pttKey && (
             <Button size="sm" variant="ghost" onClick={() => saveInput({ pttKey: null })}>
               Remover tecla
             </Button>
           )}
         </div>
-        <p className="mt-1.5 text-xs leading-relaxed text-subtle">
-          A tecla só funciona com a janela do ClearChat em foco. O clique no microfone do composer
-          continua funcionando com o push-to-talk ligado ou desligado.
-        </p>
+        {pttProblem && (
+          <p
+            className="mt-1.5 flex items-center gap-1 text-[11px] text-warning"
+            role="alert"
+            data-testid="ptt-key-invalid"
+          >
+            <TriangleAlert className="size-3 shrink-0" /> A tecla salva não vale como push-to-talk:{' '}
+            {pttProblem}
+          </p>
+        )}
       </section>
 
       {/* ---- auto-stop por silêncio ---- */}
@@ -413,7 +568,9 @@ export function AudioSettings(): React.JSX.Element | null {
         <div className="mb-2 flex items-center gap-2">
           <Label
             className="mb-0"
-            help="Encerra a gravação sozinha quando você para de falar. O tempo conta de silêncio CONTÍNUO (falar de novo zera a contagem)."
+            help={
+              'Encerra a gravação do ditado sozinha quando você para de falar. O tempo conta de silêncio CONTÍNUO (falar de novo zera a contagem).\nMilissegundos de silêncio (padrão 5000). 0 = sem limite: a gravação só para no botão, na tecla do push-to-talk ou em Esc.\nA chamada de voz tem o próprio silêncio de turno (mais abaixo).'
+            }
           >
             Parar por silêncio
           </Label>
@@ -423,16 +580,14 @@ export function AudioSettings(): React.JSX.Element | null {
             onChange={(v) => saveInput({ silenceStopEnabled: v })}
           />
         </div>
-        <SilenceMsField
-          value={input.silenceStopMs}
-          disabled={!input.silenceStopEnabled}
-          onCommit={(silenceStopMs) => saveInput({ silenceStopMs })}
-        />
-        <p className="mt-1.5 text-xs leading-relaxed text-subtle">
-          Milissegundos de silêncio que encerram a gravação (padrão 5000).{' '}
-          <strong>0 = sem limite</strong> — a gravação só para no botão, na tecla do push-to-talk ou
-          em Esc.
-        </p>
+        <div className="flex items-center gap-2">
+          <SilenceMsField
+            value={input.silenceStopMs}
+            disabled={!input.silenceStopEnabled}
+            onCommit={(silenceStopMs) => saveInput({ silenceStopMs })}
+          />
+          <span className="text-[11px] text-subtle">ms · 0 = sem limite</span>
+        </div>
       </section>
 
       {/* ---- idioma ---- */}
@@ -490,12 +645,14 @@ export function AudioSettings(): React.JSX.Element | null {
           <span className="text-[13px] font-medium text-fg/90">Transcrição (STT)</span>
           <HelpTip label="Transcrição de voz em texto">
             <p>
-              O áudio gravado no ditado vira texto por um endpoint OpenAI-compatível{' '}
-              <code className="font-mono">/audio/transcriptions</code> (padrão Groq) ou por um motor
-              local. A chave de API fica no banco local e nunca chega à tela — o campo mostra só a
-              máscara.
+              O áudio gravado no ditado e na chamada de voz vira texto por um endpoint
+              OpenAI-compatível <code className="font-mono">/audio/transcriptions</code> (padrão
+              Groq) ou pelo motor local (whisper.cpp). Híbrido usa a API e cai no motor local quando
+              a API falha. A chave de API fica no banco local e nunca chega à tela — o campo mostra
+              só a máscara.
             </p>
           </HelpTip>
+          <SttApiInfo stt={stt} language={input.language} />
         </div>
         <div className="space-y-4">
           <div>
@@ -543,21 +700,16 @@ export function AudioSettings(): React.JSX.Element | null {
               />
             </div>
             <div className="col-span-2">
-              <Label help="Chave do endpoint (header Authorization: Bearer). O campo mostra a máscara da chave salva; digitar uma chave nova substitui, limpar o campo remove.">
+              <Label help="Chave do endpoint (header Authorization: Bearer). A máscara da chave salva aparece no campo vazio; cole uma chave nova e clique em Salvar para trocar, ou em Remover (X) para apagar.">
                 Chave de API
               </Label>
-              <ApiKeyField
-                mask={stt.api.apiKey}
-                draft={keyDraft}
-                onDraft={setKeyDraft}
-                onCommit={() => saveSttApi({ apiKey: keyDraft.trim() })}
-              />
+              <ApiKeyField mask={stt.api.apiKey} onSave={saveSttKey} />
             </div>
           </div>
           <div className="flex items-center gap-2">
             <Label
               className="mb-0"
-              help="Melhor-esforço enquanto você fala: o texto parcial aparece no composer e a transcrição final o reescreve ao parar. No modo Local as parciais de verdade vêm do motor local (outra fatia)."
+              help="Melhor-esforço enquanto você fala: o texto parcial aparece no composer (fora do texto editável) e a transcrição final entra no rascunho ao parar. No modo API cada parcial é uma request extra ao endpoint; no modo Local elas vêm do motor local."
             >
               Parciais ao vivo
             </Label>
@@ -586,6 +738,11 @@ export function AudioSettings(): React.JSX.Element | null {
             }
             onAction={runModelAction}
             onDismissError={() => setModelError(null)}
+            runtimeProblem={
+              runtime && stt.local?.installed && !runtime.sttLocal.available
+                ? (runtime.sttLocal.reason ?? 'runtime indisponível')
+                : null
+            }
           />
         </div>
       </section>
@@ -598,10 +755,11 @@ export function AudioSettings(): React.JSX.Element | null {
             <p>
               Síntese de fala para a chamada de voz: um endpoint OpenAI-compatível{' '}
               <code className="font-mono">POST /audio/speech</code> ou o motor local Kokoro (pesos
-              ONNX baixados aqui embaixo). A chave de API fica no banco local e nunca chega à tela —
-              o campo mostra só a máscara.
+              ONNX baixados aqui embaixo; a fonemização pt-BR usa o <C>espeak-ng</C> do sistema). A
+              chave de API fica no banco local e nunca chega à tela — o campo mostra só a máscara.
             </p>
           </HelpTip>
+          <TtsApiInfo tts={tts} />
         </div>
         <div className="space-y-4">
           <div>
@@ -672,14 +830,12 @@ export function AudioSettings(): React.JSX.Element | null {
                 </datalist>
               </div>
               <div>
-                <Label help="Chave do endpoint (header Authorization: Bearer). O campo mostra a máscara da chave salva; digitar uma chave nova substitui, limpar o campo remove.">
+                <Label help="Chave do endpoint (header Authorization: Bearer). A máscara da chave salva aparece no campo vazio; cole uma chave nova e clique em Salvar para trocar, ou em Remover (X) para apagar.">
                   Chave de API
                 </Label>
                 <ApiKeyField
                   mask={tts.api.apiKey}
-                  draft={ttsKeyDraft}
-                  onDraft={setTtsKeyDraft}
-                  onCommit={() => saveTtsApi({ apiKey: ttsKeyDraft.trim() })}
+                  onSave={saveTtsKey}
                   what="fala"
                   testId="tts-api-key"
                 />
@@ -690,7 +846,7 @@ export function AudioSettings(): React.JSX.Element | null {
               <div className="flex flex-wrap items-center gap-2">
                 <Label className="mb-0">Motor local</Label>
                 <Select
-                  value={tts.local?.engine ?? 'kokoro'}
+                  value={ttsEngine}
                   label="Motor local de fala"
                   className="h-8 w-[300px]"
                   menuMinWidth={320}
@@ -704,7 +860,11 @@ export function AudioSettings(): React.JSX.Element | null {
                     })
                     refreshTtsVoices()
                   }}
-                  options={(['kokoro', 'chatterbox'] as TtsLocalEngine[]).map((e) => ({
+                  // Chatterbox ainda não sintetiza: só aparece se já estiver salvo (para trocar)
+                  options={(ttsEngine === 'chatterbox'
+                    ? (['kokoro', 'chatterbox'] as TtsLocalEngine[])
+                    : (['kokoro'] as TtsLocalEngine[])
+                  ).map((e) => ({
                     value: e,
                     label: TTS_ENGINE_LABELS[e]
                   }))}
@@ -719,6 +879,16 @@ export function AudioSettings(): React.JSX.Element | null {
                   {tts.local?.installed ? 'instalado' : 'não instalado'}
                 </span>
               </div>
+              {runtime && ttsEngine === 'kokoro' && !runtime.ttsLocal.available && (
+                <p
+                  className="flex items-start gap-1 text-[11px] text-warning"
+                  role="alert"
+                  data-testid="tts-runtime-warning"
+                >
+                  <TriangleAlert className="mt-0.5 size-3 shrink-0" /> Motor local não está pronto:{' '}
+                  {runtime.ttsLocal.reason ?? 'runtime indisponível'}
+                </p>
+              )}
               <div>
                 <Label help="Voz do motor local. As vozes pt-BR do Kokoro vêm dos voice packs baixados aqui embaixo (sem o pack instalado, a síntese avisa).">
                   Voz
@@ -728,7 +898,7 @@ export function AudioSettings(): React.JSX.Element | null {
                   label="Voz do motor local"
                   className="h-8 w-full max-w-[360px]"
                   menuMinWidth={360}
-                  disabled={(tts.local?.engine ?? 'kokoro') !== 'kokoro'}
+                  disabled={ttsEngine !== 'kokoro'}
                   onChange={(voice) =>
                     saveTts({
                       local: {
@@ -749,10 +919,13 @@ export function AudioSettings(): React.JSX.Element | null {
                       : [{ value: 'pf_dora', label: 'pf_dora (padrão)' }]
                   }
                 />
-                {(tts.local?.engine ?? 'kokoro') !== 'kokoro' && (
-                  <p className="mt-1.5 text-xs leading-relaxed text-subtle">
-                    O runtime do Chatterbox entra numa fatia futura — até lá, use o motor{' '}
-                    <strong>kokoro</strong> ou o backend de API.
+                {ttsEngine !== 'kokoro' && (
+                  <p
+                    className="mt-1.5 flex items-center gap-1 text-[11px] text-warning"
+                    role="alert"
+                  >
+                    <TriangleAlert className="size-3 shrink-0" /> O Chatterbox ainda não funciona —
+                    escolha o motor kokoro ou o backend de API.
                   </p>
                 )}
               </div>
@@ -765,14 +938,20 @@ export function AudioSettings(): React.JSX.Element | null {
               size="sm"
               variant="secondary"
               data-testid="tts-test"
-              disabled={ttsTest.state !== 'idle'}
-              icon={<Play className="size-3.5" />}
+              disabled={ttsTest.state === 'busy'}
+              icon={
+                ttsTest.state === 'playing' ? (
+                  <Square className="size-3" fill="currentColor" />
+                ) : (
+                  <Play className="size-3.5" />
+                )
+              }
               onClick={runTtsTest}
             >
               {ttsTest.state === 'busy'
                 ? 'Sintetizando…'
                 : ttsTest.state === 'playing'
-                  ? 'Reproduzindo…'
+                  ? 'Parar teste'
                   : 'Testar voz'}
             </Button>
             <Button
@@ -784,6 +963,13 @@ export function AudioSettings(): React.JSX.Element | null {
             >
               Gerar clipes de voz
             </Button>
+            <HelpTip label="Clipes de voz">
+              <p>
+                Os clipes (interjeições e falas de espera da chamada de voz) são gerados com a voz
+                escolhida e ficam em cache em <C>userData/voice-clips</C>, um cache por voz. Ao
+                trocar a voz, gere de novo — sem clipes, interjeições e falas de espera não tocam.
+              </p>
+            </HelpTip>
             {ttsClips.busy && (
               <span
                 className="text-[11px] text-subtle tabular-nums"
@@ -797,12 +983,12 @@ export function AudioSettings(): React.JSX.Element | null {
                 {ttsClips.count} clipes gerados para a voz atual
               </span>
             )}
+            {!ttsClips.busy && ttsClips.count === 0 && (
+              <span className="text-[11px] text-warning" data-testid="tts-clips-missing">
+                sem clipes para a voz atual
+              </span>
+            )}
           </div>
-          <p className="text-xs leading-relaxed text-subtle">
-            Os clipes (interjeições e falas de espera da chamada de voz) são gerados pela voz
-            escolhida e ficam em cache em <code className="font-mono">userData/voice-clips</code> —
-            regenerados sozinhos quando a voz muda.
-          </p>
           {ttsTest.error && (
             <div
               role="alert"
@@ -848,6 +1034,62 @@ export function AudioSettings(): React.JSX.Element | null {
         </div>
       </section>
 
+      {/* ---- chamada de voz: disponível + silêncio do turno (padrões globais) ---- */}
+      <section className="border-t border-border pt-4" data-testid="voice-call-settings">
+        <div className="mb-3 flex items-baseline gap-2">
+          <span className="text-[13px] font-medium text-fg/90">Chamada de voz</span>
+          <HelpTip label="Chamada de voz">
+            <p>
+              Conversa falada com o agente (botão de telefone no composer): você fala, o silêncio
+              encerra a sua vez, a fala vira mensagem do chat e a resposta é falada. Estes são os
+              padrões GLOBAIS — cada persona/chat pode ligar/desligar a chamada e ter modelo, tools
+              e prompt próprios (painel do chat → aba Chat → Chamada de voz).
+            </p>
+            <p className="mt-2">
+              Precisa da transcrição (STT) e da fala (TTS) configuradas acima; o que faltar é
+              avisado ao tentar entrar na chamada.
+            </p>
+          </HelpTip>
+        </div>
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3">
+          <div className="flex items-center gap-2">
+            <Label
+              className="mb-0"
+              help="Desligada, o botão de telefone some de todos os chats (exceto os que ligam a chamada explicitamente na própria config)."
+            >
+              Chamada de voz disponível
+            </Label>
+            <Switch
+              checked={callDefaults.enabled}
+              label="Chamada de voz disponível"
+              onChange={(enabled) => saveCallDefaults({ enabled })}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Label
+              className="mb-0"
+              help={`Silêncio contínuo (ms) que encerra a SUA vez de falar na chamada (padrão ${DEFAULT_TURN_SILENCE_MS} ms). Mais curto = respostas mais rápidas, mas pausas para pensar podem cortar a frase. Independente do "Parar por silêncio" do ditado.`}
+            >
+              Silêncio que encerra a fala (ms)
+            </Label>
+            <NumberField
+              value={callDefaults.turn.silenceStopMs ?? DEFAULT_TURN_SILENCE_MS}
+              min={200}
+              max={10000}
+              step={100}
+              label="Silêncio que encerra a fala na chamada (ms)"
+              testId="voice-call-turn-silence"
+              onCommit={(v) =>
+                saveCallDefaults({
+                  // o padrão volta a ser "segue o padrão" (null) — muda junto se o padrão mudar
+                  turn: { silenceStopMs: v === DEFAULT_TURN_SILENCE_MS ? null : v }
+                })
+              }
+            />
+          </div>
+        </div>
+      </section>
+
       {/* ---- chamada de voz: atos de fala curta (interjeições/fillers) ---- */}
       <section className="border-t border-border pt-4" data-testid="voice-acts-settings">
         <div className="mb-3 flex items-baseline gap-2">
@@ -856,9 +1098,9 @@ export function AudioSettings(): React.JSX.Element | null {
           </span>
           <HelpTip label="Interjeições e fillers da chamada de voz">
             <p>
-              Atos de fala curta da chamada de voz (SPEC → &quot;Fillers&quot; e &quot;Interjeições
-              (regras)&quot;): regras v1, sem classificador treinado. Estes são os padrões GLOBAIS —
-              persona/chat podem sobrescrever (★ do painel da chamada).
+              Atos de fala curta da chamada de voz, decididos por regras simples (sem classificador
+              treinado). Estes são os padrões GLOBAIS — persona/chat podem sobrescrever (★ do painel
+              da chamada).
             </p>
             <p className="mt-2">
               Interjeições entram nas pausas da sua fala (clipe curto tipo &quot;uhum&quot;); o
@@ -995,8 +1237,12 @@ export function AudioSettings(): React.JSX.Element | null {
           </div>
 
           <div>
-            <Label help="Classes de clipe que podem sair como interjeição (os clipes vêm de 'Gerar clipes de voz' acima). Vazio = todas.">
-              Classes permitidas
+            <Label
+              help={
+                "Tipos de interjeição que podem sair (os clipes vêm de 'Gerar clipes de voz' acima). Nenhum marcado = todos.\nO tipo vem do fim da transcrição parcial: pergunta evita 'Pensando'; negação/incerteza não interjeita; sem confiança sai 'Confirmação'."
+              }
+            >
+              Interjeições permitidas
             </Label>
             <div
               className="flex flex-wrap items-center gap-3"
@@ -1005,11 +1251,16 @@ export function AudioSettings(): React.JSX.Element | null {
               {INTERJECTION_CLASSES.map((cls) => {
                 const checked = callDefaults.interjections.classes.includes(cls)
                 return (
-                  <label key={cls} className="flex cursor-pointer items-center gap-1.5 text-[12px]">
+                  <label
+                    key={cls}
+                    title={`${cls} — ex.: ${INTERJECTION_LABELS[cls].example}`}
+                    className="flex cursor-pointer items-center gap-1.5 text-[12px]"
+                  >
                     <input
                       type="checkbox"
                       checked={checked}
-                      aria-label={`Classe ${cls}`}
+                      aria-label={`Interjeição: ${INTERJECTION_LABELS[cls].label}`}
+                      data-class={cls}
                       onChange={() => {
                         const classes = checked
                           ? callDefaults.interjections.classes.filter((c) => c !== cls)
@@ -1025,43 +1276,31 @@ export function AudioSettings(): React.JSX.Element | null {
                       }}
                       className="size-3.5 accent-accent-strong"
                     />
-                    {cls}
+                    {INTERJECTION_LABELS[cls].label}
+                    <span className="text-[10.5px] text-faint">
+                      {INTERJECTION_LABELS[cls].example}
+                    </span>
                   </label>
                 )
               })}
             </div>
-            <p className="mt-1.5 text-xs leading-relaxed text-subtle">
-              Classe vem da cauda da transcrição parcial: pergunta evita THINKING; negação/incerteza
-              não interjeita; sem confiança sai ACK neutro.
-            </p>
           </div>
-
-          <div>
-            <Label help="Texto livre para orientar as falas preenchidoras no futuro. v1 decide por REGRA — este prompt ainda NÃO é consumido (classificador é fatia futura).">
-              Prompt dos fillers (v1: não consumido)
-            </Label>
-            <textarea
-              value={callDefaults.fillers.prompt ?? ''}
-              aria-label="Prompt dos fillers"
-              data-testid="voice-filler-prompt"
-              rows={2}
-              placeholder="ex.: fale curto e informal enquanto pensa"
-              onChange={(e) =>
-                saveCallDefaults({
-                  fillers: { ...callDefaults.fillers, prompt: e.target.value }
-                })
-              }
-              className="field w-full max-w-[560px] px-2 py-1.5 text-[12px]"
-            />
-          </div>
+          {/* `fillers.prompt` ainda não é consumido (a decisão é por regra): campo escondido até ser */}
         </div>
       </section>
     </div>
   )
 }
 
-/** Reproduz o áudio sintetizado (bytes → blob → `<audio>`); falhas viram mensagem legível. */
-function playTtsAudio(r: TtsSynthResult, onEnd: () => void, onError: (msg: string) => void): void {
+/**
+ * Reproduz o áudio sintetizado (bytes → blob → `<audio>`); falhas viram mensagem legível. Devolve o
+ * elemento + blob URL para o chamador poder PARAR (botão "Parar teste" ou o modal fechando).
+ */
+function playTtsAudio(
+  r: TtsSynthResult,
+  onEnd: () => void,
+  onError: (msg: string) => void
+): { el: HTMLAudioElement; url: string } | null {
   try {
     // cópia: `Uint8Array<ArrayBuffer>` satisfaz `BlobPart` em qualquer origem do buffer
     const blob = new Blob([new Uint8Array(r.audio)], { type: r.mime })
@@ -1077,68 +1316,168 @@ function playTtsAudio(r: TtsSynthResult, onEnd: () => void, onError: (msg: strin
     }
     void el.play().catch((e: unknown) => {
       URL.revokeObjectURL(url)
+      // pausa do "Parar teste" antes de começar não é erro
+      if ((e as { name?: string })?.name === 'AbortError') return
       onError(errorMessage(e))
     })
+    return { el, url }
   } catch (e) {
     onError(errorMessage(e))
+    return null
   }
 }
 
-/** Campo da chave com máscara ecoada: `type=password`, sem botão "mostrar" (a chave real não sai do main). */
+/**
+ * Campo da chave (padrão de `WebSearchSettings`): começa VAZIO com a máscara da chave salva no
+ * placeholder; colar uma chave mostra "Salvar" (Enter também salva); com chave salva e campo vazio,
+ * X remove. Limpar o campo nunca apaga nada. O olho mostra/oculta só o que foi digitado — a chave
+ * real não sai do main.
+ */
 function ApiKeyField({
   mask,
-  draft,
-  onDraft,
-  onCommit,
+  onSave,
   what = 'transcrição',
   testId = 'stt-api-key'
 }: {
   mask: string
-  draft: string
-  onDraft: (v: string) => void
-  onCommit: () => void
+  /** `null` remove; string = chave nova. Resolve `true` quando gravou. */
+  onSave: (key: string | null) => Promise<boolean>
   /** Rótulo do domínio (transcrição/fala) nos textos de aria/placeholder. */
   what?: string
   /** `data-testid` do campo (STT usa o padrão; TTS usa 'tts-api-key'). */
   testId?: string
 }): React.JSX.Element {
-  const [focused, setFocused] = useState(false)
+  const [value, setValue] = useState('')
+  const [show, setShow] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const dirty = value.trim() !== ''
+  const save = async (key: string | null): Promise<void> => {
+    setBusy(true)
+    const ok = await onSave(key)
+    setBusy(false)
+    if (ok) {
+      setValue('')
+      setShow(false)
+    }
+  }
   return (
-    <div className="relative">
-      <KeyRound className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-faint" />
-      <input
-        type="password"
-        value={draft}
-        spellCheck={false}
-        autoComplete="off"
-        aria-label={`Chave de API (${what})`}
-        data-testid={testId}
-        placeholder={mask ? `${mask} — digite para trocar` : `Cole a chave da API de ${what}`}
-        onFocus={() => setFocused(true)}
-        onChange={(e) => onDraft(e.target.value)}
-        onBlur={() => {
-          setFocused(false)
-          if (draft.trim() !== mask) onCommit()
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault()
-            ;(e.target as HTMLInputElement).blur()
-          }
-        }}
-        className="field h-8 w-full py-0 pr-8 pl-7 font-mono text-[12px] placeholder:font-mono"
-      />
-      {!focused && draft && draft !== mask && (
+    <div className="flex items-center gap-1.5">
+      <div className="relative min-w-0 flex-1">
+        <KeyRound className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-faint" />
+        <input
+          type={show ? 'text' : 'password'}
+          value={value}
+          spellCheck={false}
+          autoComplete="off"
+          aria-label={`Chave de API (${what})`}
+          data-testid={testId}
+          placeholder={mask ? `${mask} — digite para trocar` : `Cole a chave da API de ${what}`}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && dirty) {
+              e.preventDefault()
+              void save(value.trim())
+            }
+          }}
+          className="field h-8 w-full py-0 pr-9 pl-7 font-mono text-[12px] placeholder:font-mono"
+        />
         <button
           type="button"
-          aria-label="Descartar chave digitada"
-          onClick={() => onDraft(mask)}
-          className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-md p-1 text-subtle hover:bg-hover hover:text-fg"
+          onClick={() => setShow((v) => !v)}
+          disabled={!value}
+          aria-label={show ? 'Ocultar chave digitada' : 'Mostrar chave digitada'}
+          className="absolute top-1/2 right-1.5 -translate-y-1/2 rounded-md p-1.5 text-subtle hover:bg-hover hover:text-fg disabled:opacity-40"
         >
-          <X className="size-3.5" />
+          {show ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
         </button>
+      </div>
+      {dirty && (
+        <Button
+          size="sm"
+          variant="primary"
+          loading={busy}
+          data-testid={`${testId}-save`}
+          onClick={() => void save(value.trim())}
+        >
+          Salvar
+        </Button>
+      )}
+      {mask && !dirty && (
+        <IconButton
+          size="sm"
+          label="Remover chave"
+          aria-label={`Remover chave (${what})`}
+          data-testid={`${testId}-remove`}
+          onClick={() => void save(null)}
+        >
+          <X />
+        </IconButton>
       )}
     </div>
+  )
+}
+
+/** `</>` da transcrição: a request multipart exata do `/audio/transcriptions`. */
+function SttApiInfo({ stt, language }: { stt: SttSettings; language: string }): React.JSX.Element {
+  const lang = language.split(/[-_]/)[0]?.toLowerCase() || language
+  return (
+    <ApiInfo
+      title="Transcrição: request de cada gravação (e das parciais)"
+      code={[
+        `POST ${stt.api.baseUrl.replace(/\/+$/, '')}/audio/transcriptions`,
+        'Authorization: Bearer {sua chave}',
+        'Content-Type: multipart/form-data',
+        '',
+        'file            = audio.wav (PCM16 mono 16 kHz — o áudio gravado)',
+        `model           = ${stt.api.model}`,
+        `language        = ${lang}`,
+        'response_format = json'
+      ].join('\n')}
+      codeLabel="Modos API e Híbrido (a chave salva entra no lugar de {sua chave})"
+    >
+      <p>
+        Só o áudio gravado e esses campos saem do app. Com <C>Parciais ao vivo</C> ligado, o mesmo
+        request é repetido em janelas enquanto você fala (melhor-esforço); a transcrição final manda
+        o áudio inteiro. No modo <C>Local</C> nada sai do computador.
+      </p>
+    </ApiInfo>
+  )
+}
+
+/** `</>` da fala: o JSON exato do `/audio/speech` (backend API). */
+function TtsApiInfo({ tts }: { tts: TtsSettings }): React.JSX.Element {
+  if (tts.backend === 'local')
+    return (
+      <ApiInfo title="Fala local (Kokoro)">
+        <p>
+          Nada sai do computador: o texto de cada frase da resposta é fonemizado pelo{' '}
+          <C>espeak-ng</C> do sistema e sintetizado pelo Kokoro (ONNX) localmente.
+        </p>
+      </ApiInfo>
+    )
+  const body: Record<string, string> = {
+    model: tts.api.model || '{modelo}',
+    ...(tts.api.voice ? { voice: tts.api.voice } : {}),
+    input: '{frase da resposta}',
+    response_format: 'wav'
+  }
+  return (
+    <ApiInfo
+      title="Fala: request de cada frase falada"
+      code={[
+        `POST ${(tts.api.baseUrl || '{endpoint}').replace(/\/+$/, '')}/audio/speech`,
+        'Authorization: Bearer {sua chave}',
+        'Content-Type: application/json',
+        '',
+        JSON.stringify(body, null, 2)
+      ].join('\n')}
+      codeLabel="Uma request por frase da resposta (e por clipe ao gerar os clipes de voz)"
+    >
+      <p>
+        Sai só o texto de cada frase falada (a resposta do agente é dividida em frases). Sem voz
+        definida, o campo <C>voice</C> é omitido e vale a voz padrão da API.
+      </p>
+    </ApiInfo>
   )
 }
 
@@ -1233,7 +1572,8 @@ export function LocalEnginePanel({
   error,
   onEngine,
   onAction,
-  onDismissError
+  onDismissError,
+  runtimeProblem
 }: {
   local: SttLocalConfig | null
   models: VoiceModelInfo[]
@@ -1242,6 +1582,8 @@ export function LocalEnginePanel({
   onEngine?: (engine: SttLocalConfig['engine']) => void
   onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
   onDismissError: () => void
+  /** Modelo instalado mas o runtime não carrega (probe do main) — motivo legível. */
+  runtimeProblem?: string | null
 }): React.JSX.Element {
   const engine = local?.engine ?? 'whisper.cpp'
   return (
@@ -1250,7 +1592,12 @@ export function LocalEnginePanel({
       data-testid="stt-local-engine"
     >
       <div className="flex flex-wrap items-center gap-2">
-        <Label className="mb-0">Motor local</Label>
+        <Label
+          className="mb-0"
+          help="Transcrição no próprio computador (modos Local e Híbrido) com o whisper.cpp — baixe um modelo abaixo. Os arquivos ficam em userData/models (verificados por tamanho, magic bytes e sha256)."
+        >
+          Motor local
+        </Label>
         {onEngine ? (
           <Select
             value={engine}
@@ -1275,13 +1622,18 @@ export function LocalEnginePanel({
           {local?.installed ? 'instalado' : 'não instalado'}
         </span>
       </div>
+      {runtimeProblem && (
+        <p
+          className="mt-2 flex items-start gap-1 text-[11px] text-warning"
+          role="alert"
+          data-testid="stt-runtime-warning"
+        >
+          <TriangleAlert className="mt-0.5 size-3 shrink-0" /> Motor local não está pronto:{' '}
+          {runtimeProblem}
+        </p>
+      )}
       <ModelError error={error} onDismiss={onDismissError} />
       <LocalModelList kind="stt" models={models} progress={progress} onAction={onAction} />
-      <p className="mt-2 text-[11px] leading-relaxed text-subtle">
-        Os arquivos ficam em <code className="font-mono">userData/models</code> (verificados por
-        tamanho/magic bytes/sha256). A inferência local (rodar whisper/vosk/nemotron) entra numa
-        fatia futura — até lá, use o modo <strong>API</strong> ou <strong>Híbrido</strong>.
-      </p>
     </div>
   )
 }
@@ -1298,7 +1650,10 @@ function LocalModelList({
   progress: Record<string, { bytes: number; total: number }>
   onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
 }): React.JSX.Element | null {
-  const items = models.filter((m) => m.kind === kind)
+  // Chatterbox ainda não sintetiza: os pesos só aparecem se já estiverem em disco (para remover)
+  const items = models.filter(
+    (m) => m.kind === kind && (m.engine !== 'chatterbox' || m.state !== 'notInstalled')
+  )
   if (!items.length) return null
   const groups: { engine: string; items: VoiceModelInfo[] }[] = []
   for (const m of items) {
@@ -1385,7 +1740,7 @@ function ModelRow({
               <Button size="sm" variant="secondary" disabled>
                 {a.label}
               </Button>
-              <span className="text-[10px] text-subtle">disponível na fatia de TTS</span>
+              <span className="text-[10px] text-subtle">download indisponível</span>
             </>
           )}
         </span>
@@ -1393,9 +1748,7 @@ function ModelRow({
       <p className="mt-1 text-[11px] leading-relaxed text-subtle">{model.description}</p>
       <p className="text-[10.5px] text-faint">
         {formatModelLanguages(model.languages)}
-        {model.sizeBytes > 0
-          ? ` · ${formatModelSize(model.sizeBytes)}`
-          : ' · tamanho a definir na fatia de TTS'}
+        {model.sizeBytes > 0 ? ` · ${formatModelSize(model.sizeBytes)}` : ' · tamanho desconhecido'}
       </p>
       {model.state === 'downloading' && (
         <div className="mt-1.5">
@@ -1460,7 +1813,12 @@ function ModelError({
   )
 }
 
-/** Captura da tecla do push-to-talk: mostra a atual e grava a próxima pressionada (Esc cancela). */
+/**
+ * Captura da tecla do push-to-talk: mostra a atual e grava a próxima pressionada. Esc cancela SÓ a
+ * captura (camada própria na pilha de Esc — o modal de Configurações continua aberto). Tecla que
+ * não vale como PTT (`pttHotkeyProblem`: digitaria texto) é recusada com o motivo, e a captura
+ * continua esperando.
+ */
 function KeyCaptureField({
   value,
   onChange
@@ -1469,32 +1827,54 @@ function KeyCaptureField({
   onChange: (v: string) => void
 }): React.JSX.Element {
   const [capturing, setCapturing] = useState(false)
+  const [problem, setProblem] = useState<string | null>(null)
+  useEscapeLayer(capturing, () => {
+    setCapturing(false)
+    setProblem(null)
+  })
   useEffect(() => {
     if (!capturing) return
     const onKey = (e: KeyboardEvent): void => {
+      // Esc é da camada de Esc (fecha só a captura)
+      if (e.key === 'Escape') return
       e.preventDefault()
       e.stopPropagation()
-      if (e.key === 'Escape') {
-        setCapturing(false)
+      const hotkey = hotkeyFromEvent(e)
+      if (!hotkey) return
+      const why = pttHotkeyProblem(hotkey)
+      if (why) {
+        setProblem(`${formatHotkeyLabel(hotkey)}: ${why}`)
         return
       }
-      const hotkey = hotkeyFromEvent(e)
-      if (hotkey) {
-        onChange(hotkey)
-        setCapturing(false)
-      }
+      setProblem(null)
+      onChange(hotkey)
+      setCapturing(false)
     }
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
   }, [capturing, onChange])
   return (
-    <Button
-      size="sm"
-      variant={capturing ? 'primary' : 'secondary'}
-      data-testid="ptt-key-capture"
-      onClick={() => setCapturing((c) => !c)}
-    >
-      {capturing ? 'Pressione a tecla… (Esc cancela)' : value ? 'Alterar tecla' : 'Definir tecla'}
-    </Button>
+    <>
+      <Button
+        size="sm"
+        variant={capturing ? 'primary' : 'secondary'}
+        data-testid="ptt-key-capture"
+        onClick={() => {
+          setProblem(null)
+          setCapturing((c) => !c)
+        }}
+      >
+        {capturing ? 'Pressione a tecla… (Esc cancela)' : value ? 'Alterar tecla' : 'Definir tecla'}
+      </Button>
+      {problem && (
+        <span
+          role="alert"
+          data-testid="ptt-key-problem"
+          className="basis-full text-[11px] leading-snug text-warning"
+        >
+          {problem}
+        </span>
+      )}
+    </>
   )
 }

@@ -51,7 +51,7 @@ export interface LocalModelAction {
 /**
  * Estado → ação do painel de modelos locais: `notInstalled` → "Baixar", `downloading` → "Cancelar",
  * `installed` → "Remover", `corrupt` → "Baixar novamente" (com aviso). Sem URL de download
- * (placeholder de TTS) a ação fica `null` — a UI mostra o botão desabilitado com a nota da fatia.
+ * (placeholder sem URL) a ação fica `null` — a UI mostra o botão desabilitado ("download indisponível").
  */
 export function modelAction(state: VoiceModelState, hasDownload: boolean): LocalModelAction {
   switch (state) {

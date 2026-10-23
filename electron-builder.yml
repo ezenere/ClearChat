@@ -22,6 +22,10 @@ files:
 asarUnpack:
   - resources/**
   - node_modules/better-sqlite3/**
+  # módulos nativos do áudio local: o `.node` e as libs que ele carrega (libonnxruntime.so…)
+  # precisam existir no disco — dentro do app.asar o dlopen não os enxerga
+  - node_modules/onnxruntime-node/**
+  - node_modules/@napi-rs/whisper-*/**
 npmRebuild: false
 # Só os idiomas da UI do Chromium que importam (pt-BR + fallback en-US): ~40 MB a menos.
 electronLanguages:
@@ -42,6 +46,14 @@ linux:
     - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
     - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{darwin,win32}-*'
+    # onnxruntime-node (motor local de fala): só os binários do Linux, e só o provider de CPU —
+    # os providers CUDA/TensorRT (~270 MB, baixados pelo postinstall do pacote) nunca são usados
+    # (a sessão é criada com executionProviders: ['cpu']). Para nem baixá-los: `ONNXRUNTIME_NODE_INSTALL=skip npm ci`
+    # (um .npmrc com a chave faz o npm avisar "Unknown project config" em todo comando).
+    - '!node_modules/onnxruntime-node/bin/napi-v6/{darwin,win32}{,/**}'
+    - '!node_modules/onnxruntime-node/bin/napi-v6/linux/*/libonnxruntime_providers_*'
+    # só a arquitetura do build (${arch} é expandido pelo electron-builder — x64/arm64)
+    - '!node_modules/onnxruntime-node/bin/napi-v6/linux/!(${arch}){,/**}'
   # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
   # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
   syncDesktopName: true
@@ -94,6 +106,7 @@ win:
     - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
     - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{darwin,linux,linuxmusl}-*'
+    - '!node_modules/onnxruntime-node/bin/napi-v6/{darwin,linux}{,/**}'
   icon: build/icon.ico
   target:
     - nsis
@@ -113,6 +126,7 @@ mac:
     - '!node_modules/better-sqlite3/{deps,src,build,binding.gyp}{,/**}'
     - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{win32,linux,linuxmusl}-*'
+    - '!node_modules/onnxruntime-node/bin/napi-v6/{win32,linux}{,/**}'
   category: public.app-category.developer-tools
   entitlementsInherit: build/entitlements.mac.plist
   notarize: false

@@ -36,6 +36,7 @@ import { ModelLabel } from '../ui/ModelLabel'
 import { HelpTip } from '../ui/Tooltip'
 import { IconPicker, PresetIcon } from './PresetIcon'
 import { MemorySection } from '../memory/MemorySection'
+import { VoiceCallConfigSection } from '../voice/VoiceCallConfigSection'
 
 function useResolver(): (p: Pick<Preset, 'config'> | null) => ChatConfig {
   const providers = useStore((s) => s.providers)
@@ -218,6 +219,7 @@ function PresetChatEditor({
         <RootOptions cfg={cfg} patch={patch} />
       </CollapsibleSection>
       <SignatureSection cfg={cfg} patch={patch} />
+      <VoiceCallConfigSection cfg={cfg} patch={patch} scope="persona" />
       <ContextSettingsSection cfg={cfg} patch={patch} knownWindow={window} />
     </>
   )

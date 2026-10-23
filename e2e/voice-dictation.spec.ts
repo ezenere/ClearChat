@@ -13,9 +13,10 @@
 //
 // Cobre: botão de microfone no composer (clique inicia/para), chevron com menu de microfone
 // (Padrão do sistema + dispositivos do fake device), gravação com áudio do fake device → parciais
-// (`▌` no rascunho) → Parar gravação → texto final no rascunho editável (envio SEMPRE manual — a
-// mensagem não sai sozinha), Esc cancela descartando e o request multipart chega ao servidor falso
-// (file/model/language/response_format + Authorization da chave salva).
+// (no fantasma `voice-partial`, FORA da textarea) → Parar gravação → texto final no rascunho
+// editável (envio SEMPRE manual — a mensagem não sai sozinha), Esc cancela descartando, o request
+// multipart chega ao servidor falso (file/model/language/response_format + Authorization da chave
+// salva) e o microfone salvo inexistente cai no padrão com aviso (captura real, OverconstrainedError).
 import {
   _electron as electron,
   type ElectronApplication,
@@ -203,15 +204,18 @@ async function main(): Promise<void> {
       await page.getByTestId('stt-model').fill('whisper-large-v3-turbo')
       await page.getByTestId('stt-model').press('Tab')
       await page.getByTestId('stt-api-key').fill(STT_KEY)
-      await page.getByTestId('stt-api-key').press('Tab')
-      // a chave sai MASCARADA do main e volta ecoada no campo (nunca em claro)
+      // padrão de "Pesquisa na web": Salvar explícito; o campo volta vazio com a máscara no
+      // placeholder (a chave sai MASCARADA do main — nunca em claro)
+      await page.getByTestId('stt-api-key-save').click()
       const keyField = page.getByTestId('stt-api-key')
       await waitFor(
-        async () => !(await keyField.inputValue()).includes(STT_KEY),
+        async () =>
+          (await keyField.inputValue()) === '' &&
+          ((await keyField.getAttribute('placeholder')) ?? '').includes('…'),
         5000,
-        'máscara no campo'
+        'máscara no placeholder'
       )
-      const masked = await keyField.inputValue()
+      const masked = ((await keyField.getAttribute('placeholder')) ?? '').split(' — ')[0]
       assert(masked.includes('…') && masked.endsWith(STT_KEY.slice(-4)), `máscara: ${masked}`)
       // tecla do push-to-talk: captura a próxima tecla e mostra a atual
       await page.getByTestId('ptt-key-capture').click()
@@ -272,14 +276,17 @@ async function main(): Promise<void> {
         (await page.getByRole('button', { name: 'Enviar' }).count()) === 0,
         'envio ainda visível'
       )
-      // parcial ao vivo aparece no rascunho com o cursor ▌
+      // parcial ao vivo aparece no fantasma (fora da textarea — o rascunho editável não muda)
+      const ghost = page.getByTestId('voice-partial')
       await waitFor(
-        async () => (await composerValue()).includes('▌'),
+        async () =>
+          ((await ghost.innerText().catch(() => '')) || '').includes(STT_TEXT.slice(0, 8)),
         20_000,
-        'parcial no rascunho'
+        'parcial no fantasma'
       )
       await shot('gravando')
-      const partial = await composerValue()
+      const partial = (await ghost.innerText()).trim()
+      assert(!(await composerValue()).includes('▌'), 'parcial vazou para a textarea')
       assert(partial.includes(STT_TEXT.slice(0, 8)), `parcial inesperada: ${partial}`)
       const chat = (await call<any[]>('chats.list'))[0]
       const before = (await call<any[]>('sessions.messages', chat.mainSessionId)).length
@@ -337,6 +344,28 @@ async function main(): Promise<void> {
     assert(!(await composerValue()).includes('▌'), 'parcial sobrou após cancelar')
     assert((await composerValue()) === before, `rascunho mudou: "${await composerValue()}"`)
     await shot('cancelado')
+  })
+
+  await step('microfone salvo inexistente → cai no padrão do sistema com aviso', async () => {
+    const view = await call<any>('voice.settings.get')
+    await call('voice.settings.set', 'audioInput', {
+      ...view.audioInput,
+      deviceId: 'microfone-que-nao-existe'
+    })
+    // as settings do composer são relidas no início de cada gravação
+    await micButton().click()
+    await page.locator('[data-testid="voice-mic-button"][aria-pressed="true"]').waitFor({
+      timeout: 15_000
+    })
+    const notice = page.getByTestId('voice-notice')
+    await notice.waitFor({ timeout: 10_000 })
+    const txt = await notice.innerText()
+    assert(/Microfone salvo não encontrado/.test(txt), `aviso: ${txt}`)
+    await shot('microfone-ausente')
+    await page.getByTestId('voice-cancel-button').click()
+    await waveform().waitFor({ state: 'detached', timeout: 10_000 })
+    await call('voice.settings.set', 'audioInput', { ...view.audioInput, deviceId: null })
+    return txt
   })
 
   await app.close()

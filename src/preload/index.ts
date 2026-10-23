@@ -195,7 +195,11 @@ const api: FullClearApi = {
       playbackIdle: () => invoke(IPC.voice.callPlaybackIdle),
       bargeIn: () => invoke(IPC.voice.callBargeIn),
       interjectionObserved: (input) => invoke(IPC.voice.callInterjectionObserved, input),
-      backchannel: (input) => invoke(IPC.voice.callBackchannel, input)
+      backchannel: (input) => invoke(IPC.voice.callBackchannel, input),
+      getState: () => invoke(IPC.voice.callGetState)
+    },
+    runtime: {
+      status: () => invoke(IPC.voice.runtimeStatus)
     }
   },
   sync: {

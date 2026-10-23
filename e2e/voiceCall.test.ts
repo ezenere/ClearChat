@@ -22,6 +22,13 @@ import {
   type UtterancePlayer
 } from '../src/renderer/src/lib/voice/utteranceQueue.ts'
 import { UtteranceGate } from '../src/renderer/src/lib/voice/utteranceGate.ts'
+import { voiceCallReadiness } from '../src/renderer/src/lib/voice/callReadiness.ts'
+import {
+  DEFAULT_STT_SETTINGS as STT0,
+  DEFAULT_TTS_SETTINGS as TTS0,
+  type SttSettings,
+  type TtsSettings
+} from '@shared/voice'
 
 // ---------------- resolução do VoiceCallConfig (herança persona→chat→global) ----------------
 
@@ -88,7 +95,8 @@ test('resolveVoiceCallConfig: model/tools passam pelo normalizador (model sem pr
 
 // ---------------- silêncio que encerra o turno ----------------
 
-test('resolveTurnSilenceMs: explícito vale; null segue audioInput; 0/desligado cai no fallback', () => {
+test('resolveTurnSilenceMs: explícito vale; null = padrão próprio da chamada (não herda o ditado)', () => {
+  assert.equal(DEFAULT_TURN_SILENCE_MS, 1000, 'padrão de turno de conversa (~1 s)')
   assert.equal(
     resolveTurnSilenceMs(
       { silenceStopMs: 1500 },
@@ -101,7 +109,8 @@ test('resolveTurnSilenceMs: explícito vale; null segue audioInput; 0/desligado 
       { silenceStopMs: null },
       { silenceStopEnabled: true, silenceStopMs: 5000 }
     ),
-    5000
+    DEFAULT_TURN_SILENCE_MS,
+    'o auto-stop de 5 s do ditado NÃO vira o turno da chamada'
   )
   assert.equal(
     resolveTurnSilenceMs(
@@ -109,12 +118,10 @@ test('resolveTurnSilenceMs: explícito vale; null segue audioInput; 0/desligado 
       { silenceStopEnabled: false, silenceStopMs: 5000 }
     ),
     DEFAULT_TURN_SILENCE_MS,
-    'auto-stop desligado → fallback (na chamada SEMPRE há limite)'
+    'auto-stop desligado → padrão (na chamada SEMPRE há limite)'
   )
-  assert.equal(
-    resolveTurnSilenceMs({ silenceStopMs: null }, { silenceStopEnabled: true, silenceStopMs: 0 }),
-    DEFAULT_TURN_SILENCE_MS
-  )
+  assert.equal(resolveTurnSilenceMs({ silenceStopMs: 0 }), DEFAULT_TURN_SILENCE_MS)
+  assert.equal(resolveTurnSilenceMs(null), DEFAULT_TURN_SILENCE_MS)
 })
 
 test('normalizeVoiceCallDefaults: turn.silenceStopMs é preservado (> 0) e 0/lixeira vira null', () => {
@@ -581,3 +588,106 @@ function emptyConfig(): VoiceCallConfig {
 function asConfig(v: unknown): VoiceCallConfig {
   return v as VoiceCallConfig
 }
+
+// ---------------- pré-checagem da chamada (renderer, pura) ----------------
+
+test('voiceCallReadiness: padrões de fábrica apontam o que falta (chave STT, Kokoro)', () => {
+  const problems = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 })
+  assert.equal(problems.length, 2)
+  assert.match(problems[0], /Transcrição: configure a chave/)
+  assert.match(problems[1], /Fala: baixe o modelo Kokoro/)
+})
+
+test('voiceCallReadiness: pronta com chave (máscara) + Kokoro instalado; casos por modo/backend', () => {
+  const stt: SttSettings = { ...STT0, api: { ...STT0.api, apiKey: 'gsk_…abcd' } }
+  const tts: TtsSettings = {
+    ...TTS0,
+    local: { engine: 'kokoro', voice: 'pf_dora', installed: true }
+  }
+  assert.deepEqual(voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }), [])
+  // endpoint local de STT dispensa chave
+  const localUrl: SttSettings = {
+    ...STT0,
+    api: { ...STT0.api, baseUrl: 'http://127.0.0.1:9000/v1' }
+  }
+  assert.deepEqual(voiceCallReadiness({ sttSettings: localUrl, ttsSettings: tts }), [])
+  // modo local sem modelo instalado
+  const local: SttSettings = { ...STT0, mode: 'local', local: null }
+  assert.match(voiceCallReadiness({ sttSettings: local, ttsSettings: tts })[0], /motor local/)
+  // híbrido: basta um dos dois
+  const hybridLocal: SttSettings = {
+    ...STT0,
+    mode: 'hybrid',
+    local: { engine: 'whisper.cpp', model: '', installed: true }
+  }
+  assert.deepEqual(voiceCallReadiness({ sttSettings: hybridLocal, ttsSettings: tts }), [])
+  assert.match(
+    voiceCallReadiness({ sttSettings: { ...STT0, mode: 'hybrid' }, ttsSettings: tts })[0],
+    /híbrido/
+  )
+  // Chatterbox ainda não funciona
+  const chatterbox: TtsSettings = {
+    ...TTS0,
+    local: { engine: 'chatterbox', voice: '', installed: true }
+  }
+  assert.match(voiceCallReadiness({ sttSettings: stt, ttsSettings: chatterbox })[0], /Kokoro/)
+  // TTS por API: endpoint/modelo e chave
+  const ttsApi: TtsSettings = { ...TTS0, backend: 'api' }
+  assert.match(
+    voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApi })[0],
+    /endpoint e o modelo/
+  )
+  const ttsApiNoKey: TtsSettings = {
+    ...TTS0,
+    backend: 'api',
+    api: { ...TTS0.api, baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini-tts' }
+  }
+  assert.match(voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApiNoKey })[0], /chave/)
+  assert.deepEqual(
+    voiceCallReadiness({
+      sttSettings: stt,
+      ttsSettings: { ...ttsApiNoKey, api: { ...ttsApiNoKey.api, apiKey: 'sk-…wxyz' } }
+    }),
+    []
+  )
+})
+
+test('voiceCallReadiness: probe de runtime (espeak-ng ausente / whisper quebrado) bloqueia o motor local', () => {
+  const stt: SttSettings = { ...STT0, api: { ...STT0.api, apiKey: 'gsk_…abcd' } }
+  const tts: TtsSettings = {
+    ...TTS0,
+    local: { engine: 'kokoro', voice: 'pf_dora', installed: true }
+  }
+  const ok = { available: true, reason: null }
+  const runtime = {
+    whisper: ok,
+    onnxruntime: ok,
+    espeak: { available: false, reason: 'espeak-ng não encontrado' },
+    sttLocal: ok,
+    ttsLocal: { available: false, reason: 'espeak-ng não encontrado' }
+  }
+  const p = voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }, runtime)
+  assert.equal(p.length, 1)
+  assert.match(p[0], /Fala: o motor local não está pronto — espeak-ng não encontrado/)
+  // STT local instalado mas whisper não carrega: modo local bloqueia, híbrido cai na API
+  const broken = {
+    ...runtime,
+    ttsLocal: ok,
+    sttLocal: { available: false, reason: 'whisper falhou' }
+  }
+  const local: SttSettings = {
+    ...stt,
+    mode: 'local',
+    local: { engine: 'whisper.cpp', model: '', installed: true }
+  }
+  assert.match(
+    voiceCallReadiness({ sttSettings: local, ttsSettings: tts }, broken)[0],
+    /whisper falhou/
+  )
+  assert.deepEqual(
+    voiceCallReadiness({ sttSettings: { ...local, mode: 'hybrid' }, ttsSettings: tts }, broken),
+    []
+  )
+  // sem probe (main antigo): só as settings contam
+  assert.deepEqual(voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }, null), [])
+})

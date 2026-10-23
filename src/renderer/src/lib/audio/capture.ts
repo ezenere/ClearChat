@@ -12,6 +12,17 @@ import workletUrl from './captureWorklet.ts?worker&url'
 import { concatFloat32, floatToPcm16, frameRms, resampleMono } from './pcm'
 import { SilenceDetector, type SilenceDetectorConfig } from './silence'
 
+/** Erro de microfone inexistente/inválido (deviceId salvo que sumiu) — vale tentar o padrão. */
+function isMissingDevice(err: unknown): boolean {
+  const name = err && typeof err === 'object' ? (err as { name?: unknown }).name : undefined
+  return (
+    name === 'OverconstrainedError' ||
+    name === 'ConstraintNotSatisfiedError' ||
+    name === 'NotFoundError' ||
+    name === 'DevicesNotFoundError'
+  )
+}
+
 /** Nome do processador registrado no worklet — precisa casar com `PROCESSOR_NAME` em captureWorklet.ts. */
 export const CAPTURE_PROCESSOR_NAME = 'clearchat-capture'
 
@@ -117,6 +128,7 @@ export class AudioCapture {
   #mute: GainNode | null = null
   #detector: SilenceDetector | null = null
   #silenceNotified = false
+  #fellBack = false
   #pcmOutRate = DEFAULT_PCM_SAMPLE_RATE
   #chunkSamples = 0
   #frameSamples = 0
@@ -138,6 +150,11 @@ export class AudioCapture {
     return this.#deviceId
   }
 
+  /** O último `start` caiu no microfone padrão porque o `deviceId` pedido não existe mais. */
+  get fellBack(): boolean {
+    return this.#fellBack
+  }
+
   /** Taxa de amostragem real do AudioContext (a de saída PCM é `options.sampleRate`). */
   get contextSampleRate(): number | null {
     return this.#context?.sampleRate ?? null
@@ -155,14 +172,26 @@ export class AudioCapture {
 
   /**
    * Abre o microfone (`deviceId` null = padrão do sistema) e inicia a emissão de eventos.
-   * Rejeita com erro legível se a captura já estiver ativa, se `getUserMedia` falhar
-   * (permissão negada) ou se o AudioWorklet não carregar.
+   * Microfone salvo que não existe mais (`OverconstrainedError`/`NotFoundError` com `deviceId`
+   * explícito) cai no padrão do sistema — `fellBack` fica `true` para o chamador avisar o usuário.
+   * Rejeita com o erro original (DOMException com `name` — ver `captureErrorText`) se a captura já
+   * estiver ativa, se `getUserMedia` falhar (permissão negada, nenhum microfone) ou se o AudioWorklet
+   * não carregar; em qualquer falha o que já foi aberto (faixa, AudioContext) é liberado.
    */
   async start(deviceId: string | null): Promise<void> {
     if (this.#state !== 'idle') {
       throw new Error('AudioCapture: captura já em andamento (use stop() antes)')
     }
     this.#state = 'starting'
+    this.#fellBack = false
+    let stream: MediaStream | null = null
+    let context: AudioContext | null = null
+    const release = (): void => {
+      if (context) void context.close().catch(() => {})
+      stream?.getTracks().forEach((t) => t.stop())
+      context = null
+      stream = null
+    }
     try {
       const mediaDevices = navigator.mediaDevices
       if (!mediaDevices?.getUserMedia) {
@@ -172,48 +201,66 @@ export class AudioCapture {
         ...DEFAULT_AUDIO_TRACK_CONSTRAINTS,
         ...this.#options.constraints
       }
-      if (deviceId) constraints.deviceId = { exact: deviceId }
-      const stream = await mediaDevices.getUserMedia({ audio: constraints, video: false })
-      const context = new AudioContext({ latencyHint: 'interactive' })
+      let usedDevice = deviceId
+      try {
+        stream = await mediaDevices.getUserMedia({
+          audio: deviceId ? { ...constraints, deviceId: { exact: deviceId } } : constraints,
+          video: false
+        })
+      } catch (cause) {
+        // microfone salvo desconectado/trocado: tenta o padrão do sistema (o chamador avisa)
+        if (!deviceId || !isMissingDevice(cause)) throw cause
+        stream = await mediaDevices.getUserMedia({ audio: constraints, video: false })
+        usedDevice = null
+        this.#fellBack = true
+      }
+      if (this.#state !== 'starting') throw new Error('AudioCapture: start interrompido por stop()')
+      const outRate = this.#options.sampleRate ?? DEFAULT_PCM_SAMPLE_RATE
+      let source: MediaStreamAudioSourceNode
+      // AudioContext já na taxa de saída (16 kHz): o Chromium reamostra o microfone com filtro
+      // próprio; runtime que recusar cai no contexto na taxa nativa + `resampleMono` (passa-baixa).
+      try {
+        context = new AudioContext({ latencyHint: 'interactive', sampleRate: outRate })
+        source = context.createMediaStreamSource(stream)
+      } catch {
+        if (context) void context.close().catch(() => {})
+        context = new AudioContext({ latencyHint: 'interactive' })
+        source = context.createMediaStreamSource(stream)
+      }
       try {
         if (!context.audioWorklet) {
           throw new Error('AudioWorklet indisponível no runtime')
         }
         await context.audioWorklet.addModule(workletUrl)
       } catch (cause) {
-        await context.close()
-        stream.getTracks().forEach((t) => t.stop())
         throw new Error(
           `AudioCapture: falha ao carregar o worklet de captura (${cause instanceof Error ? cause.message : String(cause)})`,
           { cause }
         )
       }
-      const source = context.createMediaStreamSource(stream)
+      // Interrupção por stop() durante o start assíncrono (ex.: tecla do PTT solta na janela de
+      // permissão): o start aborta e libera o que acabou de abrir, sem derrubar o chamador.
+      if (this.#state !== 'starting') throw new Error('AudioCapture: start interrompido por stop()')
       const node = new AudioWorkletNode(context, CAPTURE_PROCESSOR_NAME, {
         numberOfInputs: 1,
         numberOfOutputs: 1,
         outputChannelCount: [1]
       })
-      // Interrupção por stop() durante o start assíncrono (ex.: tecla do PTT solta na janela de
-      // permissão): o start aborta e libera o que acabou de abrir, sem derrubar o chamador.
-      const abort = (): Error => {
-        void context.close().catch(() => {})
-        stream.getTracks().forEach((t) => t.stop())
-        return new Error('AudioCapture: start interrompido por stop()')
-      }
-      if (this.#state !== 'starting') throw abort()
       // O nó precisa chegar ao destination para ser "puxado"; o ganho mudo evita eco.
       const mute = context.createGain()
       mute.gain.value = 0
       source.connect(node)
       node.connect(mute)
       mute.connect(context.destination)
-      await context.resume()
-      if (this.#state !== 'starting') {
+      try {
+        await context.resume()
+        if (this.#state !== 'starting')
+          throw new Error('AudioCapture: start interrompido por stop()')
+      } catch (cause) {
         source.disconnect()
         node.disconnect()
         mute.disconnect()
-        throw abort()
+        throw cause
       }
 
       this.#stream = stream
@@ -221,8 +268,8 @@ export class AudioCapture {
       this.#source = source
       this.#node = node
       this.#mute = mute
-      this.#deviceId = deviceId
-      this.#pcmOutRate = this.#options.sampleRate ?? DEFAULT_PCM_SAMPLE_RATE
+      this.#deviceId = usedDevice
+      this.#pcmOutRate = outRate
       const chunkMs = this.#options.chunkMs ?? DEFAULT_CHUNK_MS
       const levelMs = this.#options.levelMs ?? DEFAULT_LEVEL_MS
       this.#chunkSamples = Math.max(1, Math.round((context.sampleRate * chunkMs) / 1000))
@@ -239,11 +286,16 @@ export class AudioCapture {
       // `track.stop()` não dispara 'ended'; este handler cobre só a perda externa do microfone.
       for (const track of stream.getTracks()) {
         track.addEventListener('ended', () => {
+          if (this.#stream !== stream) return
           void this.stop().then(() => this.#emit('ended'))
         })
       }
+      // posse transferida para a instância (o teardown/stop libera daqui em diante)
+      stream = null
+      context = null
       this.#state = 'running'
     } catch (cause) {
+      release()
       this.#teardown()
       this.#state = 'idle'
       throw cause instanceof Error ? cause : new Error(String(cause))

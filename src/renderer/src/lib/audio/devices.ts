@@ -80,3 +80,23 @@ export function resolveInputDeviceId(
   const def = devices.find((d) => d.isDefault)
   return def?.deviceId ?? devices[0]?.deviceId ?? null
 }
+
+/** deviceIds sintéticos do Chromium ("Default"/"Communications") — duplicam um microfone real. */
+const SYNTHETIC_DEVICE_IDS = new Set(['default', 'communications'])
+
+/**
+ * Lista para os menus (composer e Configurações → Áudio): esconde as entradas sintéticas do
+ * Chromium (`default`/`communications` — o item "Padrão do sistema" já representa o padrão) e
+ * devolve o nome do microfone padrão atual ("Default - Microfone USB" → "Microfone USB") para
+ * enriquecer o rótulo do "Padrão do sistema". Pura (testada em `e2e/audio.test.ts`).
+ */
+export function menuInputDevices(devices: readonly InputDevice[]): {
+  systemLabel: string | null
+  devices: InputDevice[]
+} {
+  const def = devices.find((d) => d.deviceId === 'default')
+  const raw = def?.label.trim() ?? ''
+  const name = raw.replace(/^(default|padrão)\s*[-–—:]\s*/i, '').trim()
+  const systemLabel = name && !/^(default|padrão)$/i.test(name) ? name : null
+  return { systemLabel, devices: devices.filter((d) => !SYNTHETIC_DEVICE_IDS.has(d.deviceId)) }
+}

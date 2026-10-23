@@ -184,8 +184,10 @@ async function waitFor<T>(
 
 /** Síntese por sentença: registrada na ordem; em modo 'gated' o teste libera cada uma na mão. */
 let synthMode: 'auto' | 'gated' = 'auto'
-/** Falha de TTS (a sentença rejeita como o backend fora do ar — para a fala, texto segue). */
+/** Falha de TTS (a sentença rejeita como o backend fora do ar — ela é pulada, texto segue). */
 let failSynth = false
+/** Falha de TTS só nas sentenças que contêm este trecho (as demais sintetizam). */
+let failSynthOn: string | null = null
 const synthCalls: string[] = []
 const gates: { open: () => void }[] = []
 const openGate = (i: number): void => gates[i]?.open()
@@ -199,7 +201,7 @@ async function synth(
   signal: AbortSignal
 ): Promise<{ audio: Uint8Array; mime: string }> {
   synthCalls.push(text)
-  if (failSynth) throw new Error('TTS fora do ar')
+  if (failSynth || (failSynthOn && text.includes(failSynthOn))) throw new Error('TTS fora do ar')
   if (synthMode === 'gated') {
     await Promise.race([new Promise<void>((r) => gates.push({ open: r })), aborted(signal)])
   } else {
@@ -549,9 +551,9 @@ test('falha de TTS: erro no estado e a fase não fica "Falando…" (texto segue 
   await idle(sid)
   await waitFor(() => m.state().error != null, 4000, 'erro de TTS no estado')
   assert.match(m.state().error!, /TTS fora do ar/)
-  assert.equal(synthCalls.length, 1, 'a 2ª sentença foi descartada junto')
+  await waitFor(() => synthCalls.length === 2, 4000, 'a 2ª sentença também foi tentada')
   assert.deepEqual(emitted, [], 'nada foi emitido para tocar')
-  assert.notEqual(m.state().phase, 'speaking', 'a fase não fica presa em "Falando…"')
+  await waitFor(() => m.state().phase !== 'speaking', 4000, 'a fase não fica presa em "Falando…"')
   const msgs = path(sid)
   assert.equal(
     textOf(msgs[1].message.content),
@@ -559,6 +561,27 @@ test('falha de TTS: erro no estado e a fase não fica "Falando…" (texto segue 
     'o texto da resposta segue completo no histórico'
   )
   failSynth = false
+  m.stop()
+})
+
+test('falha de TTS numa sentença: ela é pulada e o resto da resposta continua sendo falado', async () => {
+  synthMode = 'auto'
+  failSynth = false
+  failSynthOn = 'Primeira'
+  synthCalls.length = 0
+  emitted.length = 0
+  const { manager: m } = await boot()
+  m.stop()
+  const { sid } = await newChat()
+  m.start(sid)
+  m.speechBegin()
+  m.speechEnd()
+  m.turn('duas')
+  await idle(sid)
+  await waitFor(() => emitted.length === 1, 4000, 'a 2ª sentença foi emitida')
+  assert.deepEqual(synthCalls, ['Primeira frase.', 'Segunda frase.'])
+  assert.match(m.state().error ?? '', /TTS fora do ar/, 'o erro da sentença pulada aparece')
+  failSynthOn = null
   m.stop()
 })
 

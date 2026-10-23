@@ -1,4 +1,15 @@
-import { ArrowUp, Lightbulb, Paperclip, Square, TriangleAlert, X, Zap } from 'lucide-react'
+import {
+  ArrowUp,
+  Info,
+  Lightbulb,
+  Mic,
+  MicOff,
+  Paperclip,
+  Square,
+  TriangleAlert,
+  X,
+  Zap
+} from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { modalityWarning } from '@shared/attachments'
 import type { QueuedMessage, Session } from '@shared/types'
@@ -38,12 +49,14 @@ import { SpendButton } from './SpendButton'
 import { BarLevelsContext, barAttrs, useBarCollapse, useBarLevel } from '../../lib/useBarCollapse'
 import { useDictation } from '../../lib/voice/useDictation'
 import {
-  composeDictationDraft,
-  mergeDictationDraft,
-  splitDictationEdit
+  DICTATION_CURSOR,
+  insertDictationText,
+  rebaseDictationAnchor,
+  type DictationAnchor
 } from '../../lib/voice/dictation'
 import { MicButton } from '../voice/MicControls'
 import { VoiceCallButton } from '../voice/VoiceCallButton'
+import { VoiceCallDock, VoiceCallElsewhere } from '../voice/VoiceCallDock'
 import { Waveform } from '../voice/Waveform'
 
 /** Estado do agente na barra do composer; recolhido, só o ponto (o texto vai no tooltip). */
@@ -77,6 +90,33 @@ function ComposerStatus({ text }: { text: string }): React.JSX.Element {
   )
 }
 
+/**
+ * Mic do ditado + menu do microfone + telefone da chamada; barra apertada (coluna estreita) deixa
+ * só o mic e, no limite, nada (a tecla do PTT e Configurações → Áudio continuam; na chamada a
+ * barra da chamada substitui o composer). Durante a gravação o mic nunca some.
+ */
+function VoiceControls({
+  dictation,
+  session,
+  showMic
+}: {
+  dictation: ReturnType<typeof useDictation>
+  session: Session
+  showMic: boolean
+}): React.JSX.Element {
+  const level = useBarLevel('voice-controls')
+  // gravando/transcrevendo: o mic fica sempre (parar/estado visível)
+  const idle = dictation.state === 'idle'
+  const compact = level > 0 && idle
+  const hidden = level > 1 && idle
+  return (
+    <span {...barAttrs('voice-controls', level)} className="flex shrink-0 items-center gap-2">
+      {showMic && !hidden && <MicButton dictation={dictation} compact={compact} />}
+      {!compact && <VoiceCallButton session={session} />}
+    </span>
+  )
+}
+
 /** "Enter envia · Shift+Enter quebra linha" — o primeiro a sair quando falta espaço. */
 function ComposerHint(): React.JSX.Element {
   const level = useBarLevel('composer-hint')
@@ -90,6 +130,17 @@ function ComposerHint(): React.JSX.Element {
       )}
     </span>
   )
+}
+
+/**
+ * Rascunhos dos composers escondidos pela chamada de voz quando o usuário troca de chat no meio
+ * dela (o composer desmonta): voltam intactos ao reabrir o chat.
+ */
+const callDrafts = new Map<string, string>()
+function takeCallDraft(sessionId: string): string {
+  const t = callDrafts.get(sessionId) ?? ''
+  callDrafts.delete(sessionId)
+  return t
 }
 
 /** Nome para imagens coladas da área de transferência (o navegador entrega sempre "image.png"). */
@@ -199,7 +250,8 @@ export function Composer({
   const blocked = !!question || !!retry
   const host = useHostInfo(session.chatId)
   const hostOffline = host?.mode === 'host-offline'
-  const [text, setText] = useState('')
+  // rascunho guardado enquanto a chamada escondia o composer (trocar de chat no meio da chamada)
+  const [text, setText] = useState(() => takeCallDraft(session.id))
   const ref = useRef<HTMLTextAreaElement>(null)
   const [barRef, barLevels] = useBarCollapse<HTMLDivElement>()
   const pending = useStore(selectPendingAttachments(session.id))
@@ -218,13 +270,76 @@ export function Composer({
   /** Pediu para enviar com anexo que o modelo (talvez) não aceita: destaca a confirmação (por conjunto de avisos). */
   const [confirmKey, setConfirmKey] = useState<string | null>(null)
 
-  /** Ditado por voz: parciais viram rascunho diferenciado (`▌`); o final entra no rascunho normal. */
-  const dictation = useDictation({
-    onFinal: (spoken) => setText((t) => mergeDictationDraft(t, spoken))
-  })
-  const dictating = dictation.state !== 'idle'
   /** Chamada de voz ativa (em qualquer chat): o microfone do ditado some (um de cada vez). */
   const callActive = useStore((s) => s.voiceCall.active)
+  /** A chamada é DESTA sessão: a barra da chamada substitui o composer (texto desabilitado). */
+  const callHere = useStore((s) => s.voiceCall.active && s.voiceCall.sessionId === session.id)
+  // fim da chamada: o composer volta (rascunho intacto — o estado vive aqui) com o foco no texto
+  const wasCallHere = useRef(callHere)
+  useEffect(() => {
+    if (wasCallHere.current && !callHere) ref.current?.focus()
+    wasCallHere.current = callHere
+  }, [callHere])
+  const settingsOpen = useStore((s) => s.settingsOpen)
+  /** Texto mais recente (a inserção do final acontece fora do ciclo de render). */
+  const textRef = useRef(text)
+  useEffect(() => {
+    textRef.current = text
+  })
+  // composer desmontado com a chamada ativa (troca de chat): o rascunho espera a chamada acabar
+  const callHereRef = useRef(callHere)
+  useEffect(() => {
+    callHereRef.current = callHere
+  }, [callHere])
+  useEffect(
+    () => () => {
+      if (callHereRef.current && textRef.current) callDrafts.set(session.id, textRef.current)
+    },
+    [session.id]
+  )
+  /** Cursor/seleção quando o ditado começou: o texto final entra AÍ (ajustado às edições). */
+  const anchorRef = useRef<DictationAnchor | null>(null)
+  /**
+   * Texto final do ditado: entra no ponto de inserção (seleção do início do ditado, ajustada ao
+   * que foi digitado durante a gravação) via `execCommand('insertText')` — fica no histórico de
+   * desfazer da textarea (Ctrl+Z); sem a textarea (ou se o comando falhar), grava direto no estado.
+   */
+  const insertFinal = (spoken: string): void => {
+    const current = textRef.current
+    const at = rebaseDictationAnchor(anchorRef.current, current)
+    anchorRef.current = null
+    const r = insertDictationText(current, at.start, at.end, spoken)
+    if (!r.insert) return
+    const ta = ref.current
+    if (ta && ta.value === current) {
+      ta.focus()
+      ta.setSelectionRange(r.start, r.end)
+      if (document.execCommand('insertText', false, r.insert)) {
+        ta.setSelectionRange(r.caret, r.caret)
+        return
+      }
+    }
+    textRef.current = r.value
+    setText(r.value)
+  }
+  /** Ditado por voz: a parcial ao vivo fica num fantasma FORA da textarea; o final entra no rascunho. */
+  const dictation = useDictation({
+    onFinal: insertFinal,
+    // UI do ditado escondida/bloqueada → tecla do PTT desligada e gravação em curso cancelada
+    suspended: callActive || blocked || hostOffline || settingsOpen
+  })
+  const dictating = dictation.state !== 'idle'
+  const wasDictating = useRef(false)
+  useEffect(() => {
+    if (dictating && !wasDictating.current) {
+      const ta = ref.current
+      const t = textRef.current
+      anchorRef.current = ta
+        ? { text: t, start: ta.selectionStart ?? t.length, end: ta.selectionEnd ?? t.length }
+        : { text: t, start: t.length, end: t.length }
+    }
+    wasDictating.current = dictating
+  }, [dictating])
 
   useEffect(() => {
     if (autoFocus) ref.current?.focus()
@@ -248,7 +363,8 @@ export function Composer({
 
   const submit = async (force = false): Promise<void> => {
     const t = text.trim()
-    if (!canSend || dictating) return
+    // composer escondido pela chamada de voz deste chat: nada é enviado por atalho
+    if (!canSend || dictating || callHere) return
     if (warnings.length && !force) {
       setConfirmKey(warnKey)
       return
@@ -305,8 +421,25 @@ export function Composer({
           {chat && <HostComposerLine chat={chat} sessionId={session.id} />}
           {chat && session.depth === 0 && <OutdatedHostsBanner />}
           <PendingBar session={session} blocked={blocked} />
+          {/* chamada ativa em OUTRO chat: o composer daqui funciona; pílula leva de volta */}
+          {callActive && !callHere && <VoiceCallElsewhere />}
           {hostOffline && chat ? (
             <HostOfflineCard chat={chat} />
+          ) : callHere ? (
+            // chamada de voz NESTE chat: a barra da chamada ocupa o lugar do composer (sem digitar
+            // no rascunho por engano); fila e aprovações seguem acima, pergunta/retry num card
+            <>
+              {(question || retry) && (
+                <div
+                  data-testid="voice-call-blocking-card"
+                  className="mb-2 rounded-2xl border border-border bg-surface shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7)]"
+                >
+                  {question && <QuestionForm key={question.id} request={question} />}
+                  {!question && retry && <RetryForm key={retry.id} request={retry} />}
+                </div>
+              )}
+              <VoiceCallDock />
+            </>
           ) : (
             <div
               className={cn(
@@ -381,6 +514,25 @@ export function Composer({
                   </button>
                 </div>
               )}
+              {!blocked && dictation.notice && !dictation.error && (
+                <div
+                  role="status"
+                  data-testid="voice-notice"
+                  onClick={(e) => e.stopPropagation()}
+                  className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-warning/25 bg-warning/[0.06] px-2.5 py-1.5 text-[12px] text-warning"
+                >
+                  <Info className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1">{dictation.notice}</span>
+                  <button
+                    type="button"
+                    aria-label="Dispensar aviso de voz"
+                    onClick={dictation.clearNotice}
+                    className="shrink-0 rounded-md p-1 transition-colors hover:bg-warning/15"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              )}
               {!blocked && dictation.error && (
                 <div
                   role="alert"
@@ -403,7 +555,7 @@ export function Composer({
               {!blocked && (
                 <AutoTextarea
                   ref={ref}
-                  value={dictating ? composeDictationDraft(text, dictation.partial) : text}
+                  value={text}
                   minRows={1}
                   maxRows={14}
                   placeholder={
@@ -417,16 +569,7 @@ export function Composer({
                           ? 'Mensagem ao subagente…'
                           : 'Mensagem…'
                   }
-                  onChange={(e) => {
-                    if (!dictating) {
-                      setText(e.target.value)
-                      return
-                    }
-                    // edição durante a gravação: separa o texto do usuário do rascunho falado
-                    const r = splitDictationEdit(e.target.value, dictation.partial, text)
-                    setText(r.text)
-                    if (r.partial !== dictation.partial) dictation.clearPartial()
-                  }}
+                  onChange={(e) => setText(e.target.value)}
                   onPaste={(e) => {
                     const files = [...e.clipboardData.files]
                     if (!files.length) return
@@ -443,6 +586,21 @@ export function Composer({
                   }}
                   className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
                 />
+              )}
+              {!blocked && dictating && (
+                // parcial ao vivo FORA do texto editável (digitar durante a gravação é seguro)
+                <div
+                  data-testid="voice-partial"
+                  aria-live="polite"
+                  className="mx-4 mb-1 flex items-start gap-1.5 text-[13px] leading-6 text-subtle italic"
+                >
+                  <Mic className="mt-1 size-3.5 shrink-0 animate-pulse-soft text-accent-strong" />
+                  <span className="min-w-0 break-words">
+                    {dictation.partial ||
+                      (dictation.state === 'stopping' ? 'Transcrevendo…' : 'Ouvindo…')}
+                    <span className="text-accent-strong not-italic">{DICTATION_CURSOR}</span>
+                  </span>
+                </div>
               )}
               <BarLevelsContext.Provider value={barLevels}>
                 <div
@@ -467,9 +625,10 @@ export function Composer({
                     </Tip>
                   )}
                   {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
-                  {!blocked && !callActive && <MicButton dictation={dictation} />}
-                  {!blocked && <VoiceCallButton session={session} />}
-                  {dictating && (
+                  {!blocked && (
+                    <VoiceControls dictation={dictation} session={session} showMic={!callActive} />
+                  )}
+                  {!blocked && dictating && (
                     <Waveform
                       level={dictation.level}
                       recording={dictation.state === 'recording'}
@@ -514,7 +673,7 @@ export function Composer({
                     {chat && <ContextMeter chat={chat} session={session} />}
                     {chat && <SpendButton chat={chat} />}
                     {busy && (
-                      <Tip label="Parar">
+                      <Tip label={dictating ? 'Parar o agente' : 'Parar'}>
                         <button
                           type="button"
                           onClick={(e) => {
@@ -522,7 +681,8 @@ export function Composer({
                             void run(() => api.agent.stop(session.id), 'Falha ao parar')
                           }}
                           className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
-                          aria-label="Parar"
+                          aria-label={dictating ? 'Parar o agente' : 'Parar'}
+                          data-testid="agent-stop-button"
                         >
                           <Square className="size-3" fill="currentColor" />
                         </button>
@@ -546,9 +706,12 @@ export function Composer({
                         </Tip>
                         <Tip
                           label={
-                            dictation.state === 'stopping' ? 'Transcrevendo…' : 'Parar gravação'
+                            dictation.state === 'stopping'
+                              ? 'Transcrevendo…'
+                              : 'Parar gravação e transcrever'
                           }
                         >
+                          {/* vermelho + MicOff: distinto do "Parar o agente" (quadrado neutro) */}
                           <button
                             type="button"
                             data-testid="voice-stop-button"
@@ -558,9 +721,9 @@ export function Composer({
                               e.stopPropagation()
                               void dictation.stop()
                             }}
-                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover disabled:opacity-60"
+                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-danger text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-danger/85 disabled:opacity-60"
                           >
-                            <Square className="size-3" fill="currentColor" />
+                            <MicOff className="size-4" strokeWidth={2.25} />
                           </button>
                         </Tip>
                       </>

@@ -1,11 +1,11 @@
 // Config da chamada de voz do chat atual (persona→chat→global + ★/herança) para o dock e o painel
 // de timeline (`VoiceCallDock`/`VoiceCallPanel`): resolve `ChatConfig.voice` contra `voiceCallDefaults`
-// e grava overrides por `patchConfig` (a opção ★ = padrão global remove o override). Ver SPEC →
+// e grava overrides por `patchConfig` (a opção ★ = padrão global remove o override). Os padrões
+// globais vêm do espelho reativo `useVoiceSettings` (nunca uma cópia do primeiro mount). Ver SPEC →
 // "Chamada de voz → Modo sombra e timeline".
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo } from 'react'
 import {
   DEFAULT_VOICE_CALL_CONFIG,
-  DEFAULT_VOICE_CALL_DEFAULTS,
   resolveVoiceCallConfig,
   type InterjectionPolicy,
   type ResolvedVoiceCall,
@@ -13,8 +13,8 @@ import {
   type VoiceCallDefaults,
   type VoiceFillers
 } from '@shared/voice'
-import { api } from '../api'
 import { useStore } from '../../store'
+import { loadVoiceSettings, useVoiceSettings } from './voiceSettings'
 
 /** Config da chamada do chat atual + padrões globais (★/herança). */
 export function useVoiceCallConfig(): {
@@ -28,13 +28,12 @@ export function useVoiceCallConfig(): {
   const chatId = useStore((s) => s.voiceCall.chatId)
   const chat = useStore((s) => s.chats.find((c) => c.id === s.voiceCall.chatId) ?? null)
   const patchConfig = useStore((s) => s.patchConfig)
-  const [defaults, setDefaults] = useState<VoiceCallDefaults>(DEFAULT_VOICE_CALL_DEFAULTS)
+  // padrões globais do espelho único (`voiceSettings`): Configurações → Áudio grava por lá e o ★
+  // acompanha na hora; relê ao abrir a chamada (outra tela pode ter mudado)
+  const defaults = useVoiceSettings((s) => s.view.voiceCallDefaults)
   useEffect(() => {
-    void api.voice?.settings
-      .get()
-      .then((all) => setDefaults(all.voiceCallDefaults))
-      .catch(() => void 0)
-  }, [])
+    if (chatId) void loadVoiceSettings()
+  }, [chatId])
   const voice: VoiceCallConfig = chat?.config.voice ?? DEFAULT_VOICE_CALL_CONFIG
   const resolved = useMemo(() => resolveVoiceCallConfig(voice, defaults), [voice, defaults])
   const setInterjections = (patch: Partial<InterjectionPolicy> | 'inherit'): void => {

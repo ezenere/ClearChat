@@ -254,7 +254,9 @@ export const IPC = {
     callPlaybackIdle: 'voice:call:playback-idle',
     callBargeIn: 'voice:call:barge-in',
     callInterjectionObserved: 'voice:call:interjection-observed',
-    callBackchannel: 'voice:call:backchannel'
+    callBackchannel: 'voice:call:backchannel',
+    callGetState: 'voice:call:get-state',
+    runtimeStatus: 'voice:runtime:status'
   }
 } as const
 
@@ -474,6 +476,11 @@ export interface VoicePartialEvent {
   isFinal: boolean
   /** Duração da chamada que gerou a parcial, em ms. */
   ms: number
+  /**
+   * Aviso legível (uma vez por sessão) quando as parciais foram desligadas (chave/cota/config) ou
+   * a gravação atingiu o teto de duração. Ausente = parcial normal. A final segue valendo.
+   */
+  error?: string
 }
 
 /** Resultado final de uma sessão de transcrição (`TranscribeResult` + backend/fellBack de `voice/stt.ts`). */
@@ -593,7 +600,43 @@ export interface VoiceApi {
      * cancela a resposta nem vira turno (fala longa é barge-in, via `bargeIn`).
      */
     backchannel(input: { ms: number }): Promise<void>
+    /**
+     * Estado atual da chamada no main (canal `voice:call:get-state`) — para o renderer reidratar
+     * depois de recarregar (o evento `voice:call:state` só chega em transições). Opcional na
+     * interface só para não quebrar implementações antigas (o preload sempre expõe).
+     */
+    getState?(): Promise<VoiceCallState>
   }
+  /** Prontidão dos runtimes locais (canal `voice:runtime:status`) — opcional como `call.getState`. */
+  runtime?: {
+    /** Sonda (memoizado) whisper.cpp/onnxruntime/espeak-ng e o "pronto" local de STT e TTS. */
+    status(): Promise<VoiceRuntimeStatus>
+  }
+}
+
+/** Resultado de um probe de runtime local (`voice:runtime:status`). */
+export interface VoiceRuntimeCheck {
+  available: boolean
+  /** Motivo legível (pt-BR) quando indisponível; null quando ok. */
+  reason: string | null
+}
+
+/**
+ * Prontidão dos runtimes locais de áudio ("pronto = modelo instalado + runtime carregável"):
+ * os binários nativos carregam DE VERDADE (whisper no processo do worker, onnxruntime no main) e
+ * o espeak-ng existe no sistema.
+ */
+export interface VoiceRuntimeStatus {
+  /** whisper.cpp (`@napi-rs/whisper`) carrega no processo do motor local de STT. */
+  whisper: VoiceRuntimeCheck
+  /** `onnxruntime-node` carrega (motor local de fala Kokoro). */
+  onnxruntime: VoiceRuntimeCheck
+  /** `espeak-ng` do sistema responde (fonemização pt-BR do Kokoro). */
+  espeak: VoiceRuntimeCheck
+  /** STT local pronto agora: engine escolhido com runtime + modelo instalado. */
+  sttLocal: VoiceRuntimeCheck
+  /** TTS local pronto agora: onnxruntime + espeak-ng + modelo e voz do Kokoro instalados. */
+  ttsLocal: VoiceRuntimeCheck
 }
 
 /** Estado do modelo local no disco (espelho de `LocalModelState` em `src/main/voice/models.ts`). */

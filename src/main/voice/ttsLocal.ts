@@ -5,9 +5,8 @@
 // Sem Electron, sem UI, sem IPC; dependências injetáveis (runner do espeak-ng e sessão ONNX).
 // O pipeline é o do `hexgrad/kokoro` (`model.py`): fonemas → ids por caractere (chars fora do
 // vocabulário caem) → `[0, *ids, 0]` → estilo `voice[min(ids, 509)]` → `waveform` a 24 kHz.
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { promisify } from 'node:util'
 import type { Tensor as OrtTensor } from 'onnxruntime-node'
 import type { TtsLocalEngine } from '@shared/voice'
 import { abortError } from '../tools/util'
@@ -220,6 +219,8 @@ export interface KokoroTensor {
 /** Sessão ONNX mínima do modelo Kokoro (injetável). */
 export interface KokoroSession {
   run(feeds: Record<string, KokoroTensor>): Promise<{ waveform: { data: Float32Array } }>
+  /** Libera a sessão nativa (opcional — a padrão chama `InferenceSession.release`). */
+  release?(): Promise<void>
 }
 
 export interface KokoroEngineDeps {
@@ -236,23 +237,88 @@ export interface KokoroEngine extends TtsLocalBackend {
   engine: Extract<TtsLocalEngine, 'kokoro'>
   /** Vozes pt-BR com o estado de instalação em disco. */
   voices(): Promise<{ id: string; label: string; installed: boolean }[]>
+  /** Solta as sessões ONNX carregadas (modelo removido/trocado); a próxima síntese recarrega. */
+  release(): Promise<void>
 }
 
-const execFileAsync = promisify(execFile)
+/** Como instalar o espeak-ng nesta plataforma (texto da mensagem de erro). */
+export function espeakInstallHint(platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'darwin') return 'instale com o Homebrew: `brew install espeak-ng`'
+  if (platform === 'win32')
+    return 'instale o espeak-ng para Windows (github.com/espeak-ng/espeak-ng/releases) e deixe o espeak-ng.exe no PATH'
+  return 'instale o pacote "espeak-ng" pelo gerenciador de pacotes da sua distribuição (ex.: `sudo apt install espeak-ng`, `sudo dnf install espeak-ng` ou `sudo pacman -S espeak-ng`)'
+}
+
+/** Erro legível de espeak-ng ausente (com a dica da plataforma). */
+export function espeakMissingError(cause?: unknown): TtsError {
+  return new TtsError(
+    'config',
+    `espeak-ng não encontrado no sistema — o motor local Kokoro usa o espeak-ng para a fonemização pt-BR (${espeakInstallHint()})`,
+    { backend: 'local', cause }
+  )
+}
+
+const ESPEAK_TIMEOUT_MS = 15_000
+const ESPEAK_MAX_OUTPUT = 1 << 20
+
+/**
+ * Executa um comando sem shell, com stdin FECHADO (o espeak-ng lê o stdin quando não recebe texto —
+ * nunca pode ficar esperando), timeout e teto de saída. Devolve o stdout.
+ */
+function spawnCapture(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    } catch (e) {
+      reject(e)
+      return
+    }
+    const out: Buffer[] = []
+    const err: Buffer[] = []
+    let size = 0
+    let killed = false
+    const timer = setTimeout(() => {
+      killed = true
+      child.kill('SIGKILL')
+    }, ESPEAK_TIMEOUT_MS)
+    child.stdout?.on('data', (b: Buffer) => {
+      size += b.length
+      if (size > ESPEAK_MAX_OUTPUT) {
+        killed = true
+        child.kill('SIGKILL')
+        return
+      }
+      out.push(b)
+    })
+    child.stderr?.on('data', (b: Buffer) => {
+      if (err.length < 16) err.push(b)
+    })
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      reject(e)
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      if (code === 0 && !killed) resolve(Buffer.concat(out).toString('utf8'))
+      else
+        reject(
+          Object.assign(new Error(`${command} saiu com código ${code}`), {
+            killed,
+            stderr: Buffer.concat(err).toString('utf8')
+          })
+        )
+    })
+  })
+}
 
 /** Runner padrão do espeak-ng (CLI do sistema — o app não embute o espeak-ng, que é GPL). */
 async function defaultRun(command: string, args: string[]): Promise<string> {
   try {
-    const { stdout } = await execFileAsync(command, args, { timeout: 15_000, maxBuffer: 1 << 20 })
-    return stdout
+    return await spawnCapture(command, args)
   } catch (e) {
     const err = e as NodeJS.ErrnoException & { killed?: boolean; stderr?: string }
-    if (err.code === 'ENOENT')
-      throw new TtsError(
-        'config',
-        'espeak-ng não encontrado no sistema — o motor local Kokoro usa o espeak-ng para a fonemização pt-BR (instale o pacote "espeak-ng" do sistema, ex.: `pacman -S espeak-ng`)',
-        { backend: 'local', cause: e }
-      )
+    if (err.code === 'ENOENT') throw espeakMissingError(e)
     const detail = (err.stderr ?? '').toString().replace(/\s+/g, ' ').trim().slice(0, 160)
     throw new TtsError(
       'config',
@@ -264,10 +330,84 @@ async function defaultRun(command: string, args: string[]): Promise<string> {
   }
 }
 
+// ---------------- probes do runtime (prontidão do motor local) ----------------
+
+/** Resultado de um probe de runtime. */
+export interface TtsRuntimeProbe {
+  available: boolean
+  reason: string | null
+}
+
+let onnxProbe: Promise<TtsRuntimeProbe> | null = null
+
+/**
+ * `onnxruntime-node` carrega neste processo (binding nativo + libonnxruntime da plataforma)?
+ * Memoizado por execução; nunca lança.
+ */
+export function probeOnnxRuntime(): Promise<TtsRuntimeProbe> {
+  onnxProbe ??= import('onnxruntime-node').then(
+    (m) => {
+      const ort = m as unknown as { InferenceSession?: { create?: unknown } }
+      return typeof ort.InferenceSession?.create === 'function'
+        ? { available: true, reason: null }
+        : { available: false, reason: 'onnxruntime-node sem InferenceSession' }
+    },
+    (e: unknown) => ({
+      available: false,
+      reason: `o runtime ONNX (onnxruntime-node) não pôde ser carregado nesta instalação (${e instanceof Error ? e.message : String(e)})`
+    })
+  )
+  return onnxProbe
+}
+
+/** Reprova do espeak-ng ausente só depois deste tempo (o usuário pode instalar com o app aberto). */
+const ESPEAK_NEGATIVE_TTL_MS = 30_000
+let espeakProbe: { at: number; result: Promise<TtsRuntimeProbe> } | null = null
+
+/** O `espeak-ng` do sistema responde (`--version`)? Positivo memoizado; negativo expira em 30 s. */
+export function probeEspeak(
+  run: (command: string, args: string[]) => Promise<string> = defaultRun
+): Promise<TtsRuntimeProbe> {
+  const now = Date.now()
+  if (espeakProbe) return espeakProbe.result
+  const result = run('espeak-ng', ['--version']).then(
+    () => ({ available: true, reason: null }),
+    (e: unknown) => ({ available: false, reason: e instanceof Error ? e.message : String(e) })
+  )
+  espeakProbe = { at: now, result }
+  void result.then((r) => {
+    if (!r.available && espeakProbe?.result === result)
+      setTimeout(() => {
+        if (espeakProbe?.result === result) espeakProbe = null
+      }, ESPEAK_NEGATIVE_TTL_MS).unref?.()
+  })
+  return result
+}
+
+/** Zera os probes memoizados (testes). */
+export function resetTtsRuntimeProbes(): void {
+  onnxProbe = null
+  espeakProbe = null
+}
+
 /** Sessão ONNX padrão (`onnxruntime-node`, CPU). */
 async function defaultCreateSession(modelPath: string): Promise<KokoroSession> {
+  const probe = await probeOnnxRuntime()
+  if (!probe.available)
+    throw new TtsError('config', `motor local de fala não está pronto — ${probe.reason}`, {
+      backend: 'local'
+    })
   const ort = await import('onnxruntime-node')
-  const session = await ort.InferenceSession.create(modelPath, { executionProviders: ['cpu'] })
+  let session: Awaited<ReturnType<typeof ort.InferenceSession.create>>
+  try {
+    session = await ort.InferenceSession.create(modelPath, { executionProviders: ['cpu'] })
+  } catch (e) {
+    throw new TtsError(
+      'config',
+      `modelo do Kokoro inválido ou corrompido — baixe novamente em Configurações → Áudio (${e instanceof Error ? e.message : String(e)})`,
+      { backend: 'local', cause: e }
+    )
+  }
   return {
     async run(feeds) {
       const ortFeeds: Record<string, OrtTensor> = {}
@@ -276,7 +416,8 @@ async function defaultCreateSession(modelPath: string): Promise<KokoroSession> {
       }
       const out = await session.run(ortFeeds)
       return { waveform: out.waveform as { data: Float32Array } }
-    }
+    },
+    release: () => session.release()
   }
 }
 
@@ -302,7 +443,11 @@ export async function phonemizeText(
       ps += part
       continue
     }
-    const frag = mapEspeakPhonemes(await run('espeak-ng', ['-v', 'pt-br', '-q', '--ipa=3', part]))
+    // `--` encerra as opções: texto começando com '-' ("- item", "-f/arquivo", "-w…") nunca vira
+    // opção do espeak-ng (antes: frase descartada, arquivo arbitrário lido ou espera no stdin)
+    const frag = mapEspeakPhonemes(
+      await run('espeak-ng', ['-v', 'pt-br', '-q', '--ipa=3', '--', part])
+    )
     ps += ps && !/\s$/.test(ps) ? ` ${frag}` : frag
   }
   return ps.trim().replace(/«/g, '(').replace(/»/g, ')')
@@ -349,12 +494,28 @@ export function createKokoroEngine(deps: KokoroEngineDeps): KokoroEngine {
     if (!s) {
       s = createSession(modelPath)
       sessions.set(modelPath, s)
+      // falha não fica em cache: a próxima síntese tenta de novo (ex.: modelo baixado de novo)
+      const created = s
+      created.catch(() => {
+        if (sessions.get(modelPath) === created) sessions.delete(modelPath)
+      })
     }
     return s
   }
 
   return {
     engine: 'kokoro',
+    async release() {
+      const all = [...sessions.values()]
+      sessions.clear()
+      for (const p of all) {
+        try {
+          await (await p).release?.()
+        } catch {
+          /* sessão que falhou ao criar / já liberada */
+        }
+      }
+    },
     async voices() {
       const models = await installedModels()
       return KOKORO_VOICES.map((v) => ({
@@ -419,6 +580,35 @@ export function createKokoroEngine(deps: KokoroEngineDeps): KokoroEngine {
       }
     }
   }
+}
+
+/**
+ * Prontidão do motor local Kokoro ("pronto = modelo instalado + runtime carregável"):
+ * `onnxruntime-node` carrega, `espeak-ng` existe no sistema e há modelo + voz `voiceId` instalados.
+ * Nunca lança; `reason` diz o que falta (pt-BR).
+ */
+export async function kokoroReadiness(
+  baseDir: string,
+  voiceId: string | null,
+  deps: { run?: (command: string, args: string[]) => Promise<string> } = {}
+): Promise<TtsRuntimeProbe> {
+  const [onnx, espeak, models] = await Promise.all([
+    probeOnnxRuntime(),
+    probeEspeak(deps.run),
+    listLocalModels(baseDir).catch(() => [] as LocalModelInfo[])
+  ])
+  const missing: string[] = []
+  if (!onnx.available) missing.push(onnx.reason ?? 'runtime ONNX indisponível')
+  if (!espeak.available) missing.push(espeakMissingError().message)
+  const installed = (id: string): boolean =>
+    models.some((m) => m.entry.id === id && m.state === 'installed')
+  if (!KOKORO_MODEL_IDS.some(installed)) missing.push('modelo do Kokoro não instalado')
+  const voice = KOKORO_VOICES.find((v) => v.id === voiceId)
+  if (!voice) missing.push(`voz "${voiceId ?? ''}" desconhecida para o Kokoro`)
+  else if (!installed(voice.catalogId)) missing.push(`voz ${voice.id} não instalada`)
+  return missing.length
+    ? { available: false, reason: missing.join('; ') }
+    : { available: true, reason: null }
 }
 
 /** Float32 [-1, 1] → PCM16 little-endian (clamp — o decoder pode passar de ±1 em picos). */

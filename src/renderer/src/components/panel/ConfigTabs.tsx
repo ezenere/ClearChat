@@ -21,6 +21,7 @@ import {
 } from './editors'
 import { CollapsibleSection, Section } from './fields'
 import { MemorySection } from '../memory/MemorySection'
+import { VoiceCallConfigSection } from '../voice/VoiceCallConfigSection'
 
 function usePatch(chat: Chat): (p: Partial<ChatConfig>) => void {
   const patchConfig = useStore((s) => s.patchConfig)
@@ -57,6 +58,7 @@ export function ChatTab({ chat }: { chat: Chat }): React.JSX.Element {
       <ContextSection chat={chat} />
       <RootSection chat={chat} />
       <SignatureSection cfg={chat.config} patch={patch} />
+      <VoiceCallConfigSection cfg={chat.config} patch={patch} />
     </>
   )
 }

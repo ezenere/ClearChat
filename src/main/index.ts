@@ -3,7 +3,8 @@ import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { closeDb, getDb, getDbPath } from './db'
-import { registerIpc } from './ipc'
+import { registerIpc, resetVoiceForWebContents } from './ipc'
+import { shutdownSttWorker } from './voice/sttWorkerHost'
 import { registerEventWindow } from './events'
 import { initSync, shutdownSync, syncEngine } from './sync'
 import { initRunner, shutdownRunner } from './agent/runner'
@@ -83,6 +84,18 @@ function createWindow(): BrowserWindow {
 
   registerEventWindow(win)
   win.once('ready-to-show', () => win.show())
+
+  // Voz: o estado do main (sessão de transcrição, chamada) é do renderer desta janela — se ele
+  // recarregar, navegar, cair ou a janela fechar, nada fica órfão no main (SPEC → "Áudio").
+  const wcId = win.webContents.id
+  win.webContents.on('render-process-gone', (_e, details) =>
+    resetVoiceForWebContents(wcId, `caiu (${details.reason})`)
+  )
+  win.webContents.on('did-start-navigation', (details) => {
+    if (details.isMainFrame && !details.isSameDocument)
+      resetVoiceForWebContents(wcId, 'recarregou/navegou')
+  })
+  win.on('closed', () => resetVoiceForWebContents(wcId, 'janela fechada'))
 
   // Links externos abrem no navegador do sistema, nunca dentro do app.
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -208,6 +221,7 @@ app.on('before-quit', () => {
   shutdownUpdates()
   shutdownSync()
   shutdownRunner()
+  shutdownSttWorker()
   killAllProcesses()
 })
 // garantia: nenhum process group de process_start fica órfão

@@ -33,6 +33,7 @@ import {
   readManifest,
   removeLocalModel,
   resolveLocalModelPath,
+  updateManifest,
   verifyModelFile,
   writeManifest,
   type ManifestEntry
@@ -468,7 +469,7 @@ test('download: id desconhecido e placeholder sem URL → erro legível', async 
   )
   await assert.rejects(
     downloadLocalModel(base, 'placeholder', { catalog: [entry, placeholder], fetch }),
-    /não tem download disponível ainda \(preenchido na fatia de TTS\)/
+    /ainda não tem download disponível/
   )
   assert.equal(placeholder.url, null)
   assert.deepEqual(filesIn(base), [])
@@ -567,4 +568,90 @@ process.on('exit', () => {
   } catch {
     // melhor esforço
   }
+})
+
+// ---------------- concorrência (manifest sob trava) ----------------
+
+test('concorrência: dois downloads em paralelo terminam com os DOIS registros no manifest', async () => {
+  const base = newBase()
+  const a = payload(12)
+  const b = payload(20)
+  const entryA = mkEntryFor(a, { id: 'model-a', url: 'https://example.test/ggml-a.bin' })
+  const entryB = mkEntryFor(b, { id: 'model-b', url: 'https://example.test/ggml-b.bin' })
+  // fetch que entrega os corpos intercalados (os dois downloads ficam em voo ao mesmo tempo)
+  const slowFetch = async (url: string): Promise<Response> => {
+    const data = url.endsWith('ggml-a.bin') ? a : b
+    const body = new ReadableStream<Uint8Array>({
+      async start(c) {
+        for (let i = 0; i < data.length; i += 4) {
+          await new Promise((r) => setTimeout(r, 2))
+          c.enqueue(data.slice(i, i + 4))
+        }
+        c.close()
+      }
+    })
+    return new Response(body, { headers: { 'content-length': String(data.length) } })
+  }
+  const catalog = [entryA, entryB]
+  const [ia, ib] = await Promise.all([
+    downloadLocalModel(base, 'model-a', { catalog, fetch: slowFetch }),
+    downloadLocalModel(base, 'model-b', { catalog, fetch: slowFetch })
+  ])
+  assert.equal(ia.state, 'installed')
+  assert.equal(ib.state, 'installed')
+  const manifest = await readManifest(base)
+  assert.deepEqual(Object.keys(manifest).sort(), ['model-a', 'model-b'], 'nenhum registro perdido')
+  assert.deepEqual(filesIn(base), ['ggml-a.bin', 'ggml-b.bin', 'manifest.json'], 'sem .part/.tmp')
+  const states = (await listLocalModels(base, { catalog })).map((m) => m.state)
+  assert.deepEqual(states, ['installed', 'installed'])
+})
+
+test('concorrência: download e remoção em paralelo não apagam o registro um do outro', async () => {
+  const base = newBase()
+  const a = payload(12)
+  const b = payload(20)
+  const entryA = mkEntryFor(a, { id: 'model-a', url: 'https://example.test/ggml-a.bin' })
+  const entryB = mkEntryFor(b, { id: 'model-b', url: 'https://example.test/ggml-b.bin' })
+  const catalog = [entryA, entryB]
+  await downloadLocalModel(base, 'model-a', { catalog, fetch: mockFetchChunks([a]).fetch })
+  await Promise.all([
+    downloadLocalModel(base, 'model-b', { catalog, fetch: mockFetchChunks([b]).fetch }),
+    removeLocalModel(base, 'model-a', { catalog })
+  ])
+  assert.deepEqual(Object.keys(await readManifest(base)), ['model-b'])
+  assert.deepEqual(filesIn(base), ['ggml-b.bin', 'manifest.json'])
+})
+
+test('concorrência: N escritas do manifest em paralelo (updateManifest) não perdem nenhuma chave', async () => {
+  const base = newBase()
+  await Promise.all(
+    Array.from({ length: 12 }, (_, i) =>
+      updateManifest(base, (m) => {
+        m[`id-${i}`] = manifestEntry(`id-${i}`, `f${i}.bin`, i)
+      })
+    )
+  )
+  assert.equal(Object.keys(await readManifest(base)).length, 12)
+  assert.deepEqual(filesIn(base), ['manifest.json'], 'nenhum .tmp sobrando')
+})
+
+test('remove: modelo Vosk apaga também a pasta extraída models/<id>/', async () => {
+  const base = newBase()
+  const zip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4])
+  const entry = mkEntryFor(zip, {
+    id: 'vosk-test',
+    engine: 'vosk',
+    url: 'https://example.test/vosk-test.zip'
+  })
+  await downloadLocalModel(base, entry.id, {
+    catalog: [entry],
+    fetch: mockFetchChunks([zip]).fetch
+  })
+  mkdirSync(join(modelsDir(base), 'vosk-test', 'ivector'), { recursive: true })
+  writeFileSync(join(modelsDir(base), 'vosk-test', 'ivector', 'final.ie'), 'x')
+  // `.part` órfão de crash (nome antigo e nome único) também sai
+  writeFileSync(join(modelsDir(base), 'vosk-test.zip.part'), 'x')
+  writeFileSync(join(modelsDir(base), 'vosk-test.zip.abcd1234.part'), 'x')
+  await removeLocalModel(base, entry.id, { catalog: [entry] })
+  assert.deepEqual(filesIn(base), ['manifest.json'])
 })
