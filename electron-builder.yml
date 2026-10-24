@@ -54,6 +54,9 @@ linux:
     - '!node_modules/onnxruntime-node/bin/napi-v6/linux/*/libonnxruntime_providers_*'
     # só a arquitetura do build (${arch} é expandido pelo electron-builder — x64/arm64)
     - '!node_modules/onnxruntime-node/bin/napi-v6/linux/!(${arch}){,/**}'
+    # whisper.cpp (@napi-rs/whisper): o npm só instala o binário da máquina do build; para gerar os
+    # pacotes de outra plataforma, instale os dela (`npm i --no-save --force @napi-rs/whisper-<plat>@<ver>`)
+    - '!node_modules/@napi-rs/whisper-{darwin,win32}-*{,/**}'
   # clearchat.desktop + StartupWMClass=clearchat, iguais ao app_id/WM_CLASS da janela
   # (package.json "desktopName"), para o dock agrupar as janelas no ícone certo.
   syncDesktopName: true
@@ -107,6 +110,7 @@ win:
     - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{darwin,linux,linuxmusl}-*'
     - '!node_modules/onnxruntime-node/bin/napi-v6/{darwin,linux}{,/**}'
+    - '!node_modules/@napi-rs/whisper-{darwin,linux}-*{,/**}'
   icon: build/icon.ico
   target:
     - nsis
@@ -127,6 +131,8 @@ mac:
     - '!node_modules/node-addon-api{,/**}'
     - '!node_modules/better-sqlite3/prebuilds/{win32,linux,linuxmusl}-*'
     - '!node_modules/onnxruntime-node/bin/napi-v6/{win32,linux}{,/**}'
+    - '!node_modules/@napi-rs/whisper-{linux,win32}-*{,/**}'
+    - '!node_modules/@napi-rs/whisper-darwin-!(${arch}){,/**}'
   category: public.app-category.developer-tools
   entitlementsInherit: build/entitlements.mac.plist
   # Ditado e chamada de voz: com o Hardened Runtime, sem a entitlement audio-input
