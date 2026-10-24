@@ -1,7 +1,8 @@
-// Painéis "Local (GPU)" dentro de Fala (TTS) e Transcrição (STT): motor instalado, voz agrupada
-// (Vozes do modelo / Voz pt-BR livre (CC0) / Minhas vozes) com prévia, passos do OmniVoice,
-// "Parâmetros" do motor escolhido (velocidade, temperatura… — os mesmos do card no Modo avançado) e
-// a prontidão visível (runtime/motor/servidor/compat) com o caminho para resolver no Modo avançado.
+// Painéis "Local (GPU)" dentro de Fala (TTS) e Transcrição (STT) — o motor vem do seletor de
+// Modelo: voz agrupada (Vozes do modelo / Voz pt-BR livre (CC0) / Minhas vozes) com prévia, passos
+// do OmniVoice, "Parâmetros" do motor escolhido (velocidade, temperatura… — os mesmos do card em
+// Modelos locais) e a prontidão visível (runtime/motor/servidor/compat) com o caminho para resolver
+// em Áudio → Modelos locais (sub-tela com "← Áudio").
 import { Info, TriangleAlert, OctagonX } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { SttSettings, TtsSettings } from '@shared/voice'
@@ -11,11 +12,9 @@ import { api, errorMessage } from '../../../lib/api'
 import { cn } from '../../../lib/format'
 import {
   compatUi,
-  gpuConfigFor,
   gpuSttProblems,
   gpuTtsProblems,
   groupGpuVoices,
-  installedTtsEngines,
   measuredLine,
   savedGpuParams,
   sttWithGpuParams,
@@ -30,17 +29,17 @@ import {
   type GpuStatus,
   type GpuTtsEngineId
 } from '../../../lib/voice/gpu/types'
-import { refreshGpuStatus, revealGpuSection } from '../../../lib/voice/gpu/useGpuStatus'
+import { refreshGpuStatus } from '../../../lib/voice/gpu/useGpuStatus'
+import { openGpuLocalModels } from '../../../lib/voice/localModelsNav'
 import { playAudioBytes } from '../../../lib/voice/voiceSettingsHelpers'
 import { Button, Label } from '../../ui/controls'
-import { Select } from '../../ui/Select'
 import { DismissibleError, VoicePicker } from '../voiceSettingsParts'
 import { Badge, StepsControl } from './gpuParts'
 import { GpuParamsEditor } from './GpuParamsEditor'
 
-/** Link "Modo avançado (GPU local)" que abre e mostra a seção. */
+/** Link "Modelos locais" que abre a sub-tela e mostra a parte da GPU. */
 export function GpuSectionLink({
-  children = 'Modo avançado (GPU local)',
+  children = 'Modelos locais',
   target = 'engines',
   testId
 }: {
@@ -52,7 +51,7 @@ export function GpuSectionLink({
     <button
       type="button"
       data-testid={testId}
-      onClick={() => revealGpuSection(target)}
+      onClick={() => openGpuLocalModels(target)}
       className="rounded px-0.5 text-accent-strong underline-offset-2 hover:underline"
     >
       {children}
@@ -94,7 +93,7 @@ export function GpuReadiness({
           )}
           <span>
             {p.text.charAt(0).toUpperCase() + p.text.slice(1)}
-            {/Modo avançado/.test(p.text) && (
+            {/Modelos locais/.test(p.text) && (
               <>
                 {' '}
                 <GpuSectionLink testId={`${testId}-link`}>abrir</GpuSectionLink>
@@ -118,7 +117,6 @@ export function GpuTtsPanel({
   onCommit: (next: TtsSettings) => Promise<boolean>
 }): React.JSX.Element {
   const g = asGpuTts(tts)
-  const installed = installedTtsEngines(status)
   const engine = status?.engines.find((e) => e.id === g.gpu?.engine) ?? null
   const [preview, setPreview] = useState<{ id: string; state: 'busy' | 'playing' } | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -190,44 +188,15 @@ export function GpuTtsPanel({
 
   return (
     <div className="space-y-3" data-testid="tts-gpu">
-      <div>
-        <Label help="Motores de voz instalados no Modo avançado (GPU local). A latência é a do último “Testar” no seu computador.">
-          Motor
-        </Label>
-        <div className="flex flex-wrap items-center gap-2">
-          <Select
-            value={g.gpu?.engine ?? null}
-            label="Motor de fala da GPU"
-            placeholder="Escolha um motor…"
-            className="h-8 w-full max-w-[360px]"
-            menuMinWidth={360}
-            onChange={(id) => {
-              const e = installed.find((x) => x.id === id)
-              if (e) save(gpuConfigFor(e, g.gpu))
-            }}
-            options={installed.map((e) => ({
-              value: e.id,
-              label: e.label,
-              description: [
-                e.measured
-                  ? measuredLine('tts', e.measured)
-                  : e.streaming
-                    ? 'streaming'
-                    : 'frase inteira',
-                e.license.commercial ? null : 'não comercial',
-                e.compat.level === 'warn' ? 'pode não rodar bem' : null
-              ]
-                .filter(Boolean)
-                .join(' · ')
-            }))}
-          />
-          {engine && engine.compat.level !== 'ok' && (
-            <Badge tone={compatUi(engine.compat).tone}>{compatUi(engine.compat).badge}</Badge>
-          )}
-          <span className="text-[11.5px] text-subtle">
-            gerenciar no <GpuSectionLink testId="tts-gpu-manage" />
-          </span>
-        </div>
+      <div className="flex flex-wrap items-center gap-2 text-[11.5px] text-subtle">
+        {engine?.measured && <span>{measuredLine('tts', engine.measured)}</span>}
+        {engine && !engine.license.commercial && <Badge>não comercial</Badge>}
+        {engine && engine.compat.level !== 'ok' && (
+          <Badge tone={compatUi(engine.compat).tone}>{compatUi(engine.compat).badge}</Badge>
+        )}
+        <span className="ml-auto">
+          gerenciar em <GpuSectionLink testId="tts-gpu-manage" />
+        </span>
       </div>
       {engine?.id === 'omnivoice' && (
         <StepsControl
@@ -238,7 +207,7 @@ export function GpuTtsPanel({
       )}
       {engine && engine.install.state === 'installed' && (
         <div>
-          <Label help="Vozes do modelo: as que vêm prontas (as de sotaque de Portugal estão marcadas). Voz pt-BR livre: uma voz brasileira de domínio público (CC0) para clonar. Minhas vozes: as que você gravou ou enviou no Modo avançado. ▶ sintetiza uma frase curta no servidor local.">
+          <Label help="Vozes do modelo: as que vêm prontas (as de sotaque de Portugal estão marcadas). Voz pt-BR livre: uma voz brasileira de domínio público (CC0) para clonar. Minhas vozes: as que você gravou ou enviou em Modelos locais. ▶ sintetiza uma frase curta no servidor local.">
             Voz
           </Label>
           <VoicePicker
@@ -300,7 +269,7 @@ export function GpuTtsPanel({
                         data-testid="gpu-voice-add-mine"
                         onClick={() => {
                           close()
-                          revealGpuSection('voices')
+                          openGpuLocalModels('voices')
                         }}
                         className="text-[11.5px] text-accent-strong hover:underline"
                       >
@@ -383,7 +352,7 @@ export function GpuSttPanel({
           <span className="text-[11.5px] text-subtle">{measuredLine('stt', engine.measured)}</span>
         )}
         <span className="ml-auto text-[11.5px] text-subtle">
-          gerenciar no <GpuSectionLink testId="stt-gpu-manage" />
+          gerenciar em <GpuSectionLink testId="stt-gpu-manage" />
         </span>
       </div>
       {engine?.install.state === 'installed' && onCommit && (

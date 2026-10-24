@@ -7,6 +7,8 @@
 // Ver SPEC.md → "Áudio → Serviço de TTS (clipes)".
 import type { TtsLocalEngine, TtsSettings } from '@shared/voice'
 import { connectionErrorText } from '@shared/network'
+import { voiceProviderSupport } from '@shared/voiceCatalog'
+import { apiParamsToSend } from '@shared/voiceParams'
 import { abortError } from '../tools/util'
 import { concatBytes, encodeWav, parsePcmContentType, Pcm16MonoAligner } from './wav'
 import {
@@ -337,11 +339,19 @@ async function requestSpeech(
 
   let requested = format === 'wav' && ttsEndpointWantsPcm(baseUrl) ? 'pcm' : RESPONSE_FORMAT[format]
   const t0 = Date.now()
+  // parâmetros do modelo escolhidos em Áudio → Parâmetros (`speed`, `instructions` — só os que o
+  // modelo aceita; o servidor da GPU usa o `extraBody` e nunca tem `params`)
+  const family = api.extraBody
+    ? null
+    : voiceProviderSupport({ baseUrl, kind: api.providerKind ?? undefined })
+  const modelParams =
+    family && family !== 'elevenlabs' ? apiParamsToSend('tts', family, model, api.params) : {}
   for (let attempt = 0; ; attempt++) {
     // JSON `{ model, voice, input, response_format }` (voz ausente = a voz padrão da API)
     // (+ campos extras do main — `params` do motor da GPU; nunca sobrescrevem os de cima)
     const body: Record<string, unknown> = {
       ...(api.extraBody ?? {}),
+      ...modelParams,
       model,
       input: text,
       response_format: requested

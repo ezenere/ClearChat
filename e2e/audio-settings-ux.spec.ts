@@ -1,16 +1,18 @@
 // E2E contra o MOCK de UI (Playwright `_electron`, sem backend/chave) de Configurações → Áudio,
-// seções de Transcrição (STT) e Fala (TTS): PROVEDOR só dos cadastrados em Configurações →
-// Provedores (+ "Local — whisper.cpp/Kokoro" e "Local (GPU)"; sem campos de endereço/chave; um
-// servidor local OpenAI-compatível cadastrado vale), sem provedor escolhido → "Escolha um
-// provedor…" (escolher um cadastrado liga a transcrição), MODELO no mesmo
-// seletor do chat (`ModelPicker`: grupos por provedor com contagem, busca "em todos os provedores
-// ou digitar um ID", latência medida/"lento" à direita, escolher em outro grupo troca o provedor),
-// correção do id sem prefixo, VOZ no mesmo desenho (busca, grupos por idioma, ▶ prévia por linha,
-// id livre pela busca), ElevenLabs direto (prévia publicada pelo provedor), "Testar voz" com
-// sucesso (local e API — a CSP libera `media-src blob:`) e com erro legível, curadoria (só os
-// modelos medidos rápidos; id livre = "não testado"; salvo lento = aviso com troca de um clique) e
-// a aba sem rolagem horizontal em 1440/1100.
-// Cenários: `?scenario=chat|voice-alias|voice-api|voice-elevenlabs|voice-tts-fail|voice-slow-model`.
+// seções de Transcrição (STT) e Fala (TTS): SEM seletor de Provedor — um único seletor de MODELO
+// (`ModelPicker`, o mesmo do chat) com um grupo por provedor cadastrado em Configurações →
+// Provedores (um servidor local OpenAI-compatível cadastrado vale) + "Local (CPU)"/"Local (GPU)" só
+// quando há modelo local instalado (nada instalado → nenhum grupo local); escolher uma linha grava
+// provedor/modo/motor de uma vez; o híbrido é um interruptor que só aparece com modelo de API + local
+// instalado; "Parâmetros" do modelo (ElevenLabs: formato de saída com a nota do plano, stability…,
+// restaurar; OpenRouter: speed só onde o modelo aceita; Groq: temperatura/dica de vocabulário);
+// formato fora do plano → erro legível no "Testar voz"; botão "Modelos locais" → sub-tela com
+// "← Áudio" (CPU + GPU lá; nada disso na página principal); correção do id sem prefixo, VOZ no mesmo
+// desenho (busca, grupos por idioma, ▶ prévia por linha, id livre pela busca), ElevenLabs direto
+// (prévia publicada), "Testar voz" com sucesso (local e API — a CSP libera `media-src blob:`) e com
+// erro legível, curadoria (só os modelos medidos rápidos; id livre = "não testado"; salvo lento =
+// aviso com troca de um clique) e a aba sem rolagem horizontal em 1440/1100.
+// Cenários: `?scenario=chat|voice-not-ready|voice-alias|voice-api|voice-elevenlabs|voice-tts-fail|voice-slow-model`.
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
@@ -75,18 +77,25 @@ async function openAudio(scenario: string): Promise<void> {
   await page.waitForTimeout(500)
 }
 
-/** Escolhe uma opção de um `Select` (gatilho pelo aria-label, opção pelo texto). */
-async function choose(label: string, option: string | RegExp): Promise<void> {
-  await page.getByRole('button', { name: label, exact: true }).click()
-  await popover().getByRole('button').filter({ hasText: option }).first().click()
-  await page.waitForTimeout(350)
-}
-
 /** Rola a seção até o topo da área do modal (para screenshots). */
 async function scrollTo(testId: string): Promise<void> {
   await page.getByTestId(testId).evaluate((e) => e.scrollIntoView({ block: 'start' }))
   await page.waitForTimeout(200)
 }
+
+type VoiceView = {
+  sttSettings: { api: { params?: unknown } }
+  ttsSettings: { api: { params?: unknown } }
+}
+/** Settings de voz gravadas no mock (`window.__clearMockApi`). */
+const savedVoice = (): Promise<VoiceView> =>
+  page.evaluate(() =>
+    (
+      window as unknown as {
+        __clearMockApi: { voice: { settings: { get: () => Promise<VoiceView> } } }
+      }
+    ).__clearMockApi.voice.settings.get()
+  )
 
 const visible = (testId: string): Promise<boolean> => page.getByTestId(testId).first().isVisible()
 const count = (testId: string): Promise<number> => page.getByTestId(testId).count()
@@ -131,10 +140,23 @@ app.on('window-all-closed', () => app.quit())
   })
   await page.waitForLoadState('domcontentloaded')
 
-  // ---------------- provedores: só os de Configurações → Provedores ----------------
+  // ---------------- um seletor só: Modelo (provedores + locais instalados) ----------------
+
+  /** Grupos do seletor de modelo aberto (texto do cabeçalho). */
+  const pickerGroups = async (testId: string): Promise<string[]> => {
+    await page.getByTestId(testId).click()
+    const list = page.getByRole('listbox', { name: 'Modelos' })
+    await list.locator('[data-testid="model-group"]').first().waitFor({ timeout: 4000 })
+    await page.waitForTimeout(300)
+    const g = await list
+      .locator('[data-testid="model-group"]')
+      .evaluateAll((els) => els.map((e) => (e as HTMLElement).innerText.replace(/\s+/g, ' ')))
+    await page.keyboard.press('Escape')
+    return g
+  }
 
   await step(
-    'Provedor: só os cadastrados + opções locais; o Groq cadastrado é o da transcrição',
+    'sem seletor de Provedor: um seletor de Modelo com os provedores cadastrados; nada local sem instalado',
     async () => {
       await openAudio('chat')
       for (const id of [
@@ -142,83 +164,78 @@ app.on('window-all-closed', () => app.quit())
         'stt-api-key',
         'stt-advanced',
         'tts-base-url',
-        'tts-advanced'
+        'tts-advanced',
+        'stt-provider',
+        'tts-provider'
       ])
         assert.equal(await count(id), 0, `${id} ainda na tela`)
-      await page.getByRole('button', { name: 'Provedor da transcrição', exact: true }).click()
-      const sttOpts = (await popover().getByRole('button').allInnerTexts()).map((t) =>
-        t.replace(/\n/g, ' · ')
-      )
-      await page.keyboard.press('Escape')
-      const joined = sttOpts.join(' | ')
-      assert(!/personalizado/i.test(joined), `opção de endpoint: ${joined}`)
-      for (const want of [
-        'OpenRouter',
-        'Local (LM Studio)',
-        'Groq',
-        'Local — whisper.cpp',
-        'Local (GPU)'
-      ])
-        assert(joined.includes(want), `${want} fora da lista: ${joined}`)
-      // servidor local OpenAI-compatível cadastrado (localhost, sem chave) vale para voz
-      assert.match(joined, /Local \(LM Studio\)[^|]*servidor local/)
-      // a setting aponta para o provedor cadastrado: modelo + lista do provedor
-      assert.match(
-        await page
-          .getByRole('button', { name: 'Provedor da transcrição', exact: true })
-          .innerText(),
-        /Groq/
-      )
-      await page.getByTestId('stt-api').waitFor()
       assert.equal(
-        await page.getByTestId('stt-model').getAttribute('data-value'),
-        'whisper-large-v3-turbo'
+        await page.getByRole('button', { name: 'Provedor da transcrição', exact: true }).count(),
+        0,
+        'seletor de Provedor da transcrição'
+      )
+      assert.equal(
+        await page.getByRole('button', { name: 'Provedor da fala', exact: true }).count(),
+        0,
+        'seletor de Provedor da fala'
+      )
+      // a setting aponta para o Groq cadastrado: o gatilho mostra provedor · modelo
+      assert.equal(await page.getByTestId('stt-model').getAttribute('data-provider-id'), 'p4')
+      assert.match(
+        await page.getByTestId('stt-model').innerText(),
+        /Groq[\s\S]*whisper-large-v3-turbo/
       )
       await waitFor(async () => (await count('voice-catalog-count')) > 0, 3000, 'modelos do Groq')
+      const groups = await pickerGroups('stt-model')
+      const joined = groups.join(' | ')
+      for (const want of ['OpenRouter', 'Groq'])
+        assert(joined.includes(want), `${want} fora da lista: ${joined}`)
+      // provedor cuja listagem veio vazia (LM Studio sem modelos de transcrição) não vira grupo
+      assert(!/LM Studio/.test(joined), `grupo vazio na lista: ${joined}`)
+      assert(!/Local \((CPU|GPU)\)/.test(joined), `grupo local sem nada instalado: ${joined}`)
+      assert(!/ElevenLabs/.test(joined), 'ElevenLabs na transcrição (só fala)')
       assert(!/personalizado/i.test(await page.getByTestId('audio-settings').innerText()))
+      // nada de modelos locais/GPU na página principal (moram em "Modelos locais")
+      for (const id of [
+        'stt-local-engine',
+        'voice-models-kokoro',
+        'voice-models-whisper.cpp',
+        'gpu-mode-section'
+      ])
+        assert.equal(await count(id), 0, `${id} na página principal`)
       await scrollTo('stt-section')
-      await shot('ux-01-provider')
+      await shot('ux-01-model-only')
       return joined.slice(0, 200)
     }
   )
 
   await step(
-    'sem provedor escolhido: "Escolha um provedor…"; escolher o Groq cadastrado liga a transcrição',
+    'sem modelo escolhido: "Escolha um modelo…"; escolher um do Groq liga a transcrição',
     async () => {
       await openAudio('voice-not-ready')
-      assert.match(
-        await page
-          .getByRole('button', { name: 'Provedor da transcrição', exact: true })
-          .innerText(),
-        /Escolha um provedor/
-      )
-      assert.equal(await count('stt-api'), 0, 'modelo sem provedor')
+      assert.match(await page.getByTestId('stt-model').innerText(), /Escolha um modelo/)
+      assert.equal(await count('stt-api-params'), 0, 'parâmetros sem modelo')
       await scrollTo('stt-section')
-      await shot('ux-02-no-provider')
-      // escolher o provedor cadastrado liga a transcrição (modelo sugerido da família)
-      await choose('Provedor da transcrição', /^Groq/)
-      await page.getByTestId('stt-api').waitFor()
-      assert.equal(
-        await page.getByTestId('stt-model').getAttribute('data-value'),
-        'whisper-large-v3-turbo'
+      await shot('ux-02-no-model')
+      await pickModel(page, page.getByTestId('stt-model'), 'whisper-large-v3-turbo', {
+        provider: 'Groq'
+      })
+      await waitFor(
+        async () => (await page.getByTestId('stt-model').getAttribute('data-provider-id')) === 'p4',
+        3000,
+        'provedor gravado junto com o modelo'
       )
+      await page.getByTestId('stt-api-params').waitFor()
       await openAudio('chat')
     }
   )
 
-  // ---------------- STT: modelo no seletor do chat ----------------
-
   await step(
-    'STT: modelo no MESMO seletor do chat — grupos por provedor com contagem, busca, "lento"',
+    'STT: grupos por provedor com contagem, busca, "lento"; escolher em outro grupo troca o provedor',
     async () => {
-      await choose('Provedor da transcrição', /^OpenRouter/)
-      await waitFor(
-        async () =>
-          (await page.getByTestId('stt-model').getAttribute('data-value')) ===
-          'openai/whisper-large-v3-turbo',
-        3000,
-        'modelo do OpenRouter'
-      )
+      await pickModel(page, page.getByTestId('stt-model'), 'openai/whisper-large-v3-turbo', {
+        provider: 'OpenRouter'
+      })
       await page.getByTestId('stt-model').click()
       const search = page.getByRole('textbox', { name: 'Buscar modelo' })
       await search.waitFor()
@@ -245,17 +262,11 @@ app.on('window-all-closed', () => app.quit())
       await gemini.waitFor()
       assert.match(await gemini.innerText(), /lento/)
       await shot('ux-04-stt-model-picker')
-      // escolher um modelo de OUTRO grupo troca o provedor junto
       await list
         .locator('[role=option][data-provider="Groq"][data-model="whisper-large-v3"]')
         .click()
       await waitFor(
-        async () =>
-          /Groq/.test(
-            await page
-              .getByRole('button', { name: 'Provedor da transcrição', exact: true })
-              .innerText()
-          ),
+        async () => (await page.getByTestId('stt-model').getAttribute('data-provider-id')) === 'p4',
         3000,
         'provedor trocado pelo modelo'
       )
@@ -268,22 +279,111 @@ app.on('window-all-closed', () => app.quit())
   )
 
   await step(
-    'STT: Local (whisper.cpp) e "Motor local nas parciais e como reserva" (híbrido)',
+    'STT: "Parâmetros" do Groq (temperatura e dica de vocabulário) e do OpenRouter (só temperatura)',
     async () => {
-      await choose('Provedor da transcrição', /^Local — whisper\.cpp/)
-      assert(await visible('stt-local-engine'), 'motor local')
-      assert.equal(await count('stt-api'), 0, 'modelo de API no modo local')
+      await page.getByTestId('stt-api-params-toggle').click()
+      await page.getByTestId('stt-api-params-row-temperature').waitFor()
+      await page.getByTestId('stt-api-params-row-prompt').waitFor()
+      assert.match(
+        await page.getByTestId('stt-api-params-temperature-value').innerText(),
+        /do provedor/
+      )
+      await page.getByTestId('stt-api-params-prompt').fill('ClearChat, OpenRouter, Kubernetes')
+      await page.getByTestId('stt-api-params-prompt').press('Enter')
+      await page.getByTestId('stt-api-params-count').waitFor()
       await scrollTo('stt-section')
-      await shot('ux-05-stt-local')
-      await choose('Provedor da transcrição', /^OpenRouter/)
-      assert.equal(await count('stt-local-engine'), 0)
-      await page.getByRole('switch', { name: 'Motor local nas parciais e como reserva' }).click()
-      await page.getByTestId('stt-local-engine').waitFor()
-      const cur = await page.getByTestId('stt-local-current').innerText()
-      assert.match(cur, /parciais|reserva/)
-      await page.getByRole('switch', { name: 'Motor local nas parciais e como reserva' }).click()
-      await page.getByTestId('stt-local-engine').waitFor({ state: 'detached' })
-      return cur
+      await shot('ux-05-stt-params-groq')
+      const saved = await savedVoice()
+      assert.deepEqual(saved.sttSettings.api.params, {
+        openai: { prompt: 'ClearChat, OpenRouter, Kubernetes' }
+      })
+      await pickModel(page, page.getByTestId('stt-model'), 'openai/whisper-large-v3-turbo', {
+        provider: 'OpenRouter'
+      })
+      await page.getByTestId('stt-api-params-row-temperature').waitFor()
+      assert.equal(
+        await count('stt-api-params-row-prompt'),
+        0,
+        'OpenRouter ignora prompt: sem controle'
+      )
+    }
+  )
+
+  await step(
+    '"Modelos locais": botão ao lado do título → sub-tela com "← Áudio" (CPU + GPU); baixar → grupo Local (CPU) e híbrido',
+    async () => {
+      const btn = page.getByTestId('audio-local-models-open')
+      // ao lado do título "Áudio"
+      const geo = await page.evaluate(() => {
+        const t = document.getElementById('settings-panel-title')!.getBoundingClientRect()
+        const b = document
+          .querySelector('[data-testid="audio-local-models-open"]')!
+          .getBoundingClientRect()
+        return { dy: Math.abs(t.top + t.height / 2 - (b.top + b.height / 2)), dx: b.left - t.right }
+      })
+      assert(
+        geo.dy < 8 && geo.dx >= 0 && geo.dx < 40,
+        `botão fora do título: ${JSON.stringify(geo)}`
+      )
+      assert.equal(await count('stt-hybrid-model'), 0)
+      assert.equal(
+        await page.getByRole('switch', { name: 'Motor local nas parciais e como reserva' }).count(),
+        0,
+        'híbrido sem modelo local instalado'
+      )
+      await btn.click()
+      await page.getByTestId('audio-local-models').waitFor()
+      await page.getByTestId('audio-title-crumb').waitFor()
+      for (const id of [
+        'local-cpu-section',
+        'local-stt-models',
+        'local-tts-models',
+        'gpu-mode-section'
+      ])
+        assert(await visible(id), `${id} fora da sub-tela`)
+      assert.equal(await count('stt-section'), 0, 'página principal escondida')
+      assert.equal(await page.getByTestId('gpu-mode-section').getAttribute('data-expanded'), 'true')
+      await shot('ux-06-local-models')
+      // baixa o whisper (mock) aqui
+      await page.getByTestId('voice-model-action-mock-whisper-tiny').click()
+      await waitFor(
+        async () =>
+          /instalado/.test(await page.getByTestId('local-stt-installed').innerText()) &&
+          !/nenhum/.test(await page.getByTestId('local-stt-installed').innerText()),
+        8000,
+        'download do mock'
+      )
+      await page.getByTestId('audio-local-back').click()
+      await page.getByTestId('stt-section').waitFor()
+      // o instalado entra no seletor como "Local (CPU)"; o híbrido aparece (modelo de API + local)
+      const groups = await pickerGroups('stt-model')
+      assert(
+        groups.some((g) => /^Local \(CPU\) 1/.test(g)),
+        `grupo local: ${groups.join(' | ')}`
+      )
+      assert(!groups.some((g) => /Local \(GPU\)/.test(g)), 'GPU sem whisper instalado')
+      const hybrid = page.getByRole('switch', { name: 'Motor local nas parciais e como reserva' })
+      await hybrid.waitFor()
+      await hybrid.click()
+      await page.getByTestId('stt-hybrid-model').waitFor()
+      assert.match(await page.getByTestId('stt-hybrid-model').innerText(), /Whisper tiny \(mock\)/)
+      await hybrid.click()
+      // escolher o local grava modo local + motor + modelo de uma vez
+      await page.getByTestId('stt-model').click()
+      await page
+        .getByRole('listbox', { name: 'Modelos' })
+        .locator('[role=option][data-provider="Local (CPU)"][data-model="mock-whisper-tiny"]')
+        .click()
+      await page.getByTestId('stt-local').waitFor()
+      assert.match(await page.getByTestId('stt-local-current').innerText(), /Whisper tiny \(mock\)/)
+      assert.equal(await count('stt-api-params'), 0, 'sem parâmetros remotos no local')
+      assert.equal(await hybrid.count(), 0, 'sem híbrido com modelo local escolhido')
+      await scrollTo('stt-section')
+      await shot('ux-07-stt-local-picked')
+      await pickModel(page, page.getByTestId('stt-model'), 'whisper-large-v3-turbo', {
+        provider: 'Groq'
+      })
+      return groups.join(' | ')
     }
   )
 
@@ -304,12 +404,15 @@ app.on('window-all-closed', () => app.quit())
   // ---------------- TTS ----------------
 
   await step(
-    'TTS Local: Kokoro + catálogo; "Testar voz" toca (sem erro, sem bloqueio da CSP)',
+    'TTS Local: Kokoro (catálogo só em Modelos locais); "Testar voz" toca (sem erro, sem bloqueio da CSP)',
     async () => {
       await openAudio('chat')
       assert(await visible('tts-local'), 'motor local')
-      assert(await visible('voice-models-kokoro'), 'catálogo do Kokoro')
+      assert.equal(await count('voice-models-kokoro'), 0, 'catálogo do Kokoro na página principal')
       assert.equal(await count('tts-api'), 0)
+      assert.match(await page.getByTestId('tts-model').innerText(), /Local \(CPU\)[\s\S]*Kokoro/)
+      // salvo no Kokoro sem os pesos em disco: aviso com o caminho para Modelos locais
+      await page.getByTestId('tts-model-local-missing').waitFor()
       await page.getByTestId('tts-test').click()
       await waitFor(
         async () => (await page.getByTestId('tts-test').getAttribute('data-state')) !== 'busy',
@@ -329,7 +432,6 @@ app.on('window-all-closed', () => app.quit())
     async () => {
       await page.getByTestId('tts-preset-openrouter').click()
       await page.getByTestId('tts-api').waitFor()
-      assert.equal(await count('voice-models-kokoro'), 0, 'catálogo do Kokoro no modo API')
       await waitFor(
         async () =>
           (await page.getByTestId('tts-model').getAttribute('data-value')) ===
@@ -525,11 +627,11 @@ app.on('window-all-closed', () => app.quit())
     async () => {
       await openAudio('voice-elevenlabs')
       // STT não lista o ElevenLabs (só fala)
-      await page.getByRole('button', { name: 'Provedor da transcrição', exact: true }).click()
-      const sttOpts = await popover().getByRole('button').allInnerTexts()
+      const sttOpts = await pickerGroups('stt-model')
       assert(!sttOpts.some((t) => t.includes('ElevenLabs')), 'ElevenLabs na transcrição')
-      await page.keyboard.press('Escape')
-      await choose('Provedor da fala', /^ElevenLabs/)
+      await pickModel(page, page.getByTestId('tts-model'), 'eleven_flash_v2_5', {
+        provider: 'ElevenLabs'
+      })
       await waitFor(
         async () =>
           (await page.getByTestId('tts-model').getAttribute('data-value')) === 'eleven_flash_v2_5',
@@ -607,13 +709,103 @@ app.on('window-all-closed', () => app.quit())
       assert.equal(await page.getByRole('switch', { name: 'Streaming por WebSocket' }).count(), 0)
       await shot('ux-17-transport-v4')
       // OpenRouter: HTTP por frase com o motivo
-      await choose('Provedor da fala', /^OpenRouter/)
+      await pickModel(page, page.getByTestId('tts-model'), 'elevenlabs/eleven-flash-v2.5', {
+        provider: 'OpenRouter'
+      })
       await waitFor(async () => /OpenRouter/.test(await text()), 3000, 'motivo do OpenRouter')
       assert.equal(
         await text(),
         'Na chamada: HTTP por frase — o OpenRouter não tem WebSocket de fala'
       )
       return 'Flash → WS · desligado → HTTP · v4 Turbo → HTTP · OpenRouter → HTTP'
+    }
+  )
+
+  await step(
+    'Parâmetros (OpenRouter): velocidade só nos modelos com controle (ElevenLabs 0,7–1,2); Fish Audio: instruções',
+    async () => {
+      // continua no OpenRouter · ElevenLabs Flash (passo anterior)
+      await page.getByTestId('tts-api-params-toggle').click()
+      const speed = page.getByTestId('tts-api-params-speed')
+      await speed.waitFor()
+      assert.deepEqual(
+        [await speed.getAttribute('min'), await speed.getAttribute('max')],
+        ['0.7', '1.2']
+      )
+      assert.equal(await count('tts-api-params-row-instructions'), 0)
+      await pickModel(page, page.getByTestId('tts-model'), 'fish-audio/s1', {
+        provider: 'OpenRouter'
+      })
+      await page.getByTestId('tts-api-params-row-instructions').waitFor()
+      assert.equal(
+        await count('tts-api-params-row-speed'),
+        0,
+        'Fish Audio sem controle de velocidade'
+      )
+      await pickModel(page, page.getByTestId('tts-model'), 'elevenlabs/eleven-flash-v2.5', {
+        provider: 'OpenRouter'
+      })
+    }
+  )
+
+  await step(
+    'Parâmetros (ElevenLabs direto): formato de saída com nota do plano, stability, restaurar; 44,1 kHz sem Pro → erro legível no "Testar voz"',
+    async () => {
+      await pickModel(page, page.getByTestId('tts-model'), 'eleven_flash_v2_5', {
+        provider: 'ElevenLabs'
+      })
+      const toggle = page.getByTestId('tts-api-params-toggle')
+      if ((await toggle.getAttribute('aria-expanded')) !== 'true') await toggle.click()
+      for (const k of [
+        'output_format',
+        'stability',
+        'similarity_boost',
+        'style',
+        'use_speaker_boost',
+        'speed',
+        'apply_text_normalization',
+        'auto_mode'
+      ])
+        await page.getByTestId(`tts-api-params-row-${k}`).waitFor()
+      assert.match(
+        await page.getByTestId('tts-api-params-stability-value').innerText(),
+        /da voz \(conta\)/
+      )
+      // stability pelo teclado (um passo) → gravada; o contador mostra 1 alterado
+      const st = page.getByTestId('tts-api-params-stability')
+      await st.focus()
+      await page.keyboard.press('ArrowLeft')
+      await page.getByTestId('tts-api-params-count').waitFor()
+      assert.equal(await page.getByTestId('tts-api-params-stability-value').innerText(), '0,45')
+      // formato 44,1 kHz: nota "exige plano Pro"
+      await page
+        .getByRole('button', { name: 'Formato de saída (Eleven Flash v2.5)', exact: true })
+        .click()
+      const opt = popover().getByRole('button').filter({ hasText: 'PCM 44,1 kHz' }).first()
+      assert.match(await opt.innerText(), /exige plano Pro/)
+      await opt.click()
+      await page.getByTestId('tts-api-params-output_format-note').waitFor()
+      await scrollTo('tts-api-params')
+      await shot('ux-18-elevenlabs-params')
+      const saved = await savedVoice()
+      assert.deepEqual(saved.ttsSettings.api.params, {
+        elevenlabs: { output_format: 'pcm_44100', stability: 0.45 }
+      })
+      // a conta (mock) não é Pro: o "Testar voz" mostra o erro inline, sem trocar o formato sozinho
+      await page.getByTestId('tts-test').click()
+      await page.getByTestId('tts-error').waitFor({ timeout: 3000 })
+      const err = await page.getByTestId('tts-error').innerText()
+      assert.match(
+        err,
+        /O formato de saída 44,1 kHz exige o plano Pro da ElevenLabs — escolha outro formato em Configurações → Áudio → Parâmetros/
+      )
+      await shot('ux-19-format-error')
+      // restaurar padrão: tudo volta (24 kHz, da voz)
+      await page.getByTestId('tts-api-params-restore').click()
+      await waitFor(async () => (await count('tts-api-params-count')) === 0, 3000, 'restaurado')
+      const after = await savedVoice()
+      assert.equal(after.ttsSettings.api.params, undefined)
+      return err
     }
   )
 

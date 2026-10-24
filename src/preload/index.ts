@@ -23,6 +23,13 @@ import {
 import type { VoiceCallState } from '@shared/voice'
 import type { GpuStatus } from '@shared/gpuVoice'
 import type { AgentEvent } from '@shared/types'
+import {
+  CTX_ACTION_CHANNEL,
+  CTX_QUERY_CHANNEL,
+  CTX_REPLY_CHANNEL,
+  type AppCtx,
+  type CtxAppAction
+} from '@shared/contextMenu'
 
 const invoke = ipcRenderer.invoke.bind(ipcRenderer)
 
@@ -330,6 +337,33 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, listener)
+    }
+  },
+  contextMenu: {
+    onQuery: (cb) => {
+      const listener = (_e: IpcRendererEvent, reqId: number): void => {
+        let ctx: AppCtx | null
+        try {
+          ctx = cb()
+        } catch {
+          ctx = null
+        }
+        ipcRenderer.send(CTX_REPLY_CHANNEL, reqId, ctx)
+      }
+      ipcRenderer.on(CTX_QUERY_CHANNEL, listener)
+      return () => {
+        ipcRenderer.removeListener(CTX_QUERY_CHANNEL, listener)
+      }
+    },
+    onAction: (cb) => {
+      const listener = (
+        _e: IpcRendererEvent,
+        event: { token: number; action: CtxAppAction }
+      ): void => cb(event)
+      ipcRenderer.on(CTX_ACTION_CHANNEL, listener)
+      return () => {
+        ipcRenderer.removeListener(CTX_ACTION_CHANNEL, listener)
+      }
     }
   },
   onVoiceCallTimeline: (cb) => {

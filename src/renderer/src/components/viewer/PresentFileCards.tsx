@@ -31,6 +31,7 @@ import { useHostInfo } from '../sync/hooks'
 import { MessageInfo } from '../apiDocs'
 import { IconButton } from '../ui/controls'
 import { fileIcon } from './fileIcons'
+import { contributeCtx } from '../../lib/contextMenu'
 
 function TitleBlock({ file }: { file: PresentedFile }): React.JSX.Element {
   const t = presentTitleBlock(file)
@@ -83,6 +84,18 @@ function Card({
       data-testid="present-file-card"
       data-active={active || undefined}
       data-disabled={disabled || undefined}
+      onContextMenu={(e) =>
+        // botão direito: as mesmas ações dos botões do card + copiar o caminho
+        contributeCtx(e, {
+          copy: { fileCopyPath: file.path },
+          run: {
+            fileRun: onRun,
+            fileOpenExternal: onExternal,
+            fileShowInFolder: onFolder,
+            fileSaveAs: onSaveAs
+          }
+        })
+      }
       className={cn(
         'group/pf flex items-center gap-1 rounded-xl border pr-1.5 transition-colors',
         active

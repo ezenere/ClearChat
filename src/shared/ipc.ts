@@ -1328,6 +1328,21 @@ export interface ClearApi {
       length: number
     ): Promise<RemoteReadResult>
   }
+  /**
+   * Menu de contexto (SPEC → "Menu de contexto"): ponte do menu nativo com as ações do app.
+   * Opcional no tipo porque o mock de dev não tem menu nativo; o preload real sempre expõe.
+   */
+  contextMenu?: {
+    /**
+     * O main pergunta o que está sob o clique direito (`ctx:query`); `cb` devolve o descritor
+     * (ou null) e o preload responde (`ctx:reply`). Unsubscribe como em `onEvent`.
+     */
+    onQuery(cb: () => import('./contextMenu').AppCtx | null): () => void
+    /** O usuário escolheu uma ação do app no menu (`ctx:action`). Unsubscribe como em `onEvent`. */
+    onAction(
+      cb: (e: { token: number; action: import('./contextMenu').CtxAppAction }) => void
+    ): () => void
+  }
   /** Assina eventos do agente; retorna a função de unsubscribe. */
   onEvent(cb: (e: AgentEvent) => void): () => void
 }

@@ -14,9 +14,9 @@ import {
   type LucideIcon
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import { filterSettingsNav } from '../lib/settingsNav'
+import { filterSettingsNav, type SettingsNavSub } from '../lib/settingsNav'
 import { cn } from '../lib/format'
-import type { SettingsTab } from '../store'
+import type { SettingsTab, SettingsTarget } from '../store'
 import { useEscapeLayer } from './ui/escape'
 import { Tip } from './ui/Tooltip'
 
@@ -58,7 +58,8 @@ export function SettingsNav({
   panelId
 }: {
   tab: SettingsTab
-  onSelect: (t: SettingsTab) => void
+  /** Aba (ou sub-tela achada pela busca — ex.: 'audio:local'). */
+  onSelect: (t: SettingsTarget) => void
   /** id da área de conteúdo (`aria-controls`). */
   panelId: string
 }): React.JSX.Element {
@@ -70,7 +71,7 @@ export function SettingsNav({
   const asideRef = useRef<HTMLElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const full = !compact || expanded
-  const { groups, best, total } = useMemo(() => filterSettingsNav(query), [query])
+  const { groups, best, bestSub, total } = useMemo(() => filterSettingsNav(query), [query])
 
   // Esc: 1º limpa a busca; no compacto, 2º recolhe a barra; depois fecha o modal (camada do Modal)
   useEscapeLayer(compact && expanded, () => setExpanded(false))
@@ -88,8 +89,8 @@ export function SettingsNav({
     return () => window.removeEventListener('mousedown', onDown)
   }, [compact, expanded])
 
-  const select = (id: SettingsTab): void => {
-    onSelect(id)
+  const select = (id: SettingsTab, sub?: SettingsNavSub | null): void => {
+    onSelect(sub?.target ?? id)
     if (compact && expanded) {
       setExpanded(false)
       setQuery('')
@@ -141,7 +142,7 @@ export function SettingsNav({
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && best) {
                     e.preventDefault()
-                    select(best.id)
+                    select(best.id, bestSub)
                   } else if (e.key === 'ArrowDown') {
                     e.preventDefault()
                     items()[0]?.focus()
@@ -206,7 +207,7 @@ export function SettingsNav({
                 gi > 0 && <div aria-hidden className="mx-auto my-2 h-px w-6 bg-border" />
               )}
               <div className={cn('space-y-px', !full && gi === 0 && 'pt-1')}>
-                {matches.map(({ item, keyword }) => {
+                {matches.map(({ item, keyword, sub }) => {
                   const Icon = ICONS[item.id]
                   const active = tab === item.id
                   const isBest = !!query && best?.id === item.id
@@ -219,7 +220,8 @@ export function SettingsNav({
                       aria-label={item.label}
                       aria-current={active ? 'page' : undefined}
                       aria-controls={panelId}
-                      onClick={() => select(item.id)}
+                      data-sub={(query && sub?.target) || undefined}
+                      onClick={() => select(item.id, query ? sub : null)}
                       className={cn(
                         'group flex w-full items-center rounded-lg text-[13px] transition-colors',
                         full ? 'min-h-8 gap-2.5 px-2.5 py-1.5' : 'size-9 justify-center',

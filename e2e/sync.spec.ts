@@ -957,7 +957,13 @@ async function main(): Promise<void> {
       await api(A, 'voice.settings.set', 'ttsSettings', {
         ...cur.ttsSettings,
         backend: 'api',
-        api: { providerId: xi, model: 'eleven_flash_v2_5', voice: 'voz-do-pc' }
+        api: {
+          providerId: xi,
+          model: 'eleven_flash_v2_5',
+          voice: 'voz-do-pc',
+          // parâmetros do modelo remoto (preferência — sincroniza; os da GPU não)
+          params: { elevenlabs: { output_format: 'pcm_16000', stability: 0.4, speed: 1.1 } }
+        }
       })
       await api(A, 'voice.settings.set', 'voiceCallDefaults', {
         ...cur.voiceCallDefaults,
@@ -1004,6 +1010,13 @@ async function main(): Promise<void> {
         'B recebeu as settings de voz'
       )
       assert(vB.ttsSettings.backend === 'api' && vB.ttsSettings.api.voice === 'voz-do-pc', 'fala')
+      assert(
+        JSON.stringify(vB.ttsSettings.api.params) ===
+          JSON.stringify({
+            elevenlabs: { output_format: 'pcm_16000', stability: 0.4, speed: 1.1 }
+          }),
+        `parâmetros do modelo remoto em B: ${JSON.stringify(vB.ttsSettings.api.params)}`
+      )
       assert(vB.audioInput.language === 'es-ES' && vB.audioInput.silenceStopMs === 3200, 'ditado')
       assert(vB.audioInput.deviceId !== 'microfone-do-pc', 'o microfone de A não chega em B')
       const provB = (await api<any[]>(B, 'providers.list')).find((p) => p.id === xi)

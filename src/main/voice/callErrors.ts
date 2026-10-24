@@ -56,6 +56,10 @@ export function classifyVoiceError(
       return { fatal: true, reason: `créditos ${of(label)} esgotados (${what(source)})`, detail }
     return { fatal: false, reason: `limite de requisições ${of(label)} (${what(source)})`, detail }
   }
+  // formato de saída fora do plano (ElevenLabs 403 `output_format_not_allowed`): a mensagem já diz
+  // o que fazer ("…escolha outro formato em Configurações → Áudio → Parâmetros")
+  if (kind === 'config' && /formato de saída/i.test(detail))
+    return { fatal: true, reason: detail.replace(/^TtsError: /, ''), detail }
   if (kind === 'config')
     return {
       fatal: true,

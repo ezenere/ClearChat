@@ -6,6 +6,8 @@
 // Ver SPEC.md → "Áudio → Serviço de transcrição (STT)".
 import type { SttSettings } from '@shared/voice'
 import { connectionErrorText, isConnectionFailure } from '@shared/network'
+import { voiceProviderSupport } from '@shared/voiceCatalog'
+import { apiParamsToSend } from '@shared/voiceParams'
 import { abortError } from '../tools/util'
 
 // ---------------- medição de uso (custos da chamada de voz) ----------------
@@ -313,6 +315,11 @@ export async function transcribeAudio(
   const language = languageParam(opts.language)
   if (language) body.append('language', language)
   body.append('response_format', 'json')
+  // parâmetros do modelo escolhidos em Áudio → Parâmetros (`temperature`, `prompt` — só os que a
+  // família aceita; o servidor da GPU nunca tem `params`)
+  const family = voiceProviderSupport({ baseUrl, kind: api.providerKind ?? undefined })
+  for (const [k, v] of Object.entries(apiParamsToSend('stt', family, model, api.params)))
+    body.append(k, String(v))
 
   const t0 = Date.now()
   let raw: string

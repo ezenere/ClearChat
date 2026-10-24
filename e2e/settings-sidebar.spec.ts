@@ -256,6 +256,47 @@ app.on('window-all-closed', () => app.quit())
     return 'microfone → Áudio · memoria → Memórias · whitelist → só Agente · xyzzy → vazio'
   })
 
+  await step(
+    'Procurar "kokoro"/"gpu": Áudio com a dica "Modelos locais"; Enter/clique abre a sub-tela (← Áudio volta)',
+    async () => {
+      await openSettings()
+      await search().fill('')
+      await tabBtn('Provedores').click()
+      await search().fill('kokoro')
+      await page.waitForTimeout(100)
+      const labels = await nav()
+        .locator('button[data-nav-item]')
+        .evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')))
+      assert.deepEqual(labels, ['Áudio'])
+      assert(
+        await nav().getByText('Modelos locais · kokoro', { exact: true }).isVisible(),
+        'dica da sub-tela'
+      )
+      assert.equal(await nav().locator('[data-best]').getAttribute('data-sub'), 'audio:local')
+      await shot('1440-busca-kokoro')
+      await search().press('Enter')
+      await page.getByTestId('audio-local-models').waitFor()
+      assert.deepEqual((await activeState()).active, ['Áudio'])
+      await page.getByTestId('voice-models-kokoro').waitFor({ timeout: 4000 })
+      await shot('1440-busca-kokoro-subtela')
+      // ← Áudio volta à página principal; clicar na aba de novo também
+      await page.getByTestId('audio-local-back').click()
+      await page.getByTestId('stt-section').waitFor()
+      // "gpu" pelo clique no resultado
+      await search().fill('gpu')
+      await page.waitForTimeout(100)
+      await nav().locator('button[data-nav-item="audio"]').click()
+      await page.getByTestId('gpu-mode-section').waitFor()
+      assert.equal(await page.getByTestId('audio-settings').getAttribute('data-view'), 'local')
+      await search().fill('')
+      await tabBtn('Áudio').click()
+      await page.getByTestId('stt-section').waitFor()
+      await page.keyboard.press('Escape')
+      await dialog().waitFor({ state: 'detached' })
+      return 'kokoro → Modelos locais · gpu → Modelos locais · aba → principal'
+    }
+  )
+
   await step('Esc: 1º limpa a busca, 2º fecha o modal', async () => {
     await openSettings()
     await search().fill('gpu')
@@ -349,7 +390,8 @@ app.on('window-all-closed', () => app.quit())
       assert(await dialog().isVisible(), 'Esc fechou o modal')
       await page.getByTestId('settings-search-toggle').click()
       await search().waitFor()
-      await page.locator('#settings-panel-title').click()
+      // clique fora da barra (no conteúdo, à direita do título — a barra expandida cobre a esquerda)
+      await page.getByTestId('settings-content').click({ position: { x: 520, y: 14 } })
       await page.waitForTimeout(150)
       assert.equal(await side.getAttribute('data-expanded'), null, 'clique fora não recolheu')
       return `barra ${w}px · tooltip · lupa → tavily → Pesquisa na web`

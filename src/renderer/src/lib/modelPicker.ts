@@ -7,6 +7,8 @@ import type { ModelRef } from '@shared/models'
 export interface PickerProvider {
   id: string
   name: string
+  /** Grupo fechado (ex.: "Local (CPU)" em Áudio): sem a linha "Usar “id” em …" do ID livre. */
+  noFreeId?: boolean
 }
 
 export interface PickerModels {
@@ -168,7 +170,9 @@ export function buildPickerRows(opts: {
     const ordered = [...providers].sort(
       (a, b) => Number(b.id === selected?.providerId) - Number(a.id === selected?.providerId)
     )
-    const free = ordered.filter((p) => !(models[p.id]?.list ?? []).some((m) => m.id === text))
+    const free = ordered.filter(
+      (p) => !p.noFreeId && !(models[p.id]?.list ?? []).some((m) => m.id === text)
+    )
     if (free.length) {
       rows.push({ kind: 'free-header', key: 'free' })
       for (const p of free)

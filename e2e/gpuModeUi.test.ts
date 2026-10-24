@@ -416,7 +416,7 @@ test('gpuTtsProblems: runtime ausente/quebrado, motor ausente/bloqueado, voz sum
   assert.match(
     gpuTtsProblems(cfg, status({ runtime: { state: 'absent', version: null, sizeMb: null } }))[0]
       .text,
-    /instale o runtime em Configurações → Áudio → Modo avançado \(GPU local\)/
+    /instale o runtime em Configurações → Áudio → Modelos locais/
   )
   assert.match(
     gpuTtsProblems(
@@ -519,7 +519,7 @@ test('voiceCallReadiness com GPU: só erros barram; texto aponta o Modo avançad
   )
   assert.equal(
     p[1],
-    'Fala (GPU local): instale o motor OmniVoice em Configurações → Áudio → Modo avançado (GPU local).'
+    'Fala (GPU local): instale o motor OmniVoice em Configurações → Áudio → Modelos locais.'
   )
   assert.match(
     voiceCallReadiness(view, null, null).join(' '),
@@ -696,9 +696,7 @@ test('voiceCallReadiness com GPU: servidor parado = ok (liga sozinho), com erro 
       null,
       status({ engines: [omni, { ...wh, install: { state: 'absent' } }] })
     ),
-    [
-      'Transcrição (GPU local): instale o motor Whisper em Configurações → Áudio → Modo avançado (GPU local).'
-    ]
+    ['Transcrição (GPU local): instale o motor Whisper em Configurações → Áudio → Modelos locais.']
   )
 })
 

@@ -5,7 +5,7 @@
 // neste Electron/Linux) + servidor FALSO de STT
 // (`e2e/fakes/sttServer.ts`) respondendo `/audio/transcriptions` com transcrição fixa (cadastrado
 // em Configurações → Provedores como OpenAI-compatível em localhost, com chave, e escolhido em
-// Áudio → Transcrição). userData isolado (`CLEARCHAT_USER_DATA`); nenhuma chave real.
+// Áudio → Transcrição pelo seletor único de Modelo). userData isolado (`CLEARCHAT_USER_DATA`); nenhuma chave real.
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
@@ -253,14 +253,28 @@ async function main(): Promise<void> {
       await dialog().getByText('STT falso').first().waitFor()
       await dialog().getByRole('button', { name: 'Áudio', exact: true }).click()
       await page.getByTestId('audio-settings').waitFor()
-      await page.getByRole('button', { name: 'Provedor da transcrição', exact: true }).click()
-      await page
-        .locator('div.shadow-popover')
-        .last()
-        .getByRole('button')
-        .filter({ hasText: /^STT falso/ })
-        .first()
-        .click()
+      // um seletor só (Modelo): o modelo do provedor "STT falso" (listado ou pelo ID livre)
+      await page.getByTestId('stt-model').click()
+      const search = page.getByRole('textbox', { name: 'Buscar modelo' })
+      await search.waitFor()
+      await page.waitForFunction(
+        () => document.activeElement?.getAttribute('aria-label') === 'Buscar modelo'
+      )
+      await search.fill('whisper-large-v3-turbo')
+      const list = page.getByRole('listbox', { name: 'Modelos' })
+      const listed = list.locator(
+        '[role=option][data-provider="STT falso"][data-model="whisper-large-v3-turbo"]'
+      )
+      const free = list.locator(
+        '[role=option][data-provider="STT falso"][data-free="whisper-large-v3-turbo"]'
+      )
+      await listed.or(free).first().waitFor({ timeout: 10_000 })
+      await listed.or(free).first().click()
+      await waitFor(
+        async () => /STT falso/.test(await page.getByTestId('stt-model').innerText()),
+        5000,
+        'provedor gravado junto com o modelo'
+      )
       await waitFor(
         async () =>
           (await page.getByTestId('stt-model').getAttribute('data-value')) ===

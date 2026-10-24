@@ -10,6 +10,13 @@
 import type { TtsEndpointConfig } from '@shared/voice'
 import { elevenLabsWsSupportsModel as sharedWsSupportsModel } from '@shared/voice'
 import { connectionErrorText } from '@shared/network'
+import {
+  apiParamsToSend,
+  elevenLabsOutputFormat,
+  pcmFormatLabel,
+  pcmFormatRate,
+  type VoiceParamValues
+} from '@shared/voiceParams'
 import { abortError } from '../tools/util'
 import {
   TtsError,
@@ -31,7 +38,11 @@ export const ELEVENLABS_DEFAULT_MODEL = 'eleven_flash_v2_5'
 /** Voz padrão quando nenhuma foi escolhida ("Sarah", premade). */
 export const ELEVENLABS_DEFAULT_VOICE_ID = 'EXAVITQu4vr4xnSDxMaL'
 
-/** Formato pedido em REST e no WebSocket (PCM16 LE mono, 24 kHz — o que o player da chamada toca). */
+/**
+ * Formato PADRÃO pedido em REST e no WebSocket (PCM16 LE mono, 24 kHz — todos os planos). O usuário
+ * escolhe outro em Áudio → Parâmetros (`api.params.elevenlabs.output_format`); a taxa do stream
+ * segue o formato (o player da chamada toca na taxa que vier).
+ */
 export const ELEVENLABS_OUTPUT_FORMAT = 'pcm_24000'
 export const ELEVENLABS_SAMPLE_RATE = 24_000
 
@@ -138,6 +149,53 @@ export interface ElevenLabsConfig {
   modelId: string
   voiceId: string
   languageCode: string | null
+  /** `output_format` PCM pedido (padrão `pcm_24000`) e a taxa dele. */
+  outputFormat?: string
+  sampleRate?: number
+  /** `voice_settings` escolhidos (null = os salvos da voz na conta — nada é enviado). */
+  voiceSettings?: Record<string, unknown> | null
+  /** `apply_text_normalization` diferente do automático (null = não envia). */
+  textNormalization?: 'on' | 'off' | null
+  /** `auto_mode=true` no WebSocket (frases completas, sem o `chunk_length_schedule`). */
+  autoMode?: boolean
+}
+
+/** Chaves de `voice_settings` entre os parâmetros da ElevenLabs. */
+const VOICE_SETTINGS_KEYS = [
+  'stability',
+  'similarity_boost',
+  'style',
+  'use_speaker_boost',
+  'speed'
+] as const
+
+/** `voice_settings` a partir dos parâmetros escolhidos (nenhum → null: vale o da voz na conta). */
+export function elevenLabsVoiceSettings(sent: VoiceParamValues): Record<string, unknown> | null {
+  const out: Record<string, unknown> = {}
+  for (const k of VOICE_SETTINGS_KEYS) if (sent[k] !== undefined) out[k] = sent[k]
+  return Object.keys(out).length ? out : null
+}
+
+/**
+ * Parâmetros da ElevenLabs de `ttsSettings.api.params` → campos do `ElevenLabsConfig` (formato,
+ * `voice_settings`, normalização, `auto_mode`) — só o que o modelo aceita (`@shared/voiceParams`).
+ */
+export function elevenLabsParamConfig(
+  api: Pick<TtsEndpointConfig, 'params'>,
+  modelId: string
+): Required<
+  Pick<ElevenLabsConfig, 'outputFormat' | 'sampleRate' | 'voiceSettings' | 'textNormalization'>
+> & { autoMode: boolean } {
+  const sent = apiParamsToSend('tts', 'elevenlabs', modelId, api.params, { ws: true })
+  const outputFormat = elevenLabsOutputFormat(api.params)
+  const norm = sent.apply_text_normalization
+  return {
+    outputFormat,
+    sampleRate: pcmFormatRate(outputFormat),
+    voiceSettings: elevenLabsVoiceSettings(sent),
+    textNormalization: norm === 'on' || norm === 'off' ? norm : null,
+    autoMode: sent.auto_mode === true
+  }
 }
 
 /** `ttsSettings.api` → configuração ElevenLabs (erro `config` legível sem chave). */
@@ -154,9 +212,14 @@ export function elevenLabsConfig(api: TtsEndpointConfig): ElevenLabsConfig {
     apiKey,
     modelId,
     voiceId: elevenLabsVoiceId(api.voice),
-    languageCode: elevenLabsLanguageCode(modelId)
+    languageCode: elevenLabsLanguageCode(modelId),
+    ...elevenLabsParamConfig(api, modelId)
   }
 }
+
+/** Taxa do PCM pedido (o formato escolhido; padrão 24 kHz). */
+export const elevenLabsRate = (cfg: Pick<ElevenLabsConfig, 'sampleRate'>): number =>
+  cfg.sampleRate ?? ELEVENLABS_SAMPLE_RATE
 
 /** Base REST normalizada: vazia → a oficial; `/v1` final removido (os caminhos já o têm). */
 export function elevenLabsBase(raw: string | null | undefined): string {
@@ -192,8 +255,28 @@ export function elevenLabsErrorDetail(raw: string): { message: string; status: s
 }
 
 /**
+ * O plano da conta não permite o formato de saída pedido? (HTTP 403 `output_format_not_allowed` /
+ * `subscription_required` — "Output format 'pcm_44100' is only available on the Pro tier and above.")
+ * Devolve o formato citado (ou null quando não é esse erro).
+ */
+export function elevenLabsFormatNotAllowed(hay: string): string | null {
+  const h = hay.toLowerCase()
+  if (!/output_format_not_allowed|output format/.test(h)) return null
+  if (!/not_allowed|only available|tier|subscription|plan/.test(h)) return null
+  return /output format '?([a-z0-9_]+)'?/i.exec(hay)?.[1] ?? ''
+}
+
+/** Mensagem pt-BR do formato de saída recusado pelo plano (Áudio → Parâmetros resolve). */
+export function elevenLabsFormatMessage(format: string, tier: string | null): string {
+  const what = /^pcm_\d+$/.test(format) ? ` ${pcmFormatLabel(format)}` : format ? ` ${format}` : ''
+  const plan = tier ? `o plano ${tier} da ElevenLabs` : 'um plano maior da ElevenLabs'
+  return `O formato de saída${what} exige ${plan} — escolha outro formato em Configurações → Áudio → Parâmetros`
+}
+
+/**
  * Classifica um erro da ElevenLabs (HTTP, frame de erro do WebSocket ou motivo do fechamento):
- * chave inválida/sem permissão → `auth`; cota/créditos/limite de concorrência → `quota`; voz
+ * formato de saída fora do plano → `config` (fatal, aponta Áudio → Parâmetros); chave
+ * inválida/sem permissão → `auth`; cota/créditos/limite de concorrência → `quota`; voz
  * inexistente → `http` com texto próprio; demais → `http`.
  */
 export function elevenLabsError(
@@ -206,6 +289,14 @@ export function elevenLabsError(
   const tail = msg ? ` — ${msg}` : code ? ` — ${code}` : ''
   const st = input.status
   const httpTag = st ? ` (HTTP ${st})` : ''
+  const format = elevenLabsFormatNotAllowed(`${code} ${msg}`)
+  if (format !== null) {
+    const tier = /on the (\w+) tier/i.exec(msg)?.[1] ?? null
+    return new TtsError('config', elevenLabsFormatMessage(format, tier), {
+      backend: 'api',
+      status: st
+    })
+  }
   if (
     st === 401 ||
     st === 403 ||
@@ -299,12 +390,15 @@ async function requestElevenLabsSpeech(
 ): Promise<ElevenLabsSpeech> {
   const url =
     `${cfg.baseUrl}/v1/text-to-speech/${encodeURIComponent(cfg.voiceId)}/stream` +
-    `?output_format=${ELEVENLABS_OUTPUT_FORMAT}`
+    `?output_format=${encodeURIComponent(cfg.outputFormat ?? ELEVENLABS_OUTPUT_FORMAT)}`
   const timeoutMs = opts.timeoutMs ?? TTS_DEFAULT_TIMEOUT_MS
   const timeout = AbortSignal.timeout(timeoutMs)
   const signal = opts.signal ? AbortSignal.any([opts.signal, timeout]) : timeout
   const body: Record<string, unknown> = { text, model_id: cfg.modelId }
   if (cfg.languageCode) body.language_code = cfg.languageCode
+  // parâmetros escolhidos em Áudio → Parâmetros (nada escolhido = os da voz na conta)
+  if (cfg.voiceSettings) body.voice_settings = cfg.voiceSettings
+  if (cfg.textNormalization) body.apply_text_normalization = cfg.textNormalization
   const ctx = { timeout, timeoutMs, url }
   const t0 = Date.now()
   let res: Response
@@ -341,7 +435,7 @@ async function requestElevenLabsSpeech(
   return { res, url, t0, timeout, timeoutMs }
 }
 
-/** Síntese REST completa → WAV 24 kHz (clipes/"Testar voz" — a mesma voz da chamada). */
+/** Síntese REST completa → WAV na taxa do formato (clipes/"Testar voz" — a mesma voz da chamada). */
 export async function synthesizeElevenLabs(
   text: string,
   api: TtsEndpointConfig,
@@ -362,7 +456,7 @@ export async function synthesizeElevenLabs(
       status: sp.res.status
     })
   return {
-    audio: encodeWav(mono, ELEVENLABS_SAMPLE_RATE),
+    audio: encodeWav(mono, elevenLabsRate(cfg)),
     mime: 'audio/wav',
     model: cfg.modelId,
     backend: 'api',
@@ -390,7 +484,7 @@ export async function synthesizeElevenLabsStream(
     return {
       streaming: false,
       result: {
-        audio: encodeWav(mono, ELEVENLABS_SAMPLE_RATE),
+        audio: encodeWav(mono, elevenLabsRate(cfg)),
         mime: 'audio/wav',
         model: cfg.modelId,
         backend: 'api',
@@ -428,7 +522,7 @@ export async function synthesizeElevenLabsStream(
   }
   return {
     streaming: true,
-    sampleRate: ELEVENLABS_SAMPLE_RATE,
+    sampleRate: elevenLabsRate(cfg),
     model: cfg.modelId,
     backend: 'api',
     t0: sp.t0,

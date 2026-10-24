@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, nativeImage, nativeTheme, protocol } from 'electron'
+import { app, shell, BrowserWindow, nativeImage, nativeTheme, protocol, session } from 'electron'
 import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -7,6 +7,7 @@ import { registerIpc, resetVoiceForWebContents, shutdownGpuVoice, shutdownVoiceC
 import { shutdownSttWorker } from './voice/sttWorkerHost'
 import { shutdownTtsWorker } from './voice/ttsWorkerHost'
 import { registerEventWindow } from './events'
+import { installContextMenu, setupSpellcheck } from './contextMenu'
 import { initSync, shutdownSync, syncEngine } from './sync'
 import { initRunner, shutdownRunner } from './agent/runner'
 import { emit } from './events'
@@ -79,11 +80,14 @@ function createWindow(): BrowserWindow {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: true
+      sandbox: true,
+      spellcheck: true
     }
   })
 
   registerEventWindow(win)
+  // botão direito: menu nativo (edição/seleção/links/imagens + ações da mensagem) — SPEC → "Menu de contexto"
+  installContextMenu(win, { appActions: true })
   win.once('ready-to-show', () => win.show())
 
   // Voz: o estado do main (sessão de transcrição, chamada) é do renderer desta janela — se ele
@@ -115,6 +119,8 @@ function createWindow(): BrowserWindow {
 app.whenReady().then(() => {
   electronApp.setAppUserModelId(APP_ID)
   nativeTheme.themeSource = 'dark'
+  // corretor ortográfico pt-BR + en-US nos campos de texto (macOS: corretor do sistema)
+  setupSpellcheck(session.defaultSession)
 
   // F12 abre DevTools em dev; ignora Ctrl+R em produção.
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))

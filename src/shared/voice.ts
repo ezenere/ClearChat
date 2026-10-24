@@ -22,6 +22,7 @@ import {
   type SttGpuConfig,
   type TtsGpuConfig
 } from './gpuVoice'
+import { normalizeVoiceApiParams, type VoiceApiParams } from './voiceParams'
 // contrato do modo GPU também a partir daqui (as settings `ttsSettings.gpu`/`sttSettings.gpu`)
 export {
   DEFAULT_STT_GPU,
@@ -97,6 +98,13 @@ export interface SttEndpointConfig {
    */
   baseUrl?: string
   apiKey?: string
+  /** Tipo do provedor salvo, preenchido SÓ pelo main (decide os `params` da família). */
+  providerKind?: string
+  /**
+   * Parâmetros do modelo por família de API (`temperature`, `prompt` — `@shared/voiceParams`): só
+   * os escolhidos (aditivo; sincroniza com o resto de `sttSettings` — protocolo 1.5.0, §4.3.2).
+   */
+  params?: VoiceApiParams
 }
 
 export interface SttLocalConfig {
@@ -191,6 +199,12 @@ export interface TtsEndpointConfig {
    * `false` (aditivo; sincroniza com o resto de `ttsSettings` — protocolo 1.5.0).
    */
   elevenLabsWs?: boolean
+  /**
+   * Parâmetros do modelo por família de API (`@shared/voiceParams` — ElevenLabs: formato de saída,
+   * `voice_settings`, normalização, `auto_mode`; OpenRouter/OpenAI: `speed`, `instructions`): só os
+   * escolhidos (aditivo; sincroniza com o resto de `ttsSettings` — protocolo 1.5.0, §4.3.2).
+   */
+  params?: VoiceApiParams
   /**
    * Campos extras do corpo JSON de `/audio/speech`, preenchidos SÓ pelo main (o servidor da GPU
    * recebe `{ params }` — os parâmetros do motor). Nunca gravado (o normalizador descarta).
@@ -719,7 +733,12 @@ export function normalizeSttSettings(v: unknown): SttSettings {
     // só provedor + modelo: `baseUrl`/`apiKey` gravados por versões de desenvolvimento são descartados
     api: {
       providerId: strOrNull(api?.providerId),
-      model: strOr(api?.model, DEFAULT_STT_API.model)
+      model: strOr(api?.model, DEFAULT_STT_API.model),
+      // aditivo: parâmetros do modelo por família (vazio = a chave sai)
+      ...(() => {
+        const params = normalizeVoiceApiParams('stt', api?.params)
+        return params ? { params } : {}
+      })()
     },
     // null = nenhum motor instalado (objeto inválido também cai em null)
     local: local
@@ -780,7 +799,12 @@ export function normalizeTtsSettings(v: unknown): TtsSettings {
       model: strOr(api?.model, DEFAULT_TTS_API.model),
       voice: strOrNull(api?.voice),
       // aditivo: só o `false` explícito é gravado (ausente = WebSocket ligado)
-      ...(api?.elevenLabsWs === false ? { elevenLabsWs: false } : {})
+      ...(api?.elevenLabsWs === false ? { elevenLabsWs: false } : {}),
+      // aditivo: parâmetros do modelo por família (vazio = a chave sai)
+      ...(() => {
+        const params = normalizeVoiceApiParams('tts', api?.params)
+        return params ? { params } : {}
+      })()
     },
     // null explícito = limpo pelo usuário; ausente/lixo → o motor padrão (Kokoro)
     local:

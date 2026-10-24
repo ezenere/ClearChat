@@ -1,4 +1,5 @@
-// Configurações → Áudio → "Modo avançado (GPU local)" (fechado por padrão, badge "avançado"):
+// Configurações → Áudio → Modelos locais → "GPU local (Modo avançado)" — na sub-tela "Modelos
+// locais" fica sempre aberta (`embedded`); fora dela, fechada por padrão (badge "avançado"):
 // hardware detectado (só os fatos; a compatibilidade fica no card de cada motor — uma linha curta no
 // topo só quando NADA roda), runtime (Python + PyTorch + servidor, baixado sob demanda — os
 // modelos, inclusive o Whisper, são instalados à parte), motores em DUAS seções — "Voz (TTS)" e
@@ -53,7 +54,8 @@ import {
   patchGpuStatus,
   refreshGpuStatus,
   setGpuSectionExpanded,
-  useGpuStatus
+  useGpuStatus,
+  useGpuStore
 } from '../../../lib/voice/gpu/useGpuStatus'
 import { Button, IconButton } from '../../ui/controls'
 import { C, HelpTip } from '../../ui/Tooltip'
@@ -78,15 +80,20 @@ export function GpuModeSection({
   tts,
   onCommitTts,
   stt,
-  onCommitStt
+  onCommitStt,
+  embedded = false
 }: {
   tts: TtsSettings
   onCommitTts: (next: TtsSettings) => Promise<boolean>
   /** Transcrição (parâmetros do whisper em `sttSettings.gpu.params`); ausente = sem editor. */
   stt?: SttSettings
   onCommitStt?: (next: SttSettings) => Promise<boolean>
+  /** Dentro da sub-tela "Modelos locais": sempre aberta (sem o recolher). */
+  embedded?: boolean
 }): React.JSX.Element {
-  const { status, available, loading, error, expanded, reveal, revealTarget } = useGpuStatus()
+  const state = useGpuStatus()
+  const { status, available, loading, error, reveal, revealTarget } = state
+  const expanded = embedded || state.expanded
   const root = useRef<HTMLElement>(null)
   const engines = useRef<HTMLDivElement>(null)
 
@@ -95,12 +102,14 @@ export function GpuModeSection({
     if (expanded) void refreshGpuStatus()
   }, [expanded])
 
-  // link "instale no Modo avançado" dos painéis de Fala/Transcrição: rola até a seção
+  // link "instale em Modelos locais" dos painéis de Fala/Transcrição: rola até a seção (uma vez —
+  // o pedido é consumido para não rolar de novo ao reabrir a sub-tela)
   useEffect(() => {
     if (!reveal || revealTarget === 'voices') return
     const t = setTimeout(() => {
       const el = revealTarget === 'engines' ? (engines.current ?? root.current) : root.current
       el?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+      useGpuStore.setState({ reveal: 0 })
     }, 60)
     return () => clearTimeout(t)
   }, [reveal, revealTarget])
@@ -113,21 +122,27 @@ export function GpuModeSection({
       data-expanded={expanded}
     >
       <div className="flex items-center gap-2">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-controls="gpu-mode-body"
-          data-testid="gpu-mode-toggle"
-          onClick={() => setGpuSectionExpanded(!expanded)}
-          className="flex items-center gap-1.5 rounded-md text-left text-[13px] font-medium text-fg hover:text-fg"
-        >
-          {expanded ? (
-            <ChevronDown className="size-3.5 text-subtle" />
-          ) : (
-            <ChevronRight className="size-3.5 text-subtle" />
-          )}
-          Modo avançado (GPU local)
-        </button>
+        {embedded ? (
+          <h4 className="text-[13px] font-medium text-fg" data-testid="gpu-mode-title">
+            GPU local (Modo avançado)
+          </h4>
+        ) : (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            aria-controls="gpu-mode-body"
+            data-testid="gpu-mode-toggle"
+            onClick={() => setGpuSectionExpanded(!expanded)}
+            className="flex items-center gap-1.5 rounded-md text-left text-[13px] font-medium text-fg hover:text-fg"
+          >
+            {expanded ? (
+              <ChevronDown className="size-3.5 text-subtle" />
+            ) : (
+              <ChevronRight className="size-3.5 text-subtle" />
+            )}
+            Modo avançado (GPU local)
+          </button>
+        )}
         <Badge tone="accent">avançado</Badge>
         <HelpTip label="Modo avançado (GPU local)" wide>
           <p>
@@ -323,8 +338,8 @@ function GpuModeBody({
             <HelpTip label="Motores de voz da GPU" wide>
               <p>
                 Motores que FALAM as respostas. Cada um é um download separado (pesos do Hugging
-                Face). Instalados, aparecem em Fala (TTS) → Provedor “Local (GPU)”, onde você
-                escolhe o motor e a voz.
+                Face). Instalados, aparecem no seletor de Modelo de Fala (TTS), no grupo “Local
+                (GPU)”; a voz é escolhida logo abaixo dele.
               </p>
               <p>
                 “Testar” sintetiza uma frase curta no servidor local e mede o tempo até o 1º áudio e
@@ -354,8 +369,8 @@ function GpuModeBody({
                 faster-whisper, não o modelo.
               </p>
               <p>
-                Instalado, aparece em Transcrição (STT) → Provedor “Local (GPU)”. “Testar”
-                transcreve uma frase gravada e mede o tempo por frase.
+                Instalado, aparece no seletor de Modelo de Transcrição (STT), no grupo “Local
+                (GPU)”. “Testar” transcreve uma frase gravada e mede o tempo por frase.
               </p>
             </HelpTip>
           </div>

@@ -8,6 +8,7 @@ import rehypeKatex from 'rehype-katex'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import { normalizeFences } from '../../lib/fences'
+import { contributeCtx } from '../../lib/contextMenu'
 import { cn } from '../../lib/format'
 import { normalizeMath } from '../../lib/math'
 import { tableMinWidthEm, type HastLike } from '../../lib/tableWidth'
@@ -56,7 +57,10 @@ function CodeBlock({ children }: { children?: ReactNode }): React.JSX.Element {
   const lang = /language-([\w+-]+)/.exec(cls)?.[1]
   const text = textOf(children).replace(/\n$/, '')
   return (
-    <div className="group/code my-3 overflow-hidden rounded-xl border border-border bg-[#0d0d12]">
+    <div
+      className="group/code my-3 overflow-hidden rounded-xl border border-border bg-[#0d0d12]"
+      onContextMenu={(e) => contributeCtx(e, { copy: { copyCode: text } })}
+    >
       <div className="flex h-8 items-center justify-between border-b border-border/70 bg-white/[0.015] pr-1.5 pl-3">
         <span className="font-mono text-[11px] text-subtle">{lang ?? 'texto'}</span>
         <CopyButton text={text} />

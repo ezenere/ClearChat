@@ -1,6 +1,14 @@
 // Navegação lateral de Configurações (lógica PURA — sem React/DOM; testada em e2e/settingsNav.test.ts):
 // grupos e ordem das abas, índice de palavras-chave por aba e a busca "Procurar".
-import type { SettingsTab } from '../store'
+import type { SettingsTab, SettingsTarget } from '../store'
+
+/** Sub-tela de uma aba que a busca acha (ex.: Áudio → "Modelos locais"). */
+export interface SettingsNavSub {
+  /** Destino de `setSettingsOpen` (ex.: 'audio:local'). */
+  target: Exclude<SettingsTarget, SettingsTab>
+  label: string
+  keywords: string[]
+}
 
 export interface SettingsNavItem {
   id: SettingsTab
@@ -8,6 +16,8 @@ export interface SettingsNavItem {
   label: string
   /** Termos das configurações dentro da aba (minúsculas; acentos são ignorados na busca). */
   keywords: string[]
+  /** Sub-telas da aba com termos próprios (casar um deles abre a sub-tela). */
+  subs?: SettingsNavSub[]
 }
 
 export interface SettingsNavGroup {
@@ -83,15 +93,36 @@ export const SETTINGS_NAV: SettingsNavGroup[] = [
           'interjeições',
           'fillers',
           'frases de demora',
-          'gpu',
-          'modo avançado',
           'elevenlabs',
-          'kokoro',
-          'whisper',
-          'xtts',
-          'omnivoice',
-          'vibevoice',
-          'qwen3-tts'
+          'openrouter',
+          'parâmetros',
+          'formato de saída',
+          'estabilidade',
+          'velocidade da voz'
+        ],
+        subs: [
+          {
+            target: 'audio:local',
+            label: 'Modelos locais',
+            keywords: [
+              'modelos locais',
+              'offline',
+              'gpu',
+              'modo avançado',
+              'kokoro',
+              'whisper',
+              'whisper.cpp',
+              'vosk',
+              'nemotron',
+              'xtts',
+              'omnivoice',
+              'vibevoice',
+              'qwen3-tts',
+              'runtime',
+              'minhas vozes',
+              'baixar modelo'
+            ]
+          }
         ]
       }
     ]
@@ -246,6 +277,8 @@ export interface SettingsNavMatch {
   score: number
   /** Palavra-chave que casou quando o rótulo não casou (mostrada sob o item). */
   keyword?: string
+  /** A palavra-chave é de uma sub-tela: clicar abre ela (ex.: 'audio:local'). */
+  sub?: SettingsNavSub
 }
 
 export interface SettingsNavFilter {
@@ -253,12 +286,19 @@ export interface SettingsNavFilter {
   groups: { group: SettingsNavGroup; matches: SettingsNavMatch[] }[]
   /** Melhor resultado (o que o Enter abre): maior `score`; empate → ordem da barra. */
   best: SettingsNavItem | null
+  /** Sub-tela do melhor resultado (quando a palavra-chave que casou é dela). */
+  bestSub: SettingsNavSub | null
   total: number
 }
 
 function matchItem(item: SettingsNavItem, terms: string[]): SettingsNavMatch | null {
   const label = normalizeSearch(item.label)
-  const keys = item.keywords.map(normalizeSearch)
+  // palavras-chave da aba e das sub-telas (o rótulo da sub-tela também vale como palavra-chave)
+  const entries: { raw: string; sub?: SettingsNavSub }[] = [
+    ...item.keywords.map((raw) => ({ raw })),
+    ...(item.subs ?? []).flatMap((sub) => [sub.label, ...sub.keywords].map((raw) => ({ raw, sub })))
+  ]
+  const keys = entries.map((e) => normalizeSearch(e.raw))
   const hay = [label, ...keys]
   // cada termo precisa aparecer no rótulo ou em alguma palavra-chave (termos em qualquer ordem)
   if (!terms.every((t) => hay.some((h) => h.includes(t)))) return null
@@ -272,7 +312,17 @@ function matchItem(item: SettingsNavItem, terms: string[]): SettingsNavMatch | n
       k === whole ? 3 : k.startsWith(whole) ? 2 : terms.some((t) => k.includes(t)) ? 1 : 0
     if (score > best.score) best = { score, i }
   })
-  return { item, score: Math.max(best.score, 1), keyword: item.keywords[best.i] }
+  const hit = entries[best.i]
+  return {
+    item,
+    score: Math.max(best.score, 1),
+    keyword: hit
+      ? hit.sub && hit.raw !== hit.sub.label
+        ? `${hit.sub.label} · ${hit.raw}`
+        : hit.raw
+      : undefined,
+    ...(hit?.sub ? { sub: hit.sub } : {})
+  }
 }
 
 /** Filtra a barra lateral pela busca "Procurar" (rótulo + palavras-chave, sem acento/caixa). */
@@ -289,6 +339,7 @@ export function filterSettingsNav(query: string): SettingsNavFilter {
   return {
     groups,
     best: terms.length ? (best?.item ?? null) : null,
+    bestSub: terms.length ? (best?.sub ?? null) : null,
     total: groups.reduce((n, g) => n + g.matches.length, 0)
   }
 }

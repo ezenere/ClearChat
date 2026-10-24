@@ -11,6 +11,7 @@ import type { AttachmentInfo, QueuedMessage } from '@shared/types'
 import type { SyncServerKind, TakeoverOptions } from '@shared/sync'
 import { REMOTE_FS_LIMITS, type RemoteDirResult, type RemoteReadResult } from '@shared/remoteFs'
 import { emit, onAgentEvent } from '../events'
+import { installContextMenu } from '../contextMenu'
 import { getDb } from '../db'
 import { chatsRepo, messagesRepo, sessionsRepo } from '../repo'
 import * as runner from '../agent/runner'
@@ -138,6 +139,8 @@ function captchaWindow(base: string, action: 'login' | 'signup'): Promise<string
     win.webContents.on('will-navigate', (e, url) => void check(e, url))
     win.webContents.on('did-navigate', (_e, url) => void check(null, url))
     win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    // botão direito: menu básico (campos, seleção, links) — sem as ações do app
+    installContextMenu(win, { appActions: false })
     win.on('closed', () => finish(null))
     void win.loadURL(
       `${base}/captcha?client=app&nonce=${encodeURIComponent(nonce)}&action=${action}`

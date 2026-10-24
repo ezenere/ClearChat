@@ -556,7 +556,7 @@ app.on('window-all-closed', () => app.quit())
       const t2 = page.getByTestId('toast').filter({ hasText: 'Chamada de voz indisponível' })
       await t2.waitFor({ timeout: 4000 })
       const txt = await t2.innerText()
-      assert.match(txt, /Transcrição: escolha um provedor em Configurações → Áudio/)
+      assert.match(txt, /Transcrição: escolha um modelo de transcrição em Configurações → Áudio/)
       assert.match(txt, /Kokoro/)
       // runtime local quebrado (espeak-ng ausente — probe `voice.runtime.status`)
       await open('voice-no-espeak', 'Ideias de nomes para o app')
@@ -1175,6 +1175,32 @@ app.on('window-all-closed', () => app.quit())
       assert.equal(await sw.getAttribute('aria-checked'), 'false')
       assert.equal(await box.getByTestId('voice-call-keepalive-after').count(), 0, 'tempos somem')
       await sw.click()
+      await page.keyboard.press('Escape')
+      await dialog().waitFor({ state: 'detached' })
+    }
+  )
+
+  await step(
+    'Áudio: "Modelos locais" (sub-tela) e o atalho "Configurações → Áudio…" do microfone voltam à página principal; Kokoro salvo sem pesos aponta Modelos locais',
+    async () => {
+      await open('chat', 'Ideias de nomes para o app')
+      await openAudioSettings()
+      // o mock salva o Kokoro sem os pesos em disco: o seletor de Modelo avisa com o caminho
+      const missing = page.getByTestId('tts-model-local-missing')
+      await missing.scrollIntoViewIfNeeded()
+      assert.match(await missing.innerText(), /instale em Modelos locais/)
+      await missing.getByRole('button', { name: 'instale em Modelos locais' }).click()
+      await page.getByTestId('audio-local-models').waitFor()
+      assert.equal(await page.getByTestId('audio-settings').getAttribute('data-view'), 'local')
+      await page.getByTestId('voice-models-kokoro').waitFor({ timeout: 4000 })
+      await page.keyboard.press('Escape')
+      await dialog().waitFor({ state: 'detached' })
+      // o atalho do menu do microfone abre a aba na página principal
+      await page.getByTestId('voice-mic-menu-button').click()
+      await page.getByTestId('voice-settings-link').click()
+      await page.getByTestId('audio-settings').waitFor()
+      assert.equal(await page.getByTestId('audio-settings').getAttribute('data-view'), 'main')
+      assert(await page.getByTestId('audio-local-models-open').isVisible())
       await page.keyboard.press('Escape')
       await dialog().waitFor({ state: 'detached' })
     }

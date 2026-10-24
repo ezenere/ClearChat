@@ -617,14 +617,20 @@ const PROVS = [
 test('voiceCallReadiness: padrões de fábrica apontam o que falta (provedor de STT, Kokoro)', () => {
   const problems = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 })
   assert.equal(problems.length, 2)
-  assert.match(problems[0], /Transcrição: escolha um provedor em Configurações → Áudio/)
-  assert.match(problems[1], /Fala: baixe o modelo Kokoro/)
+  assert.match(
+    problems[0],
+    /Transcrição: escolha um modelo de transcrição em Configurações → Áudio/
+  )
+  assert.match(
+    problems[1],
+    /Fala: instale o Kokoro e uma voz em Configurações → Áudio → Modelos locais/
+  )
   // nenhum provedor que sirva transcrição cadastrado (ElevenLabs só fala) → aponta Provedores
   const none = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 }, null, null, [PROVS[1]])
   assert.match(none[0], /cadastre um provedor que sirva transcrição em Configurações → Provedores/)
   // com provedor cadastrado mas não escolhido → só "escolha"
   const pick = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 }, null, null, PROVS)
-  assert.match(pick[0], /Transcrição: escolha um provedor em Configurações → Áudio\./)
+  assert.match(pick[0], /Transcrição: escolha um modelo de transcrição em Configurações → Áudio\./)
 })
 
 test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo/backend', () => {
@@ -641,7 +647,7 @@ test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo
   // provedor escolhido apagado de Provedores
   assert.match(
     voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }, null, null, [PROVS[1]])[0],
-    /o provedor escolhido não existe mais/
+    /o provedor do modelo escolhido não existe mais/
   )
   // sem modelo
   assert.match(
@@ -653,7 +659,7 @@ test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo
   )
   // modo local sem modelo instalado
   const local: SttSettings = { ...STT0, mode: 'local', local: null }
-  assert.match(voiceCallReadiness({ sttSettings: local, ttsSettings: tts })[0], /motor local/)
+  assert.match(voiceCallReadiness({ sttSettings: local, ttsSettings: tts })[0], /Modelos locais/)
   // híbrido: basta um dos dois
   const hybridLocal: SttSettings = {
     ...STT0,
@@ -663,7 +669,7 @@ test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo
   assert.deepEqual(voiceCallReadiness({ sttSettings: hybridLocal, ttsSettings: tts }), [])
   assert.match(
     voiceCallReadiness({ sttSettings: { ...STT0, mode: 'hybrid' }, ttsSettings: tts })[0],
-    /híbrido\): escolha um provedor[^]*instale um modelo local/
+    /híbrido\): escolha um modelo de transcrição[^]*instale um modelo local/
   )
   // Chatterbox ainda não funciona
   const chatterbox: TtsSettings = {
@@ -675,7 +681,7 @@ test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo
   const ttsApi: TtsSettings = { ...TTS0, backend: 'api' }
   assert.match(
     voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApi })[0],
-    /Fala: escolha um provedor em Configurações → Áudio/
+    /Fala: escolha um modelo de fala em Configurações → Áudio/
   )
   const ttsApiNoModel: TtsSettings = {
     ...TTS0,

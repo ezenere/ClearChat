@@ -88,6 +88,8 @@ import { useHostInfo } from '../sync/hooks'
 import { BranchSwitcher } from './BranchSwitcher'
 import { reasoningHeader } from '../../lib/reasoning'
 import { CallMarker, EndCallLine, VoiceBadge } from './VoiceMarks'
+import { contributeCtx } from '../../lib/contextMenu'
+import { markdownToPlainText } from '@shared/contextMenu'
 
 // ---------- Bits ----------
 
@@ -562,7 +564,17 @@ function UserMessage({
   // mensagem digitada na principal: editar = nova versão (ramo); o resto edita no lugar
   const branch = isBranchEditable(msg, ctx.depth)
   return (
-    <div className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2">
+    <div
+      className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
+      onContextMenu={(e) =>
+        // botão direito: as mesmas ações da barra do hover (SPEC → "Menu de contexto")
+        !editing &&
+        contributeCtx(e, {
+          copy: { copyMessage: text },
+          run: canEdit ? { editMessage: () => setEditing(true) } : undefined
+        })
+      }
+    >
       {editing ? (
         <InlineEditor
           initial={text}
@@ -942,6 +954,13 @@ function InterChatMessage({
     <div
       data-testid="inter-chat-message"
       className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
+      onContextMenu={(e) =>
+        !editing &&
+        contributeCtx(e, {
+          copy: { copyMessage: text },
+          run: canEdit ? { editMessage: () => setEditing(true) } : undefined
+        })
+      }
     >
       {editing ? (
         <InlineEditor
@@ -1029,6 +1048,7 @@ function SubsessionUserMessage({
             : 'user-in-sub'
       }
       className="group/msg flex animate-slide-up flex-col items-end gap-1 py-2"
+      onContextMenu={(e) => contributeCtx(e, { copy: { copyMessage: text } })}
     >
       <OriginLabel>
         {from === 'parent' ? (
@@ -1183,7 +1203,21 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
   // última resposta de um turno: regenerar cria uma nova versão (a atual continua salva)
   const canRegen = canEdit && ctx.depth === 0 && ctx.regenTargets.has(msg.id)
   return (
-    <div className="group/msg animate-slide-up py-2">
+    <div
+      className="group/msg animate-slide-up py-2"
+      onContextMenu={(e) =>
+        !editing &&
+        contributeCtx(e, {
+          copy: { copyMessage: () => markdownToPlainText(content), copyMarkdown: content },
+          run: {
+            ...(canEdit ? { editMessage: () => setEditing(true) } : {}),
+            ...(canRegen
+              ? { regenerate: () => void useStore.getState().regenerate(ctx.sessionId, msg.id) }
+              : {})
+          }
+        })
+      }
+    >
       {m.reasoning && (
         <Reasoning
           text={m.reasoning}
@@ -1283,7 +1317,10 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
 function OrphanTool({ msg, canEdit }: { msg: StoredMessage; canEdit: boolean }): React.JSX.Element {
   const text = msg.message.role === 'tool' ? messageText(msg.message.content) : ''
   return (
-    <div className="group/msg py-1.5">
+    <div
+      className="group/msg py-1.5"
+      onContextMenu={(e) => contributeCtx(e, { copy: { copyMessage: text } })}
+    >
       <div className="rounded-xl border border-border bg-surface/70 px-3.5 py-2.5">
         <div className="mb-1 flex items-center gap-1.5 text-[11px] text-subtle">
           Resultado de tool <MessageInfo msg={msg} />

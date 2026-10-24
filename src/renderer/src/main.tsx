@@ -5,6 +5,7 @@ import { createRoot } from 'react-dom/client'
 import App from './App'
 import { installApi } from './lib/api'
 import { setupRemoteSources } from './lib/remoteSourcesSetup'
+import { installContextMenuBridge } from './lib/contextMenu'
 
 async function start(): Promise<void> {
   // Mock de desenvolvimento (apenas para screenshots/design sem backend). A condição é
@@ -26,6 +27,8 @@ async function start(): Promise<void> {
   }
   // fonte remota de arquivos (chat em controle remoto: busca do host pelo sync)
   setupRemoteSources()
+  // botão direito: ações do app (mensagem, código, arquivo) no menu nativo do main
+  installContextMenuBridge()
   createRoot(document.getElementById('root')!).render(
     <StrictMode>
       <App />

@@ -36,11 +36,11 @@ import {
 import type { TtsSettings } from '@shared/voice'
 import {
   ELEVENLABS_OUTPUT_FORMAT,
-  ELEVENLABS_SAMPLE_RATE,
   elevenLabsConfig,
   elevenLabsError,
   elevenLabsErrorDetail,
   elevenLabsHeaders,
+  elevenLabsRate,
   elevenLabsWsSupportsModel,
   isElevenLabsEndpoint,
   type ElevenLabsConfig
@@ -115,6 +115,8 @@ export function elevenLabsWsUrl(
   cfg: Pick<ElevenLabsSocketOptions, 'baseUrl' | 'voiceId' | 'modelId' | 'languageCode'> & {
     autoMode?: boolean
     inactivityTimeoutS?: number
+    outputFormat?: string
+    textNormalization?: 'on' | 'off' | null
   }
 ): string {
   const u = new URL(cfg.baseUrl)
@@ -122,10 +124,11 @@ export function elevenLabsWsUrl(
   u.pathname = `${u.pathname.replace(/\/+$/, '')}/v1/text-to-speech/${encodeURIComponent(cfg.voiceId)}/multi-stream-input`
   const q = new URLSearchParams()
   q.set('model_id', cfg.modelId)
-  q.set('output_format', ELEVENLABS_OUTPUT_FORMAT)
+  q.set('output_format', cfg.outputFormat ?? ELEVENLABS_OUTPUT_FORMAT)
   q.set('inactivity_timeout', String(cfg.inactivityTimeoutS ?? ELEVENLABS_WS_INACTIVITY_S))
   if (cfg.languageCode) q.set('language_code', cfg.languageCode)
   if (cfg.autoMode) q.set('auto_mode', 'true')
+  if (cfg.textNormalization) q.set('apply_text_normalization', cfg.textNormalization)
   u.search = q.toString()
   return u.toString()
 }
@@ -171,6 +174,8 @@ const configKey = (o: ElevenLabsSocketOptions): string =>
     o.chunkLengthSchedule ?? null,
     o.voiceSettings ?? null,
     !!o.autoMode,
+    o.outputFormat ?? null,
+    o.textNormalization ?? null,
     o.inactivityTimeoutS ?? null
   ])
 
@@ -350,7 +355,7 @@ export class ElevenLabsContext {
     }
     return {
       streaming: true,
-      sampleRate: ELEVENLABS_SAMPLE_RATE,
+      sampleRate: this.#sock.sampleRate,
       model,
       backend: 'api',
       t0: this.firstTextAt ?? this.#sock.now(),
@@ -486,6 +491,16 @@ export class ElevenLabsSocket {
 
   get audioTimeoutMs(): number {
     return this.#o.audioTimeoutMs ?? ELEVENLABS_WS_AUDIO_TIMEOUT_MS
+  }
+
+  /** Taxa do PCM que o socket recebe (a do `output_format` pedido). */
+  get sampleRate(): number {
+    return elevenLabsRate(this.#o)
+  }
+
+  /** `auto_mode=true`: só frases completas entram no contexto (sem palavra a palavra). */
+  get autoMode(): boolean {
+    return !!this.#o.autoMode
   }
 
   get state(): 'idle' | 'connecting' | 'open' | 'closed' {
@@ -962,6 +977,9 @@ export class ElevenLabsCallTts implements TtsTextFeed {
   partial(text: string): void {
     const sock = this.#socket()
     if (!sock) return
+    // auto_mode: a ElevenLabs gera ao receber o texto (sem buffer) — palavra solta pioraria a
+    // prosódia; só a frase inteira entra (no `cut`)
+    if (sock.autoMode) return
     const rest = text.replace(/^\s+/, '')
     if (!rest) return
     const cur = this.#current()
@@ -1033,7 +1051,7 @@ export class ElevenLabsCallTts implements TtsTextFeed {
       if (turn.ctx.error || turn.ctx.aborted) break // a resposta falhou: contexto avulso
       return {
         streaming: true,
-        sampleRate: ELEVENLABS_SAMPLE_RATE,
+        sampleRate: sock.sampleRate,
         model,
         backend: 'api',
         t0: item.cutAt,
@@ -1103,7 +1121,7 @@ export class ElevenLabsCallTts implements TtsTextFeed {
   #open(sock: ElevenLabsSocket): Turn {
     const ctx = this.#newContext(sock)
     ctx.multi = true
-    const seg = new AlignedPcmSegmenter({ sampleRate: ELEVENLABS_SAMPLE_RATE })
+    const seg = new AlignedPcmSegmenter({ sampleRate: sock.sampleRate })
     const turn: Turn = {
       ctx,
       seg,

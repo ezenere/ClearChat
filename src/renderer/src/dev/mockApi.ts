@@ -2838,6 +2838,19 @@ export function createMockApi(scenario: string): ClearApi {
                 )
               }
               void input
+              // ElevenLabs direto com o formato de saída do plano Pro (conta sem Pro): o mesmo texto
+              // que o main gera do 403 `output_format_not_allowed`
+              const el = providers.find((p) => p.id === tts.api.providerId)
+              if (
+                tts.backend === 'api' &&
+                el?.kind === 'elevenlabs' &&
+                tts.api.params?.elevenlabs?.output_format === 'pcm_44100'
+              ) {
+                await delay(undefined, 200)
+                throw new Error(
+                  'TtsError: O formato de saída 44,1 kHz exige o plano Pro da ElevenLabs — escolha outro formato em Configurações → Áudio → Parâmetros'
+                )
+              }
               return fakeSynth('wav')
             },
             clips: {

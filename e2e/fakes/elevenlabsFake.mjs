@@ -37,7 +37,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  * - `idleCloseMs` (fecha o socket ocioso — simula o `inactivity_timeout`)
  * - `dropOnFirstFlush` (derruba a 1ª conexão no 1º flush, antes do áudio — testa o reenvio)
  * - `alignment` (padrão true): alinhamento de caracteres junto do áudio, como o da ElevenLabs
+ * - `planTier` (padrão 'pro'): 'creator' recusa os formatos do Pro (`pcm_44100`) com o 403
+ *   `output_format_not_allowed` exato da API (REST) / frame de erro + fechamento (WebSocket)
  */
+
+/** Formatos PCM aceitos (o fake gera o mesmo PCM falso — a taxa só muda o cabeçalho do cliente). */
+const PCM_FORMAT = /^pcm_(8000|16000|22050|24000|32000|44100|48000)$/
+const PRO_FORMATS = new Set(['pcm_44100', 'wav_44100'])
+const formatNotAllowed = (f) => ({
+  detail: {
+    type: 'authorization_error',
+    code: 'subscription_required',
+    message: `Output format '${f}' is only available on the Pro tier and above.`,
+    status: 'output_format_not_allowed',
+    request_id: 'fake'
+  }
+})
 export async function startElevenLabsFake(opts = {}) {
   const state = {
     apiKey: opts.apiKey ?? 'test-key',
@@ -57,6 +72,7 @@ export async function startElevenLabsFake(opts = {}) {
       { model_id: 'eleven_v3', name: 'Eleven v3', can_do_text_to_speech: true },
       { model_id: 'scribe_v1', name: 'Scribe', can_do_text_to_speech: false }
     ],
+    planTier: opts.planTier ?? 'pro',
     samplesPerChar: opts.samplesPerChar ?? DEFAULT_SAMPLES_PER_CHAR,
     chunkSamples: opts.chunkSamples ?? 2400,
     firstAudioDelayMs: opts.firstAudioDelayMs ?? 20,
@@ -148,8 +164,10 @@ export async function startElevenLabsFake(opts = {}) {
         }
         if (typeof j.text !== 'string' || !j.text.trim())
           return json(res, 400, { detail: { status: 'invalid_text', message: 'text required' } })
-        if (url.searchParams.get('output_format') !== 'pcm_24000')
-          protocolErrors.push(`REST output_format=${url.searchParams.get('output_format')}`)
+        const fmt = url.searchParams.get('output_format') ?? ''
+        if (!PCM_FORMAT.test(fmt)) protocolErrors.push(`REST output_format=${fmt}`)
+        if (state.planTier !== 'pro' && PRO_FORMATS.has(fmt))
+          return json(res, 403, formatNotAllowed(fmt))
         const total = j.text.length * state.samplesPerChar
         res.writeHead(200, { 'content-type': 'audio/pcm' })
         let sent = 0
@@ -190,7 +208,7 @@ export async function startElevenLabsFake(opts = {}) {
       clientClosed: false
     }
     connections.push(conn)
-    if (conn.query.output_format !== 'pcm_24000')
+    if (!PCM_FORMAT.test(conn.query.output_format ?? ''))
       protocolErrors.push(`WS output_format=${conn.query.output_format}`)
     if (!conn.query.model_id) protocolErrors.push('WS sem model_id')
     /** contextos: id → { buffer, flushed, closed, generating, sentSamples, finalSent } */
@@ -281,6 +299,12 @@ export async function startElevenLabsFake(opts = {}) {
         if (!state.voices[voiceId]) {
           send({ message: `voice_id ${voiceId} not found`, error: 'voice_not_found', code: 1008 })
           ws.close(1008, 'voice_not_found')
+          return
+        }
+        if (state.planTier !== 'pro' && PRO_FORMATS.has(conn.query.output_format)) {
+          const d = formatNotAllowed(conn.query.output_format).detail
+          send({ message: d.message, error: d.status, code: 1008 })
+          ws.close(1008, d.status)
           return
         }
         if (state.mode === 'quota') {

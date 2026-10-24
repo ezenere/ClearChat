@@ -188,6 +188,18 @@ export async function clipsHash(
     model: settings.backend === 'api' ? settings.api.model : null,
     // OmniVoice: os passos mudam o som → clipes novos (ausente nos outros backends: hash igual ao de antes)
     ...(settings.backend === 'gpu' && settings.gpu?.steps ? { steps: settings.gpu.steps } : {}),
+    // parâmetros do modelo remoto (formato de saída, voice_settings, speed…) mudam o som; o
+    // `auto_mode` só muda a chamada (ausente/vazio → hash igual ao de antes)
+    ...(() => {
+      if (settings.backend !== 'api' || !settings.api.params) return {}
+      const p = JSON.parse(JSON.stringify(settings.api.params)) as Record<
+        string,
+        Record<string, unknown>
+      >
+      if (p.elevenlabs) delete p.elevenlabs.auto_mode
+      for (const k of Object.keys(p)) if (!Object.keys(p[k]).length) delete p[k]
+      return Object.keys(p).length ? { apiParams: p } : {}
+    })(),
     // parâmetros do motor da GPU (velocidade, temperatura…) também mudam o som
     ...(settings.backend === 'gpu' && settings.gpu
       ? {

@@ -1,6 +1,8 @@
 // E2E contra o MOCK de UI (Playwright `_electron`, sem backend/GPU/chave) do "Modo avançado (GPU
-// local)" em Configurações → Áudio (`components/voice/gpu/`, mock em `dev/mockGpu.ts`): seção
-// fechada por padrão; hardware só com os fatos (sem banner de veredito — a compat fica em cada
+// local)" — agora dentro de Configurações → Áudio → "Modelos locais" (sub-tela com "← Áudio";
+// `components/voice/gpu/`, mock em `dev/mockGpu.ts`): fora da página principal e sempre aberta na
+// sub-tela; sem motor instalado nenhum grupo "Local (GPU)" no seletor de Modelo (instalado, o motor
+// aparece lá e escolher define backend + motor); hardware só com os fatos (sem banner de veredito — a compat fica em cada
 // motor; uma linha curta só quando nada roda); servidor local só leitura ("liga sozinho");
 // chamada com a GPU: barra em "Preparando a GPU…" (aviso de uso, pouca VRAM, falha encerra) e
 // depois "Ouvindo…"; runtime com progresso/cancelar; motor
@@ -104,12 +106,55 @@ async function openChat(scenario: string): Promise<void> {
   await page.waitForTimeout(300)
 }
 
-/** Expande o Modo avançado e espera o status. */
+const inLocal = async (): Promise<boolean> => (await tid('audio-local-models').count()) > 0
+
+/** Abre a sub-tela "Modelos locais" (onde mora o Modo avançado). */
+async function toLocal(): Promise<void> {
+  if (await inLocal()) return
+  await tid('audio-local-models-open').click()
+  await tid('audio-local-models').waitFor()
+}
+
+/** Volta para a página principal de Áudio ("← Áudio"). */
+async function toMain(): Promise<void> {
+  if (!(await inLocal())) return
+  await tid('audio-local-back').click()
+  await tid('stt-section').waitFor()
+}
+
+/** Abre "Modelos locais" e espera o status da GPU (a seção fica sempre aberta lá). */
 async function expandGpu(): Promise<void> {
-  if ((await tid('gpu-mode-toggle').getAttribute('aria-expanded')) !== 'true')
-    await tid('gpu-mode-toggle').click()
+  await toLocal()
   await tid('gpu-hardware').waitFor({ timeout: 5000 })
   await page.waitForTimeout(250)
+}
+
+/** Grupos do seletor de modelo (cabeçalhos) na página principal. */
+async function pickerGroups(testId: string): Promise<string[]> {
+  await toMain()
+  await tid(testId).click()
+  const list = page.getByRole('listbox', { name: 'Modelos' })
+  await list.locator('[data-testid="model-group"]').first().waitFor({ timeout: 4000 })
+  await page.waitForTimeout(250)
+  const g = await list
+    .locator('[data-testid="model-group"]')
+    .evaluateAll((els) => els.map((e) => (e as HTMLElement).innerText.replace(/\s+/g, ' ')))
+  await page.keyboard.press('Escape')
+  return g
+}
+
+/** Escolhe um motor do grupo "Local (GPU)" no seletor de Modelo (Fala ou Transcrição). */
+async function pickGpu(testId: 'tts-model' | 'stt-model', model?: string): Promise<void> {
+  await toMain()
+  await scrollTo(testId === 'tts-model' ? 'tts-section' : 'stt-section')
+  await tid(testId).click()
+  const list = page.getByRole('listbox', { name: 'Modelos' })
+  await list
+    .locator(`[role=option][data-provider="Local (GPU)"]${model ? `[data-model="${model}"]` : ''}`)
+    .first()
+    .click()
+  await list.waitFor({ state: 'detached', timeout: 4000 })
+  await page.waitForTimeout(300)
 }
 
 async function scrollTo(testId: string): Promise<void> {
@@ -117,23 +162,6 @@ async function scrollTo(testId: string): Promise<void> {
     .first()
     .evaluate((e) => e.scrollIntoView({ block: 'start' }))
   await page.waitForTimeout(200)
-}
-
-/** Opções do Select (gatilho pelo aria-label) com o estado desabilitado. */
-async function selectOptions(label: string): Promise<{ text: string; disabled: boolean }[]> {
-  await page.getByRole('button', { name: label, exact: true }).click()
-  await page.waitForTimeout(200)
-  const opts = await popover()
-    .getByRole('button')
-    .evaluateAll((els) =>
-      els.map((e) => ({
-        text: (e as HTMLElement).innerText,
-        disabled: (e as HTMLButtonElement).disabled
-      }))
-    )
-  await page.keyboard.press('Escape')
-  await page.waitForTimeout(150)
-  return opts
 }
 
 async function choose(label: string, option: string | RegExp): Promise<void> {
@@ -243,30 +271,25 @@ app.on('window-all-closed', () => app.quit())
 
   // ---------------- fechado por padrão + backend desabilitado ----------------
 
-  await step('seção fechada por padrão; Fala "Local (GPU)" desabilitada com o link', async () => {
-    await openAudio('gpu-ok')
-    assert.equal(await attr('gpu-mode-toggle', 'aria-expanded'), 'false')
-    assert.equal(await tid('gpu-mode-body').count(), 0, 'corpo da seção visível fechado')
-    assert(await tid('gpu-mode-summary').isVisible(), 'resumo da seção fechada')
-    const opts = await selectOptions('Provedor da fala')
-    const gpu = opts.find((o) => o.text.startsWith('Local (GPU)'))
-    assert(gpu, `sem opção GPU: ${opts.map((o) => o.text).join(' | ')}`)
-    assert.equal(gpu.disabled, true, 'opção GPU habilitada sem motor')
-    assert.match(gpu.text, /Modo avançado/)
-    assert(await tid('tts-gpu-hint').isVisible(), 'dica do backend GPU')
-    const stt = await selectOptions('Provedor da transcrição')
-    assert.equal(
-      stt.find((o) => o.text.startsWith('Local (GPU)'))?.disabled,
-      true,
-      'STT GPU habilitado'
-    )
-    await scrollTo('tts-section')
-    await shot('01-tts-gpu-disabled')
-    // o link abre a seção e rola até os motores
-    await tid('tts-gpu-install-link').click()
-    await tid('gpu-engines').waitFor({ timeout: 3000 })
-    assert.equal(await attr('gpu-mode-toggle', 'aria-expanded'), 'true')
-  })
+  await step(
+    'Modo avançado só em "Modelos locais" (sempre aberto lá); sem motor instalado nenhum grupo "Local (GPU)"',
+    async () => {
+      await openAudio('gpu-ok')
+      assert.equal(await tid('gpu-mode-section').count(), 0, 'Modo avançado na página principal')
+      assert.equal(await tid('tts-gpu-hint').count(), 0, 'dica antiga do provedor GPU')
+      const tts = await pickerGroups('tts-model')
+      const stt = await pickerGroups('stt-model')
+      assert(!tts.some((g) => /Local \(GPU\)/.test(g)), `Fala: ${tts.join(' | ')}`)
+      assert(!stt.some((g) => /Local \(GPU\)/.test(g)), `Transcrição: ${stt.join(' | ')}`)
+      await scrollTo('tts-section')
+      await shot('01-no-gpu-group')
+      await toLocal()
+      assert.equal(await attr('gpu-mode-section', 'data-expanded'), 'true')
+      assert.equal(await tid('gpu-mode-toggle').count(), 0, 'recolher dentro da sub-tela')
+      await tid('gpu-engines').waitFor({ timeout: 3000 })
+      return `Fala: ${tts.join(' | ')}`
+    }
+  )
 
   await step(
     'gpu-ok: hardware sem banner de veredito, ordem dos motores, instalar sem runtime avisa que baixa junto',
@@ -388,51 +411,57 @@ app.on('window-all-closed', () => app.quit())
     return m.trim()
   })
 
-  await step('Fala: "Local (GPU)" habilitado → motor + vozes em grupos; CC0 "Baixar"', async () => {
-    await scrollTo('tts-section')
-    await choose('Provedor da fala', /^Local \(GPU\)/)
-    await tid('tts-gpu').waitFor()
-    assert.equal(await tid('tts-gpu-hint').count(), 0, 'dica com motor instalado')
-    assert.match(
-      await page.getByRole('button', { name: 'Motor de fala da GPU', exact: true }).innerText(),
-      /OmniVoice/
-    )
-    // OmniVoice só clona: sem voz → erro de prontidão até baixar a CC0
-    assert.match(await tid('tts-gpu-readiness').innerText(), /voz de referência/)
-    // seletor de voz no desenho do seletor de modelo: grupos por origem, ações dentro do grupo
-    await tid('gpu-voice').click()
-    await tid('gpu-voice-menu').waitFor()
-    assert(await tid('gpu-voice-group-cc0').isVisible(), 'grupo CC0')
-    assert(await tid('gpu-voice-group-user').isVisible(), 'grupo Minhas vozes')
-    await tid('gpu-cc0-download').click()
-    await tid('gpu-voice-cc0-faber').waitFor({ timeout: 4000 })
-    await waitFor(
-      async () => (await attr('gpu-voice', 'data-value')) === 'cc0-faber',
-      3000,
-      'CC0 escolhida'
-    )
-    assert.equal(await attr('gpu-voice-cc0-faber', 'aria-selected'), 'true')
-    await waitFor(
-      async () => !/voz de referência/.test(await tid('tts-gpu').innerText()),
-      3000,
-      'prontidão sem erro de voz'
-    )
-    await tid('gpu-voice-preview-cc0-faber').click()
-    await waitFor(
-      async () => (await attr('gpu-voice-preview-cc0-faber', 'data-state')) !== 'busy',
-      4000,
-      'prévia'
-    )
-    assert.equal(await tid('tts-gpu-error').count(), 0, 'erro na prévia')
-    await shot('05-tts-gpu-panel')
-    await page.keyboard.press('Escape')
-  })
+  await step(
+    'Fala: grupo "Local (GPU)" com o motor instalado → voz em grupos; CC0 "Baixar"',
+    async () => {
+      const groups = await pickerGroups('tts-model')
+      assert(
+        groups.some((g) => /^Local \(GPU\) 1/.test(g)),
+        `grupo GPU: ${groups.join(' | ')}`
+      )
+      await pickGpu('tts-model', 'omnivoice')
+      await tid('tts-gpu').waitFor()
+      assert.equal(await attr('tts-model', 'data-value'), 'omnivoice')
+      assert.match(await tid('tts-model').innerText(), /Local \(GPU\)[\s\S]*OmniVoice/)
+      // OmniVoice só clona: sem voz → erro de prontidão até baixar a CC0
+      assert.match(await tid('tts-gpu-readiness').innerText(), /voz de referência/)
+      // seletor de voz no desenho do seletor de modelo: grupos por origem, ações dentro do grupo
+      await tid('gpu-voice').click()
+      await tid('gpu-voice-menu').waitFor()
+      assert(await tid('gpu-voice-group-cc0').isVisible(), 'grupo CC0')
+      assert(await tid('gpu-voice-group-user').isVisible(), 'grupo Minhas vozes')
+      await tid('gpu-cc0-download').click()
+      await tid('gpu-voice-cc0-faber').waitFor({ timeout: 4000 })
+      await waitFor(
+        async () => (await attr('gpu-voice', 'data-value')) === 'cc0-faber',
+        3000,
+        'CC0 escolhida'
+      )
+      assert.equal(await attr('gpu-voice-cc0-faber', 'aria-selected'), 'true')
+      await waitFor(
+        async () => !/voz de referência/.test(await tid('tts-gpu').innerText()),
+        3000,
+        'prontidão sem erro de voz'
+      )
+      await tid('gpu-voice-preview-cc0-faber').click()
+      await waitFor(
+        async () => (await attr('gpu-voice-preview-cc0-faber', 'data-state')) !== 'busy',
+        4000,
+        'prévia'
+      )
+      assert.equal(await tid('tts-gpu-error').count(), 0, 'erro na prévia')
+      await shot('05-tts-gpu-panel')
+      await page.keyboard.press('Escape')
+    }
+  )
 
   await step(
     'clonar voz por UPLOAD: duração, nome, salvar → em Minhas vozes e no seletor',
     async () => {
       await tid('gpu-voice').click()
       await tid('gpu-voice-add-mine').click()
+      // "Gravar ou enviar…" leva à sub-tela Modelos locais com o formulário aberto
+      await tid('audio-local-models').waitFor({ timeout: 3000 })
       await tid('gpu-clone-form').waitFor({ timeout: 3000 })
       await tid('gpu-clone-file').setInputFiles(wavPath)
       await tid('gpu-clone-sample').waitFor({ timeout: 4000 })
@@ -452,7 +481,9 @@ app.on('window-all-closed', () => app.quit())
       await tid('gpu-clone-save').click()
       await tid('gpu-clone-form').waitFor({ state: 'detached', timeout: 4000 })
       await tid('gpu-user-voice-user-1').waitFor()
-      // aparece no grupo "Minhas vozes" do seletor de voz do painel de Fala
+      // aparece no grupo "Minhas vozes" do seletor de voz do painel de Fala (página principal)
+      await toMain()
+      await scrollTo('tts-section')
       await tid('gpu-voice').click()
       await tid('gpu-voice-group-user').getByTestId('gpu-voice-user-1').waitFor({ timeout: 3000 })
       await tid('gpu-voice-user-1').click()
@@ -466,19 +497,24 @@ app.on('window-all-closed', () => app.quit())
   )
 
   await step('Passos do OmniVoice: 32 grava e reflete nos dois controles', async () => {
+    await toMain()
+    await tid('tts-gpu-steps-32').click()
+    await page.waitForTimeout(300)
+    await toLocal()
     if ((await attr('gpu-engine-params-omnivoice', 'data-open')) !== 'true')
       await tid('gpu-engine-params-omnivoice-toggle').click()
-    await tid('tts-gpu-steps-32').click()
     await waitFor(
       async () => (await attr('gpu-omnivoice-steps-32', 'aria-checked')) === 'true',
       3000,
       'passos 32 no card'
     )
-    await tid('tts-gpu-steps-16').click()
+    await tid('gpu-omnivoice-steps-16').click()
+    await page.waitForTimeout(300)
+    await toMain()
     await waitFor(
-      async () => (await attr('gpu-omnivoice-steps-16', 'aria-checked')) === 'true',
+      async () => (await attr('tts-gpu-steps-16', 'aria-checked')) === 'true',
       3000,
-      'passos 16 no card'
+      'passos 16 no painel de Fala'
     )
   })
 
@@ -510,12 +546,11 @@ app.on('window-all-closed', () => app.quit())
     assert.match(lat['whisper-large-v3-turbo'], /~100 ms por frase/)
     await scrollTo('gpu-server')
     await shot('07-gpu-installed')
-    await scrollTo('stt-section')
-    await choose('Provedor da transcrição', /^Local \(GPU\)/)
+    await pickGpu('stt-model', 'whisper-large-v3-turbo')
     await tid('stt-gpu').waitFor()
     assert.match(await tid('stt-gpu-state').innerText(), /instalado/)
-    assert.equal(await tid('stt-api').count(), 0, 'provedor de API no modo GPU')
-    assert.equal(await tid('stt-local-engine').count(), 0, 'whisper.cpp no modo GPU')
+    assert.equal(await tid('stt-api-params').count(), 0, 'parâmetros de API no modo GPU')
+    assert.equal(await tid('stt-local').count(), 0, 'whisper.cpp no modo GPU')
     await shot('08-stt-gpu')
     return Object.values(lat).join(' | ')
   })
@@ -523,6 +558,7 @@ app.on('window-all-closed', () => app.quit())
   await step(
     'clonar voz GRAVANDO (microfone injetado): contagem, nível, transcrever automaticamente',
     async () => {
+      await toLocal()
       await scrollTo('gpu-user-voices')
       await tid('gpu-voice-add').click()
       await tid('gpu-clone-form').waitFor()
@@ -567,17 +603,20 @@ app.on('window-all-closed', () => app.quit())
   )
 
   await step(
-    'pré-checagem da chamada: motor da fala removido → toast aponta o Modo avançado',
+    'pré-checagem da chamada: motor da fala removido → toast aponta Modelos locais',
     async () => {
-      await scrollTo('tts-section')
-      await choose('Provedor da fala', /^Local \(GPU\)/)
+      await pickGpu('tts-model', 'omnivoice')
       await tid('tts-gpu').waitFor()
+      await toLocal()
       await tid('gpu-engine-action-omnivoice').click() // Remover
       await waitFor(
         async () => (await attr('gpu-engine-omnivoice', 'data-install')) === 'absent',
         3000,
         'OmniVoice removido'
       )
+      await toMain()
+      // a seleção continua no OmniVoice (marcado "não instalado" no seletor) com a prontidão
+      await tid('tts-model-local-missing').waitFor()
       const ready = await tid('tts-gpu-readiness').innerText()
       assert.match(ready, /instale o motor OmniVoice/i)
       await scrollTo('tts-section')
@@ -596,7 +635,7 @@ app.on('window-all-closed', () => app.quit())
       const text = await toast.innerText()
       assert.match(
         text,
-        /Fala \(GPU local\): instale o motor OmniVoice em Configurações → Áudio → Modo avançado/
+        /Fala \(GPU local\): instale o motor OmniVoice em Configurações → Áudio → Modelos locais/
       )
       await shot('12-call-readiness-toast')
       return text.slice(0, 160)
@@ -971,11 +1010,10 @@ app.on('window-all-closed', () => app.quit())
       )
       await tid('gpu-engine-params-xtts-v2').scrollIntoViewIfNeeded()
       await shot('28-params-card-xtts')
-      // painel de Fala com o XTTS: o mesmo valor (gravado nas settings)
-      await scrollTo('tts-section')
-      await choose('Provedor da fala', /^Local \(GPU\)/)
+      // painel de Fala com o XTTS (escolhido no seletor de Modelo): o mesmo valor (gravado)
+      await page.waitForTimeout(400)
+      await pickGpu('tts-model', 'xtts-v2')
       await tid('tts-gpu').waitFor()
-      await choose('Motor de fala da GPU', /XTTS/)
       await tid('tts-gpu-params-toggle').click()
       await waitFor(
         async () => (await tid('tts-gpu-params-speed-value').innerText()) === '1,25×',
@@ -986,11 +1024,15 @@ app.on('window-all-closed', () => app.quit())
       await shot('29-params-tts-panel')
       await tid('tts-gpu-params-restore').click()
       await waitFor(
-        async () => (await tid('gpu-engine-params-xtts-v2-speed-value').innerText()) === '1,15×',
+        async () => (await tid('tts-gpu-params-count').count()) === 0,
         3000,
-        'restaurado no card'
+        'restaurado no painel'
       )
       assert.equal(await tid('tts-gpu-params-restore').isDisabled(), true)
+      await page.waitForTimeout(300)
+      await toLocal()
+      await tid('gpu-engine-params-xtts-v2-toggle').click()
+      assert.equal(await tid('gpu-engine-params-xtts-v2-speed-value').innerText(), '1,15×')
       assert.equal(await tid('gpu-engine-params-xtts-v2-count').count(), 0)
     }
   )
@@ -998,8 +1040,7 @@ app.on('window-all-closed', () => app.quit())
   await step(
     'Parâmetros do whisper: painel de Transcrição (VAD liga, idioma, restaurar)',
     async () => {
-      await scrollTo('stt-section')
-      await choose('Provedor da transcrição', /^Local \(GPU\)/)
+      await pickGpu('stt-model', 'whisper-large-v3-turbo')
       await tid('stt-gpu').waitFor()
       await tid('stt-gpu-params-toggle').click()
       await tid('stt-gpu-params-vad_filter').getByRole('switch').click()
@@ -1014,14 +1055,18 @@ app.on('window-all-closed', () => app.quit())
         2000,
         'idioma gravado'
       )
-      // o card do whisper no Modo avançado mostra os mesmos valores
+      await tid('stt-gpu-params').scrollIntoViewIfNeeded()
+      await shot('30-params-whisper')
+      // o card do whisper em Modelos locais mostra os mesmos valores
+      await page.waitForTimeout(400)
+      await toLocal()
       await tid('gpu-engine-params-whisper-large-v3-turbo-toggle').click()
       assert.match(
         await tid('gpu-engine-params-whisper-large-v3-turbo-count').innerText(),
         /2 alterados/
       )
-      await tid('stt-gpu-params').scrollIntoViewIfNeeded()
-      await shot('30-params-whisper')
+      await toMain()
+      await tid('stt-gpu-params-toggle').click()
       await tid('stt-gpu-params-restore').click()
       await waitFor(
         async () => (await tid('stt-gpu-params-count').count()) === 0,

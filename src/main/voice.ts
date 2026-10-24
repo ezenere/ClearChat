@@ -79,7 +79,7 @@ export function getVoiceSettings(): VoiceSettings {
   const lookup = (id: string): Provider | null => providersRepo.get(id)
   return {
     ...v,
-    stt: { ...v.stt, api: resolveVoiceEndpoint(v.stt.api, lookup) },
+    stt: { ...v.stt, api: withTtsProviderKind(resolveVoiceEndpoint(v.stt.api, lookup), lookup) },
     tts: { ...v.tts, api: withTtsProviderKind(resolveVoiceEndpoint(v.tts.api, lookup), lookup) }
   }
 }

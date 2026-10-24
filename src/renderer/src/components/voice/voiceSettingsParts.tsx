@@ -1,10 +1,9 @@
 // Peças compartilhadas das seções de Transcrição (STT) e Fala (TTS) de Configurações → Áudio:
-// seletor de PROVEDOR (só os cadastrados em Configurações → Provedores que servem a capacidade +
-// as opções locais embutidas — o cadastro de endpoint fica centralizado em Provedores), seletor de
-// MODELO = o mesmo do chat
-// (`ModelPicker`, agrupado por provedor, com a latência medida/pt-BR à direita), seletor de VOZ no
-// mesmo desenho (busca, grupos, ▶ prévia por linha), motor/modelos locais e avisos. A chave real
-// nunca vem ao renderer (o main lista e sintetiza com ela).
+// seletor ÚNICO de MODELO = o mesmo do chat (`ModelPicker`: um grupo por provedor cadastrado que
+// serve a capacidade + "Local (CPU)"/"Local (GPU)" quando há modelo local instalado; latência
+// medida/pt-BR à direita), seletor de VOZ no mesmo desenho (busca, grupos, ▶ prévia por linha), a
+// lista de modelos locais (sub-tela "Modelos locais") e avisos. A chave real nunca vem ao renderer
+// (o main lista e sintetiza com ela).
 import {
   Check,
   ChevronDown,
@@ -21,12 +20,10 @@ import {
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { VoiceModelInfo } from '@shared/ipc'
 import type { ModelInfo } from '@shared/types'
-import type { SttLocalConfig } from '@shared/voice'
 import {
   callTtsWarning,
   formatLatency,
   resolveModelAlias,
-  voiceProviderSupport,
   type VoiceCapability,
   type VoiceCatalogModel,
   type VoiceCatalogVoice,
@@ -36,12 +33,8 @@ import type { ModelRef } from '@shared/models'
 import { cn } from '../../lib/format'
 import type { PickerModels } from '../../lib/modelPicker'
 import type { VoiceCatalogs } from '../../lib/voice/useVoiceCatalogs'
-import {
-  GPU_SOURCE,
-  LOCAL_SOURCE,
-  voiceProvidersFor,
-  type ProviderOption
-} from '../../lib/voice/voiceSettingsHelpers'
+import { voiceProvidersFor, type ProviderOption } from '../../lib/voice/voiceSettingsHelpers'
+import { isLocalGroup, type LocalModelGroup } from '../../lib/voice/voiceModelOptions'
 import {
   formatModelLanguages,
   formatModelSize,
@@ -49,109 +42,15 @@ import {
   type LocalModelAction
 } from '../../lib/voice/modelList'
 import { useStore } from '../../store'
-import { Button, IconButton, Label } from '../ui/controls'
+import { Button, IconButton } from '../ui/controls'
 import { Popover } from '../ui/layers'
 import { ModelPicker, type ModelPickerSource } from '../ui/ModelPicker'
-import { Select } from '../ui/Select'
-import { CARD, WarnNote } from './audioUi'
+import { WarnNote } from './audioUi'
 
 const FAMILY_LABEL: Record<VoiceProviderSupport, string> = {
   openrouter: 'OpenRouter',
   elevenlabs: 'ElevenLabs',
   openai: 'OpenAI-compatível'
-}
-
-const isLocalUrl = (url: string): boolean => {
-  try {
-    const h = new URL(url).hostname
-    return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
-  } catch {
-    return false
-  }
-}
-
-// ---------------- provedor ----------------
-
-/**
- * Provedor da transcrição/fala: os provedores de Configurações → Provedores que servem a
- * capacidade (um servidor local OpenAI-compatível cadastrado lá — `localhost`, sem chave — também
- * vale) + as opções embutidas: motor local (whisper.cpp / Kokoro) e "Local (GPU)" (Modo avançado).
- * `value` = providerId, `LOCAL_SOURCE`, `GPU_SOURCE` ou null (nenhum escolhido / provedor apagado).
- */
-export function VoiceSourceSelect({
-  capability,
-  providers,
-  value,
-  onChange,
-  local,
-  gpu,
-  testId
-}: {
-  capability: VoiceCapability
-  providers: ProviderOption[]
-  value: string | null
-  onChange: (v: string) => void
-  local: { label: string; description: string }
-  /** null = backend da GPU ausente neste build. */
-  gpu: { enabled: boolean; description: string } | null
-  testId: string
-}): React.JSX.Element {
-  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
-  const usable = voiceProvidersFor(providers, capability)
-  const what = capability === 'stt' ? 'transcrição' : 'fala'
-  return (
-    <div data-testid={testId}>
-      <Select
-        value={value}
-        label={capability === 'stt' ? 'Provedor da transcrição' : 'Provedor da fala'}
-        placeholder="Escolha um provedor…"
-        onChange={onChange}
-        options={[
-          ...usable.map((p) => {
-            const fam = voiceProviderSupport(p)
-            return {
-              value: p.id,
-              label: p.name,
-              description: [
-                fam ? FAMILY_LABEL[fam] : null,
-                p.baseUrl,
-                isLocalUrl(p.baseUrl) ? 'servidor local' : null
-              ]
-                .filter(Boolean)
-                .join(' · ')
-            }
-          }),
-          { value: LOCAL_SOURCE, label: local.label, description: local.description },
-          ...(gpu
-            ? [
-                {
-                  value: GPU_SOURCE,
-                  label: 'Local (GPU)',
-                  description: gpu.description,
-                  disabled: !gpu.enabled && value !== GPU_SOURCE
-                }
-              ]
-            : [])
-        ]}
-      />
-      {!usable.length && (
-        <p
-          className="mt-1.5 flex flex-wrap items-center gap-x-1.5 text-[11.5px] text-subtle"
-          data-testid={`${testId}-empty`}
-        >
-          Nenhum provedor cadastrado serve {what}. Cadastre o OpenRouter, a OpenAI, o Groq
-          {capability === 'tts' ? ', o ElevenLabs' : ''} ou um servidor local OpenAI-compatível em
-          <button
-            type="button"
-            onClick={() => setSettingsOpen(true, 'providers')}
-            className="inline-flex items-center gap-1 text-accent-strong hover:underline"
-          >
-            <Settings2 className="size-3" /> Provedores
-          </button>
-        </p>
-      )}
-    </div>
-  )
 }
 
 // ---------------- modelo ----------------
@@ -183,12 +82,14 @@ function ModelLatencyBadge({ m }: { m: VoiceCatalogModel }): React.JSX.Element |
 }
 
 /**
- * Modelo de STT/TTS no MESMO seletor do chat (`ModelPicker`): todos os provedores de voz numa lista
- * agrupada (contagem, busca "em todos os provedores ou digitar um ID", recarregar), com a latência
- * medida e o pt-BR à direita. Escolher um modelo de outro grupo troca o provedor junto. Lista
- * CURADA (TTS no OpenRouter/ElevenLabs): só os modelos medidos para a chamada; um id livre é aceito
- * com o aviso "não testado para chamada"; um salvo lento mostra a troca de um clique. Id fora da
- * lista com UM equivalente óbvio é corrigido sozinho (nota visível).
+ * Modelo de STT/TTS no MESMO seletor do chat (`ModelPicker`) — o ÚNICO seletor da seção (sem
+ * "Provedor" à parte): um grupo por provedor de voz cadastrado + "Local (CPU)" e "Local (GPU)"
+ * (`localGroups` — só existem com modelo local instalado). Escolher uma linha define tudo de uma
+ * vez (o chamador grava modo/backend + provedor + motor + modelo). Busca "em todos os provedores ou
+ * digitar um ID" (ID livre só nos provedores), latência medida e pt-BR à direita. Lista CURADA
+ * (TTS no OpenRouter/ElevenLabs): só os modelos medidos para a chamada; um id livre é aceito com o
+ * aviso "não testado para chamada"; um salvo lento mostra a troca de um clique. Id fora da lista
+ * com UM equivalente óbvio é corrigido sozinho (nota visível).
  */
 export function VoiceModelField({
   capability,
@@ -198,22 +99,27 @@ export function VoiceModelField({
   onChange,
   testId,
   family = null,
-  recommended
+  recommended,
+  localGroups = []
 }: {
   capability: VoiceCapability
   catalogs: VoiceCatalogs
   /** Provedores cadastrados (filtrados pela capacidade aqui). */
   providers: ProviderOption[]
-  /** Provedor + modelo salvos (providerId null = nenhum provedor escolhido: sem lista). */
+  /** Seleção atual (providerId = provedor ou grupo local; null = nada escolhido). */
   value: { providerId: string | null; model: string }
   onChange: (ref: ModelRef) => void
   testId: string
   family?: VoiceProviderSupport | null
   recommended?: { label: string; onUse: () => void }
+  /** Grupos "Local (CPU)"/"Local (GPU)" (vazios já filtrados — sem instalado, nenhum grupo). */
+  localGroups?: LocalModelGroup[]
 }): React.JSX.Element {
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const usable = useMemo(() => voiceProvidersFor(providers, capability), [providers, capability])
   const { entries, load } = catalogs
-  const state = catalogs.stateFor(value.providerId)
+  const local = isLocalGroup(value.providerId)
+  const state = catalogs.stateFor(local ? null : value.providerId)
   const catalog = state.catalog
   const what = capability === 'stt' ? 'transcrição' : 'fala'
 
@@ -224,6 +130,11 @@ export function VoiceModelField({
       for (const x of e?.catalog?.models ?? []) m.set(`${pid}\u0000${x.id}`, x)
     return m
   }, [entries])
+  const localByKey = useMemo(() => {
+    const m = new Map<string, LocalModelGroup['options'][number]>()
+    for (const g of localGroups) for (const o of g.options) m.set(`${g.id}\u0000${o.id}`, o)
+    return m
+  }, [localGroups])
   const source = useMemo<ModelPickerSource>(() => {
     const models: Record<string, PickerModels | undefined> = {}
     for (const p of usable) {
@@ -241,15 +152,36 @@ export function VoiceModelField({
         ...(e.error || e.catalog?.error ? { error: e.error ?? e.catalog?.error ?? undefined } : {})
       }
     }
-    return { providers: usable.map((p) => ({ id: p.id, name: p.name })), models, load }
-  }, [usable, entries, load])
+    for (const g of localGroups)
+      models[g.id] = {
+        status: 'ok',
+        list: g.options.map((o) => ({ id: o.id, name: o.name }))
+      }
+    // provedor cuja listagem já voltou vazia (ex.: LM Studio/Groq sem modelos de fala) não vira
+    // grupo — só polui; o escolhido no momento sempre aparece
+    const shown = usable.filter((p) => {
+      const m = models[p.id]
+      return p.id === value.providerId || !m || m.status !== 'ok' || m.list.length > 0
+    })
+    return {
+      providers: [
+        ...shown.map((p) => ({ id: p.id, name: p.name })),
+        ...localGroups.map((g) => ({ id: g.id, name: g.name, noFreeId: true }))
+      ],
+      models,
+      // os grupos locais não têm listagem remota
+      load: (id: string, force?: boolean) => {
+        if (!isLocalGroup(id)) load(id, force)
+      }
+    }
+  }, [usable, entries, load, localGroups, value.providerId])
 
-  const models = useMemo(() => catalog?.models ?? [], [catalog])
+  const models = useMemo(() => (local ? [] : (catalog?.models ?? [])), [catalog, local])
   const ids = useMemo(() => models.map((m) => m.id), [models])
-  const curated = !!catalog?.curated
+  const curated = !local && !!catalog?.curated
   const allIds = useMemo(
-    () => [...ids, ...(catalog?.hiddenModels ?? []).map((m) => m.id)],
-    [ids, catalog]
+    () => (local ? [] : [...ids, ...(catalog?.hiddenModels ?? []).map((m) => m.id)]),
+    [ids, catalog, local]
   )
   const [note, setNote] = useState<string | null>(null)
   const cur = value.model.trim()
@@ -267,7 +199,8 @@ export function VoiceModelField({
   }, [fixTo, pid, onChange])
   const unknown = !!cur && ids.length > 0 && !inList && !fix && !curated
   const untested = curated && !!cur && !inList && !fix
-  const fail = state.error ?? catalog?.error ?? null
+  const fail = local ? null : (state.error ?? catalog?.error ?? null)
+  const localSel = local ? localByKey.get(`${pid}\u0000${cur}`) : undefined
 
   return (
     <div>
@@ -280,9 +213,16 @@ export function VoiceModelField({
         source={source}
         testId={testId}
         label={`Modelo de ${what}`}
-        placeholder={pid ? 'Escolha um modelo…' : 'Escolha o provedor acima'}
+        placeholder="Escolha um modelo…"
         emptyText={`Nenhum provedor cadastrado serve ${what}.`}
         badges={(p, m) => {
+          const lo = localByKey.get(`${p}\u0000${m.id}`)
+          if (lo)
+            return lo.installed ? null : (
+              <span className="shrink-0 rounded-full border border-warning/30 px-1.5 py-px text-[10px] leading-4 text-warning">
+                não instalado
+              </span>
+            )
           const x = byKey.get(`${p}\u0000${m.id}`)
           return x?.ptVoices?.length ? (
             <span className="shrink-0 rounded-full border border-border px-1.5 py-px text-[10px] leading-4 text-subtle">
@@ -291,6 +231,9 @@ export function VoiceModelField({
           ) : null
         }}
         meta={(p, m) => {
+          const lo = localByKey.get(`${p}\u0000${m.id}`)
+          if (lo)
+            return lo.detail ? <span className="text-[10px] text-faint">{lo.detail}</span> : null
           const x = byKey.get(`${p}\u0000${m.id}`)
           if (!x) return null
           return (
@@ -302,6 +245,35 @@ export function VoiceModelField({
         }}
       />
       <div className="mt-1.5 space-y-1 empty:hidden">
+        {!usable.length && (
+          <p
+            className="flex flex-wrap items-center gap-x-1.5 text-[11.5px] text-subtle"
+            data-testid={`${testId}-empty`}
+          >
+            Nenhum provedor cadastrado serve {what}. Cadastre o OpenRouter, a OpenAI, o Groq
+            {capability === 'tts' ? ', o ElevenLabs' : ''} ou um servidor local OpenAI-compatível em
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true, 'providers')}
+              className="inline-flex items-center gap-1 text-accent-strong hover:underline"
+            >
+              <Settings2 className="size-3" /> Provedores
+            </button>
+          </p>
+        )}
+        {localSel && !localSel.installed && (
+          <WarnNote testId={`${testId}-local-missing`}>
+            {localSel.name} não está instalado neste computador —{' '}
+            <button
+              type="button"
+              className="underline underline-offset-2"
+              onClick={() => setSettingsOpen(true, 'audio:local')}
+            >
+              instale em Modelos locais
+            </button>
+            .
+          </WarnNote>
+        )}
         {state.loading && (
           <p
             className="flex items-center gap-1 text-[11.5px] text-subtle"
@@ -716,100 +688,7 @@ export function DismissibleError({
   )
 }
 
-// ---------------- motor/modelos locais ----------------
-
-/**
- * Motor local de STT: seletor de engine + status (espelho de `sttSettings.local.installed`) e a
- * lista dos modelos do catálogo por engine com download/remoção reais (progresso, estados e avisos
- * de `modelAction`). Erros de download/remoção viram aviso legível no painel.
- */
-export function LocalEnginePanel({
-  local,
-  models,
-  progress,
-  error,
-  onEngine,
-  onAction,
-  onDismissError,
-  runtimeProblem,
-  title = 'Motor local',
-  help = 'Transcrição no próprio computador com o whisper.cpp — baixe um modelo abaixo. Os arquivos ficam em userData/models (verificados por tamanho, magic bytes e sha256).',
-  children
-}: {
-  local: SttLocalConfig | null
-  models: VoiceModelInfo[]
-  progress: Record<string, { bytes: number; total: number }>
-  error: string | null
-  onEngine?: (engine: SttLocalConfig['engine']) => void
-  onAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
-  onDismissError: () => void
-  /** Modelo instalado mas o runtime não carrega (probe do main) — motivo legível. */
-  runtimeProblem?: string | null
-  title?: string
-  help?: string
-  /** Linha extra abaixo do cabeçalho (ex.: "modelo em uso" no híbrido). */
-  children?: ReactNode
-}): React.JSX.Element {
-  const engine = local?.engine ?? 'whisper.cpp'
-  return (
-    <div className={cn(CARD, 'px-3.5 py-3')} data-testid="stt-local-engine">
-      <div className="flex flex-wrap items-center gap-2">
-        <Label className="mb-0" help={help}>
-          {title}
-        </Label>
-        {onEngine ? (
-          <Select
-            value={engine}
-            label="Motor local de transcrição"
-            className="h-7 w-[150px] text-[12.5px]"
-            menuMinWidth={220}
-            onChange={(v) => onEngine(v as SttLocalConfig['engine'])}
-            options={[
-              { value: 'whisper.cpp', label: 'whisper.cpp' },
-              { value: 'vosk', label: 'vosk' },
-              { value: 'nemotron', label: 'nemotron' }
-            ]}
-          />
-        ) : (
-          <span className="font-mono text-[12px] text-muted">{engine}</span>
-        )}
-        <span
-          className={cn(
-            BADGE,
-            'ml-auto',
-            local?.installed ? 'border-success/30 text-success' : 'border-warning/30 text-warning'
-          )}
-        >
-          {local?.installed ? 'instalado' : 'não instalado'}
-        </span>
-      </div>
-      {children}
-      {runtimeProblem && (
-        <div className="mt-2">
-          <WarnNote testId="stt-runtime-warning">
-            Motor local não está pronto: {runtimeProblem}
-          </WarnNote>
-        </div>
-      )}
-      {error && (
-        <div className="mt-2">
-          <DismissibleError
-            error={error}
-            onDismiss={onDismissError}
-            testId="voice-model-error"
-            dismissLabel="Dispensar erro de modelos locais"
-          />
-        </div>
-      )}
-      <LocalModelList
-        kind="stt"
-        models={models.filter((m) => m.kind !== 'stt' || m.engine === engine)}
-        progress={progress}
-        onAction={onAction}
-      />
-    </div>
-  )
-}
+// ---------------- modelos locais (sub-tela "Modelos locais") ----------------
 
 /** Lista dos modelos locais agrupados por engine (nome, descrição, idiomas, tamanho). */
 export function LocalModelList({

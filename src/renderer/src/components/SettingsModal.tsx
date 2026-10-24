@@ -6,7 +6,7 @@ import { inferProviderKind, PROVIDER_KIND_LABEL, providerKind } from '@shared/pr
 import type { Provider } from '@shared/types'
 import { api, errorMessage } from '../lib/api'
 import { shortPath } from '../lib/format'
-import { useStore, type SettingsTab } from '../store'
+import { useStore, type SettingsTab, type SettingsTarget } from '../store'
 import { PresetEditor, PresetsList } from './presets/PresetsSettings'
 import { PresetIcon } from './presets/PresetIcon'
 import { ModelFieldInfo, SystemPromptInfo } from './apiDocs'
@@ -25,7 +25,7 @@ import { SkillsSettings } from './skills/SkillsSettings'
 import { AccountSettings } from './sync/AccountSettings'
 import { VersionFooter } from './UpdateNotice'
 import { AutoTitleSettings } from './AutoTitleSettings'
-import { AudioSettings } from './voice/AudioSettings'
+import { AudioSettings, AudioTitleAside } from './voice/AudioSettings'
 import { SettingsNav } from './SettingsNav'
 import { settingsNavItem } from '../lib/settingsNav'
 
@@ -308,7 +308,7 @@ export function SettingsModal(): React.JSX.Element {
   const tab = useStore((s) => s.settingsTab)
   const [editing, setEditing] = useState<string | 'new' | null>(null)
   const [editingPreset, setEditingPreset] = useState<string | 'new' | null>(null)
-  const setTab = (t: SettingsTab): void => {
+  const setTab = (t: SettingsTarget): void => {
     setOpen(true, t)
     setEditingPreset(null)
   }
@@ -340,12 +340,15 @@ export function SettingsModal(): React.JSX.Element {
           data-tab={tab}
           className="min-h-0 flex-1 overflow-y-auto px-5 pt-4 pb-5"
         >
-          <h3
-            id="settings-panel-title"
-            className="mb-3 text-[15px] font-semibold tracking-tight text-fg"
-          >
-            {item.label}
-          </h3>
+          <div className="mb-3 flex items-center gap-2">
+            <h3
+              id="settings-panel-title"
+              className="text-[15px] font-semibold tracking-tight text-fg"
+            >
+              {item.label}
+            </h3>
+            {tab === 'audio' && <AudioTitleAside />}
+          </div>
           <SettingsPanel
             tab={tab}
             editing={editing}

@@ -47,6 +47,7 @@ import { useHostInfo } from '../sync/hooks'
 import { Button, IconButton, Spinner, Switch } from '../ui/controls'
 import { Tip } from '../ui/Tooltip'
 import { Markdown } from '../chat/Markdown'
+import { contributeCtx } from '../../lib/contextMenu'
 import { fileIcon } from './fileIcons'
 import { stepZoom, VIEWER_MIN_WIDTH } from './viewerLayout'
 
@@ -716,6 +717,18 @@ export function FileViewerPane({
       data-testid="file-viewer"
       aria-label={`Arquivo: ${file.name}`}
       onKeyDown={onKeyDown}
+      onContextMenu={(e) =>
+        // botão direito: as mesmas ações da barra do painel (iframes de HTML/PDF têm o menu básico)
+        contributeCtx(e, {
+          copy: { fileCopyPath: resource?.info.path ?? file.path },
+          run: {
+            fileRun: runFile,
+            fileOpenExternal: openExternal,
+            fileShowInFolder: showInFolder,
+            fileSaveAs: saveAs
+          }
+        })
+      }
       style={{ width: shown }}
       className="relative flex shrink-0 animate-fade-in flex-col border-l border-border bg-surface"
     >

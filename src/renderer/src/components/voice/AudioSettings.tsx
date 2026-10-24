@@ -1,15 +1,16 @@
 // Configurações → Áudio, no padrão das outras abas (seções `h3` + (?) separadas por borda, campos
 // de largura total, `ToggleRow` com o switch à direita, linhas "rótulo … número"): ditado
 // (microfone padrão, idioma, push-to-talk com captura de tecla, auto-stop por silêncio),
-// transcrição (STT — `SttSettingsSection`: provedor de Configurações → Provedores ou motor
-// local/GPU, modelo no seletor do chat), fala (TTS — `TtsSettingsSection`: provedor/local/GPU,
-// modelo, voz com prévia, "Testar voz" e clipes), os padrões da chamada de voz (ligada, fim de
-// turno, modelo da chamada, interjeições/fillers) e, no fim, o "Modo avançado (GPU local)"
-// (`gpu/GpuModeSection`, fechado por padrão). Cada controle grava na hora via `saveVoiceSetting`
-// (espelho reativo `useVoiceSettings` — o composer e a chamada acompanham) e falha de gravação vira
-// aviso visível. Os provedores vêm do store (cadastro só em Configurações → Provedores); a chave
-// real nunca sai do main (contrato testado em `e2e/voiceSettings.test.ts`).
-import { TriangleAlert, X } from 'lucide-react'
+// transcrição (STT — `SttSettingsSection`) e fala (TTS — `TtsSettingsSection`) com UM seletor de
+// Modelo cada (provedores cadastrados + "Local (CPU)"/"Local (GPU)" quando há modelo instalado) e
+// os "Parâmetros" do modelo, e os padrões da chamada de voz (ligada, fim de turno, modelo da
+// chamada, interjeições/fillers). Tudo o que é modelo LOCAL (CPU e GPU — baixar/remover, runtime,
+// Modo avançado, suas vozes) mora na sub-tela "Modelos locais" (`LocalModelsScreen`, botão ao lado
+// do título "Áudio" — `AudioTitleAside`; "← Áudio" volta). Cada controle grava na hora via
+// `saveVoiceSetting` (espelho reativo `useVoiceSettings` — o composer e a chamada acompanham) e falha
+// de gravação vira aviso visível. Os provedores vêm do store (cadastro só em Configurações →
+// Provedores); a chave real nunca sai do main (contrato testado em `e2e/voiceSettings.test.ts`).
+import { HardDrive, TriangleAlert, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   VoiceModelInfo,
@@ -44,7 +45,7 @@ import { SttSettingsSection } from './SttSettingsSection'
 import { TtsSettingsSection } from './TtsSettingsSection'
 import { VoiceCallModelEditor } from './VoiceCallModelEditor'
 import { DelayPhrasesSettings } from './DelayPhrasesSettings'
-import { GpuModeSection } from './gpu/GpuModeSection'
+import { LocalModelsScreen } from './LocalModelsScreen'
 import type { ProviderOption } from '../../lib/voice/voiceSettingsHelpers'
 import { useInputDeviceList } from '../../lib/voice/useInputDevices'
 
@@ -73,8 +74,47 @@ const INTERJECTION_LABELS: Record<InterjectionClass, { label: string; example: s
   THINKING: { label: 'Pensando', example: '“hum…”, “deixa eu ver”' }
 }
 
+/**
+ * À direita do título "Áudio" (Configurações): o botão "Modelos locais" (abre a sub-tela) + (?);
+ * dentro da sub-tela, o caminho "› Modelos locais".
+ */
+export function AudioTitleAside(): React.JSX.Element {
+  const view = useStore((s) => s.settingsAudioView)
+  const setView = useStore((s) => s.setAudioSettingsView)
+  if (view === 'local')
+    return (
+      <span
+        className="text-[15px] font-semibold tracking-tight text-subtle"
+        data-testid="audio-title-crumb"
+      >
+        › Modelos locais
+      </span>
+    )
+  return (
+    <span className="flex items-center gap-1.5">
+      <Button
+        size="sm"
+        variant="secondary"
+        icon={<HardDrive className="size-3.5" />}
+        data-testid="audio-local-models-open"
+        onClick={() => setView('local')}
+      >
+        Modelos locais
+      </Button>
+      <HelpTip label="Modelos locais">
+        Tudo o que roda no seu computador: na CPU, o whisper.cpp/Vosk/Nemotron (transcrição) e o
+        Kokoro (fala) — baixar, remover, vozes; na GPU, o Modo avançado (hardware, runtime, motores
+        de voz e transcrição, parâmetros e as suas vozes). Os instalados aparecem no seletor de
+        Modelo desta página, nos grupos “Local (CPU)” e “Local (GPU)”.
+      </HelpTip>
+    </span>
+  )
+}
+
 export function AudioSettings(): React.JSX.Element | null {
   const voice = api.voice
+  const view = useStore((s) => s.settingsAudioView)
+  const setView = useStore((s) => s.setAudioSettingsView)
   const [input, setInput] = useState<AudioInputSettings>(DEFAULT_AUDIO_INPUT)
   const [stt, setStt] = useState<SttSettings>(DEFAULT_STT_SETTINGS)
   const [tts, setTts] = useState<TtsSettings>(DEFAULT_TTS_SETTINGS)
@@ -175,6 +215,11 @@ export function AudioSettings(): React.JSX.Element | null {
       return false
     }
   }, [])
+
+  // trocar de sub-tela começa do topo (o link da GPU rola depois até a parte pedida)
+  useEffect(() => {
+    document.getElementById('settings-panel')?.scrollTo({ top: 0 })
+  }, [view])
 
   if (!voice) {
     return (
@@ -287,34 +332,57 @@ export function AudioSettings(): React.JSX.Element | null {
   const turn = callDefaults.turn
   const ij = callDefaults.interjections
 
+  const saveErrorBox = saveError && (
+    <div
+      role="alert"
+      data-testid="voice-settings-error"
+      className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
+    >
+      <TriangleAlert className="size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1">{saveError}</span>
+      <button
+        type="button"
+        aria-label="Dispensar erro de gravação"
+        onClick={() => setSaveError(null)}
+        className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
+      >
+        <X className="size-3.5" />
+      </button>
+    </div>
+  )
+
+  if (view === 'local')
+    return (
+      <div className="space-y-4" data-testid="audio-settings" data-view="local">
+        {saveErrorBox}
+        <LocalModelsScreen
+          stt={stt}
+          tts={tts}
+          onCommitStt={commitStt}
+          onCommitTts={commitTts}
+          models={models}
+          modelProgress={modelProgress}
+          modelError={modelError}
+          runtime={runtime}
+          onModelAction={runModelAction}
+          onDismissModelError={() => setModelError(null)}
+          onBack={() => setView('main')}
+        />
+      </div>
+    )
+
   return (
-    <div className="space-y-5" data-testid="audio-settings">
+    <div className="space-y-5" data-testid="audio-settings" data-view="main">
       <div className="flex items-center gap-1.5 text-xs leading-relaxed text-subtle">
         Ditado, transcrição, fala e chamada de voz — valem para todos os chats.
         <HelpTip label="Áudio">
           Cada persona/chat pode ligar/desligar a chamada de voz e ter modelo, tools e prompt
           próprios (painel do chat → aba Voz). Os provedores de transcrição e fala são os de
-          Configurações → Provedores.
+          Configurações → Provedores; os modelos que rodam no computador ficam em “Modelos locais”
+          (botão ao lado do título).
         </HelpTip>
       </div>
-      {saveError && (
-        <div
-          role="alert"
-          data-testid="voice-settings-error"
-          className="flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
-        >
-          <TriangleAlert className="size-3.5 shrink-0" />
-          <span className="min-w-0 flex-1">{saveError}</span>
-          <button
-            type="button"
-            aria-label="Dispensar erro de gravação"
-            onClick={() => setSaveError(null)}
-            className="shrink-0 rounded-md p-1 transition-colors hover:bg-danger/15"
-          >
-            <X className="size-3.5" />
-          </button>
-        </div>
-      )}
+      {saveErrorBox}
 
       {/* ---- ditado: microfone, idioma, push-to-talk, silêncio ---- */}
       <AudioSection
@@ -471,29 +539,23 @@ export function AudioSettings(): React.JSX.Element | null {
         />
       </AudioSection>
 
-      {/* ---- STT (provedor/local/GPU + modelo) ---- */}
+      {/* ---- STT (modelo: provedores + locais instalados; parâmetros; híbrido) ---- */}
       <SttSettingsSection
         stt={stt}
         language={input.language}
         providers={providers}
         models={models}
-        modelProgress={modelProgress}
-        modelError={modelError}
         runtime={runtime}
         onCommit={commitStt}
-        onModelAction={runModelAction}
-        onDismissModelError={() => setModelError(null)}
       />
 
-      {/* ---- TTS (provedor/local/GPU + modelo + voz; teste e clipes) ---- */}
+      {/* ---- TTS (modelo + voz + parâmetros; teste e clipes) ---- */}
       <TtsSettingsSection
         tts={tts}
         providers={providers}
         models={models}
-        modelProgress={modelProgress}
         runtime={runtime}
         onCommit={commitTts}
-        onModelAction={runModelAction}
       />
 
       {/* ---- chamada de voz: disponível + fim de turno (padrões globais) ---- */}
@@ -751,9 +813,6 @@ export function AudioSettings(): React.JSX.Element | null {
         </div>
         {/* `fillers.prompt` ainda não é consumido (a decisão é por regra): campo escondido até ser */}
       </AudioSection>
-
-      {/* ---- modo avançado: motores de voz/transcrição na GPU local (fechado por padrão) ---- */}
-      <GpuModeSection tts={tts} onCommitTts={commitTts} stt={stt} onCommitStt={commitStt} />
     </div>
   )
 }

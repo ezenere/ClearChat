@@ -38,6 +38,7 @@ import { outdatedHosts, SyncEngine } from '../src/main/sync/engine'
 import { EDIT_NEEDS_UPDATE, type RunnerAdapter } from '../src/main/sync/host'
 import { draftMatchesMessage } from '../src/main/sync/stream'
 import { activePath, resolveParents } from '../src/shared/branches'
+import * as voiceNormalizers from '../src/shared/voice'
 import type { AgentEvent, Session, ToolCall } from '../src/shared/types'
 import { trackFailure, type SubFailure } from '../src/renderer/src/lib/subFailures'
 import { startFakeSyncServer, type FakeSyncServer } from './fakes/syncServer.ts'
@@ -452,6 +453,52 @@ test('1.5.0: settings de áudio — partes do dispositivo nunca saem e sobrevive
     gpu: { engine: 'whisper-large-v3-turbo' }
   })
   assert.equal(buildLocal(b, 'setting', 'audioInput')!.plain.value, null)
+})
+
+test('1.5.0: parâmetros dos modelos remotos (api.params) sincronizam; os da GPU continuam locais', () => {
+  const a = newDb()
+  const b = newDb()
+  const ttsParams = {
+    elevenlabs: { output_format: 'pcm_44100', stability: 0.4, speed: 1.1, auto_mode: true },
+    openrouter: { speed: 1.15 }
+  }
+  const sttParams = { openai: { temperature: 0.2, prompt: 'ClearChat, OpenRouter' } }
+  putSetting(a, 'ttsSettings', {
+    backend: 'api',
+    api: { providerId: 'xi', model: 'eleven_flash_v2_5', voice: 'v1', params: ttsParams },
+    local: { engine: 'kokoro', voice: 'pf_dora', installed: true },
+    gpu: { engine: 'xtts-v2', voice: null, params: { 'xtts-v2': { speed: 1.3 } } }
+  })
+  putSetting(a, 'sttSettings', {
+    mode: 'api',
+    api: { providerId: 'groq', model: 'whisper-large-v3-turbo', params: sttParams },
+    local: null,
+    livePartials: true,
+    gpu: { engine: 'whisper-large-v3-turbo', params: { beam_size: 3 } }
+  })
+  const out = (id: string): any => buildLocal(a, 'setting', id)!.plain.value
+  assert.deepEqual(out('ttsSettings').api.params, ttsParams, 'params remotos sobem inteiros')
+  assert.equal(out('ttsSettings').gpu, undefined, 'parâmetros da GPU não sobem')
+  assert.deepEqual(out('sttSettings').api.params, sttParams)
+  assert.equal(out('sttSettings').gpu, undefined)
+  // B (GPU própria com parâmetros dela) recebe: params remotos de A + bloco gpu de B intacto
+  putSetting(b, 'ttsSettings', {
+    backend: 'gpu',
+    api: { providerId: null, model: '', voice: null },
+    local: null,
+    gpu: { engine: 'omnivoice', voice: 'cc0-faber', params: { omnivoice: { speed: 0.9 } } }
+  })
+  for (const id of ['ttsSettings', 'sttSettings'])
+    applyRemote(b, 'setting', id, buildLocal(a, 'setting', id)!.plain)
+  const tb = getSetting(b, 'ttsSettings')
+  assert.deepEqual(tb.api.params, ttsParams, 'params remotos chegam em B')
+  assert.equal(tb.backend, 'gpu', 'B continua na GPU dele')
+  assert.deepEqual(tb.gpu.params, { omnivoice: { speed: 0.9 } }, 'parâmetros da GPU de B intactos')
+  assert.deepEqual(getSetting(b, 'sttSettings').api.params, sttParams)
+  // e voltam pela normalização do app (nada é descartado no caminho)
+  const { normalizeTtsSettings, normalizeSttSettings } = voiceNormalizers
+  assert.deepEqual(normalizeTtsSettings(tb).api.params, ttsParams)
+  assert.deepEqual(normalizeSttSettings(getSetting(b, 'sttSettings')).api.params, sttParams)
 })
 
 test('1.5.0: provedor ElevenLabs — kind vai e volta; o "openai" de app antigo é reparado', () => {

@@ -1,12 +1,13 @@
-// Configurações → Áudio → Fala (TTS). PROVEDOR = um dos cadastrados em Configurações → Provedores
-// que serve fala (OpenRouter, ElevenLabs direto, OpenAI-compatível — inclusive um servidor local)
-// ou as opções embutidas "Local — Kokoro" e "Local (GPU)" (Modo avançado; só escolhível com um
-// motor de voz da GPU instalado — senão desabilitada com o link). Com provedor: MODELO no mesmo
-// seletor do chat (agrupado por provedor, latência medida à direita, lista curada para a chamada)
-// e VOZ no mesmo desenho (busca, grupos por idioma, ▶ prévia por linha). Kokoro: voz + pesos para
-// baixar. GPU: motor + voz agrupada (`GpuTtsPanel`). "Testar voz", "Gerar clipes de voz" e a
-// contagem dos clipes. Endereço e chave ficam só no provedor cadastrado — a chave nunca passa pela
-// tela.
+// Configurações → Áudio → Fala (TTS). Um seletor só — MODELO — no mesmo desenho do chat: um grupo
+// por provedor cadastrado em Configurações → Provedores que serve fala (OpenRouter, ElevenLabs
+// direto, OpenAI-compatível — inclusive um servidor local; latência medida à direita, lista curada
+// para a chamada) + "Local (CPU)" (Kokoro instalado) e "Local (GPU)" (motores instalados no Modo
+// avançado) — os grupos locais só aparecem com algo instalado (instalar/remover fica em "Modelos
+// locais"). Escolher uma linha grava backend + provedor + motor + modelo de uma vez. A VOZ segue a
+// família do modelo (vozes da ElevenLabs/OpenRouter, do Kokoro, do motor da GPU com as CC0 e as
+// suas). Modelo remoto: "Parâmetros" (ElevenLabs: formato de saída, voice_settings, normalização,
+// frases completas; OpenRouter/OpenAI: velocidade, instruções). "Testar voz", "Gerar clipes de voz"
+// e a contagem dos clipes. Endereço e chave ficam só no provedor cadastrado.
 import { Play, Settings2, Square } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TtsVoicesView, VoiceModelInfo, VoiceRuntimeStatus } from '@shared/ipc'
@@ -21,8 +22,8 @@ import {
   type VoiceCatalogVoice,
   type VoiceProviderSupport
 } from '@shared/voiceCatalog'
+import { apiParamsToSend, elevenLabsOutputFormat } from '@shared/voiceParams'
 import { api, errorMessage } from '../../lib/api'
-import type { LocalModelAction } from '../../lib/voice/modelList'
 import { useVoiceCatalogs } from '../../lib/voice/useVoiceCatalogs'
 import { useStore } from '../../store'
 import { Button, Label } from '../ui/controls'
@@ -31,51 +32,25 @@ import { ToggleRow } from '../panel/fields'
 import { ApiInfo, C, HelpTip } from '../ui/Tooltip'
 import { AudioSection, WarnNote } from './audioUi'
 import { groupCatalogVoices } from './catalogVoiceGroups'
-import {
-  DismissibleError,
-  LocalModelList,
-  VoiceModelField,
-  VoicePicker,
-  VoiceSourceSelect
-} from './voiceSettingsParts'
+import { DismissibleError, VoiceModelField, VoicePicker } from './voiceSettingsParts'
+import { ApiParamsEditor } from './ApiParamsEditor'
 import {
   effectiveFamily,
-  GPU_SOURCE,
-  LOCAL_SOURCE,
   playAudioBytes,
   providerMissing,
   type ProviderOption
 } from '../../lib/voice/voiceSettingsHelpers'
-import { gpuConfigFor, installedTtsEngines } from '../../lib/voice/gpu/gpuUi'
-import type { GpuStatus } from '../../lib/voice/gpu/types'
+import {
+  applyTtsPick,
+  isLocalGroup,
+  ttsLocalGroups,
+  ttsModelRef
+} from '../../lib/voice/voiceModelOptions'
 import { useGpuStatus } from '../../lib/voice/gpu/useGpuStatus'
-import { GpuSectionLink, GpuTtsPanel } from './gpu/GpuBackendPanels'
-
-/** "Local (GPU)": completa `gpu` (1º motor instalado + voz sugerida) quando falta ou sumiu. */
-function toGpu(t: TtsSettings, status: GpuStatus | null): TtsSettings {
-  const installed = installedTtsEngines(status)
-  const cur = installed.find((e) => e.id === t.gpu?.engine)
-  const gpu = cur ? t.gpu : installed[0] ? gpuConfigFor(installed[0], t.gpu) : t.gpu
-  return { ...t, backend: 'gpu', ...(gpu ? { gpu } : {}) }
-}
+import { GpuTtsPanel } from './gpu/GpuBackendPanels'
 
 /** Mensagem do IPC sem o prefixo da classe (`TtsError: …`) — o texto do main já é legível. */
 const ipcError = (e: unknown): string => errorMessage(e).replace(/^[A-Z]\w*Error: /, '')
-
-/** Modelo/voz sugeridos ao trocar de provedor (só quando o salvo não serve à família nova). */
-const TTS_DEFAULTS: Record<VoiceProviderSupport, { model: string; voice: string | null }> = {
-  openrouter: { model: 'elevenlabs/eleven-flash-v2.5', voice: 'sarah' },
-  elevenlabs: { model: 'eleven_flash_v2_5', voice: null },
-  openai: { model: 'gpt-4o-mini-tts', voice: 'alloy' }
-}
-
-const modelFitsFamily = (model: string, family: VoiceProviderSupport | null): boolean => {
-  const m = model.trim()
-  if (!m) return false
-  if (family === 'openrouter') return m.includes('/')
-  if (family === 'elevenlabs') return !m.includes('/') && /^eleven/i.test(m)
-  return true
-}
 
 /** Atalho "Usar OpenRouter (ElevenLabs Flash)" (com um OpenRouter cadastrado em Provedores). */
 const OPENROUTER_PRESET = { model: 'elevenlabs/eleven-flash-v2.5', voice: 'sarah' } as const
@@ -93,27 +68,25 @@ export function TtsSettingsSection({
   tts,
   providers,
   models,
-  modelProgress,
   runtime,
-  onCommit,
-  onModelAction
+  onCommit
 }: {
   tts: TtsSettings
   providers: ProviderOption[]
+  /** Modelos locais (catálogo + estado em disco) — o Kokoro instalado entra no seletor. */
   models: VoiceModelInfo[]
-  modelProgress: Record<string, { bytes: number; total: number }>
   runtime: VoiceRuntimeStatus | null
   /** Grava `ttsSettings`. */
   onCommit: (next: TtsSettings) => Promise<boolean>
-  onModelAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
 }): React.JSX.Element | null {
   const voiceApi = api.voice
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
   const backend = tts.backend
   const isApi = backend === 'api'
   const isGpu = backend === 'gpu'
-  const { status: gpuStatus, available: gpuAvailable } = useGpuStatus()
-  const gpuEngines = installedTtsEngines(gpuStatus)
+  const { status: gpuStatus } = useGpuStatus()
+  const localGroups = ttsLocalGroups(models, gpuStatus, tts)
+  const ref = ttsModelRef(tts)
   const provider = providers.find((p) => p.id === tts.api.providerId) ?? null
   const missing = isApi && providerMissing(tts.api, providers)
   const family = effectiveFamily(provider)
@@ -199,20 +172,28 @@ export function TtsSettingsSection({
    * modelo sem vozes (ex.: Fish Audio) = voz padrão.
    */
   const pickModel = useCallback(
-    (ref: ModelRef) => {
-      const m = catalogs.entries[ref.providerId]?.catalog?.models.find((x) => x.id === ref.model)
-      let voice = tts.api.voice
+    (r: ModelRef) => {
+      if (isLocalGroup(r.providerId)) {
+        void commit(applyTtsPick(tts, r, { models, gpu: gpuStatus })).then(refreshLocalVoices)
+        return
+      }
+      const m = catalogs.entries[r.providerId]?.catalog?.models.find((x) => x.id === r.model)
+      const fromProvider = providers.find((p) => p.id === tts.api.providerId)
+      const toProvider = providers.find((p) => p.id === r.providerId)
+      // voz de outra família (ex.: id da ElevenLabs → OpenRouter) não serve: a padrão da família nova
+      const sameFamily =
+        !!fromProvider &&
+        !!toProvider &&
+        voiceProviderSupport(fromProvider) === voiceProviderSupport(toProvider)
+      let voice = sameFamily ? tts.api.voice : null
       if (m?.voiceIds) {
         if (!m.voiceIds.length) voice = null
         else if (!voice || !m.voiceIds.includes(voice))
           voice = m.ptVoices?.find((v) => m.voiceIds!.includes(v)) ?? m.voiceIds[0]
       }
-      void commit({
-        ...tts,
-        api: { ...tts.api, providerId: ref.providerId, model: ref.model, voice }
-      })
+      void commit(applyTtsPick(tts, r, { models, gpu: gpuStatus, voice }))
     },
-    [catalogs.entries, commit, tts]
+    [catalogs.entries, commit, tts, models, gpuStatus, providers, refreshLocalVoices]
   )
 
   // vozes do modelo escolhido (OpenRouter: `supported_voices` do modelo; ElevenLabs: da conta),
@@ -253,24 +234,6 @@ export function TtsSettingsSection({
           })
       }
     : undefined
-
-  const pickSource = (v: string): void => {
-    if (v === LOCAL_SOURCE)
-      return void commit({ ...tts, backend: 'local' }).then(refreshLocalVoices)
-    if (v === GPU_SOURCE) return void commit(toGpu(tts, gpuStatus))
-    const p = providers.find((x) => x.id === v)
-    const fam = p ? voiceProviderSupport(p) : null
-    const keep = modelFitsFamily(tts.api.model, fam)
-    void commit({
-      ...tts,
-      backend: 'api',
-      api: {
-        ...tts.api,
-        providerId: v,
-        ...(keep || !fam ? {} : { model: TTS_DEFAULTS[fam].model, voice: TTS_DEFAULTS[fam].voice })
-      }
-    })
-  }
 
   const openRouter = providers.find((p) => voiceProviderSupport(p) === 'openrouter') ?? null
   const presetActive = isApi && family === 'openrouter' && tts.api.model === OPENROUTER_PRESET.model
@@ -431,41 +394,25 @@ export function TtsSettingsSection({
       }
     >
       <div>
-        <Label help="Provedores de Configurações → Provedores que servem fala (o endpoint e a chave vêm de lá), o motor local Kokoro (no computador) ou a GPU (Modo avançado, abaixo).">
-          Provedor
+        <Label help="Um seletor para tudo: os modelos de fala de cada provedor cadastrado (o endpoint e a chave vêm de Configurações → Provedores) e, quando houver algo instalado em “Modelos locais”, os grupos Local (CPU) (Kokoro) e Local (GPU). Escolher um modelo já define o provedor/motor. Nos provedores, só os testados para a chamada de voz: 1º áudio em até ~0,9 s numa frase curta e pt-BR aceitável (o badge mostra o tempo medido). Para mais qualidade: Eleven v4 Turbo pela ElevenLabs direta (~0,29 s até o 1º áudio medido, mais expressivo que o Flash; na chamada vai por HTTP frase a frase — o WebSocket não aceita o v4). Um id livre é aceito, com o aviso de que não foi testado.">
+          Modelo
         </Label>
-        <VoiceSourceSelect
+        <VoiceModelField
           capability="tts"
+          catalogs={catalogs}
           providers={providers}
-          value={backend === 'local' ? LOCAL_SOURCE : isGpu ? GPU_SOURCE : (provider?.id ?? null)}
-          onChange={pickSource}
-          local={{
-            label: 'Local — Kokoro',
-            description: 'No computador (CPU) — o texto nunca sai daqui'
-          }}
-          gpu={
-            gpuAvailable || isGpu
-              ? {
-                  enabled: gpuEngines.length > 0,
-                  description: gpuEngines.length
-                    ? `Motores na sua placa de vídeo: ${gpuEngines.map((e) => e.label).join(', ')}`
-                    : 'Instale um motor de voz no Modo avançado (GPU local), abaixo'
-                }
-              : null
-          }
-          testId="tts-provider"
+          value={{ providerId: ref?.providerId ?? null, model: ref?.model ?? '' }}
+          onChange={pickModel}
+          testId="tts-model"
+          family={isApi ? family : null}
+          recommended={isApi ? recommended : undefined}
+          localGroups={localGroups}
         />
-        {gpuAvailable && !gpuEngines.length && !isGpu && (
-          <p className="mt-1.5 text-[11.5px] text-subtle" data-testid="tts-gpu-hint">
-            Local (GPU): instale um motor de voz no <GpuSectionLink testId="tts-gpu-install-link" />{' '}
-            para usar a sua placa de vídeo.
-          </p>
-        )}
       </div>
 
       {missing && (
         <WarnNote testId="tts-provider-missing">
-          O provedor escolhido não existe mais — escolha outro acima.
+          O provedor do modelo escolhido não existe mais — escolha outro modelo acima.
         </WarnNote>
       )}
 
@@ -497,21 +444,6 @@ export function TtsSettingsSection({
       {isApi && provider && (
         <div className="space-y-3" data-testid="tts-api">
           <div>
-            <Label help="Modelos de fala dos provedores cadastrados, agrupados por provedor (escolher um de outro grupo troca o provedor). Só os testados para a chamada de voz: 1º áudio em até ~0,9 s numa frase curta e pt-BR aceitável (o badge mostra o tempo medido). Um id livre é aceito, com o aviso de que não foi testado.">
-              Modelo
-            </Label>
-            <VoiceModelField
-              capability="tts"
-              catalogs={catalogs}
-              providers={providers}
-              value={{ providerId: tts.api.providerId, model: tts.api.model }}
-              onChange={pickModel}
-              testId="tts-model"
-              family={family}
-              recommended={recommended}
-            />
-          </div>
-          <div>
             <Label help="Voz pedida ao provedor, agrupada por idioma (pt-BR primeiro; as recomendadas para o modelo no topo). A lista vem do modelo escolhido (OpenRouter: supported_voices; ElevenLabs: as vozes da sua conta). ▶ toca uma prévia (a do provedor quando existe; senão sintetiza uma frase curta — custa como uma frase falada). Digitar um id na busca permite usar qualquer voz.">
               Voz
             </Label>
@@ -527,6 +459,20 @@ export function TtsSettingsSection({
             />
           </div>
           <CallTransport tts={tts} family={family} onCommit={commit} />
+          <ApiParamsEditor
+            capability="tts"
+            family={family}
+            model={tts.api.model}
+            modelLabel={model?.label ?? tts.api.model}
+            params={tts.api.params}
+            ws={ttsCallTransport(tts.api, family).ws}
+            onChange={(params) => {
+              const { params: _drop, ...rest } = tts.api
+              void _drop
+              void commit({ ...tts, api: params ? { ...rest, params } : rest })
+            }}
+            testId="tts-api-params"
+          />
         </div>
       )}
 
@@ -536,11 +482,20 @@ export function TtsSettingsSection({
         <div className="space-y-3" data-testid="tts-local">
           <div>
             <Label
-              help="Voz do Kokoro-82M (ONNX). As vozes pt-BR vêm dos voice packs baixados abaixo (sem o pack instalado, a síntese avisa)."
+              help="Voz do Kokoro-82M (ONNX). As vozes pt-BR vêm dos voice packs baixados em Modelos locais (sem o pack instalado, a síntese avisa)."
               hint={
-                <span className={tts.local?.installed ? 'text-success' : 'text-warning'}>
-                  Kokoro {tts.local?.installed ? 'instalado' : 'não instalado — baixe abaixo'}
-                </span>
+                tts.local?.installed ? (
+                  <span className="text-success">Kokoro instalado</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="text-warning underline underline-offset-2"
+                    data-testid="tts-local-install-link"
+                    onClick={() => setSettingsOpen(true, 'audio:local')}
+                  >
+                    Kokoro não instalado — instale em Modelos locais
+                  </button>
+                )
               }
             >
               Voz
@@ -563,7 +518,9 @@ export function TtsSettingsSection({
                 localVoices.length
                   ? localVoices.map((v) => ({
                       value: v.id,
-                      label: v.installed ? `${v.label} — instalada` : `${v.label} — baixar abaixo`
+                      label: v.installed
+                        ? `${v.label} — instalada`
+                        : `${v.label} — baixar em Modelos locais`
                     }))
                   : [{ value: 'pf_dora', label: 'pf_dora (padrão)' }]
               }
@@ -684,14 +641,6 @@ export function TtsSettingsSection({
         testId="tts-clips-error"
         dismissLabel="Dispensar erro de clipes"
       />
-      {backend === 'local' && (
-        <LocalModelList
-          kind="tts"
-          models={models}
-          progress={modelProgress}
-          onAction={onModelAction}
-        />
-      )}
     </AudioSection>
   )
 }
@@ -773,7 +722,13 @@ function TtsApiInfo({
       </ApiInfo>
     )
   const base = (baseUrl || '{endpoint}').replace(/\/+$/, '')
-  if (family === 'elevenlabs')
+  const sent = apiParamsToSend('tts', family, tts.api.model, tts.api.params, { ws: true })
+  if (family === 'elevenlabs') {
+    const vs = Object.fromEntries(
+      ['stability', 'similarity_boost', 'style', 'use_speaker_boost', 'speed']
+        .filter((k) => sent[k] !== undefined)
+        .map((k) => [k, sent[k]])
+    )
     return (
       <ApiInfo
         title="Fala: ElevenLabs direto"
@@ -781,20 +736,31 @@ function TtsApiInfo({
           `GET ${base.replace(/\/v\d+$/i, '')}/v1/models   ·   GET …/v1/voices   (listas, header xi-api-key)`,
           '',
           `Síntese: backend ElevenLabs (stream-input) com model_id = ${tts.api.model || '{modelo}'}`,
-          `voice_id = ${tts.api.voice ?? '{voz}'}`,
-          'text     = {frase da resposta}'
+          `voice_id      = ${tts.api.voice ?? '{voz}'}`,
+          `output_format = ${elevenLabsOutputFormat(tts.api.params)}`,
+          ...(Object.keys(vs).length ? [`voice_settings = ${JSON.stringify(vs)}`] : []),
+          ...(sent.apply_text_normalization
+            ? [`apply_text_normalization = ${String(sent.apply_text_normalization)}`]
+            : []),
+          ...(sent.auto_mode ? ['auto_mode     = true (WebSocket da chamada)'] : []),
+          'text          = {frase da resposta}'
         ].join('\n')}
         codeLabel="A chave do provedor vai no header xi-api-key"
       >
-        <p>Sai só o texto de cada frase falada.</p>
+        <p>
+          Sai só o texto de cada frase falada (e os parâmetros escolhidos em “Parâmetros”; sem
+          nenhum, valem os ajustes da voz na sua conta).
+        </p>
       </ApiInfo>
     )
+  }
   // OpenRouter não aceita wav: o app pede pcm (e embrulha em WAV) — ver SPEC → "Serviço de TTS"
-  const body: Record<string, string> = {
+  const body: Record<string, unknown> = {
     model: tts.api.model || '{modelo}',
     ...(tts.api.voice ? { voice: tts.api.voice } : {}),
     input: '{frase da resposta}',
-    response_format: family === 'openrouter' ? 'pcm' : 'wav'
+    response_format: family === 'openrouter' ? 'pcm' : 'wav',
+    ...sent
   }
   return (
     <ApiInfo

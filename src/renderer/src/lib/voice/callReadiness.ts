@@ -7,7 +7,7 @@
 // motores locais também são conferidos; sem ele, o que só o main sabe chega como erro legível do
 // `voice:call:start`/TTS. Backend/modo "Local (GPU)" (Modo avançado): com o status da GPU
 // (`voice.gpu.status()`) confere runtime, motor (instalado/bloqueado/com problema), voz e o servidor
-// local — cada problema aponta para Configurações → Áudio → Modo avançado (GPU local).
+// local — cada problema aponta para Configurações → Áudio → Modelos locais (sub-tela).
 import type { VoiceRuntimeStatus } from '@shared/ipc'
 import type { SttSettings, TtsSettings } from '@shared/voice'
 import { providerSupportsVoice, type VoiceCapability } from '@shared/voiceCatalog'
@@ -34,10 +34,10 @@ function apiProblem(
   const usable = providers?.filter((p) => providerSupportsVoice(p, capability))
   if (!api.providerId)
     return usable && !usable.length
-      ? `cadastre um provedor que sirva ${what} em Configurações → Provedores e escolha-o em Configurações → Áudio`
-      : 'escolha um provedor em Configurações → Áudio'
+      ? `cadastre um provedor que sirva ${what} em Configurações → Provedores (ou instale um modelo em Configurações → Áudio → Modelos locais) e escolha o modelo em Configurações → Áudio`
+      : `escolha um modelo de ${what} em Configurações → Áudio`
   if (providers && !providers.some((p) => p.id === api.providerId))
-    return 'o provedor escolhido não existe mais — escolha outro em Configurações → Áudio'
+    return 'o provedor do modelo escolhido não existe mais — escolha outro modelo em Configurações → Áudio'
   if (!api.model.trim()) return `escolha o modelo de ${what} em Configurações → Áudio`
   return null
 }
@@ -83,12 +83,13 @@ export function voiceCallReadiness(
         `Transcrição: o motor local não está pronto — ${runtime.sttLocal.reason ?? 'runtime indisponível'}.`
       )
     else if (!localStt)
-      out.push(
-        'Transcrição: instale um modelo do motor local (Configurações → Áudio → Transcrição → Motor local).'
-      )
+      out.push('Transcrição: instale um modelo local em Configurações → Áudio → Modelos locais.')
   } else if (!localStt) {
     const p = apiProblem(stt.api, 'stt', providers)
-    if (p) out.push(`Transcrição (híbrido): ${p} — ou instale um modelo local.`)
+    if (p)
+      out.push(
+        `Transcrição (híbrido): ${p} — ou instale um modelo local em Configurações → Áudio → Modelos locais.`
+      )
   }
   if (gtts.backend === 'gpu') {
     if (!gpu && runtime?.gpuTts) {
@@ -100,10 +101,10 @@ export function voiceCallReadiness(
   } else if (tts.backend === 'local') {
     if (!tts.local || tts.local.engine !== 'kokoro')
       out.push(
-        'Fala: escolha o motor local Kokoro ou o backend de API (Configurações → Áudio → Fala).'
+        'Fala: escolha um modelo de fala em Configurações → Áudio (o Kokoro ou um modelo de API).'
       )
     else if (!tts.local.installed)
-      out.push('Fala: baixe o modelo Kokoro e uma voz (Configurações → Áudio → Fala).')
+      out.push('Fala: instale o Kokoro e uma voz em Configurações → Áudio → Modelos locais.')
     else if (runtime && !runtime.ttsLocal.available)
       // ex.: espeak-ng ausente no sistema (fonemização pt-BR do Kokoro)
       out.push(

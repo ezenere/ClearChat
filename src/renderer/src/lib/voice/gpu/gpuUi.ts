@@ -481,7 +481,7 @@ export interface GpuProblem {
   text: string
 }
 
-const WHERE = 'Configurações → Áudio → Modo avançado (GPU local)'
+const WHERE = 'Configurações → Áudio → Modelos locais'
 
 function runtimeProblems(s: GpuStatus): GpuProblem[] {
   if (s.runtime.state === 'installed') return []

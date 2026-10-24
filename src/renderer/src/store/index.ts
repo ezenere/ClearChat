@@ -89,6 +89,15 @@ export type SettingsTab =
   | 'web'
   | 'audio'
 
+/**
+ * Destinos de `setSettingsOpen` além das abas: sub-telas (`audio:local` = Configurações → Áudio →
+ * "Modelos locais", com "← Áudio").
+ */
+export type SettingsTarget = SettingsTab | 'audio:local'
+
+/** Sub-tela da aba Áudio (principal ou "Modelos locais" — CPU + GPU). */
+export type AudioSettingsView = 'main' | 'local'
+
 export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'voice' | 'files'
 
 const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'memory', 'voice', 'files']
@@ -205,6 +214,8 @@ interface State {
   panelTab: PanelTab
   settingsOpen: boolean
   settingsTab: SettingsTab
+  /** Sub-tela de Configurações → Áudio (volta a 'main' ao trocar de aba). */
+  settingsAudioView: AudioSettingsView
   previewSessionId: string | null
   toasts: Toast[]
   compactions: Record<string, CompactionState | undefined>
@@ -336,7 +347,9 @@ interface Actions {
   /** Recarrega o arquivo ativo do chat. */
   reloadFile(chatId: string): void
   setViewerWidth(width: number, persist?: boolean): void
-  setSettingsOpen(open: boolean, tab?: SettingsTab): void
+  setSettingsOpen(open: boolean, tab?: SettingsTarget): void
+  /** Troca a sub-tela de Configurações → Áudio ("Modelos locais" ↔ principal). */
+  setAudioSettingsView(view: AudioSettingsView): void
   setPreview(sessionId: string | null): void
   toast(text: string, kind?: Toast['kind']): void
   dismissToast(id: number): void
@@ -462,6 +475,7 @@ export const useStore = create<Store>()((set, get) => ({
   panelTab: loadPanelTab(),
   settingsOpen: false,
   settingsTab: 'providers',
+  settingsAudioView: 'main',
   previewSessionId: null,
   toasts: [],
   compactions: {},
@@ -1158,7 +1172,17 @@ export const useStore = create<Store>()((set, get) => ({
     if (persist) saveViewerWidth(width)
   },
   setSettingsOpen(open, tab) {
-    set((s) => ({ settingsOpen: open, settingsTab: tab ?? s.settingsTab }))
+    if (tab === 'audio:local')
+      return set({ settingsOpen: open, settingsTab: 'audio', settingsAudioView: 'local' })
+    // aba explícita = a tela principal dela (sem aba: reabre onde estava)
+    set((s) => ({
+      settingsOpen: open,
+      settingsTab: tab ?? s.settingsTab,
+      ...(tab ? { settingsAudioView: 'main' as const } : {})
+    }))
+  },
+  setAudioSettingsView(view) {
+    set({ settingsAudioView: view })
   },
   setPreview(sessionId) {
     set({ previewSessionId: sessionId })
