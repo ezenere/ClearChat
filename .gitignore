@@ -22,3 +22,6 @@ gpu-tts-lab/
 # cache do Python (servidor da GPU)
 __pycache__/
 *.pyc
+
+# resultados/pastas de teste no macOS
+.mac-test/
