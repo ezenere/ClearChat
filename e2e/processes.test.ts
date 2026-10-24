@@ -42,7 +42,8 @@ import {
   parseShellVersion,
   pickShell,
   resolveUserEnv,
-  shellLabel
+  shellLabel,
+  withMacToolPaths
 } from '../src/main/tools/shellEnv.ts'
 import { shell } from '../src/main/tools/bash.ts'
 import { setToolShellInfo, shellDescriptionPrefix } from '../src/shared/shellInfo.ts'
@@ -479,6 +480,24 @@ test('lista: poda do registro lembra o id (erro com o caminho do log; stop sem e
 })
 
 // ======================= shell do usuário =======================
+
+test('withMacToolPaths: no macOS acrescenta as pastas do Homebrew que existem e faltam', () => {
+  const gui = '/usr/bin:/bin:/usr/sbin:/sbin'
+  const exists = (p: string): boolean => p === '/opt/homebrew/bin'
+  assert.equal(withMacToolPaths(gui, 'darwin', exists), `${gui}:/opt/homebrew/bin`)
+  assert.equal(
+    withMacToolPaths(`/opt/homebrew/bin:${gui}`, 'darwin', exists),
+    `/opt/homebrew/bin:${gui}`
+  )
+  assert.equal(
+    withMacToolPaths(gui, 'darwin', () => true),
+    `${gui}:/opt/homebrew/bin:/usr/local/bin`
+  )
+  assert.equal(
+    withMacToolPaths(gui, 'linux', () => true),
+    gui
+  )
+})
 
 test('pickShell: $SHELL zsh/bash existente; fish/inexistente → bash', () => {
   const exists = (p: string): boolean =>

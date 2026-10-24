@@ -57,6 +57,25 @@ export function resolveShell(): ShellInfo {
   return shellCache
 }
 
+/** Pastas do Homebrew (Apple Silicon e Intel). */
+const MAC_TOOL_DIRS = ['/opt/homebrew/bin', '/usr/local/bin']
+
+/**
+ * macOS: app aberto pelo Finder/Dock herda do launchd só `/usr/bin:/bin:/usr/sbin:/sbin`, então
+ * binários do Homebrew (espeak-ng do Kokoro) não são achados por `spawn`. Acrescenta no fim as
+ * pastas do Homebrew que existem e faltam. Outros SOs: PATH inalterado.
+ */
+export function withMacToolPaths(
+  pathEnv: string,
+  platform: NodeJS.Platform = process.platform,
+  exists: (p: string) => boolean = existsSync
+): string {
+  if (platform !== 'darwin') return pathEnv
+  const dirs = pathEnv.split(':').filter(Boolean)
+  for (const d of MAC_TOOL_DIRS) if (!dirs.includes(d) && exists(d)) dirs.push(d)
+  return dirs.join(':')
+}
+
 /** Rótulo para o bloco <environment> (ex.: "zsh 5.9"); fallback "bash". */
 export function shellLabel(): string {
   try {

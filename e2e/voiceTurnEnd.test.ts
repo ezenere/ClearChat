@@ -4,7 +4,7 @@
 // Rodar: node --import ./e2e/ts-hooks.mjs --test e2e/voiceTurnEnd.test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentEvent, ChatConfig } from '@shared/types'
@@ -190,6 +190,13 @@ test('caseInsensitiveMatch: "SRC/Main.ts" acha "src/main.ts" dentro do root; amb
   try {
     mkdirSync(join(root, 'src'))
     writeFileSync(join(root, 'src', 'main.ts'), 'x')
+    // macOS (APFS) e Windows não diferenciam caixa: "SRC" já existe → nada a ajustar.
+    if (existsSync(join(root, 'SRC'))) {
+      return (async () => {
+        assert.equal(await caseInsensitiveMatch(root, join(root, 'SRC', 'Main.ts')), null)
+        assert.equal(await caseInsensitiveMatch(root, join(root, 'nada')), null)
+      })().finally(() => rmSync(root, { recursive: true, force: true }))
+    }
     return (async () => {
       assert.equal(await caseInsensitiveMatch(root, join(root, 'SRC')), join(root, 'src'))
       assert.equal(

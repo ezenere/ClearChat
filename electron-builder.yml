@@ -129,6 +129,10 @@ mac:
     - '!node_modules/onnxruntime-node/bin/napi-v6/{win32,linux}{,/**}'
   category: public.app-category.developer-tools
   entitlementsInherit: build/entitlements.mac.plist
+  # Ditado e chamada de voz: com o Hardened Runtime, sem a entitlement audio-input
+  # (build/entitlements.mac.plist) o macOS nega o microfone em silêncio, sem perguntar.
+  extendInfo:
+    NSMicrophoneUsageDescription: O ClearChat usa o microfone para o ditado e as chamadas de voz.
   notarize: false
   target:
     - dmg

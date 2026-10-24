@@ -14,7 +14,7 @@ import { sameValue, sanitizePresetConfig, withoutCwd, type PresetConfig } from '
 import type { ChatConfig, Preset } from '@shared/types'
 import { AppSignatureField, AppSignatureInfo } from './AppSignatureField'
 import { api } from '../lib/api'
-import { compactPath } from '../lib/format'
+import { compactPath, isMac } from '../lib/format'
 import { initialPresetId, newChatBase, presetProviderMissing, resolvePreset } from '../lib/presets'
 import { useStore } from '../store'
 import { ModelFieldInfo, RootInfo, SystemPromptInfo } from './apiDocs'
@@ -339,7 +339,7 @@ export function NewChat(): React.JSX.Element {
 
         <div className="mt-8 flex items-center justify-end gap-3">
           <span className="flex items-center gap-1 text-[11px] text-subtle">
-            <Kbd>Ctrl</Kbd>
+            <Kbd>{isMac ? '⌘' : 'Ctrl'}</Kbd>
             <Kbd>Enter</Kbd>
           </span>
           <Button

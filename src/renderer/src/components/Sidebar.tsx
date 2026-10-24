@@ -75,7 +75,7 @@ export function Sidebar(): React.JSX.Element {
           <MessageSquarePlus className="size-4 text-muted group-hover:text-fg" />
           Novo chat
           <span className="ml-auto flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-            <Kbd>Ctrl</Kbd>
+            <Kbd>{isMac ? '⌘' : 'Ctrl'}</Kbd>
             <Kbd>N</Kbd>
           </span>
         </button>
@@ -112,7 +112,7 @@ export function Sidebar(): React.JSX.Element {
           <Settings className="size-4" />
           Configurações
           <span className="ml-auto flex gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-            <Kbd>Ctrl</Kbd>
+            <Kbd>{isMac ? '⌘' : 'Ctrl'}</Kbd>
             <Kbd>,</Kbd>
           </span>
         </button>

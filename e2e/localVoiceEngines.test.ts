@@ -29,6 +29,7 @@ import {
   createSttLocalBackend,
   hasSpeech,
   partialAudioCtx,
+  partialUsesReducedCtx,
   partialMaxTokens,
   STT_PARTIAL_AUDIO_CTX_MARGIN,
   sttLocalThreads,
@@ -91,10 +92,26 @@ test('threads do Kokoro: metade dos núcleos (teto 4), 1 inter-op, sem spin', ()
 // ---------------- parciais baratas ----------------
 
 test('parcial: contexto do encoder ~ duração da janela + margem (teto 30 s) e teto de tokens', () => {
-  assert.equal(partialAudioCtx(16_000), 50 + STT_PARTIAL_AUDIO_CTX_MARGIN) // 1 s
-  assert.equal(partialAudioCtx(16_000 * 10), 500 + STT_PARTIAL_AUDIO_CTX_MARGIN) // 10 s
+  assert.equal(partialAudioCtx(16_000), 440) // 1 s: 50 + 384 = 434 → múltiplo de 8
+  assert.equal(partialAudioCtx(16_000 * 10), 888) // 10 s: 500 + 384 = 884 → múltiplo de 8
   assert.equal(partialAudioCtx(16_000 * 40), WHISPER_FULL_AUDIO_CTX)
+  // Metal (macOS) aborta com contexto fora de múltiplo de 8
+  for (let s = 0; s <= 30 * 16_000; s += 1_237) {
+    const ctx = partialAudioCtx(s)
+    assert.ok(ctx === WHISPER_FULL_AUDIO_CTX || ctx % 8 === 0, `${s} amostras → ${ctx}`)
+    assert.ok(
+      ctx >=
+        Math.min(
+          WHISPER_FULL_AUDIO_CTX,
+          Math.ceil((s / 16_000) * 50) + STT_PARTIAL_AUDIO_CTX_MARGIN
+        )
+    )
+  }
   assert.ok(partialAudioCtx(16_000 * 2) < WHISPER_FULL_AUDIO_CTX / 2, 'janela curta ≪ 30 s')
+  // macOS (Metal): parciais com o contexto cheio
+  assert.equal(partialUsesReducedCtx('darwin'), false)
+  assert.equal(partialUsesReducedCtx('linux'), true)
+  assert.equal(partialUsesReducedCtx('win32'), true)
   assert.equal(partialMaxTokens(16_000), 12 + 16)
   assert.equal(partialMaxTokens(16_000 * 10), 120 + 16)
 })

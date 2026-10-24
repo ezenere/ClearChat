@@ -436,7 +436,7 @@ app.on('window-all-closed', () => app.quit())
         { timeout: 5000 }
       )
       await composer().focus()
-      await page.keyboard.press('Control+z')
+      await page.keyboard.press('ControlOrMeta+z')
       await page.waitForTimeout(150)
       const undone = await composer().inputValue()
       assert.equal(undone, 'Início fim', `desfazer remove a inserção do ditado ("${undone}")`)

@@ -263,12 +263,24 @@ export const WHISPER_FULL_AUDIO_CTX = 1500
  */
 export const STT_PARTIAL_AUDIO_CTX_MARGIN = 384
 
-/** Contexto do encoder (quadros de 20 ms) para uma parcial de `samples` amostras a 16 kHz. */
+/**
+ * Contexto do encoder (quadros de 20 ms) para uma parcial de `samples` amostras a 16 kHz. Múltiplo
+ * de 8: no macOS o whisper.cpp roda no Metal, que aborta o processo com outro valor
+ * (`GGML_ASSERT(nb01 % 8 == 0)` em ggml-metal.m).
+ */
 export function partialAudioCtx(samples: number): number {
-  return Math.min(
-    WHISPER_FULL_AUDIO_CTX,
-    Math.ceil((samples / WHISPER_RATE) * 50) + STT_PARTIAL_AUDIO_CTX_MARGIN
-  )
+  const frames = Math.ceil((samples / WHISPER_RATE) * 50) + STT_PARTIAL_AUDIO_CTX_MARGIN
+  return Math.min(WHISPER_FULL_AUDIO_CTX, Math.ceil(frames / 8) * 8)
+}
+
+/**
+ * Parciais com contexto reduzido? No macOS o whisper.cpp roda no Metal: lá o contexto cheio já é
+ * barato (tiny ~70 ms num M2 Pro), e o contexto reduzido derrubou o processo do motor (SIGSEGV na
+ * alocação do decoder com áudio real do microfone) e repetiu a frase no fim da janela. Contexto
+ * reduzido é a economia de CPU medida no Linux.
+ */
+export function partialUsesReducedCtx(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== 'darwin'
 }
 
 /** Teto de tokens de uma parcial (~12 tokens/s de fala + folga) — corta laço de repetição. */
@@ -294,7 +306,7 @@ export async function loadWhisperEngine(
         signal: opts.signal,
         ...(opts.partial
           ? {
-              audioCtx: partialAudioCtx(samples.length),
+              ...(partialUsesReducedCtx() ? { audioCtx: partialAudioCtx(samples.length) } : {}),
               maxTokens: partialMaxTokens(samples.length),
               skipIfBusy: true
             }

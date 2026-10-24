@@ -11,7 +11,7 @@ import { installContextMenu, setupSpellcheck } from './contextMenu'
 import { initSync, shutdownSync, syncEngine } from './sync'
 import { initRunner, shutdownRunner } from './agent/runner'
 import { emit } from './events'
-import { initShell } from './tools/shellEnv'
+import { initShell, withMacToolPaths } from './tools/shellEnv'
 import {
   gcProcessLogs,
   killAllProcesses,
@@ -43,6 +43,9 @@ const APP_ID = 'com.clearchat.app'
 // Nome explícito: define userData (~/.config/ClearChat) e o WM_CLASS da janela no Linux
 // (o app_id no Wayland vem de "desktopName" no package.json → clearchat.desktop).
 app.setName(APP_NAME)
+
+// macOS: o PATH do Finder/Dock não tem o Homebrew (espeak-ng etc.); antes de criar processos filhos.
+process.env.PATH = withMacToolPaths(process.env.PATH ?? '')
 
 // Testes isolados: CLEARCHAT_USER_DATA sobrescreve o diretório userData (banco etc.). Antes do ready.
 const isolatedUserData = process.env['CLEARCHAT_USER_DATA']
