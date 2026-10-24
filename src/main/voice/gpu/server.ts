@@ -25,6 +25,8 @@ export interface ServerProcInfo {
   state: ServerProcState
   port: number | null
   error: string | null
+  /** PIDs do processo (o filho + o pid que o servidor anuncia no `listening`) — contas de VRAM. */
+  pids: number[]
 }
 
 export interface SpawnSpec {
@@ -60,6 +62,7 @@ interface Proc {
   idleExit: boolean
   tail: string[]
   log: WriteStream | null
+  pids: Set<number>
 }
 
 /** Porta TCP livre em 127.0.0.1 (o SO escolhe). */
@@ -99,7 +102,8 @@ export class GpuServerManager {
       engines: [...p.engines],
       state: p.state,
       port: p.state === 'running' ? p.port : null,
-      error: p.error
+      error: p.error,
+      pids: [...p.pids]
     }))
   }
 
@@ -174,7 +178,8 @@ export class GpuServerManager {
       stopping: false,
       idleExit: false,
       tail: [],
-      log: await this.openLog(group)
+      log: await this.openLog(group),
+      pids: new Set()
     }
     this.procs.set(group, p)
     this.changed()
@@ -200,6 +205,7 @@ export class GpuServerManager {
       throw new Error(p.error, { cause: e })
     }
     p.child = child
+    if (child.pid) p.pids.add(child.pid)
     const keep = (l: string): void => {
       if (!l.trim()) return
       p.tail.push(l)
@@ -210,6 +216,9 @@ export class GpuServerManager {
       'data',
       lineSplitter((l) => {
         if (l.includes('"idle-exit"')) p.idleExit = true
+        // o processo que segura a GPU (no Windows o python do venv é um lançador → outro pid)
+        const pid = /"event":\s*"listening".*"pid":\s*(\d+)/.exec(l)
+        if (pid) p.pids.add(Number(pid[1]))
         keep(l)
       })
     )

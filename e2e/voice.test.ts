@@ -285,9 +285,13 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
     },
     model: null,
     basePromptEnabled: true,
-    basePrompt: null
+    basePrompt: null,
+    endCall: true
   })
   assert.deepEqual(normalizeVoiceCallDefaults({ fillers: null }), DEFAULT_VOICE_CALL_DEFAULTS)
+  // "O agente pode encerrar a chamada": false explícito vale; lixo → padrão (ligado)
+  assert.equal(normalizeVoiceCallDefaults({ endCall: false }).endCall, false)
+  assert.equal(normalizeVoiceCallDefaults({ endCall: 'x' }).endCall, true)
   // false explícito no fillers global vale (não vira o padrão ligado)
   assert.equal(normalizeVoiceCallDefaults({ fillers: { enabled: false } }).fillers.enabled, false)
 })

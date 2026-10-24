@@ -520,6 +520,12 @@ export function AudioSettings(): React.JSX.Element | null {
           onChange={(enabled) => saveCallDefaults({ enabled })}
           help="Desligada, o botão de telefone some de todos os chats (exceto os que ligam a chamada explicitamente na própria config)."
         />
+        <ToggleRow
+          label="O agente pode encerrar a chamada"
+          checked={callDefaults.endCall}
+          onChange={(endCall) => saveCallDefaults({ endCall })}
+          help="Tool end_call nos turnos da chamada (sem aprovação): quando você se despede ou pede para desligar, o agente diz uma despedida curta e a chamada cai depois de ela tocar — voltar a falar antes cancela. Persona/chat podem mudar (aba Voz)."
+        />
         <SubHeading>Fim da sua vez de falar</SubHeading>
         <ToggleRow
           label="Fim de turno adaptativo"
@@ -742,7 +748,7 @@ export function AudioSettings(): React.JSX.Element | null {
       </AudioSection>
 
       {/* ---- modo avançado: motores de voz/transcrição na GPU local (fechado por padrão) ---- */}
-      <GpuModeSection tts={tts} onCommitTts={commitTts} />
+      <GpuModeSection tts={tts} onCommitTts={commitTts} stt={stt} onCommitStt={commitStt} />
     </div>
   )
 }

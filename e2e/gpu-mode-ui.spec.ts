@@ -9,8 +9,12 @@
 // mostra a latência medida; clonar voz por upload e por gravação (microfone INJETADO — nunca o
 // real: getUserMedia vira um tom sintético); STT "Local (GPU)"; pré-checagem da chamada aponta o
 // problema da GPU; sem rolagem horizontal em 1100/1440.
+// Motores em duas seções ("Voz (TTS)" / "Transcrição (STT)", sem badge de tipo), runtime que não
+// promete o Whisper, VRAM do próprio servidor fora dos avisos (motor carregado não avisa; "o app
+// libera … ao trocar") e "Parâmetros" por motor (card, painel de Fala e de Transcrição: mudar,
+// gravar, restaurar).
 // Cenários: `?scenario=gpu-ok|gpu-installed|gpu-installing|gpu-none|gpu-lowvram|gpu-mac|
-// gpu-incompatible|gpu-broken|gpu-call|gpu-call-lowvram|gpu-call-oom`.
+// gpu-incompatible|gpu-broken|gpu-call|gpu-call-lowvram|gpu-call-oom|gpu-own-vram`.
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
@@ -288,6 +292,29 @@ app.on('window-all-closed', () => app.quit())
         'qwen3-tts-1.7b',
         'whisper-large-v3-turbo'
       ])
+      // duas seções com cabeçalho próprio; sem o badge de tipo nos cards
+      const inSection = async (sec: string): Promise<string[]> =>
+        tid(sec)
+          .locator('[data-testid^="gpu-engine-"][data-install]')
+          .evaluateAll((els) =>
+            els.map((e) => e.getAttribute('data-testid')!.replace('gpu-engine-', ''))
+          )
+      assert.deepEqual(await inSection('gpu-engines-tts'), order.slice(0, 5))
+      assert.deepEqual(await inSection('gpu-engines-stt'), ['whisper-large-v3-turbo'])
+      assert.match(await tid('gpu-engines-tts').innerText(), /^Voz \(TTS\)/)
+      assert.match(await tid('gpu-engines-stt').innerText(), /^Transcrição \(STT\)/)
+      for (const id of order) {
+        const head = await tid(`gpu-engine-${id}`).locator('span[data-tone="accent"]').count()
+        assert.equal(head, 0, `badge de tipo no card ${id}`)
+      }
+      // o runtime não diz que instala o Whisper (o modelo é a seção de Transcrição)
+      await page.getByRole('button', { name: 'Ajuda: Runtime da GPU' }).hover()
+      const tip = page.getByRole('tooltip').first()
+      await tip.waitFor({ timeout: 3000 })
+      const tipText = await tip.innerText()
+      assert.match(tipText, /Não inclui nenhum modelo/)
+      assert.match(tipText, /Whisper\) são instalados à parte/)
+      await page.mouse.move(5, 5)
       // sem o runtime o motor instala mesmo assim (o backend baixa o runtime antes) — com a nota
       assert.equal(
         await tid('gpu-engine-action-omnivoice').isDisabled(),
@@ -306,17 +333,24 @@ app.on('window-all-closed', () => app.quit())
     }
   )
 
-  await step('runtime: Instalar → barra com a fase → instalado', async () => {
+  await step('runtime: Instalar → barra com a fase (sem erro durante) → instalado', async () => {
     await tid('gpu-runtime-install').click()
     await tid('gpu-runtime-progress').waitFor({ timeout: 3000 })
     const phase = await tid('gpu-runtime-progress-phase').innerText()
     await shot('03-runtime-installing')
+    const phases = new Set<string>()
     await waitFor(
-      async () => (await attr('gpu-runtime', 'data-state')) === 'installed',
+      async () => {
+        if ((await tid('gpu-runtime-progress-phase').count()) > 0)
+          phases.add(await tid('gpu-runtime-progress-phase').innerText())
+        assert.equal(await tid('gpu-runtime-error').count(), 0, 'erro durante a instalação')
+        return (await attr('gpu-runtime', 'data-state')) === 'installed'
+      },
       10_000,
       'runtime instalado'
     )
-    assert.match(await tid('gpu-runtime-state').innerText(), /instalado/)
+    assert.ok(![...phases].some((p) => /whisper/i.test(p)), [...phases].join(' | '))
+    assert.match(await tid('gpu-runtime-state').innerText(), /instalado · /)
     return phase
   })
 
@@ -329,7 +363,12 @@ app.on('window-all-closed', () => app.quit())
       8000,
       'OmniVoice instalado'
     )
+    // os passos moram em "Parâmetros" (fechado por padrão)
+    assert.equal(await tid('gpu-omnivoice-steps').count(), 0, 'parâmetros abertos por padrão')
+    await tid('gpu-engine-params-omnivoice-toggle').click()
     assert(await tid('gpu-omnivoice-steps').isVisible(), 'passos do OmniVoice')
+    assert(await tid('gpu-engine-params-omnivoice-guidance_scale').isVisible(), 'guidance')
+    assert(await tid('gpu-engine-params-omnivoice-speed').isVisible(), 'velocidade')
     assert.equal(
       await attr('gpu-omnivoice-steps-16', 'aria-checked'),
       'true',
@@ -427,6 +466,8 @@ app.on('window-all-closed', () => app.quit())
   )
 
   await step('Passos do OmniVoice: 32 grava e reflete nos dois controles', async () => {
+    if ((await attr('gpu-engine-params-omnivoice', 'data-open')) !== 'true')
+      await tid('gpu-engine-params-omnivoice-toggle').click()
     await tid('tts-gpu-steps-32').click()
     await waitFor(
       async () => (await attr('gpu-omnivoice-steps-32', 'aria-checked')) === 'true',
@@ -865,6 +906,128 @@ app.on('window-all-closed', () => app.quit())
       await tid('voice-call-dock').waitFor({ state: 'detached', timeout: 3000 })
       await shot('26-call-oom-toast')
       return text.slice(0, 160)
+    }
+  )
+
+  // ---------------- VRAM do próprio servidor + parâmetros ----------------
+
+  await step(
+    'gpu-own-vram: o servidor do app ocupa a VRAM — motor carregado sem aviso, XTTS "o app libera ao trocar"',
+    async () => {
+      await openAudio('gpu-own-vram')
+      await expandGpu()
+      const vram = await tid('gpu-vram').innerText()
+      assert.match(vram, /livres · 5,5 GB com o servidor do ClearChat/)
+      assert(await tid('gpu-engine-loaded-omnivoice').isVisible(), 'badge "na GPU agora"')
+      assert.equal(await attr('gpu-engine-omnivoice', 'data-compat'), 'ok')
+      assert.equal(await attr('gpu-engine-xtts-v2', 'data-compat'), 'ok')
+      assert.equal(
+        await page
+          .locator('[data-testid^="gpu-engine-reasons-"]')
+          .filter({ hasText: /VRAM/ })
+          .count(),
+        0,
+        'aviso de VRAM causado pelo próprio app'
+      )
+      assert.match(
+        await tid('gpu-engine-vram-note-xtts-v2').innerText(),
+        /o app libera OmniVoice, Whisper large-v3-turbo da GPU/
+      )
+      await tid('gpu-engine-omnivoice').scrollIntoViewIfNeeded()
+      await shot('27-own-vram-no-warning')
+      // parar o servidor: reavalia na hora (a VRAM volta a ser livre, sem badge/nota)
+      await tid('gpu-server-stop').click()
+      await waitFor(
+        async () => (await tid('gpu-engine-loaded-omnivoice').count()) === 0,
+        3000,
+        'badge some ao parar'
+      )
+      assert.equal(await tid('gpu-engine-vram-note-xtts-v2').count(), 0)
+      assert.match(await tid('gpu-vram').innerText(), /\(8,8 GB livres\)/)
+      return vram
+    }
+  )
+
+  await step(
+    'Parâmetros: card do XTTS (velocidade 1,15× padrão → muda → grava) aparece igual no painel de Fala; Restaurar padrão',
+    async () => {
+      await tid('gpu-engine-params-xtts-v2-toggle').click()
+      assert.equal(await tid('gpu-engine-params-xtts-v2-speed-value').innerText(), '1,15×')
+      assert.equal(await tid('gpu-engine-params-xtts-v2-restore').isDisabled(), true)
+      for (const k of ['temperature', 'repetition_penalty', 'top_p', 'top_k'])
+        assert(await tid(`gpu-engine-params-xtts-v2-${k}`).isVisible(), k)
+      await tid('gpu-engine-params-xtts-v2-speed').focus()
+      await page.keyboard.press('ArrowRight')
+      await page.keyboard.press('ArrowRight')
+      await waitFor(
+        async () => (await tid('gpu-engine-params-xtts-v2-speed-value').innerText()) === '1,25×',
+        2000,
+        'velocidade 1,25×'
+      )
+      await waitFor(
+        async () => /1 alterado/.test(await tid('gpu-engine-params-xtts-v2-count').innerText()),
+        2000,
+        'contagem de alterados'
+      )
+      await tid('gpu-engine-params-xtts-v2').scrollIntoViewIfNeeded()
+      await shot('28-params-card-xtts')
+      // painel de Fala com o XTTS: o mesmo valor (gravado nas settings)
+      await scrollTo('tts-section')
+      await choose('Provedor da fala', /^Local \(GPU\)/)
+      await tid('tts-gpu').waitFor()
+      await choose('Motor de fala da GPU', /XTTS/)
+      await tid('tts-gpu-params-toggle').click()
+      await waitFor(
+        async () => (await tid('tts-gpu-params-speed-value').innerText()) === '1,25×',
+        3000,
+        'mesmo valor no painel de Fala'
+      )
+      await tid('tts-gpu-params').scrollIntoViewIfNeeded()
+      await shot('29-params-tts-panel')
+      await tid('tts-gpu-params-restore').click()
+      await waitFor(
+        async () => (await tid('gpu-engine-params-xtts-v2-speed-value').innerText()) === '1,15×',
+        3000,
+        'restaurado no card'
+      )
+      assert.equal(await tid('tts-gpu-params-restore').isDisabled(), true)
+      assert.equal(await tid('gpu-engine-params-xtts-v2-count').count(), 0)
+    }
+  )
+
+  await step(
+    'Parâmetros do whisper: painel de Transcrição (VAD liga, idioma, restaurar)',
+    async () => {
+      await scrollTo('stt-section')
+      await choose('Provedor da transcrição', /^Local \(GPU\)/)
+      await tid('stt-gpu').waitFor()
+      await tid('stt-gpu-params-toggle').click()
+      await tid('stt-gpu-params-vad_filter').getByRole('switch').click()
+      await waitFor(
+        async () => /1 alterado/.test(await tid('stt-gpu-params-count').innerText()),
+        2000,
+        'VAD gravado'
+      )
+      await choose('Idioma (Whisper large-v3-turbo)', /^Detectar/)
+      await waitFor(
+        async () => /2 alterados/.test(await tid('stt-gpu-params-count').innerText()),
+        2000,
+        'idioma gravado'
+      )
+      // o card do whisper no Modo avançado mostra os mesmos valores
+      await tid('gpu-engine-params-whisper-large-v3-turbo-toggle').click()
+      assert.match(
+        await tid('gpu-engine-params-whisper-large-v3-turbo-count').innerText(),
+        /2 alterados/
+      )
+      await tid('stt-gpu-params').scrollIntoViewIfNeeded()
+      await shot('30-params-whisper')
+      await tid('stt-gpu-params-restore').click()
+      await waitFor(
+        async () => (await tid('stt-gpu-params-count').count()) === 0,
+        2000,
+        'whisper restaurado'
+      )
     }
   )
 

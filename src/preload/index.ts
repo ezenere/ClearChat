@@ -56,8 +56,8 @@ const api: FullClearApi = {
     delete: (id) => invoke(IPC.messages.delete, id)
   },
   agent: {
-    send: (sessionId, text, attachments, skills) =>
-      invoke(IPC.agent.send, sessionId, text, attachments, skills),
+    send: (sessionId, text, attachments, skills, opts) =>
+      invoke(IPC.agent.send, sessionId, text, attachments, skills, opts),
     forceSend: (queuedId) => invoke(IPC.agent.forceSend, queuedId),
     removeQueued: (queuedId) => invoke(IPC.agent.removeQueued, queuedId),
     getQueue: (sessionId) => invoke(IPC.agent.getQueue, sessionId),

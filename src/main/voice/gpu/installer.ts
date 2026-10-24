@@ -1,8 +1,9 @@
 // "Modo avançado (GPU local)" — instalador do runtime e dos motores (main, sem Electron).
 //
 // Runtime: Python portátil (python-build-standalone, sha256 conferido) → `pip install` do torch
-// (índice CUDA 12.8 no Linux/Windows) → base fixada (faster-whisper + servidor + áudio) → checagem
-// (`server.py check`). Motor: camada venv `--system-site-packages` do grupo (pacotes fixados em
+// (índice CUDA 12.8 no Linux/Windows) → base fixada (servidor + áudio + o PACOTE faster-whisper — o
+// MODELO do whisper é um motor à parte) → checagem (`server.py check`). O registro do runtime em
+// `state.json` só é gravado no fim (é o marcador de "instalado"); sobra sem ele = interrompida. Motor: camada venv `--system-site-packages` do grupo (pacotes fixados em
 // `resources/gpu-server/requirements/<grupo>.{nodeps.txt,txt,lock}`) → checagem de import →
 // pesos (`server.py download`, revisões fixadas no HF; progresso em linhas JSON). Tudo retomável
 // (pip e o HF retomam; o Python vai para `tmp/` e só vira `python/` com rename atômico),
@@ -174,6 +175,15 @@ export class GpuInstaller {
     return 'absent'
   }
 
+  /** Por que o runtime está "com problema" (texto legível; null quando não está). */
+  runtimeProblem(s: GpuInstallState): string | null {
+    if (this.runtimeState(s) !== 'broken') return null
+    if (s.runtime && s.runtime.version !== GPU_RUNTIME_VERSION)
+      return `runtime de uma versão antiga (${s.runtime.version}) — clique em Reinstalar para atualizar para ${GPU_RUNTIME_VERSION}`
+    if (s.runtime) return 'o Python do runtime sumiu da pasta — clique em Reinstalar'
+    return 'instalação interrompida antes de terminar — clique em Reinstalar para continuar de onde parou'
+  }
+
   layerReady(s: GpuInstallState, group: GpuEngineGroup): boolean {
     if (group === 'base') return true
     return !!s.layers[group] && existsSync(this.layout.layerPython(group))
@@ -205,10 +215,16 @@ export class GpuInstaller {
 
   // ---------------- log ----------------
 
-  async log(line: string): Promise<void> {
+  private logChain: Promise<void> = Promise.resolve()
+
+  /** Acrescenta ao install.log (em série: linhas de processos simultâneos não se embaralham). */
+  log(line: string): Promise<void> {
     const ts = (this.deps.now?.() ?? new Date()).toISOString()
-    await mkdir(this.layout.root, { recursive: true })
-    await appendFile(this.layout.installLog, `[${ts}] ${line}\n`).catch(() => undefined)
+    this.logChain = this.logChain.then(async () => {
+      await mkdir(this.layout.root, { recursive: true }).catch(() => undefined)
+      await appendFile(this.layout.installLog, `[${ts}] ${line}\n`).catch(() => undefined)
+    })
+    return this.logChain
   }
 
   /** Últimas `n` linhas do install.log. */
@@ -282,10 +298,13 @@ export class GpuInstaller {
   ): Promise<void> {
     if (signal?.aborted) throw abortErr()
     await this.log(`$ ${cmd} ${args.join(' ')}`)
+    // a saída vai para o log ENQUANTO roda (a cada ~1 s): "ver log" mostra o pip trabalhando
     const lines: string[] = []
     const flush = async (): Promise<void> => {
       if (lines.length) await this.log(lines.splice(0).join('\n'))
     }
+    const ticker = setInterval(() => void flush(), 1000)
+    ticker.unref?.()
     const r = await this.run(cmd, args, {
       env: opts.env ?? this.pyEnv(),
       cwd: this.layout.root,
@@ -295,11 +314,13 @@ export class GpuInstaller {
         opts.onStdoutLine?.(l)
       },
       onStderrLine: (l) => lines.push(l)
-    }).catch((e: unknown) => {
-      throw new GpuInstallError(
-        `${what}: não consegui executar ${cmd} (${e instanceof Error ? e.message : String(e)})`
-      )
     })
+      .catch((e: unknown) => {
+        throw new GpuInstallError(
+          `${what}: não consegui executar ${cmd} (${e instanceof Error ? e.message : String(e)})`
+        )
+      })
+      .finally(() => clearInterval(ticker))
     await flush()
     if (signal?.aborted) throw abortErr()
     if (r.code !== 0) {
@@ -312,19 +333,32 @@ export class GpuInstaller {
     }
   }
 
-  private pipArgs(): string[] {
-    const cache = this.deps.pipCacheDir ?? join(this.layout.tmp, 'pip-cache')
-    return ['-m', 'pip', 'install', '--no-input', '--cache-dir', cache]
+  private get pipCache(): string {
+    return this.deps.pipCacheDir ?? join(this.layout.tmp, 'pip-cache')
   }
 
-  /** Mede o crescimento de uma pasta enquanto `work` roda → pct da fase (a cada 3 s). */
+  private pipArgs(): string[] {
+    return ['-m', 'pip', 'install', '--no-input', '--cache-dir', this.pipCache]
+  }
+
+  /**
+   * Mede o crescimento de pastas enquanto `work` roda → pct da fase (a cada 3 s). O pip primeiro
+   * BAIXA para o cache e só depois instala: medir só a pasta do Python deixava a barra parada no
+   * começo da fase durante todo o download.
+   */
   private async withGrowth<T>(
-    dir: string,
+    dirs: string | string[],
     expectedMb: number,
     onPct: (pct: number) => void,
     work: () => Promise<T>
   ): Promise<T> {
-    const start = await dirSizeMb(dir)
+    const list = Array.isArray(dirs) ? dirs : [dirs]
+    const size = async (): Promise<number> => {
+      let n = 0
+      for (const d of list) n += await dirSizeMb(d)
+      return n
+    }
+    const start = await size()
     let stop = false
     let wake: () => void = () => undefined
     const loop = (async () => {
@@ -334,7 +368,7 @@ export class GpuInstaller {
           setTimeout(r, 3000)
         })
         if (stop) break
-        const now = await dirSizeMb(dir)
+        const now = await size()
         onPct(Math.max(0, Math.min(0.99, (now - start) / Math.max(1, expectedMb))))
       }
     })()
@@ -450,9 +484,10 @@ export class GpuInstaller {
     const index = torchIndexFor(this.platform, this.arch)
     const cuda = !!index
     prog(cuda ? 'Instalando o PyTorch (CUDA 12.8, ~3 GB)' : 'Instalando o PyTorch', 4)
+    // download (~3,3 GB de wheels no cache) + instalação (~6,4 GB no Python)
     await this.withGrowth(
-      L.python,
-      cuda ? 6400 : 700,
+      [L.python, this.pipCache],
+      cuda ? 9700 : 1000,
       (f) =>
         prog(
           cuda ? 'Instalando o PyTorch (CUDA 12.8, ~3 GB)' : 'Instalando o PyTorch',
@@ -471,12 +506,13 @@ export class GpuInstaller {
           signal
         )
     )
-    // 3. base (faster-whisper, servidor, áudio)
-    prog('Instalando a base (whisper, servidor)', 80)
+    // 3. base (servidor, áudio e o pacote faster-whisper — o MODELO do whisper é um motor à parte)
+    const basePhase = 'Instalando a base (servidor local e bibliotecas de áudio)'
+    prog(basePhase, 80)
     await this.withGrowth(
-      L.python,
+      [L.python, this.pipCache],
       900,
-      (f) => prog('Instalando a base (whisper, servidor)', 80 + Math.round(f * 16)),
+      (f) => prog(basePhase, 80 + Math.round(f * 16)),
       () =>
         this.exec(
           'instalação da base',
@@ -528,7 +564,9 @@ export class GpuInstaller {
   async installEngine(
     id: GpuEngineId,
     signal: AbortSignal | undefined,
-    onProgress: (p: InstallProgress) => void
+    onProgress: (p: InstallProgress) => void,
+    /** Progresso do runtime quando ele é instalado junto (o card do runtime mostra a mesma fase). */
+    onRuntimeProgress?: (p: InstallProgress) => void
   ): Promise<void> {
     const entry = gpuEngineEntry(id)
     const L = this.layout
@@ -538,9 +576,10 @@ export class GpuInstaller {
     // runtime ausente: ele vem primeiro e ocupa 0–40% da barra do motor
     const withRuntime = !this.runtimeReady(state)
     if (withRuntime) {
-      await this.installRuntime(signal, (p) =>
+      await this.installRuntime(signal, (p) => {
+        onRuntimeProgress?.(p)
         prog(`Runtime: ${p.phase}`, p.pct === null ? null : Math.round(p.pct * 0.4), p.bytes)
-      )
+      })
       state = await this.readState()
     }
     const base = withRuntime ? 40 : 0

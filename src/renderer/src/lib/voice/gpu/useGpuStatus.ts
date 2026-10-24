@@ -52,7 +52,8 @@ export function refreshGpuStatus(): Promise<GpuStatus | null> {
   inflight = gpu
     .status()
     .then((status) => {
-      useGpuStore.setState({ status, error: null })
+      if (isNewer(status)) useGpuStore.setState({ status, error: null })
+      else useGpuStore.setState({ error: null })
       return status
     })
     .catch((e) => {
@@ -66,9 +67,20 @@ export function refreshGpuStatus(): Promise<GpuStatus | null> {
   return inflight
 }
 
-/** Aplica um status vindo de evento/ação. */
-export const setGpuStatus = (status: GpuStatus): void =>
-  useGpuStore.setState({ status, available: true, error: null })
+/**
+ * O status recebido é mais novo que o da tela? (`seq` crescente do main: um `status()` lento —
+ * a sonda do nvidia-smi — que volta DEPOIS de um evento de progresso não pode desfazer o progresso
+ * nem ressuscitar um estado velho. Sem `seq` (mock/versão antiga) → sempre aplica.)
+ */
+function isNewer(next: GpuStatus): boolean {
+  const cur = useGpuStore.getState().status
+  return next.seq == null || cur?.seq == null || next.seq >= cur.seq
+}
+
+/** Aplica um status vindo de evento/ação (descarta um mais velho que o da tela). */
+export const setGpuStatus = (status: GpuStatus): void => {
+  if (isNewer(status)) useGpuStore.setState({ status, available: true, error: null })
+}
 
 /** Atualiza o status localmente (estado otimista enquanto a ação não volta). */
 export function patchGpuStatus(fn: (s: GpuStatus) => GpuStatus): void {

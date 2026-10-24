@@ -124,8 +124,16 @@ export const TOOL_LABELS: Record<ToolName, string> = {
   memory_delete: 'Apagar memória',
   list_skills: 'Listar skills',
   skill_load: 'Carregar skill',
-  skill_read: 'Ler arquivo da skill'
+  skill_read: 'Ler arquivo da skill',
+  end_call: 'Encerrar chamada'
 }
+
+/**
+ * Tool da chamada de voz (SPEC → Chamada de voz → end_call): NÃO entra em TOOL_NAMES/enabledTools —
+ * só existe nos turnos da chamada (sessão principal), salvo desligada em "O agente pode encerrar a
+ * chamada". Sem aprovação (só encerra a chamada, depois de a resposta terminar de tocar).
+ */
+export const END_CALL_TOOL: ToolName = 'end_call'
 
 const def = (
   name: ToolName,
@@ -733,7 +741,17 @@ export const TOOL_DEFINITIONS: Record<ToolName, ToolDefinition> = {
     ['questions']
   ),
   ...MEMORY_TOOL_DEFINITIONS,
-  ...SKILL_TOOL_DEFINITIONS
+  ...SKILL_TOOL_DEFINITIONS,
+  end_call: def(
+    'end_call',
+    'Encerra a chamada de voz em andamento (desliga). Use quando o usuário se despedir ("tchau", "até mais", "valeu, era isso") ou pedir para desligar/encerrar a chamada — depois de dizer uma despedida curta NESTE MESMO turno (ela termina de tocar antes de a chamada cair). Não use se ele só fez uma pausa, agradeceu no meio da conversa ou ainda espera algo de você. Depois desta ferramenta o seu turno termina.',
+    {
+      reason: {
+        type: 'string',
+        description: 'Opcional: motivo curto (ex.: "usuário se despediu").'
+      }
+    }
+  )
 }
 
 /** Definição da tool `shell` com o shell detectado na descrição (null = genérica). */

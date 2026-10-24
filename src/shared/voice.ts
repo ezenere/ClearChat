@@ -1,9 +1,9 @@
 // Áudio/voz — contratos da feature: configuração do DITADO (100% global, settings `audioInput`,
 // `sttSettings`, `ttsSettings`) e da CHAMADA DE VOZ (por persona/chat em `ChatConfig.voice`, com os
 // padrões globais herdados na setting `voiceCallDefaults`). Tudo JSON-serializável (nunca
-// `undefined` nos writers) e pronto para sincronizar — o sync dessas configurações entra no
-// protocolo 1.5.0 (fatia futura). A UI, a captura de áudio e os backends STT/TTS entram em fatias
-// futuras. Ver SPEC.md → "Áudio".
+// `undefined` nos writers); sincronizam desde o protocolo 1.5.0, menos as partes do dispositivo
+// (microfone, `installed`, modo/bloco da GPU — `src/main/sync/records.ts`, SPEC → "Áudio no
+// sync"). Ver SPEC.md → "Áudio".
 import {
   normalizeToolList,
   type Chat,
@@ -16,7 +16,9 @@ import {
   DEFAULT_TTS_GPU,
   GPU_STT_ENGINE_ID,
   isGpuTtsEngineId,
+  normalizeGpuParamOverrides,
   normalizeOmniSteps,
+  normalizeTtsGpuParams,
   type SttGpuConfig,
   type TtsGpuConfig
 } from './gpuVoice'
@@ -186,9 +188,14 @@ export interface TtsEndpointConfig {
   /**
    * ElevenLabs direta: a chamada usa o WebSocket multi-contexto (texto em streaming) quando o
    * modelo aceita. Ausente = ligado (padrão); `false` = força HTTP por frase. Gravado só quando
-   * `false` (aditivo; settings de voz são locais — não sincronizam).
+   * `false` (aditivo; sincroniza com o resto de `ttsSettings` — protocolo 1.5.0).
    */
   elevenLabsWs?: boolean
+  /**
+   * Campos extras do corpo JSON de `/audio/speech`, preenchidos SÓ pelo main (o servidor da GPU
+   * recebe `{ params }` — os parâmetros do motor). Nunca gravado (o normalizador descarta).
+   */
+  extraBody?: Record<string, unknown>
 }
 
 /** Modelos da ElevenLabs que o WebSocket `stream-input` não aceita (v3/v4 → HTTP por frase). */
@@ -447,6 +454,11 @@ export interface VoiceCallConfig {
   fillers: VoiceFillers | null
   /** Política de interjeições; null = segue o padrão global. */
   interjections: InterjectionPolicy | null
+  /**
+   * "O agente pode encerrar a chamada" (tool `end_call`); null/ausente = segue o padrão global
+   * (`voiceCallDefaults.endCall`, ligado). Aditivo: só gravado quando escolhido.
+   */
+  endCall?: boolean | null
 }
 
 /**
@@ -484,6 +496,8 @@ export interface VoiceCallDefaults {
   basePromptEnabled: boolean
   /** Texto do prompt-base; null = `DEFAULT_VOICE_BASE_PROMPT`. */
   basePrompt: string | null
+  /** "O agente pode encerrar a chamada" (tool `end_call` nos turnos da chamada; padrão true). */
+  endCall: boolean
 }
 
 /**
@@ -542,7 +556,8 @@ export const DEFAULT_VOICE_BASE_PROMPT = [
   'A primeira frase tem no máximo 10 palavras e vai direto ao ponto. No máximo 3 frases curtas no total.',
   'Sem markdown, listas, títulos, tabelas, emojis ou blocos de código — escreva como se fala.',
   'Não narre tentativas internas nem erros de ferramentas em detalhe: se algo falhar, diga em uma frase curta o que houve e o que vai fazer.',
-  'A fala do usuário vem de transcrição automática e pode ter maiúsculas, acentos ou palavras erradas (ex.: "SRC" pode ser a pasta "src"); interprete pela intenção e, em nomes de arquivos e pastas, tente a grafia em minúsculas antes de concluir que não existe.'
+  'A fala do usuário vem de transcrição automática e pode ter maiúsculas, acentos ou palavras erradas (ex.: "SRC" pode ser a pasta "src"); interprete pela intenção e, em nomes de arquivos e pastas, tente a grafia em minúsculas antes de concluir que não existe.',
+  'Se o usuário se despedir ou pedir para desligar, responda com uma despedida curta e, se a ferramenta end_call estiver disponível, chame-a no mesmo turno.'
 ].join(' ')
 
 export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
@@ -552,7 +567,8 @@ export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
   turn: { ...DEFAULT_VOICE_CALL_TURN },
   model: null,
   basePromptEnabled: true,
-  basePrompt: null
+  basePrompt: null,
+  endCall: true
 }
 
 /** Config "vazia": tudo null = herda os padrões globais (`voiceCallDefaults`) e o próprio chat. */
@@ -658,7 +674,17 @@ export function normalizeSttSettings(v: unknown): SttSettings {
     livePartials: boolOr(src?.livePartials, DEFAULT_STT_SETTINGS.livePartials),
     reusePartialFinal: boolOr(src?.reusePartialFinal, true),
     // aditivo: com o modo `gpu` (ou um `gpu` salvo) — o único motor é o whisper-large-v3-turbo
-    ...(src?.mode === 'gpu' || asObject(src?.gpu) ? { gpu: { engine: GPU_STT_ENGINE_ID } } : {})
+    ...(src?.mode === 'gpu' || asObject(src?.gpu)
+      ? (() => {
+          const params = normalizeGpuParamOverrides(GPU_STT_ENGINE_ID, asObject(src?.gpu)?.params)
+          return {
+            gpu: {
+              engine: GPU_STT_ENGINE_ID,
+              ...(Object.keys(params).length ? { params } : {})
+            }
+          }
+        })()
+      : {})
   }
 }
 
@@ -667,10 +693,12 @@ export function normalizeTtsGpu(v: unknown): TtsGpuConfig | null {
   const g = asObject(v)
   if (!g) return null
   const steps = normalizeOmniSteps(g.steps)
+  const params = normalizeTtsGpuParams(g.params)
   return {
     engine: isGpuTtsEngineId(g.engine) ? g.engine : DEFAULT_TTS_GPU.engine,
     voice: strOrNull(g.voice),
-    ...(steps !== undefined ? { steps } : {})
+    ...(steps !== undefined ? { steps } : {}),
+    ...(params ? { params } : {})
   }
 }
 
@@ -826,7 +854,9 @@ export function normalizeVoiceCallConfig(v: unknown): VoiceCallConfig {
           prompt: promptOrNull(fillers.prompt)
         }
       : null,
-    interjections: interjections ? normalizeInterjectionPolicy(interjections) : null
+    interjections: interjections ? normalizeInterjectionPolicy(interjections) : null,
+    // aditivo: só gravado quando escolhido (ausente = herda o global)
+    ...(typeof src.endCall === 'boolean' ? { endCall: src.endCall } : {})
   }
 }
 
@@ -850,7 +880,8 @@ export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
     // chamada — um valor gravado é descartado aqui
     model: normalizeVoiceCallModel(src?.model),
     basePromptEnabled: boolOr(src?.basePromptEnabled, d.basePromptEnabled),
-    basePrompt: promptOrNull(src?.basePrompt)
+    basePrompt: promptOrNull(src?.basePrompt),
+    endCall: boolOr(src?.endCall, d.endCall)
   }
 }
 
@@ -924,6 +955,7 @@ export function layerVoiceCallConfig(
   if (!persona) return c
   const p = normalizeVoiceCallConfig(persona)
   const mode = c.promptMode ?? p.promptMode ?? null
+  const endCall = c.endCall ?? p.endCall ?? null
   return {
     enabled: c.enabled ?? p.enabled,
     model: c.model ?? p.model,
@@ -931,7 +963,8 @@ export function layerVoiceCallConfig(
     voicePrompt: c.voicePrompt ?? p.voicePrompt,
     ...(mode ? { promptMode: mode } : {}),
     fillers: c.fillers ?? p.fillers,
-    interjections: c.interjections ?? p.interjections
+    interjections: c.interjections ?? p.interjections,
+    ...(endCall !== null ? { endCall } : {})
   }
 }
 
@@ -976,6 +1009,15 @@ export interface ResolvedVoiceCall {
   interjections: InterjectionPolicy
   /** Prompt-base do modo voz (global); null = desligado. */
   basePrompt: string | null
+  /** O agente pode encerrar a chamada (tool `end_call`) — chat > persona > global (padrão true). */
+  endCall: boolean
+  /**
+   * Id da chamada em andamento (só no contexto do turno — `VoiceCallManager.callContextFor`): vai
+   * em `meta.voice.callId` das mensagens faladas. Ausente fora da chamada/na resolução da UI.
+   */
+  callId?: string
+  /** Modelo/motor da voz da chamada em andamento (`meta.voice.ttsModel` das respostas). */
+  ttsModel?: string
 }
 
 /**
@@ -997,7 +1039,8 @@ export function resolveVoiceCallConfig(
     promptMode: c.promptMode ?? 'append',
     fillers: c.fillers ?? { enabled: d.fillers.enabled, prompt: d.fillers.prompt },
     interjections: c.interjections ?? d.interjections,
-    basePrompt: d.basePromptEnabled ? (d.basePrompt ?? DEFAULT_VOICE_BASE_PROMPT) : null
+    basePrompt: d.basePromptEnabled ? (d.basePrompt ?? DEFAULT_VOICE_BASE_PROMPT) : null,
+    endCall: c.endCall ?? d.endCall
   }
 }
 
@@ -1083,6 +1126,10 @@ export interface VoiceCallState {
    * NÃO abre; ausente/null = pronta. Aditivo (só aparece com fala/transcrição na GPU).
    */
   preparing?: string | null
+  /** Id da chamada ativa (marcadores no histórico e `meta.voice.callId`). Aditivo. */
+  callId?: string
+  /** Início da chamada ativa (epoch ms do main) — o relógio "02:13" da barra. Aditivo. */
+  startedAt?: number
 }
 
 /** Estado "desligado" (retorno de `voice:call:stop` / inicial do store). */

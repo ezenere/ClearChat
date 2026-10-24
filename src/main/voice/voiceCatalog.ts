@@ -56,6 +56,24 @@ export function resetVoiceCatalogCache(): void {
   knownPreviews.clear()
 }
 
+/**
+ * Preço de lista (US$ por unidade) de um modelo já listado e em cache (custo ≈ da chamada de voz —
+ * sem rede). null = não listado/sem preço.
+ */
+export function cachedVoiceUnitPrice(
+  capability: VoiceCapability,
+  providerId: string,
+  modelId: string
+): number | null {
+  const prefix = `${capability}|${providerId}|`
+  for (const [k, view] of cache) {
+    if (!k.startsWith(prefix)) continue
+    const m = [...view.models, ...(view.hiddenModels ?? [])].find((x) => x.id === modelId)
+    if (typeof m?.unitPrice === 'number') return m.unitPrice
+  }
+  return null
+}
+
 const keyHash = (k: string): string =>
   k ? createHash('sha256').update(k).digest('hex').slice(0, 12) : '-'
 

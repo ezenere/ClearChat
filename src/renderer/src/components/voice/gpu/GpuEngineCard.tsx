@@ -1,7 +1,9 @@
-// Card de um motor do "Modo avançado (GPU local)": rótulo, tipo (Voz/Transcrição), licença (link;
-// "não comercial" marcado), tamanho + VRAM, qualidade pt-BR, streaming, compatibilidade com os
-// motivos, latência medida no último teste, Instalar/Cancelar/Remover e "Testar". Bloqueado não
-// instala (botão desabilitado com o motivo); aviso pede confirmação antes de instalar.
+// Card de um motor do "Modo avançado (GPU local)": rótulo, licença (link; "não comercial"
+// marcado), tamanho + VRAM, qualidade pt-BR, streaming, compatibilidade com os motivos (a VRAM do
+// próprio servidor do app não conta como ocupada; motor já carregado não avisa), latência medida no
+// último teste, Instalar/Cancelar/Remover, "Testar" e "Parâmetros" (instalado). O tipo (Voz /
+// Transcrição) é a seção onde o card aparece. Bloqueado não instala (botão desabilitado com o
+// motivo); aviso pede confirmação antes de instalar.
 import { Download, ExternalLink, FlaskConical, TriangleAlert, X } from 'lucide-react'
 import { useState } from 'react'
 import { errorMessage } from '../../../lib/api'
@@ -15,7 +17,9 @@ import {
 import type { GpuEngineStatus, GpuSelfTestResult } from '../../../lib/voice/gpu/types'
 import { cn } from '../../../lib/format'
 import { Button } from '../../ui/controls'
+import type { GpuParamValues } from '@shared/gpuVoice'
 import { Badge, GpuError, GpuProgress, StepsControl } from './gpuParts'
+import { GpuParamsEditor } from './GpuParamsEditor'
 
 const formatDate = (iso: string): string => {
   const d = new Date(iso)
@@ -33,7 +37,11 @@ export function GpuEngineCard({
   onCancel,
   onRemove,
   onSelfTest,
-  onSteps
+  onSteps,
+  params,
+  onParams,
+  onRestoreParams,
+  vramFreeMb
 }: {
   engine: GpuEngineStatus
   runtimeInstalled: boolean
@@ -46,6 +54,13 @@ export function GpuEngineCard({
   onRemove: () => Promise<void>
   onSelfTest: () => Promise<GpuSelfTestResult>
   onSteps?: (n: number) => void
+  /** Parâmetros salvos do motor (só os diferentes do padrão). */
+  params?: GpuParamValues
+  onParams?: (next: GpuParamValues) => void
+  /** Restaura tudo do motor num commit só (OmniVoice: parâmetros + passos). */
+  onRestoreParams?: () => void
+  /** VRAM livre agora na melhor NVIDIA (para a nota "o app libera … ao trocar"). */
+  vramFreeMb?: number | null
 }): React.JSX.Element {
   const e = engine
   const compat = compatUi(e.compat)
@@ -98,7 +113,6 @@ export function GpuEngineCard({
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="text-[13px] font-medium text-fg/90">{e.label}</span>
-        <Badge tone="accent">{e.kind === 'tts' ? 'Voz' : 'Transcrição'}</Badge>
         <Badge
           tone={installed ? 'success' : e.install.state === 'broken' ? 'danger' : 'neutral'}
           testId={`gpu-engine-state-${e.id}`}
@@ -111,6 +125,15 @@ export function GpuEngineCard({
                 ? 'com problema'
                 : 'não instalado'}
         </Badge>
+        {installed && e.vram?.loaded && (
+          <Badge
+            tone="success"
+            testId={`gpu-engine-loaded-${e.id}`}
+            title="Carregado agora no servidor local do app (a VRAM dele não conta como ocupada)."
+          >
+            na GPU agora
+          </Badge>
+        )}
         <span className="ml-auto flex items-center gap-1.5">
           {installed && (
             <Button
@@ -216,6 +239,21 @@ export function GpuEngineCard({
           ))}
         </ul>
       )}
+      {compat.level === 'ok' &&
+        installed &&
+        e.vram &&
+        !e.vram.loaded &&
+        e.vram.releases.length > 0 &&
+        vramFreeMb != null &&
+        vramFreeMb < e.vramMb && (
+          <p
+            className="mt-1 text-[11.5px] text-subtle"
+            data-testid={`gpu-engine-vram-note-${e.id}`}
+          >
+            Ao usar, o app libera {e.vram.releases.join(', ')} da GPU para caber (VRAM livre agora:{' '}
+            {formatMb(vramFreeMb)}; com a troca: {formatMb(e.vram.availMb)}).
+          </p>
+        )}
       {act.note && (
         <p className="mt-1 text-[11.5px] text-subtle" data-testid={`gpu-engine-note-${e.id}`}>
           Instalar {act.note}.
@@ -273,10 +311,22 @@ export function GpuEngineCard({
         />
       )}
 
-      {e.id === 'omnivoice' && installed && onSteps && (
-        <div className="mt-2">
-          <StepsControl value={steps ?? e.options?.steps} onChange={onSteps} />
-        </div>
+      {installed && onParams && (
+        <GpuParamsEditor
+          engineId={e.id}
+          engineLabel={e.label}
+          kind={e.kind}
+          value={params ?? {}}
+          onChange={onParams}
+          testId={`gpu-engine-params-${e.id}`}
+          extra={
+            e.id === 'omnivoice' && onSteps ? (
+              <StepsControl value={steps ?? e.options?.steps} onChange={onSteps} />
+            ) : undefined
+          }
+          extraChanged={e.id === 'omnivoice' && (steps ?? e.options?.steps ?? 16) !== 16}
+          onRestore={onRestoreParams}
+        />
       )}
 
       {test.result && (

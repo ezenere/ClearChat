@@ -196,6 +196,8 @@ export interface TranscribeStopOptions {
 }
 
 export interface TranscribeSession {
+  /** Áudio recebido até agora (ms de PCM a 16 kHz) — custos/tempos da chamada de voz. */
+  readonly audioMs?: number
   readonly id: string
   /** Acumula PCM16 mono little-endian a 16 kHz; `sampleRate` informado precisa casar. */
   push(chunk: Uint8Array, sampleRate?: number): void
@@ -918,6 +920,9 @@ export function startTranscribeSession(
   const session: TranscribeSession = {
     get id(): string {
       return state.id
+    },
+    get audioMs(): number {
+      return Math.round(state.totalBytes / BYTES_PER_MS)
     },
     push(chunk: Uint8Array, sampleRate?: number): void {
       if (state.status !== 'active') throw notActive()

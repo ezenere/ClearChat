@@ -16,6 +16,7 @@ import {
   type FillerPhrase,
   type TtsSettings
 } from '@shared/voice'
+import { resolveGpuParams } from '@shared/gpuVoice'
 import { synthesize, type TtsLocalBackend } from './tts'
 
 /** Classes de clipes (whitelist de nomes de arquivo — nada fora daqui vira arquivo). */
@@ -186,7 +187,13 @@ export async function clipsHash(
           : (settings.api.voice ?? null) || null,
     model: settings.backend === 'api' ? settings.api.model : null,
     // OmniVoice: os passos mudam o som → clipes novos (ausente nos outros backends: hash igual ao de antes)
-    ...(settings.backend === 'gpu' && settings.gpu?.steps ? { steps: settings.gpu.steps } : {})
+    ...(settings.backend === 'gpu' && settings.gpu?.steps ? { steps: settings.gpu.steps } : {}),
+    // parâmetros do motor da GPU (velocidade, temperatura…) também mudam o som
+    ...(settings.backend === 'gpu' && settings.gpu
+      ? {
+          params: resolveGpuParams(settings.gpu.engine, settings.gpu.params?.[settings.gpu.engine])
+        }
+      : {})
   })
   const hasher = await createSHA256()
   return hasher.update(payload).digest('hex')

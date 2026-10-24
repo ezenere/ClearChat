@@ -1058,10 +1058,13 @@ export class SyncEngine {
   }
 
   /**
-   * Ids de `setting` novos (SETTINGS_BACKFILL, protocolo 1.4.0) num dispositivo que já
+   * Ids de `setting` novos (SETTINGS_BACKFILL, protocolo 1.4.0/1.5.0) num dispositivo que já
    * sincronizava: depois do 1º pull, o valor local que ainda não tem registro online é marcado para
    * envio (uma vez por versão). Se outro dispositivo já enviou o seu, o pull acabou de aplicá-lo
    * (registro existe → nada a enviar: vale o que chegou primeiro ao servidor, como no LWW).
+   * Desde 1.5.0 também a `voice` de chats/personas (antes local): o registro online sem `voice` e o
+   * local com → o chat/persona é marcado (o merge por chave da config envia só o que mudou; um
+   * `voice` que já está online vence).
    */
   private backfillSettings(): void {
     if (!this.started || this.kv('settings_backfill') === SETTINGS_BACKFILL.version) return
@@ -1069,6 +1072,28 @@ export class SyncEngine {
       if (this.record('setting', id)) continue
       const l = buildLocal(this.conn, 'setting', id)
       if (l && l.plain.value != null) this.markDirty('setting', id)
+    }
+    for (const [type, table] of [
+      ['chat', 'chats'],
+      ['preset', 'presets']
+    ] as const) {
+      const rows = this.conn
+        .prepare(`SELECT id, config_json FROM ${table} WHERE config_json LIKE '%"voice"%'`)
+        .all() as { id: string; config_json: string }[]
+      for (const r of rows) {
+        const rec = this.record(type, r.id)
+        if (!rec || rec.deleted) continue // nunca enviado: vai inteiro no envio normal
+        let voice: unknown
+        try {
+          voice = (JSON.parse(r.config_json) as Plain).voice
+        } catch {
+          continue
+        }
+        if (voice == null) continue
+        const base = this.basePlain(rec)
+        const online = (base?.config as Plain | undefined)?.voice
+        if (online === undefined) this.markDirty(type, r.id, type === 'chat' ? r.id : null)
+      }
     }
     this.setKv('settings_backfill', SETTINGS_BACKFILL.version)
   }
@@ -2937,6 +2962,10 @@ export class SyncEngine {
         if (sa.capture && typeof sa.capture === 'object')
           set(sa.capture as Plain, 'providerId', 'provider')
       }
+      // modelo da chamada de voz (1.5.0: `voice` sincroniza)
+      const voice = cfg.voice as Plain | undefined
+      if (voice && typeof voice === 'object' && voice.model && typeof voice.model === 'object')
+        set(voice.model as Plain, 'providerId', 'provider')
       const mem = cfg.memory as Plain | undefined
       if (mem && typeof mem === 'object') {
         if (mem.extraction && typeof mem.extraction === 'object')
@@ -2972,10 +3001,14 @@ export class SyncEngine {
           )
       }
     }
-    // settings com provedor dentro do objeto (1.4.0): smartApproveDefaults.capture e autoTitle
+    // settings com provedor dentro do objeto (1.4.0): smartApproveDefaults.capture e autoTitle;
+    // (1.5.0) o provedor da transcrição/fala e o modelo padrão da chamada de voz
     for (const [sk, path] of [
       ['smartApproveDefaults', ['capture']],
-      ['autoTitle', []]
+      ['autoTitle', []],
+      ['sttSettings', ['api']],
+      ['ttsSettings', ['api']],
+      ['voiceCallDefaults', ['model']]
     ] as [string, string[]][]) {
       const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(sk) as
         { value: string } | undefined
@@ -3487,7 +3520,8 @@ export class SyncEngine {
     'memory',
     'skills',
     'approvals',
-    'webSearch'
+    'webSearch',
+    'voice'
   ]
 
   /** Sessões (do banco) do chat, com o status gravado. */

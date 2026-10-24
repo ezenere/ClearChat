@@ -20,6 +20,11 @@ export interface VoiceCatalogModel {
   description?: string | null
   /** Preço resumido para a UI (ex.: 'US$ 40 / 1M caracteres'), quando conhecido. */
   priceHint?: string | null
+  /**
+   * Preço de lista por unidade em US$ (OpenRouter `pricing.prompt`: TTS = por caractere de entrada;
+   * STT = por segundo de áudio) — custo ≈ da chamada de voz. null/ausente = desconhecido.
+   */
+  unitPrice?: number | null
   /** Vozes aceitas por este modelo (ids); null/ausente = todas as `voices` do catálogo. */
   voiceIds?: string[] | null
   /**
@@ -186,6 +191,13 @@ function openRouterPriceHint(pricing: unknown, capability: VoiceCapability): str
   return `US$ ${perMin >= 0.1 ? perMin.toFixed(3) : perMin.toFixed(4)} / min`
 }
 
+/** `pricing.prompt` do OpenRouter como número (US$ por unidade); inválido → null. */
+export function openRouterUnitPrice(pricing: unknown): number | null {
+  const p = asObj(pricing)
+  const v = p ? Number(p.prompt) : NaN
+  return Number.isFinite(v) && v >= 0 ? v : null
+}
+
 /**
  * Parser do `GET {baseUrl}/models?output_modalities=speech|transcription` do OpenRouter. Aceita a
  * lista completa também (filtra por `architecture.output_modalities`). Vozes vêm de
@@ -216,6 +228,7 @@ export function parseOpenRouterAudioModels(
       label: str(m.name) || id,
       description: firstSentence(str(m.description)),
       priceHint: openRouterPriceHint(m.pricing, capability),
+      unitPrice: openRouterUnitPrice(m.pricing),
       ...(capability === 'tts' ? { voiceIds } : {})
     })
   }

@@ -266,7 +266,11 @@ async function boot(): Promise<{ manager: Manager }> {
     }
   })
   manager = new call.VoiceCallManager({
-    sendTurn: (sid, text) => void runner.send(sid, text),
+    // como o IPC: o `meta.voice` da fala vai junto (stash consumido pelo `runner.send`)
+    sendTurn: (sid, text, meta) => {
+      if (meta) runner.stashUserMeta(sid, text, meta)
+      void runner.send(sid, text)
+    },
     synth,
     emitState: (s) => states.push({ ...s }),
     emitUtterance: (u) => {
@@ -546,7 +550,7 @@ test('turno continuado: fala sem texto (ruído) devolve a resposta retida', asyn
 
 // ---------------- histórico idêntico + overrides ----------------
 
-test('histórico de um turno de voz = de um turno de texto (só o conteúdo muda)', async () => {
+test('histórico de um turno de voz = de um turno de texto + meta.voice (request idêntica)', async () => {
   synthMode = 'auto'
   const { manager: m } = await boot()
   m.stop() // cada teste começa com a chamada fechada (idempotente)
@@ -569,11 +573,21 @@ test('histórico de um turno de voz = de um turno de texto (só o conteúdo muda
     pb.map((x) => x.message.role),
     pa.map((x) => x.message.role)
   )
+  // a única diferença de meta é `voice` (exibição/custos — nunca vai à API)
   assert.deepEqual(
-    pb.map((x) => Object.keys(x.meta).sort()),
+    pb.map((x) =>
+      Object.keys(x.meta)
+        .filter((k) => k !== 'voice')
+        .sort()
+    ),
     pa.map((x) => Object.keys(x.meta).sort()),
-    'mesmas chaves de meta (nada de marcador de voz)'
+    'mesmas chaves de meta além de meta.voice'
   )
+  assert.equal(pb[0].meta.voice?.source, 'call', 'fala do usuário marcada como da chamada')
+  assert.equal(pb[1].meta.voice?.source, 'call', 'resposta marcada como falada na chamada')
+  assert.equal(pb[1].meta.voice?.spoken, true)
+  assert.equal(pb[0].meta.voice?.callId, pb[1].meta.voice?.callId, 'mesma chamada')
+  assert.equal(pa[0].meta.voice, undefined, 'turno de texto sem meta.voice')
   assert.equal(
     pb.some((x) => x.meta.kind),
     false,
@@ -609,8 +623,8 @@ test('overrides do modo voz: voice.model/voice.tools/voicePrompt só nas request
   assert.equal(req.body.temperature, 0.1, 'params da chamada substituem os do chat')
   assert.deepEqual(
     (req.body.tools ?? []).map((t: any) => t.function.name),
-    ['shell'],
-    'só as tools liberadas na chamada'
+    ['shell', 'end_call'],
+    'só as tools liberadas na chamada (+ end_call, que é da chamada)'
   )
   assert.ok(
     textOf(req.body.messages[0].content).includes('persona base\n\n'),

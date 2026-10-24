@@ -941,6 +941,10 @@ export interface VoiceCallTimelineEvent {
      * 1º áudio (do turno, na 1ª sentença; senão da sentença), `reason` = backend/contexto.
      */
     | 'tts-latency'
+    /** O agente pediu para encerrar (`end_call`): a chamada cai quando a resposta terminar de tocar. */
+    | 'hangup-armed'
+    /** Desligamento pedido pelo agente cancelado (o usuário voltou a falar — `reason`). */
+    | 'hangup-cancelled'
     /**
      * Falha ao TOCAR uma utterance no renderer (`play()` rejeitado, erro de mídia/CSP/codec —
      * `reason` = mensagem, `id`/`class` = a utterance): nunca mais calada (painel + erro do dock).
@@ -1020,7 +1024,12 @@ export interface ClearApi {
       text: string,
       attachments?: AttachmentInfo[],
       /** Skills escolhidas na lâmpada do composer: SKILL.md lido no envio (erro → nada enviado). */
-      skills?: string[]
+      skills?: string[],
+      /**
+       * Extras da mensagem: `voice` = texto ditado no composer (`{ source: 'dictation' }` — o main
+       * só aceita ditado daqui; a fala da chamada é marcada pelo próprio main).
+       */
+      opts?: { voice?: import('./voiceCallMarks').VoiceMessageMeta }
     ): Promise<{ queued: boolean }>
     /** ⚡: aborta o que está rodando e injeta a mensagem já. */
     forceSend(queuedId: string): Promise<void>

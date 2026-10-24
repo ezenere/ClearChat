@@ -59,7 +59,8 @@ export function VoiceCallConfigSection({
     !!voice.model ||
     !!voice.tools ||
     !!voice.voicePrompt?.trim() ||
-    !!voice.promptMode
+    !!voice.promptMode ||
+    voice.endCall != null
   const summary = !enabled
     ? source === 'persona' && scope === 'chat'
       ? 'desligada pela persona'
@@ -95,7 +96,7 @@ export function VoiceCallConfigSection({
       help={
         'Conversa falada com o agente (telefone no composer). Aqui: se a chamada fica disponível ' +
         `${where} e o que muda só nos turnos de voz — modelo e parâmetros, tools e o prompt do modo voz. ` +
-        'Sem override, a chamada usa o modelo e as tools do próprio chat (com o raciocínio desligado).\nO histórico de um turno de voz é igual ao de um turno digitado; a config salva do chat nunca muda.'
+        'Sem override, a chamada usa o modelo e as tools do próprio chat (com o raciocínio desligado).\nNo histórico, as falas da chamada aparecem em itálico (com o mic/alto-falante) entre os marcadores de início e fim da chamada; a config salva do chat nunca muda.'
       }
     >
       <div data-testid="voice-call-config" className="space-y-3">
@@ -191,6 +192,18 @@ export function VoiceCallConfigSection({
                 }
               />
             )}
+            <EndCallField
+              value={voice.endCall ?? null}
+              inherited={
+                scope === 'chat' && personaVoice?.endCall != null
+                  ? personaVoice.endCall
+                  : defaults.endCall
+              }
+              inheritedFrom={
+                scope === 'chat' && personaVoice?.endCall != null ? 'Da persona' : 'Padrão'
+              }
+              onChange={(endCall) => set({ endCall })}
+            />
             <VoicePromptModeField
               value={voice.promptMode ?? null}
               inherited={
@@ -216,6 +229,73 @@ export function VoiceCallConfigSection({
         )}
       </div>
     </CollapsibleSection>
+  )
+}
+
+/**
+ * "O agente pode encerrar a chamada" (tool `end_call` nos turnos de voz): ★ herda (persona no chat;
+ * Configurações → Áudio na persona) / Sim / Não.
+ */
+function EndCallField({
+  value,
+  inherited,
+  inheritedFrom,
+  onChange
+}: {
+  value: boolean | null
+  inherited: boolean
+  inheritedFrom: string
+  onChange: (v: boolean | null) => void
+}): React.JSX.Element {
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <span className="flex items-center gap-1 text-[13px] text-fg/90">
+        O agente pode encerrar a chamada
+        <ApiInfo title="Tool end_call (só nos turnos da chamada, sem aprovação)">
+          <p>
+            Quando você se despede ou pede para desligar, o agente diz uma despedida curta e
+            encerra: a chamada cai depois de a despedida tocar. Se você voltar a falar antes, ela
+            continua.
+          </p>
+        </ApiInfo>
+      </span>
+      <div
+        role="radiogroup"
+        aria-label="O agente pode encerrar a chamada"
+        data-testid="voice-call-end-call"
+        data-effective={(value ?? inherited) ? 'on' : 'off'}
+        className="flex rounded-lg border border-border bg-bg/60 p-0.5"
+      >
+        {([null, true, false] as const).map((v) => {
+          const selected = value === v
+          return (
+            <button
+              key={String(v)}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              data-value={v === null ? 'inherit' : v ? 'on' : 'off'}
+              onClick={() => onChange(v)}
+              className={cn(
+                'flex items-center gap-1 rounded-md px-2 py-0.5 text-[11.5px] transition-colors',
+                selected ? 'bg-active text-fg shadow-sm' : 'text-subtle hover:text-fg'
+              )}
+            >
+              {v === null ? (
+                <>
+                  <Star aria-hidden className="size-2.5 fill-current opacity-70" />
+                  {inheritedFrom} ({inherited ? 'sim' : 'não'})
+                </>
+              ) : v ? (
+                'Sim'
+              ) : (
+                'Não'
+              )}
+            </button>
+          )
+        })}
+      </div>
+    </div>
   )
 }
 

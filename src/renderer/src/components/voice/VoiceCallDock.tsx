@@ -15,6 +15,7 @@
 // GPU…" — o microfone ainda não abriu), `voice-call-gpu-notice` (+ `-ok` "Entendi", uma vez por
 // sessão do app) e `voice-call-gpu-warning` (pouca VRAM livre — avisa, não barra).
 import { useEffect, useState } from 'react'
+import { formatCallClock } from '@shared/voiceCallMarks'
 import {
   Activity,
   Cpu,
@@ -97,6 +98,31 @@ export function VoiceCallElsewhere(): React.JSX.Element | null {
 }
 
 /**
+ * Relógio da chamada ("02:13"): desde o `startedAt` do main (sem ele — main antigo —, desde que a
+ * barra apareceu). Re-renderiza só ele, 1×/s.
+ */
+function CallClock({ startedAt }: { startedAt?: number }): React.JSX.Element {
+  // sem `startedAt` (main antigo): desde a montagem (a barra remonta por chamada — `key`)
+  const [mountedAt] = useState(() => Date.now())
+  const since = startedAt ?? mountedAt
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [])
+  return (
+    <Tip label="Duração da chamada">
+      <span
+        data-testid="voice-call-clock"
+        className="shrink-0 cursor-default text-[12px] text-subtle tabular-nums"
+      >
+        {formatCallClock(now - since)}
+      </span>
+    </Tip>
+  )
+}
+
+/**
  * Barra da chamada NO LUGAR do composer do chat da chamada (mesma largura/posição do card do
  * composer; o texto fica desabilitado durante a chamada). Painel, aviso de clipes e erro ficam
  * logo acima, no mesmo fluxo da pilha.
@@ -174,6 +200,7 @@ export function VoiceCallDock(): React.JSX.Element | null {
                 ? 'Microfone mudo'
                 : phaseLabel(call.phase)}
           </span>
+          <CallClock key={call.callId ?? call.sessionId ?? ''} startedAt={call.startedAt} />
           <span className="flex min-w-0 flex-1 flex-col">
             {preparing && (
               <span

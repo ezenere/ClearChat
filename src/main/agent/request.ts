@@ -4,7 +4,13 @@ import * as os from 'os'
 import { DEFAULT_SKILLS_SUPPORT_PROMPT, defaultToolsPrompt } from '@shared/defaults'
 import { providerKind, type ProviderKind } from '@shared/providerKinds'
 import { DEFAULT_APP_SIGNATURE, resolveAppSignatureHeaders } from '@shared/appSignatures'
-import { SKILL_TOOL_NAMES, TOOL_NAMES, toolDefinitionFor, type ToolDefinition } from '@shared/tools'
+import {
+  END_CALL_TOOL,
+  SKILL_TOOL_NAMES,
+  TOOL_NAMES,
+  toolDefinitionFor,
+  type ToolDefinition
+} from '@shared/tools'
 import { normalizeSkillsConfig, skillsActiveFor } from '@shared/skills'
 import { activeHistory, isDisplayOnly } from '@shared/context'
 import { bwrapAvailable, shellLabel } from '../tools/bash'
@@ -197,7 +203,16 @@ export function availableTools(
   const memory = memoryToolsSource(chat, session).filter((n) => !base.includes(n))
   // skills: pela config de skills (ligadas; subagentes só com `subagents`) — depois da memória
   const skills = skillsActive(chat, session) ? SKILL_TOOL_NAMES : []
-  return memory.length || skills.length ? [...base, ...memory, ...skills] : base
+  // chamada de voz: `end_call` só nos turnos da chamada (sessão principal), salvo desligada em
+  // "O agente pode encerrar a chamada" — independe de enabledTools/voice.tools (SPEC → end_call)
+  const call =
+    session.depth === 0 && session.id
+      ? voiceCallContextFor(chat, { id: session.id, depth: session.depth })
+      : null
+  const voice: ToolName[] = call && call.endCall !== false ? [END_CALL_TOOL] : []
+  return memory.length || skills.length || voice.length
+    ? [...base, ...memory, ...skills, ...voice]
+    : base
 }
 
 // ---------------- skills (SPEC → Skills) ----------------

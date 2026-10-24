@@ -7,6 +7,8 @@
 //   warmup-oom (o /v1/warmup devolve os motores pedidos com state "error" — OOM simulado)
 // `/health` e `/v1/warmup` devolvem `engines: {id: {state}}` (idle → ready depois do aquecimento).
 // FAKE_GPU_COUNTER=<arquivo>: acrescenta uma linha por início (contar reinícios).
+// FAKE_GPU_BODY_FILE=<arquivo>: acrescenta `{url, body}` (JSON por linha) de cada /v1/audio/speech e
+// /v1/config — os testes conferem os parâmetros que chegam ao servidor.
 import { createServer } from 'node:http'
 import { appendFileSync } from 'node:fs'
 
@@ -50,6 +52,8 @@ const server = createServer((req, res) => {
     res.end(
       JSON.stringify({
         status: 'ok',
+        pid: process.pid,
+        busy: false,
         engines: engineStates()
       })
     )
@@ -58,6 +62,14 @@ const server = createServer((req, res) => {
   let body = ''
   req.on('data', (c) => (body += c))
   req.on('end', () => {
+    if (
+      process.env.FAKE_GPU_BODY_FILE &&
+      (req.url === '/v1/audio/speech' || req.url === '/v1/config')
+    )
+      appendFileSync(
+        process.env.FAKE_GPU_BODY_FILE,
+        JSON.stringify({ url: req.url, body: JSON.parse(body || '{}') }) + '\n'
+      )
     if (req.url === '/v1/audio/speech') {
       const j = JSON.parse(body || '{}')
       if (!engines.includes(j.model)) {
@@ -104,7 +116,7 @@ const server = createServer((req, res) => {
   })
 })
 server.listen(port, '127.0.0.1', () => {
-  process.stdout.write(JSON.stringify({ event: 'listening', port }) + '\n')
+  process.stdout.write(JSON.stringify({ event: 'listening', port, pid: process.pid }) + '\n')
 })
 const m = /^(crash-after|idle-exit-after):(\d+)$/.exec(mode)
 if (m) {

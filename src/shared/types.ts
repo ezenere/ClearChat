@@ -2,6 +2,7 @@ import type { MemoryConfig, MemoryExtractionResult } from './memory'
 import type { SkillPartMeta, SkillsConfig } from './skills'
 import type { VoiceCallConfig } from './voice'
 import type { AutoTitleRecord } from './autoTitle'
+import type { VoiceCallMark, VoiceMessageMeta } from './voiceCallMarks'
 // Contrato compartilhado entre main, preload e renderer. Ver SPEC.md → "Tipos compartilhados".
 
 export interface Provider {
@@ -113,6 +114,8 @@ export type ToolName =
   | 'list_skills'
   | 'skill_load'
   | 'skill_read'
+  // chamada de voz: só nos turnos da chamada (SPEC → Chamada de voz → end_call), nunca por enabledTools
+  | 'end_call'
 
 /**
  * Tools cujo padrão global é PERGUNTAR (modo `lists`; ver approvalPolicy.ts) — os itens Comandos,
@@ -611,6 +614,8 @@ export interface MessageMeta {
     | 'sibling-broadcast'
     /** Card da extração de memórias (synthetic, só exibição — NUNCA enviado à API, como 'error'). */
     | 'memory-extraction'
+    /** Marcador de início/fim da chamada de voz (synthetic, só exibição — `meta.voiceCall`). */
+    | 'voice-call'
   /** Resposta do assistente cortada pelo usuário. */
   interrupted?: boolean
   usage?: Usage
@@ -686,6 +691,11 @@ export interface MessageMeta {
   // ---- título automático (1ª mensagem digitada da principal) ----
   /** Título do chat gerado por modelo a partir desta mensagem (custo/modelo — fora do histórico). */
   autoTitle?: AutoTitleRecord
+  // ---- chamada de voz (SPEC → Chamada de voz → Histórico e custos) ----
+  /** Mensagem de voz: fala da chamada (usuário/assistente) ou texto ditado. Só exibição/custos. */
+  voice?: VoiceMessageMeta
+  /** kind 'voice-call': marcador de início/fim da chamada (duração, quem encerrou, custos). */
+  voiceCall?: VoiceCallMark
 }
 
 /** Tipo de visualização de um arquivo no painel (SPEC → "Visualizador de arquivos"). */

@@ -4,7 +4,7 @@
 // sessão; a síntese segue pelo caminho de API inalterado (PCM em streaming, relay da chamada).
 // URL/token só existem aqui dentro do main — nunca nas settings, na visão do renderer ou em logs.
 import { DEFAULT_TTS_API, type TtsSettings } from '@shared/voice'
-import { DEFAULT_TTS_GPU, type GpuTtsEngineId } from '@shared/gpuVoice'
+import { DEFAULT_TTS_GPU, resolveGpuParams, type GpuTtsEngineId } from '@shared/gpuVoice'
 
 export interface GpuEndpoint {
   baseUrl: string
@@ -49,6 +49,8 @@ export async function gpuTtsAsApi(settings: TtsSettings): Promise<TtsSettings> {
     )
   const gpu = settings.gpu ?? DEFAULT_TTS_GPU
   const ep = await resolver.tts(gpu.engine, { steps: gpu.steps })
+  // parâmetros do motor (padrões + os do usuário) em CADA request: valem na próxima fala
+  const params = resolveGpuParams(gpu.engine, gpu.params?.[gpu.engine])
   return {
     ...settings,
     backend: 'api',
@@ -57,7 +59,8 @@ export async function gpuTtsAsApi(settings: TtsSettings): Promise<TtsSettings> {
       baseUrl: ep.baseUrl,
       apiKey: ep.apiKey,
       model: gpu.engine,
-      voice: gpu.voice
+      voice: gpu.voice,
+      ...(Object.keys(params).length ? { extraBody: { params } } : {})
     }
   }
 }

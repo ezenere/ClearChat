@@ -3,7 +3,18 @@
 // latência), agrupamento das vozes, voz padrão, problemas de prontidão (painéis de Fala/Transcrição
 // e pré-checagem da chamada) e o WAV da amostra de voz. Sem DOM, sem React, sem `window` — testado
 // em `e2e/gpuModeUi.test.ts`. Só `import type` de `./types` (que toca `window.api`).
-import { GPU_SERVER_IDLE_EXIT_MIN, gpuEnginesLabel } from '@shared/gpuVoice'
+import {
+  DEFAULT_TTS_GPU,
+  GPU_ENGINE_PARAMS,
+  GPU_SERVER_IDLE_EXIT_MIN,
+  gpuEnginesLabel,
+  normalizeGpuParamOverrides,
+  normalizeGpuParamValue,
+  resolveGpuParams,
+  type GpuParamSpec,
+  type GpuParamValue,
+  type GpuParamValues
+} from '@shared/gpuVoice'
 import type {
   GpuCompatLevel,
   GpuEngineId,
@@ -223,7 +234,8 @@ export function hardwareVerdict(s: GpuStatus): HardwareVerdict {
         `${plural(blocked.length, 'motor bloqueado', 'motores bloqueados')}: ${blocked.map((e) => e.label).join(', ')}`
       )
   }
-  if (nvidia && nvidia.vramFreeMb != null && nvidia.vramFreeMb < 3072)
+  // a VRAM do próprio servidor do app não conta como "ocupada por outros"
+  if (nvidia && nvidia.vramFreeMb != null && nvidia.vramFreeMb + (nvidia.vramOwnMb ?? 0) < 3072)
     details.push(
       `Pouca VRAM livre agora (${formatMb(nvidia.vramFreeMb)}) — feche jogos/apps que usam a GPU`
     )
@@ -367,8 +379,98 @@ export function gpuConfigFor(
     voice: keep ?? defaultGpuVoice(engine),
     ...(engine.id === 'omnivoice'
       ? { steps: prev?.steps ?? engine.options?.steps ?? OMNIVOICE_DEFAULT_STEPS }
-      : {})
+      : {}),
+    // os parâmetros são por motor: trocar de motor não perde os de nenhum
+    ...(prev?.params ? { params: prev.params } : {})
   }
+}
+
+// ---------------- parâmetros por motor ----------------
+
+export interface GpuParamRow {
+  spec: GpuParamSpec
+  value: GpuParamValue
+  /** Diferente do padrão. */
+  changed: boolean
+  /** Valor legível ("1,15×", "0,75", "ligado", "Português"). */
+  display: string
+  defaultDisplay: string
+}
+
+/** Valor de parâmetro legível (pt-BR; velocidade com "×"). */
+export function formatGpuParam(spec: GpuParamSpec, v: GpuParamValue): string {
+  if (spec.kind === 'boolean') return v ? 'ligado' : 'desligado'
+  if (spec.kind === 'select') return spec.options?.find((o) => o.value === v)?.label ?? String(v)
+  const n = typeof v === 'number' ? v : Number(v)
+  const t = n.toFixed(spec.decimals ?? 2).replace('.', ',')
+  return spec.key === 'speed' ? `${t}×` : t
+}
+
+/** Linhas do editor de parâmetros de um motor (valor atual, padrão, mudou?). */
+export function gpuParamRows(id: GpuEngineId, overrides: unknown): GpuParamRow[] {
+  const cur = resolveGpuParams(id, overrides)
+  return (GPU_ENGINE_PARAMS[id] ?? []).map((spec) => ({
+    spec,
+    value: cur[spec.key],
+    changed: cur[spec.key] !== spec.default,
+    display: formatGpuParam(spec, cur[spec.key]),
+    defaultDisplay: formatGpuParam(spec, spec.default)
+  }))
+}
+
+/** Overrides com `key` = `value` (limitado à faixa; voltar ao padrão tira a chave). */
+export function setGpuParam(
+  id: GpuEngineId,
+  overrides: unknown,
+  key: string,
+  value: unknown
+): GpuParamValues {
+  const base = normalizeGpuParamOverrides(id, overrides)
+  const spec = (GPU_ENGINE_PARAMS[id] ?? []).find((s) => s.key === key)
+  if (!spec) return base
+  const v = normalizeGpuParamValue(spec, value)
+  if (v === undefined) return base
+  const next = { ...base, [key]: v }
+  return normalizeGpuParamOverrides(id, next)
+}
+
+/** `ttsSettings` com os parâmetros de um motor de fala (vazio = padrão: a chave sai). */
+export function ttsWithGpuParams(
+  tts: TtsSettingsGpu,
+  id: GpuTtsEngineId,
+  overrides: GpuParamValues
+): TtsSettingsGpu {
+  const gpu = tts.gpu ?? { ...DEFAULT_TTS_GPU }
+  const all = { ...(gpu.params ?? {}) }
+  const o = normalizeGpuParamOverrides(id, overrides)
+  if (Object.keys(o).length) all[id] = o
+  else delete all[id]
+  const rest = { ...gpu }
+  delete rest.params
+  return { ...tts, gpu: { ...rest, ...(Object.keys(all).length ? { params: all } : {}) } }
+}
+
+/** `sttSettings` com os parâmetros do whisper (vazio = padrão: a chave sai). */
+export function sttWithGpuParams(stt: SttSettingsGpu, overrides: GpuParamValues): SttSettingsGpu {
+  const o = normalizeGpuParamOverrides('whisper-large-v3-turbo', overrides)
+  return {
+    ...stt,
+    gpu: {
+      engine: 'whisper-large-v3-turbo',
+      ...(Object.keys(o).length ? { params: o } : {})
+    }
+  }
+}
+
+/** Overrides salvos de um motor (fala → `ttsSettings.gpu.params[id]`; whisper → `sttSettings.gpu.params`). */
+export function savedGpuParams(
+  id: GpuEngineId,
+  tts: TtsSettingsGpu | null,
+  stt: SttSettingsGpu | null
+): GpuParamValues {
+  return id === 'whisper-large-v3-turbo'
+    ? normalizeGpuParamOverrides(id, stt?.gpu?.params)
+    : normalizeGpuParamOverrides(id, tts?.gpu?.params?.[id as GpuTtsEngineId])
 }
 
 // ---------------- prontidão ----------------
@@ -625,7 +727,9 @@ export function gpuCallPlan(
   if (stt.mode === 'gpu') engines.push('whisper-large-v3-turbo')
   if (!engines.length || !s) return null
   const running = s.server.state === 'running' ? s.server.engines : []
-  const toLoad = engines.filter((id) => !running.includes(id))
+  const toLoad = engines.filter(
+    (id) => !running.includes(id) && !s.engines.find((e) => e.id === id)?.vram?.loaded
+  )
   const vramNeedMb = toLoad.reduce(
     (n, id) => n + (s.engines.find((e) => e.id === id)?.vramMb ?? 0),
     0
@@ -637,7 +741,11 @@ export function gpuCallPlan(
       null
     )
   const gpuName = nv ? shortGpuName(nv.name) : null
-  const vramFreeMb = nv?.vramFreeMb ?? null
+  // livre agora + o que o app libera ao trocar de motor (os processos dele de outros grupos)
+  const tts0 = toLoad.map((id) => s.engines.find((e) => e.id === id)).find((e) => e?.kind === 'tts')
+  const avail = tts0?.vram?.availMb ?? null
+  const vramFreeMb =
+    nv?.vramFreeMb == null ? null : avail != null ? Math.max(avail, nv.vramFreeMb) : nv.vramFreeMb
   const label = what === 'chamada' ? 'A chamada' : 'O ditado'
   const notice = !toLoad.length
     ? null

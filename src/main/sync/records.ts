@@ -1,6 +1,7 @@
 // Mapeamento entidades locais ↔ plaintext dos registros do sync (docs/SYNC_PROTOCOL.md §4.3).
 // Sem Electron: SQL direto na conexão (testável com banco temporário). Campos locais do dispositivo
-// (§4.4: `cwd` de chats e personas) nunca saem daqui e são preservados ao aplicar.
+// (§4.4: `cwd` de chats e personas; as partes do dispositivo das settings de áudio — microfone,
+// modo/bloco da GPU local, "modelo instalado") nunca saem daqui e são preservados ao aplicar.
 import type Database from 'better-sqlite3'
 import { homedir } from 'node:os'
 import { providerKind } from '@shared/providerKinds'
@@ -54,17 +55,34 @@ export const SETTING_IDS = [
   // desde 1.4.0 (preferências; antes locais do dispositivo)
   'smartApproveDefaults',
   'autoTitle',
-  'toolOutputSpillChars'
+  'toolOutputSpillChars',
+  // desde 1.5.0 (áudio: ditado, transcrição, fala e padrões da chamada de voz) — as partes do
+  // dispositivo ficam fora (VOICE_DEVICE_FIELDS)
+  'audioInput',
+  'sttSettings',
+  'ttsSettings',
+  'voiceCallDefaults'
 ] as const
 
 /**
  * Ids de `setting` que entraram depois do 1.0.0: um dispositivo que já sincronizava não marcou os
  * valores locais como sujos (os triggers não os viam) — o motor faz uma passada única depois do
- * primeiro pull (SyncEngine.backfillSettings). Mudou a lista → mudar a versão.
+ * primeiro pull (SyncEngine.backfillSettings). Mudou a lista → mudar a versão. A lista leva TODOS
+ * os ids desde 1.4.0 (quem pula de < 1.4.0 direto para 1.5.0 também envia os de 1.4.0; os que já
+ * têm registro online são pulados). Em 1.5.0 a passada também envia a `voice` local de chats e
+ * personas (antes local do dispositivo) que ainda não está online.
  */
 export const SETTINGS_BACKFILL = {
-  version: '1.4.0',
-  ids: ['smartApproveDefaults', 'autoTitle', 'toolOutputSpillChars']
+  version: '1.5.0',
+  ids: [
+    'smartApproveDefaults',
+    'autoTitle',
+    'toolOutputSpillChars',
+    'audioInput',
+    'sttSettings',
+    'ttsSettings',
+    'voiceCallDefaults'
+  ]
 } as const
 
 /** Status transitórios de sessão (exibidos como interrupted sem janela aberta, §4.3.7). */
@@ -119,6 +137,143 @@ function setSetting(conn: Database.Database, key: string, value: unknown): void 
         'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
       )
       .run(key, JSON.stringify(value))
+}
+
+// ---------------- settings de áudio (§4.3.2/§4.4, desde 1.5.0) ----------------
+
+const isObj = (v: unknown): v is Plain => !!v && typeof v === 'object' && !Array.isArray(v)
+
+/** Ids de `setting` do áudio com partes do dispositivo (filtradas na ida, preservadas na volta). */
+export const VOICE_SETTING_IDS = ['audioInput', 'sttSettings', 'ttsSettings'] as const
+
+/** Campos do endpoint que só o main preenche ao resolver o provedor — nunca gravados nem enviados. */
+const VOICE_ENDPOINT_RUNTIME = ['baseUrl', 'apiKey', 'providerKind', 'extraBody']
+
+/**
+ * "Onde rodar" de stt/tts e o valor quando o online não tem um. O modo `gpu` ("Modo avançado (GPU
+ * local)") é do DISPOSITIVO: nunca é enviado (vai o valor que já está online) e um dispositivo em
+ * `gpu` continua em `gpu` ao receber o registro — a escolha sem GPU (api/local/híbrido) sincroniza.
+ */
+const VOICE_MODE_FIELD: Record<string, { field: string; fallback: string }> = {
+  sttSettings: { field: 'mode', fallback: 'api' },
+  ttsSettings: { field: 'backend', fallback: 'local' }
+}
+
+/** `value` da última revisão do servidor de um `setting` (sync_records.base). */
+function onlineSettingValue(conn: Database.Database, id: string): unknown {
+  try {
+    const r = conn
+      .prepare("SELECT base FROM sync_records WHERE type = 'setting' AND id = ?")
+      .get(id) as { base: string | null } | undefined
+    return r?.base ? (parse<Plain>(r.base, {}).value ?? null) : null
+  } catch {
+    return null // sem as tabelas do sync (banco sem sync ligado)
+  }
+}
+
+/**
+ * Valor local de uma setting de áudio → `value` do registro, sem as partes do dispositivo:
+ * `audioInput.deviceId` (microfone desta máquina); em stt/tts o bloco `gpu` (motor/voz/parâmetros
+ * da GPU local), `local.installed` (modelo baixado AQUI), endereço/chave que o main resolve, e o
+ * modo `gpu` (troca pelo valor online, ou o padrão). Objeto vazio → null.
+ */
+export function voiceSettingOut(conn: Database.Database, id: string, value: unknown): unknown {
+  if (!isObj(value)) return value ?? null
+  const out = JSON.parse(JSON.stringify(value)) as Plain
+  if (id === 'audioInput') delete out.deviceId
+  const mode = VOICE_MODE_FIELD[id]
+  if (mode) {
+    delete out.gpu
+    if (isObj(out.api)) for (const k of VOICE_ENDPOINT_RUNTIME) delete out.api[k]
+    if (isObj(out.local)) delete out.local.installed
+    if (out[mode.field] === 'gpu') {
+      const online = onlineSettingValue(conn, id)
+      const v = isObj(online) ? online[mode.field] : undefined
+      out[mode.field] = typeof v === 'string' && v !== 'gpu' ? v : mode.fallback
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
+/**
+ * `value` recebido de uma setting de áudio + as partes do dispositivo do valor local (`cur`):
+ * `deviceId`, bloco `gpu`, modo `gpu` (continua em `gpu`; `gpu` recebido nunca é aplicado) e
+ * `local.installed` (mantido se o motor é o mesmo — a semântica de "instalado" é por motor —, senão
+ * false: a UI oferece o download neste dispositivo). Endereço/chave recebidos são descartados.
+ */
+export function voiceSettingIn(id: string, incoming: unknown, cur: unknown): unknown {
+  const local = isObj(cur) ? cur : null
+  const inc = isObj(incoming) ? (JSON.parse(JSON.stringify(incoming)) as Plain) : null
+  if (id === 'audioInput') {
+    const dev = typeof local?.deviceId === 'string' && local.deviceId ? local.deviceId : null
+    if (!inc) return dev ? { deviceId: dev } : null
+    delete inc.deviceId
+    if (dev) inc.deviceId = dev
+    return inc
+  }
+  const mode = VOICE_MODE_FIELD[id]
+  if (!mode) return incoming ?? null
+  const gpuMode = local?.[mode.field] === 'gpu'
+  const keep: Plain = local && 'gpu' in local ? { gpu: local.gpu } : {}
+  if (!inc)
+    return gpuMode || 'gpu' in keep
+      ? { ...(gpuMode ? { [mode.field]: 'gpu' } : {}), ...keep }
+      : null
+  delete inc.gpu
+  if (isObj(inc.api)) for (const k of VOICE_ENDPOINT_RUNTIME) delete inc.api[k]
+  if (gpuMode) inc[mode.field] = 'gpu'
+  else if (inc[mode.field] === 'gpu') {
+    if (typeof local?.[mode.field] === 'string') inc[mode.field] = local[mode.field]
+    else delete inc[mode.field]
+  }
+  if (isObj(inc.local)) {
+    const ll = isObj(local?.local) ? local.local : null
+    inc.local.installed = !!ll && ll.engine === inc.local.engine && ll.installed === true
+  }
+  return { ...inc, ...keep }
+}
+
+/**
+ * Marcadores da chamada de voz no fio (§4.3.8, desde 1.5.0). Localmente o marcador é
+ * `meta.kind: 'voice-call'` + `meta.voiceCall`; no registro ele vai como `kind: 'memory-extraction'`
+ * (sem `memoryExtraction`) + `voiceCall`: é um `kind` que os apps ≤ 0.9.0 já tratam como só de
+ * exibição (`DISPLAY_ONLY_KINDS`: fora da request ao modelo, da compactação, da busca, do
+ * `read_history` e da extração) e cujo card eles não desenham sem `memoryExtraction` — assim um app
+ * antigo hospedando/continuando o chat nunca manda o texto do marcador ao modelo. Leitores ≥ 1.5.0
+ * desfazem a troca (`voiceCall` presente e `memoryExtraction` ausente ⇒ `voice-call`).
+ */
+export function metaToWire(meta: MessageMeta): MessageMeta {
+  if (meta?.kind !== 'voice-call') return meta
+  return { ...meta, kind: 'memory-extraction' }
+}
+
+/** `meta` recebido → local (desfaz `metaToWire`; `kind: 'voice-call'` explícito também vale). */
+export function metaFromWire(meta: MessageMeta): MessageMeta {
+  if (
+    meta?.kind === 'memory-extraction' &&
+    isObj(meta.voiceCall) &&
+    (meta as Plain).memoryExtraction == null
+  )
+    return { ...meta, kind: 'voice-call' }
+  return meta
+}
+
+/**
+ * Tipo do provedor recebido (§4.3.1): o valor gravado, ou inferido pela URL. Reparo (desde 1.5.0):
+ * apps < 1.5.0 não conhecem `elevenlabs` e gravam `openai` (inferência pela URL) ao regravar o
+ * provedor — uma URL da ElevenLabs nunca é um provedor de chat OpenAI-compatível, então vale
+ * `elevenlabs`.
+ */
+export function remoteProviderKind(baseUrl: string, kind: unknown): string {
+  const k = providerKind({ baseUrl, kind: typeof kind === 'string' ? kind : undefined })
+  if (k !== 'openai') return k
+  let host = baseUrl.toLowerCase()
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase()
+  } catch {
+    /* URL inválida: o texto inteiro */
+  }
+  return host.includes('elevenlabs.io') ? 'elevenlabs' : k
 }
 
 // Árvore de mensagens (§4.3.7/§4.3.8): coluna parent_id '' = raiz ↔ plaintext `parentId: null`;
@@ -179,28 +334,15 @@ export function sameRecordPlain(
 }
 
 /**
- * Campos do config de chat/persona que NUNCA saem no sync: `cwd` (caminho local do dispositivo) e
- * `voice` (chamada de voz por persona/chat — local até uma versão futura do protocolo incluir o
- * áudio; enquanto isso não vai ao servidor e o valor local sobrevive aos registros recebidos).
+ * Campos do config de chat/persona que NUNCA saem no sync: `cwd` (caminho local do dispositivo).
+ * `voice` (chamada de voz) era local até o protocolo 1.4.1 e sincroniza desde 1.5.0 (§4.3.6).
  */
-const LOCAL_ONLY_CONFIG_KEYS = ['cwd', 'voice'] as const
+const LOCAL_ONLY_CONFIG_KEYS = ['cwd'] as const
 
 const stripLocalOnly = (cfg: Plain): Plain => {
   const out = { ...cfg }
   for (const k of LOCAL_ONLY_CONFIG_KEYS) delete out[k]
   return out
-}
-
-/**
- * Config recebido do sync + os campos locais preservados (`cwd` tem regra própria em cada tipo):
- * o que veio de fora para campos locais é descartado e o valor local (se houver) volta.
- */
-function withLocalVoice(incoming: Plain, localJson: string | undefined): Plain {
-  const cfg: Plain = { ...incoming }
-  delete cfg.voice
-  const localVoice = localJson ? parse<Plain>(localJson, {}).voice : undefined
-  if (localVoice !== undefined && localVoice !== null) cfg.voice = localVoice
-  return cfg
 }
 
 // ---------------- local → plaintext ----------------
@@ -259,7 +401,11 @@ export function buildLocal(
         return { scope: null, plain: { sv: 1, value } }
       }
       if (!(SETTING_IDS as readonly string[]).includes(id)) return null
-      return { scope: null, plain: { sv: 1, value: settingValue(conn, id) } }
+      const raw = settingValue(conn, id)
+      const value = (VOICE_SETTING_IDS as readonly string[]).includes(id)
+        ? voiceSettingOut(conn, id, raw)
+        : raw
+      return { scope: null, plain: { sv: 1, value } }
     }
     case 'preset': {
       const r = conn.prepare('SELECT * FROM presets WHERE id = ?').get(id) as
@@ -431,7 +577,7 @@ export function buildLocal(
         sessionId: r.session_id,
         seq: r.seq,
         message: parse<ApiMessage>(r.message_json, { role: 'user', content: '' }),
-        meta: parse<MessageMeta>(r.meta_json, {}),
+        meta: metaToWire(parse<MessageMeta>(r.meta_json, {})),
         createdAt: r.created_at
       }
       // legado (NULL) fica sem parentId: os leitores derivam; null explícito na raiz (§4.3.8)
@@ -629,7 +775,7 @@ export function messageFromPlain(id: string, p: Plain): StoredMessage {
     sessionId: String(p.sessionId ?? ''),
     seq: Number(p.seq ?? 0),
     message: (p.message ?? { role: 'user', content: '' }) as ApiMessage,
-    meta: (p.meta ?? {}) as MessageMeta,
+    meta: metaFromWire((p.meta ?? {}) as MessageMeta),
     createdAt: Number(p.createdAt ?? 0)
   }
   if (p.parentId === null || (typeof p.parentId === 'string' && p.parentId)) m.parentId = p.parentId
@@ -664,7 +810,7 @@ export function applyRemote(
           id,
           str(p.name, 'Provider'),
           str(p.baseUrl),
-          providerKind({ baseUrl: str(p.baseUrl), kind: strOrNull(p.kind) ?? undefined }),
+          remoteProviderKind(str(p.baseUrl), p.kind),
           str(p.apiKey),
           JSON.stringify(p.headers && typeof p.headers === 'object' ? p.headers : {}),
           num(p.createdAt, Date.now())
@@ -678,8 +824,12 @@ export function applyRemote(
         const v = (value ?? {}) as { providerId?: unknown; model?: unknown }
         setSetting(conn, 'defaultProviderId', value ? strOrNull(v.providerId) : null)
         setSetting(conn, 'defaultModel', value ? strOrNull(v.model) : null)
-      } else if ((SETTING_IDS as readonly string[]).includes(id)) setSetting(conn, id, value)
+      } else if ((VOICE_SETTING_IDS as readonly string[]).includes(id))
+        setSetting(conn, id, voiceSettingIn(id, value, settingValue(conn, id)))
+      else if ((SETTING_IDS as readonly string[]).includes(id)) setSetting(conn, id, value)
       res.scopes.add('settings')
+      if ((VOICE_SETTING_IDS as readonly string[]).includes(id) || id === 'voiceCallDefaults')
+        res.scopes.add('voice')
       if (id === 'approvalModes' || id === 'approvalLists' || id === 'smartApproveDefaults')
         res.scopes.add('approvals')
       if (id.startsWith('webSearch')) res.scopes.add('webSearch')
@@ -689,7 +839,7 @@ export function applyRemote(
       const cur = conn.prepare('SELECT config_json FROM presets WHERE id = ?').get(id) as
         { config_json: string } | undefined
       const localCwd = cur ? parse<Plain>(cur.config_json, {}).cwd : undefined
-      const cfg: Plain = withLocalVoice((p.config ?? {}) as Plain, cur?.config_json)
+      const cfg: Plain = { ...((p.config ?? {}) as Plain) }
       delete cfg.cwd
       if (typeof localCwd === 'string' && localCwd) cfg.cwd = localCwd
       conn
@@ -789,7 +939,7 @@ export function applyRemote(
       const cur = conn.prepare('SELECT config_json FROM chats WHERE id = ?').get(id) as
         { config_json: string } | undefined
       const localCwd = cur ? parse<Plain>(cur.config_json, {}).cwd : undefined
-      const cfg: Plain = withLocalVoice((p.config ?? {}) as Plain, cur?.config_json)
+      const cfg: Plain = { ...((p.config ?? {}) as Plain) }
       delete cfg.cwd
       cfg.cwd =
         typeof localCwd === 'string' && localCwd ? localCwd : (ctx.defaultCwd?.() ?? homedir())
@@ -862,7 +1012,7 @@ export function applyRemote(
         .get(sessionId, seq, id) as { id: string } | undefined
       if (occ) conn.prepare('UPDATE messages SET seq = -ABS(seq) WHERE id = ?').run(occ.id)
       const message = (p.message ?? { role: 'user', content: '' }) as ApiMessage
-      const meta = (p.meta ?? {}) as MessageMeta
+      const meta = metaFromWire((p.meta ?? {}) as MessageMeta)
       conn
         .prepare(
           `INSERT INTO messages (id, session_id, seq, message_json, meta_json, created_at, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?)

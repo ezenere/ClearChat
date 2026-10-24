@@ -4,12 +4,14 @@ import type { ChatConfig, MessageMeta, ModelInfo, Session, StoredMessage, Usage 
 import { DEFAULT_COMPACT_THRESHOLD } from './defaults'
 
 /**
- * Mensagens só de exibição (synthetic): erro persistido ('error') e card da extração de memórias
- * ('memory-extraction'). NUNCA vão para a API nem contam como resposta do assistente.
+ * Mensagens só de exibição (synthetic): erro persistido ('error'), card da extração de memórias
+ * ('memory-extraction') e marcadores da chamada de voz ('voice-call'). NUNCA vão para a API nem
+ * contam como resposta do assistente.
  */
 export const DISPLAY_ONLY_KINDS: readonly NonNullable<MessageMeta['kind']>[] = [
   'error',
-  'memory-extraction'
+  'memory-extraction',
+  'voice-call'
 ]
 export const isDisplayOnly = (meta: MessageMeta | null | undefined): boolean =>
   !!meta?.kind && DISPLAY_ONLY_KINDS.includes(meta.kind)

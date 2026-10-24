@@ -1,6 +1,7 @@
 // Painéis "Local (GPU)" dentro de Fala (TTS) e Transcrição (STT): motor instalado, voz agrupada
-// (Vozes do modelo / Voz pt-BR livre (CC0) / Minhas vozes) com prévia, passos do OmniVoice e a
-// prontidão visível (runtime/motor/servidor/compat) com o caminho para resolver no Modo avançado.
+// (Vozes do modelo / Voz pt-BR livre (CC0) / Minhas vozes) com prévia, passos do OmniVoice,
+// "Parâmetros" do motor escolhido (velocidade, temperatura… — os mesmos do card no Modo avançado) e
+// a prontidão visível (runtime/motor/servidor/compat) com o caminho para resolver no Modo avançado.
 import { Info, TriangleAlert, OctagonX } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import type { SttSettings, TtsSettings } from '@shared/voice'
@@ -16,6 +17,9 @@ import {
   groupGpuVoices,
   installedTtsEngines,
   measuredLine,
+  savedGpuParams,
+  sttWithGpuParams,
+  ttsWithGpuParams,
   type GpuProblem
 } from '../../../lib/voice/gpu/gpuUi'
 import {
@@ -23,7 +27,8 @@ import {
   asGpuTts,
   fromGpuTts,
   gpuApi,
-  type GpuStatus
+  type GpuStatus,
+  type GpuTtsEngineId
 } from '../../../lib/voice/gpu/types'
 import { refreshGpuStatus, revealGpuSection } from '../../../lib/voice/gpu/useGpuStatus'
 import { playAudioBytes } from '../../../lib/voice/voiceSettingsHelpers'
@@ -31,6 +36,7 @@ import { Button, Label } from '../../ui/controls'
 import { Select } from '../../ui/Select'
 import { DismissibleError, VoicePicker } from '../voiceSettingsParts'
 import { Badge, StepsControl } from './gpuParts'
+import { GpuParamsEditor } from './GpuParamsEditor'
 
 /** Link "Modo avançado (GPU local)" que abre e mostra a seção. */
 export function GpuSectionLink({
@@ -317,6 +323,18 @@ export function GpuTtsPanel({
           />
         </div>
       )}
+      {engine && engine.install.state === 'installed' && (
+        <GpuParamsEditor
+          engineId={engine.id}
+          engineLabel={engine.label}
+          kind="tts"
+          value={savedGpuParams(engine.id, g, null)}
+          onChange={(next) =>
+            void onCommit(fromGpuTts(ttsWithGpuParams(g, engine.id as GpuTtsEngineId, next)))
+          }
+          testId="tts-gpu-params"
+        />
+      )}
       <GpuReadiness problems={problems} testId="tts-gpu-readiness" />
       <DismissibleError
         error={error}
@@ -331,10 +349,13 @@ export function GpuTtsPanel({
 /** Painel de Transcrição com modo "Local (GPU)" (whisper large-v3-turbo). */
 export function GpuSttPanel({
   stt,
-  status
+  status,
+  onCommit
 }: {
   stt: SttSettings
   status: GpuStatus | null
+  /** Grava os parâmetros do whisper (`sttSettings.gpu.params`); ausente = sem editor. */
+  onCommit?: (next: SttSettings) => Promise<boolean>
 }): React.JSX.Element {
   const s = asGpuStt(stt)
   const id = s.gpu?.engine ?? 'whisper-large-v3-turbo'
@@ -365,6 +386,16 @@ export function GpuSttPanel({
           gerenciar no <GpuSectionLink testId="stt-gpu-manage" />
         </span>
       </div>
+      {engine?.install.state === 'installed' && onCommit && (
+        <GpuParamsEditor
+          engineId="whisper-large-v3-turbo"
+          engineLabel={engine.label}
+          kind="stt"
+          value={savedGpuParams('whisper-large-v3-turbo', null, s)}
+          onChange={(next) => void onCommit(sttWithGpuParams(s, next))}
+          testId="stt-gpu-params"
+        />
+      )}
       <GpuReadiness problems={gpuSttProblems(s, status)} testId="stt-gpu-readiness" />
     </div>
   )

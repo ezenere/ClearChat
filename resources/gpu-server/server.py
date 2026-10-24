@@ -16,8 +16,10 @@ Endpoints do `serve` (TODOS exigem `Authorization: Bearer <CLEARCHAT_GPU_TOKEN>`
   GET  /v1/voices              vozes por motor (embutidas + CC0 + do usuário)
   GET  /v1/capabilities        dispositivo/VRAM, idiomas, vozes, latência medida
   POST /v1/warmup              {"engines":[...]} carrega os modelos em segundo plano
-  POST /v1/config              {"omnivoice":{"steps":16}}
-  POST /v1/audio/speech        {model, input, voice, response_format: pcm|wav}
+  POST /v1/config              {"omnivoice":{"steps":16}, "whisper":{"beam_size":1,"vad_filter":false,"language":"pt"}}
+  POST /v1/audio/speech        {model, input, voice, response_format: pcm|wav, params?: {...}}
+                               `params` = parâmetros do motor (velocidade, temperatura… — ver PARAMS;
+                               limitados às faixas; ausentes = padrão) — valem só nesta request
                                pcm e wav → corpo PCM16 em streaming (audio/pcm;rate=N;channels=1) — o
                                cliente do app decide pelo Content-Type; "wav_file" → WAV completo
   POST /v1/audio/transcriptions  multipart (file, model, language, response_format json|text|verbose_json)
@@ -101,6 +103,56 @@ STT_ID = "whisper-large-v3-turbo"
 OPENAI_VOICES = {"alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse",
                  "default"}
 GPU_WAIT_S = 20.0
+
+# Parâmetros por motor: chave → (padrão, mínimo, máximo, tipo). Espelho de GPU_ENGINE_PARAMS em
+# src/shared/gpuVoice.ts (o app manda o conjunto completo em `params`; aqui só se limita a faixa).
+XTTS_DEFAULT_SPEED = 1.15
+PARAMS: dict[str, dict[str, tuple]] = {
+    "xtts-v2": {"speed": (XTTS_DEFAULT_SPEED, 0.8, 1.5, float), "temperature": (0.75, 0.1, 1.0, float),
+                "repetition_penalty": (10.0, 1.0, 20.0, float), "top_p": (0.85, 0.1, 1.0, float),
+                "top_k": (50, 1, 100, int)},
+    "omnivoice": {"guidance_scale": (2.0, 1.0, 4.0, float), "speed": (1.0, 0.7, 1.5, float),
+                  "steps": (None, 4, 64, int)},
+    "vibevoice-realtime": {"cfg_scale": (1.5, 1.0, 3.0, float), "ddpm_steps": (5, 2, 20, int)},
+    "qwen3-tts-0.6b": {"temperature": (0.9, 0.1, 1.5, float), "top_p": (1.0, 0.1, 1.0, float),
+                       "top_k": (50, 1, 100, int)},
+    "qwen3-tts-1.7b": {"temperature": (0.9, 0.1, 1.5, float), "top_p": (1.0, 0.1, 1.0, float),
+                       "top_k": (50, 1, 100, int)},
+}
+WHISPER_DEFAULTS = {"beam_size": 1, "vad_filter": False, "language": "pt"}
+WHISPER_LANGS = {"pt", "en", "es", "auto"}
+
+
+def clamp_params(engine: str, raw) -> dict:
+    """Parâmetros de um motor: padrões + os válidos de `raw`, limitados à faixa (lixo é ignorado)."""
+    out: dict = {}
+    src = raw if isinstance(raw, dict) else {}
+    for k, (default, lo, hi, kind) in PARAMS.get(engine, {}).items():
+        v = src.get(k, default)
+        try:
+            if v is None or isinstance(v, bool):
+                raise ValueError
+            v = kind(v)
+            out[k] = max(lo, min(hi, v))
+        except (TypeError, ValueError):
+            if default is not None:
+                out[k] = default
+    return out
+
+
+def whisper_config(raw, base: dict | None = None) -> dict:
+    out = dict(base or WHISPER_DEFAULTS)
+    src = raw if isinstance(raw, dict) else {}
+    if "beam_size" in src:
+        try:
+            out["beam_size"] = max(1, min(5, int(src["beam_size"])))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(src.get("vad_filter"), bool):
+        out["vad_filter"] = src["vad_filter"]
+    if src.get("language") in WHISPER_LANGS:
+        out["language"] = src["language"]
+    return out
 
 
 def hf_home() -> Path:
@@ -496,8 +548,32 @@ class Engine:
                 except Exception:  # noqa: BLE001
                     pass
 
-    def stream(self, text: str, voice: str, cancel: threading.Event):  # pragma: no cover
+    def stream(self, text: str, voice: str, cancel: threading.Event, params: dict):  # pragma: no cover
         raise NotImplementedError
+
+
+XTTS_CHAR_LIMIT = 180  # o XTTS em pt trunca/arrasta acima de ~203 caracteres por trecho
+CLAUSE_SPLIT = re.compile(r"(?<=[,:;—–])\s+")
+
+
+def split_long(part: str, limit: int = XTTS_CHAR_LIMIT) -> list[str]:
+    """Frase longa → trechos ≤ limit (nas vírgulas/dois-pontos; em último caso nas palavras)."""
+    if len(part) <= limit:
+        return [part]
+    out: list[str] = []
+    cur = ""
+    for piece in CLAUSE_SPLIT.split(part):
+        words = [piece] if len(piece) <= limit else piece.split(" ")
+        for w in words:
+            cand = f"{cur} {w}".strip()
+            if len(cand) > limit and cur:
+                out.append(cur)
+                cur = w
+            else:
+                cur = cand
+    if cur:
+        out.append(cur)
+    return out
 
 
 XTTS_SPEAKERS = [
@@ -546,18 +622,24 @@ class XttsEngine(Engine):
 
     @staticmethod
     def clean(text: str) -> str:
-        # XTTS em pt às vezes FALA o ponto final ("…agora, ponto"): 5/24 com ponto, 0/24 sem (lab)
+        # XTTS em pt às vezes FALA o ponto final ("…agora, ponto"): 5/24 com ponto, 0/24 sem (lab);
+        # trecho cortado numa vírgula/dois-pontos (frase longa) também sai sem a pontuação do fim
         t = re.sub(r"\s+", " ", text).strip()
-        return re.sub(r"[.]+$", "", t).strip() or t
+        return re.sub(r"[.,;:]+$", "", t).strip() or t
 
-    def stream(self, text, voice, cancel):
+    def stream(self, text, voice, cancel, params):
         gpt, spk = self.voice_state(voice)
-        # frase a frase (limite de ~203 caracteres do XTTS em pt; e tira o ponto final de cada uma)
-        parts = [p for p in SENT_SPLIT.split(re.sub(r"\s+", " ", text).strip()) if p]
+        p = clamp_params(self.id, params)
+        # frase a frase (e frase longa em trechos ≤ 180 caracteres: o XTTS em pt trunca acima de
+        # ~203); tira o ponto final de cada uma
+        parts = [x for s_ in SENT_SPLIT.split(re.sub(r"\s+", " ", text).strip()) if s_ for x in split_long(s_)]
         for part in parts:
             with self.torch.inference_mode():
                 gen = self.model.inference_stream(self.clean(part), "pt", gpt, spk, stream_chunk_size=20,
-                                                  enable_text_splitting=False)
+                                                  enable_text_splitting=False, speed=p["speed"],
+                                                  temperature=p["temperature"],
+                                                  repetition_penalty=p["repetition_penalty"], top_p=p["top_p"],
+                                                  top_k=p["top_k"])
                 try:
                     for c in gen:
                         if cancel.is_set():
@@ -632,9 +714,10 @@ class QwenEngine(Engine):
         wav = self.decoder(codes)[0, 0]
         return wav[ctx * self.upsample:].float().cpu().numpy()
 
-    def stream(self, text, voice, cancel):
+    def stream(self, text, voice, cancel, params):
         torch = self.torch
         prompt, ref_code, ref_ids = self.voice_state(voice)
+        p = clamp_params(self.id, params)
         qm = self.qm
         input_ids = qm._tokenize_texts([qm._build_assistant_text(text)])
         # teto de quadros proporcional ao texto: o 1.7B entrou em laço sem EOS (655 s de áudio
@@ -642,7 +725,8 @@ class QwenEngine(Engine):
         cap = int(12.5 * (len(text) / 12.0 * 3.0 + 3.0))
         kw = dict(input_ids=input_ids, languages=["portuguese"], non_streaming_mode=False,
                   voice_clone_prompt=qm._prompt_items_to_voice_clone_prompt(prompt), ref_ids=ref_ids,
-                  **qm._merge_generate_kwargs(max_new_tokens=cap))
+                  **qm._merge_generate_kwargs(max_new_tokens=cap, temperature=p["temperature"], top_p=p["top_p"],
+                                              top_k=p["top_k"]))
         q: queue.Queue = queue.Queue()
         err: list[BaseException] = []
 
@@ -748,16 +832,20 @@ class OmniEngine(Engine):
     def prepare_voice(self, v):
         return self.m.create_voice_clone_prompt(ref_audio=v["wav"], ref_text=v["text"])
 
-    def stream(self, text, voice, cancel):
+    def stream(self, text, voice, cancel, params):
         prompt = self.voice_state(voice)
+        p = clamp_params(self.id, params)
+        steps = int(p.get("steps") or self.ctx.config["omnivoice"]["steps"])
+        speed = float(p["speed"])
         # sem streaming: frase a frase (a 1ª frase sai antes das demais)
-        parts = [p for p in re.split(r"(?<=[.!?…])\s+", text.strip()) if p]
-        for p in parts:
+        parts = [x for x in re.split(r"(?<=[.!?…])\s+", text.strip()) if x]
+        for part in parts:
             if cancel.is_set():
                 raise Cancelled()
             with self.torch.inference_mode():
-                out = self.m.generate(text=p, language="pt", voice_clone_prompt=prompt,
-                                      num_step=int(self.ctx.config["omnivoice"]["steps"]))
+                out = self.m.generate(text=part, language="pt", voice_clone_prompt=prompt, num_step=steps,
+                                      guidance_scale=float(p["guidance_scale"]),
+                                      speed=None if abs(speed - 1.0) < 1e-3 else speed)
             yield out[0]
 
 
@@ -790,6 +878,7 @@ class VibeEngine(Engine):
             mp, torch_dtype=dtype, device_map=dev, attn_implementation="sdpa")
         self.model.eval()
         self.model.set_ddpm_inference_steps(num_steps=5)
+        self._ddpm = 5
 
     def prepare_builtin(self, b):
         from transformers.cache_utils import DynamicCache
@@ -801,12 +890,17 @@ class VibeEngine(Engine):
         with self.torch.serialization.safe_globals([BaseModelOutputWithPast, DynamicCache]):
             return self.torch.load(str(p), map_location=self.ctx.device, weights_only=True)
 
-    def stream(self, text, voice, cancel):
+    def stream(self, text, voice, cancel, params):
         import copy
 
         from vibevoice.modular.streamer import AudioStreamer
 
         torch = self.torch
+        p = clamp_params(self.id, params)
+        # passos da difusão por request (uma síntese por vez na GPU — gpu_lock)
+        if getattr(self, "_ddpm", None) != p["ddpm_steps"]:
+            self.model.set_ddpm_inference_steps(num_steps=int(p["ddpm_steps"]))
+            self._ddpm = p["ddpm_steps"]
         prefilled = self.voice_state(voice)
         inputs = self.proc.process_input_with_cached_prompt(text=text, cached_prompt=prefilled, padding=True,
                                                             return_tensors="pt", return_attention_mask=True)
@@ -817,7 +911,7 @@ class VibeEngine(Engine):
         def run():
             try:
                 with torch.inference_mode():
-                    self.model.generate(**inputs, max_new_tokens=None, cfg_scale=1.5,
+                    self.model.generate(**inputs, max_new_tokens=None, cfg_scale=float(p["cfg_scale"]),
                                         tokenizer=self.proc.tokenizer, generation_config={"do_sample": False},
                                         audio_streamer=st, stop_check_fn=cancel.is_set, verbose=False,
                                         all_prefilled_outputs=copy.deepcopy(prefilled))
@@ -875,7 +969,8 @@ class Ctx:
         self.token = os.environ.get("CLEARCHAT_GPU_TOKEN") or ""
         self.voices = Voices(Path(args.voices_dir) if args.voices_dir else None)
         self.assets = Path(args.assets_dir)
-        self.config = {"omnivoice": {"steps": max(4, min(64, int(args.omni_steps)))}}
+        self.config = {"omnivoice": {"steps": max(4, min(64, int(args.omni_steps)))},
+                       "whisper": dict(WHISPER_DEFAULTS)}
         self.slots: dict[str, Slot] = {}
         for eid in [e for e in args.engines.split(",") if e]:
             self.slots[eid] = Slot(eid, "stt" if eid == STT_ID else "tts")
@@ -1023,8 +1118,9 @@ def log(msg: str) -> None:
 class Job:
     """Síntese numa thread (com a trava da GPU); pedaços float32 numa fila; cancelável."""
 
-    def __init__(self, ctx: Ctx, eng: Engine, text: str, voice: str):
+    def __init__(self, ctx: Ctx, eng: Engine, text: str, voice: str, params: dict | None = None):
         self.ctx, self.eng, self.text, self.voice = ctx, eng, text, voice
+        self.params = params if isinstance(params, dict) else {}
         self.q: queue.Queue = queue.Queue()
         self.cancel = threading.Event()
         self.t0 = time.perf_counter()
@@ -1037,7 +1133,7 @@ class Job:
             return
         self.ctx.busy = True
         try:
-            for c in self.eng.stream(self.text, self.voice, self.cancel):
+            for c in self.eng.stream(self.text, self.voice, self.cancel, self.params):
                 if self.first_ms is None:
                     self.first_ms = (time.perf_counter() - self.t0) * 1000
                 self.q.put(("chunk", c))
@@ -1167,6 +1263,8 @@ def build_app(ctx: Ctx):
                 ctx.config["omnivoice"]["steps"] = max(4, min(64, int(omni["steps"])))
             except (TypeError, ValueError):
                 return err(400, "omnivoice.steps inválido")
+        if isinstance(body.get("whisper"), dict):
+            ctx.config["whisper"] = whisper_config(body["whisper"], ctx.config["whisper"])
         return {"config": ctx.config}
 
     @app.post("/v1/audio/speech")
@@ -1198,7 +1296,7 @@ def build_app(ctx: Ctx):
             voice = eng.resolve_voice(body.get("voice"))
         except VoiceError as e:
             return err(400, str(e), "voice_not_found")
-        job = Job(ctx, eng, text, voice)
+        job = Job(ctx, eng, text, voice, body.get("params"))
         kind, payload = await run_in_threadpool(job.next)
         if kind == "error":
             k, msg = payload
@@ -1245,14 +1343,20 @@ def build_app(ctx: Ctx):
         data = await file.read()
         if not data:
             return err(400, "arquivo de áudio vazio")
-        lang = (language or "").split("-")[0].lower() or None
+        # idioma: o da config do whisper (Configurações → parâmetros; "auto" = detectar); o do request
+        # só vale se a config não tiver idioma
+        wc = ctx.config["whisper"]
+        lang_cfg = wc.get("language")
+        lang = (None if lang_cfg == "auto" else lang_cfg) if lang_cfg else \
+            ((language or "").split("-")[0].lower() or None)
 
         def run():
             s = ctx.ensure(STT_ID)
             audio = decode_to_mono(data, 16000)
             t0 = time.perf_counter()
             with ctx.stt_lock:
-                segs, info = s.obj.transcribe(audio, language=lang, beam_size=1, vad_filter=False,
+                segs, info = s.obj.transcribe(audio, language=lang, beam_size=int(wc["beam_size"]),
+                                              vad_filter=bool(wc["vad_filter"]),
                                               condition_on_previous_text=False, initial_prompt=prompt or None)
                 segs = list(segs)
             s.last_used = time.time()

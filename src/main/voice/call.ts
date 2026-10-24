@@ -19,7 +19,14 @@
 //   próximo turno);
 // - barge-in no meio da resposta: o turno é parado e o texto do assistente é truncado ao que foi
 //   falado (`interrupted: true`); nada nunca falado fica (`amendTurn` → `amendVoiceTurn`).
-import type { Chat, ChatConfig, Session, StoredMessage, AgentEvent } from '@shared/types'
+import type {
+  Chat,
+  ChatConfig,
+  Session,
+  StoredMessage,
+  AgentEvent,
+  MessageMeta
+} from '@shared/types'
 import type { VoiceCallTimelineEvent } from '@shared/ipc'
 import { isDisplayOnly } from '@shared/context'
 import {
@@ -55,6 +62,14 @@ import {
   type InterjectionObservation
 } from '@shared/voicePolicy'
 import { isBackchannelText, type UtteranceEnd } from '@shared/voiceTurn'
+import {
+  CALL_START_TEXT,
+  callEndText,
+  type VoiceCallEndedBy,
+  type VoiceCallMark,
+  type VoiceCallUsage,
+  type VoiceMessageMeta
+} from '@shared/voiceCallMarks'
 import { CLIP_PHRASES, type ClipClass } from './clips'
 import type { VoiceEvalEvent } from './evalLog'
 import { classifyVoiceError, type VoiceFailure, type VoiceFailureSource } from './callErrors'
@@ -97,6 +112,15 @@ const finiteMs = (v: unknown): number => {
   return n > 0 ? n : 0
 }
 
+/** Chama uma dependência opcional sem nunca derrubar a chamada (falha → `fallback`). */
+function safeCall<T>(fn: () => T, fallback: T): T {
+  try {
+    return fn()
+  } catch {
+    return fallback
+  }
+}
+
 const UTTERANCE_ENDS: readonly UtteranceEnd[] = ['complete', 'statement', 'unfinished', 'unknown']
 
 /** Variantes de clipe por classe de interjeição (as frases geradas em `clips.ts`). */
@@ -109,8 +133,11 @@ const INTERJECTION_VARIANTS: Partial<Record<InterjectionClass, number>> = {
 
 /** Dependências injetadas (testes usam fakes; a fiação real está em `src/main/ipc.ts`). */
 export interface VoiceCallDeps {
-  /** Envia a transcrição final como mensagem do usuário (mesmo caminho do composer). */
-  sendTurn(sessionId: string, text: string): void
+  /**
+   * Envia a transcrição final como mensagem do usuário (mesmo caminho do composer). `meta` =
+   * `{ voice }` da fala (chamada, duração, modelo da transcrição) gravado junto da mensagem.
+   */
+  sendTurn(sessionId: string, text: string, meta?: MessageMeta): void
   /** Síntese de uma sentença (bytes completos). Abort = descartada (barge-in/stop). */
   synth(text: string, signal: AbortSignal): Promise<{ audio: Uint8Array; mime: string }>
   /** Estado da chamada para o renderer (canal `voice:call:state`). */
@@ -178,6 +205,42 @@ export interface VoiceCallDeps {
    * (`end`) fecha o contexto. Com feed, a 1ª frase NÃO corta na vírgula.
    */
   ttsFeed?: () => TtsTextFeed | null
+  /**
+   * Grava um marcador da chamada no histórico (mensagem só de exibição, `meta.kind 'voice-call'` —
+   * nunca vai à API). Ausente = sem marcadores (testes antigos).
+   */
+  appendMarker?(sessionId: string, content: string, meta: MessageMeta): void
+  /** Caminho ativo da sessão (soma o custo do LLM dos turnos da chamada no marcador de fim). */
+  sessionMessages?(sessionId: string): StoredMessage[]
+  /** Preço de lista da voz por caractere (US$; OpenRouter) — custo ≈ da fala. null = desconhecido. */
+  ttsUnitPrice?(): number | null
+  /** Id da chamada (padrão `crypto.randomUUID`). */
+  newCallId?(): string
+  /**
+   * Espera máxima pelo fim da reprodução depois do `end_call` (ms; padrão 30 s): o renderer pode
+   * não avisar o `playback-idle` (janela escondida/erro) — a chamada cai mesmo assim.
+   */
+  hangupMaxWaitMs?: number
+}
+
+/** Medição da chamada em andamento (vira `VoiceCallUsage` no marcador de fim). */
+interface CallMeter {
+  callId: string
+  sessionId: string
+  startedAt: number
+  turns: number
+  userSpeechMs: number
+  stt: VoiceCallUsage['stt']
+  tts: VoiceCallUsage['tts']
+}
+
+/** Transcrição final da chamada (o IPC repassa o resultado de `voice:transcribe:stop`). */
+export interface VoiceCallTranscript {
+  text: string
+  model?: string
+  backend?: 'api' | 'local'
+  /** Áudio da fala (ms). */
+  audioMs?: number
 }
 
 /** Turno do usuário em andamento (o que o histórico tem dele). */
@@ -185,6 +248,8 @@ interface TurnInfo {
   text: string
   userMessageId: string | null
   toolsRan: boolean
+  /** `meta.voice` da fala que abriu o turno (turno continuado soma a duração). */
+  voice?: VoiceMessageMeta
 }
 
 export class VoiceCallManager {
@@ -257,6 +322,23 @@ export class VoiceCallManager {
   #lastInterjectVariant: Partial<Record<string, number>> = {}
   /** Última interjeição emitida (id + classe) — cancelada quando o usuário volta a falar/stop. */
   #interjectUtt: { id: string; cls: string; n: number } | null = null
+  // ---- histórico e custos da chamada (marcadores, meta.voice) ----
+  #meter: CallMeter | null = null
+  /** Última transcrição final ainda não usada num turno (vira o `meta.voice` da fala). */
+  #lastTranscript: VoiceCallTranscript | null = null
+  /** Falas transcritas acumuladas para o próximo envio (fila/turno continuado unem várias). */
+  #speechAcc: { audioMs: number; model?: string } = { audioMs: 0 }
+  /** Marcador de fim esperando a sessão ficar ociosa (o turno do agente ainda rodava). */
+  #pendingEnd: {
+    sessionId: string
+    write: () => void
+    timer: ReturnType<typeof setTimeout>
+  } | null = null
+  // ---- end_call: desligar depois de a despedida tocar ----
+  /** tool_call ids de `end_call` vistos nas respostas (o resultado ok arma o desligamento). */
+  #endCallIds = new Set<string>()
+  /** Desligamento pedido pelo agente (cai quando a resposta terminar de tocar). */
+  #hangup: { reason: string | null; timer: ReturnType<typeof setTimeout> | null } | null = null
 
   constructor(deps: VoiceCallDeps) {
     this.#deps = deps
@@ -264,9 +346,11 @@ export class VoiceCallManager {
       if (this.#sessionId) {
         // antes do envio: o `message-added` do usuário pode chegar DENTRO do sendTurn (síncrono)
         // e completar o id da mensagem
-        this.#turn = { text, userMessageId: null, toolsRan: false }
+        const voice = this.#takeSpeechMeta()
+        this.#turn = { text, userMessageId: null, toolsRan: false, voice }
         const before = this.#turn
-        this.#deps.sendTurn(this.#sessionId, text)
+        if (this.#meter) this.#meter.turns++
+        this.#deps.sendTurn(this.#sessionId, text, { voice })
         this.#emitTimeline({
           ts: this.#now(),
           kind: 'turn-sent',
@@ -307,6 +391,7 @@ export class VoiceCallManager {
     this.#carry = null
     this.#resetResponse()
     this.#machine.start(info.busy)
+    this.#beginMeter(sessionId)
     this.#emitState()
     return this.state()
   }
@@ -315,9 +400,24 @@ export class VoiceCallManager {
    * Sai da chamada (descarta fala pendente e para a fala do assistente). `reason` = fim por falha
    * (fica em `state().error` com a chamada inativa — o renderer mostra "Chamada encerrada: …").
    */
-  stop(reason?: string): VoiceCallState {
+  stop(
+    reason?: string,
+    opts?: {
+      by?: VoiceCallEndedBy
+      note?: string | null
+      /** Grava o marcador de fim já, mesmo com o turno rodando (app fechando). */
+      immediate?: boolean
+    }
+  ): VoiceCallState {
     if (!this.#sessionId) return this.state()
     this.#endedReason = typeof reason === 'string' && reason ? reason : null
+    const by: VoiceCallEndedBy = opts?.by ?? (this.#endedReason ? 'error' : 'user')
+    this.#cancelHangup(null)
+    this.#endMeter(
+      by,
+      by === 'error' ? this.#endedReason : (opts?.note ?? null),
+      opts?.immediate === true
+    )
     this.#speakCancelled = true
     this.#clearSynth()
     this.#ttsFeedCall((f) => f.close()) // [tts-feed] fim da chamada: fecha a conexão
@@ -398,6 +498,7 @@ export class VoiceCallManager {
    */
   speechBegin(input?: { dropped?: string[] }): VoiceCallState {
     if (!this.#sessionId) return this.state()
+    this.#cancelHangup('speech') // o usuário continuou falando: a chamada não cai
     // a interjeição/preâmbulo tocando sai de cena (o renderer já cortou com fade)
     this.#resetFiller(true)
     this.#cancelInterject()
@@ -442,6 +543,13 @@ export class VoiceCallManager {
     if (!this.#sessionId) return this.state()
     this.#error = null
     let t = typeof text === 'string' ? text.trim() : ''
+    // a fala com texto entra no `meta.voice` do próximo envio (duração/modelo da transcrição)
+    const tr = this.#lastTranscript
+    this.#lastTranscript = null
+    if (t && tr) {
+      this.#speechAcc.audioMs += Math.max(0, tr.audioMs ?? 0)
+      if (tr.model) this.#speechAcc.model = tr.model
+    }
     if (this.#carry?.awaiting) {
       // transcrição da fala que o usuário continuou: guardada para a próxima (nada é enviado)
       this.#carry = { awaiting: false, text: [this.#carry.text, t].filter(Boolean).join(' ') }
@@ -484,6 +592,7 @@ export class VoiceCallManager {
     this.#machine.playbackIdle()
     // filler segurado enquanto um clipe tocava (ex.: interjeição): tenta de novo agora
     void this.#tryFiller()
+    if (this.#checkHangup()) return this.state()
     this.#emitState()
     return this.state()
   }
@@ -495,6 +604,7 @@ export class VoiceCallManager {
    */
   bargeIn(input?: { playedIds?: string[] }): VoiceCallState {
     if (!this.#sessionId) return this.state()
+    this.#cancelHangup('barge-in')
     this.#emitTimeline({ ts: this.#now(), kind: 'barge-in' })
     const played = Array.isArray(input?.playedIds)
       ? input!.playedIds.filter((id) => this.#uttKey.has(id))
@@ -610,7 +720,11 @@ export class VoiceCallManager {
       pendingText: this.#machine.pendingText,
       error: this.#sessionId ? this.#error : this.#endedReason,
       // aditivo: só presente durante o preparo da GPU (estados sem GPU ficam iguais aos de antes)
-      ...(this.#sessionId && this.#preparing ? { preparing: this.#preparing } : {})
+      ...(this.#sessionId && this.#preparing ? { preparing: this.#preparing } : {}),
+      // aditivo: id e início da chamada ativa (relógio da barra; marcadores no histórico)
+      ...(this.#sessionId && this.#meter
+        ? { callId: this.#meter.callId, startedAt: this.#meter.startedAt }
+        : {})
     }
   }
 
@@ -638,7 +752,14 @@ export class VoiceCallManager {
   ): ResolvedVoiceCall | null {
     if (!this.#sessionId || session.id !== this.#sessionId) return null
     if (chat.id !== this.#chatId) return null
-    return this.#resolved()
+    const r = this.#resolved()
+    return this.#meter
+      ? {
+          ...r,
+          callId: this.#meter.callId,
+          ...(this.#meter.tts.model ? { ttsModel: this.#meter.tts.model } : {})
+        }
+      : r
   }
 
   #resolved(): ResolvedVoiceCall {
@@ -694,6 +815,8 @@ export class VoiceCallManager {
     this.#machine.turnArrived(text) // vira o pendente (suspenso: nada sai antes do ajuste)
     const canMerge = !!prev?.userMessageId && !prev.toolsRan && !!this.#deps.amendTurn
     const merged = canMerge && prev ? `${prev.text.trim()} ${text}`.trim() : text
+    // a fala anterior volta no turno unido: a duração dela soma no `meta.voice` do reenvio
+    if (canMerge && prev?.voice?.durationMs) this.#speechAcc.audioMs += prev.voice.durationMs
     this.#machine.replacePending(merged)
     this.#emitTimeline({
       ts: this.#now(),
@@ -763,6 +886,15 @@ export class VoiceCallManager {
   // ---------------- eventos do runner (streaming/histórico) ----------------
 
   #onAgentEvent(e: AgentEvent): void {
+    // marcador de fim adiado: grava quando a sessão da chamada encerrada fica ociosa
+    const pend = this.#pendingEnd
+    if (
+      pend &&
+      e.type === 'session-updated' &&
+      e.session.id === pend.sessionId &&
+      !isBusyStatus(e.session.status)
+    )
+      this.#flushPendingEnd()
     const sessionId = this.#sessionId
     if (!sessionId) return
     if (e.type === 'draft') {
@@ -791,7 +923,17 @@ export class VoiceCallManager {
         return
       }
       if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) {
+        for (const tc of m.message.tool_calls ?? [])
+          if (tc.function.name === 'end_call') this.#endCallIds.add(tc.id)
         this.#flushMessage(typeof m.message.content === 'string' ? m.message.content : '', m.id)
+      } else if (
+        m.message.role === 'tool' &&
+        this.#endCallIds.has(m.message.tool_call_id) &&
+        m.meta?.toolStatus === 'ok'
+      ) {
+        // o agente encerrou a chamada: cai quando a despedida terminar de tocar
+        this.#endCallIds.delete(m.message.tool_call_id)
+        this.#armHangup(m.message.tool_call_id)
       } else if (m.message.role === 'assistant' && m.meta?.kind === 'error') {
         // o turno do agente falhou de vez (erro persistido — o card de nova tentativa, quando há,
         // já foi dispensado): a chamada não fica "ativa" sem resposta
@@ -810,6 +952,7 @@ export class VoiceCallManager {
         this.#machine.responseDone()
         // [tts-feed] a resposta acabou: o contexto do TTS em streaming fecha (a última frase termina)
         this.#ttsFeedCall((f) => f.end?.())
+        if (this.#checkHangup()) return
       }
       this.#emitState()
       return
@@ -928,6 +1071,8 @@ export class VoiceCallManager {
         const item = this.#synthQueue.shift()!
         const abort = new AbortController()
         this.#synthAbort = abort
+        // caracteres enviados à síntese (cada tentativa é cobrada pelo provedor)
+        if (this.#meter) this.#meter.tts.chars += item.text.length
         let audio: Uint8Array
         let mime: string
         try {
@@ -991,6 +1136,7 @@ export class VoiceCallManager {
       this.#synthRunning = false
       // itens chegaram enquanto a fila foi descartada (ou pump cancelado): retoma
       if (this.#synthQueue.length) void this.#pumpSynth()
+      else this.#checkHangup()
     }
   }
 
@@ -1269,6 +1415,272 @@ export class VoiceCallManager {
       this.#deps.emitUtteranceCancel(u.id)
       this.#emitTimeline({ ts: this.#now(), kind: 'clip-cancelled', class: u.cls, id: u.id })
     }
+  }
+
+  // ---------------- histórico e custos (marcadores, meta.voice) ----------------
+
+  /**
+   * Transcrição final da fala do usuário (o IPC repassa `voice:transcribe:stop` do dono da
+   * chamada, ANTES do `turn`): duração/modelo da fala e o tempo de fala da chamada.
+   */
+  noteTranscript(r: VoiceCallTranscript): void {
+    if (!this.#sessionId || !this.#meter) return
+    const audioMs = finiteMs(r?.audioMs)
+    if (typeof r?.text === 'string' && r.text.trim()) this.#meter.userSpeechMs += audioMs
+    if (r?.backend === 'local') this.#meter.stt.localRequests++
+    this.#lastTranscript = {
+      text: typeof r?.text === 'string' ? r.text : '',
+      ...(typeof r?.model === 'string' && r.model ? { model: r.model } : {}),
+      ...(r?.backend ? { backend: r.backend } : {}),
+      audioMs
+    }
+  }
+
+  /** Uma transcrição pela API durante a chamada (parcial/especulação/segmento/final). */
+  noteSttApiUsage(u: { local?: boolean; audioMs?: number | null; cost?: number }): void {
+    const m = this.#meter
+    if (!this.#sessionId || !m) return
+    if (u?.local) {
+      m.stt.localRequests++
+      return
+    }
+    m.stt.apiRequests++
+    m.stt.apiAudioMs += finiteMs(u?.audioMs)
+    if (typeof u?.cost === 'number' && Number.isFinite(u.cost) && u.cost >= 0) {
+      m.stt.cost = (m.stt.cost ?? 0) + u.cost
+      m.stt.costedRequests++
+    }
+  }
+
+  /** Áudio de resposta gerado pela síntese (ms — o IPC mede PCM/WAV das frases emitidas). */
+  noteTtsAudio(ms: number): void {
+    if (!this.#sessionId || !this.#meter) return
+    this.#meter.tts.audioMs += finiteMs(ms)
+  }
+
+  /** `meta.voice` da próxima mensagem do usuário (consome o acumulado das falas). */
+  #takeSpeechMeta(): VoiceMessageMeta {
+    const acc = this.#speechAcc
+    this.#speechAcc = { audioMs: 0 }
+    const v: VoiceMessageMeta = { source: 'call' }
+    if (this.#meter) v.callId = this.#meter.callId
+    if (acc.audioMs > 0) v.durationMs = Math.round(acc.audioMs)
+    const model = acc.model ?? this.#meter?.stt.model
+    if (model) v.sttModel = model
+    return v
+  }
+
+  /** Começa a medição e grava o marcador de início. */
+  #beginMeter(sessionId: string): void {
+    this.#flushPendingEnd() // marcador de fim de uma chamada anterior ainda adiado: grava antes
+    const { stt, tts } = this.#deps.settings()
+    const callId = this.#deps.newCallId?.() ?? crypto.randomUUID()
+    const startedAt = this.#now()
+    const sttModel =
+      stt.mode === 'local'
+        ? stt.local?.model || stt.local?.engine
+        : stt.mode === 'gpu'
+          ? 'whisper (GPU local)'
+          : stt.api?.model
+    const ttsBackend: VoiceCallUsage['tts']['backend'] =
+      tts.backend === 'gpu'
+        ? 'gpu'
+        : tts.backend === 'local'
+          ? 'local'
+          : tts.api?.providerKind === 'elevenlabs'
+            ? 'elevenlabs'
+            : 'api'
+    const ttsModel =
+      ttsBackend === 'gpu'
+        ? (tts.gpu?.engine ?? 'GPU local')
+        : ttsBackend === 'local'
+          ? tts.local?.engine
+          : tts.api?.model
+    this.#meter = {
+      callId,
+      sessionId,
+      startedAt,
+      turns: 0,
+      userSpeechMs: 0,
+      stt: {
+        mode: stt.mode,
+        ...(sttModel ? { model: sttModel } : {}),
+        apiRequests: 0,
+        apiAudioMs: 0,
+        localRequests: 0,
+        costedRequests: 0
+      },
+      tts: { backend: ttsBackend, ...(ttsModel ? { model: ttsModel } : {}), chars: 0, audioMs: 0 }
+    }
+    this.#lastTranscript = null
+    this.#speechAcc = { audioMs: 0 }
+    this.#endCallIds = new Set()
+    const mark: VoiceCallMark = { callId, phase: 'start', startedAt }
+    this.#writeMarker(sessionId, CALL_START_TEXT, mark)
+  }
+
+  /** Fecha a medição e grava o marcador de fim (adiado enquanto o turno do agente roda). */
+  #endMeter(by: VoiceCallEndedBy, reason: string | null, immediate = false): void {
+    const m = this.#meter
+    this.#meter = null
+    if (!m) return
+    const endedAt = this.#now()
+    const write = (): void => {
+      const usage: VoiceCallUsage = {
+        turns: m.turns,
+        userSpeechMs: Math.round(m.userSpeechMs),
+        stt: { ...m.stt },
+        tts: { ...m.tts },
+        llm: this.#llmUsage(m.sessionId, m.callId)
+      }
+      if (m.tts.backend === 'api' && m.tts.chars > 0) {
+        const price = safeCall(() => this.#deps.ttsUnitPrice?.() ?? null, null)
+        if (typeof price === 'number' && Number.isFinite(price) && price >= 0) {
+          usage.tts.cost = m.tts.chars * price
+          usage.tts.estimated = true
+        }
+      }
+      const mark: VoiceCallMark = {
+        callId: m.callId,
+        phase: 'end',
+        startedAt: m.startedAt,
+        endedAt,
+        durationMs: Math.max(0, endedAt - m.startedAt),
+        endedBy: by,
+        ...(reason ? { reason: reason.slice(0, 300) } : {}),
+        usage
+      }
+      this.#writeMarker(m.sessionId, callEndText(mark), mark)
+    }
+    const busy = !immediate && safeCall(() => !!this.#deps.sessionInfo(m.sessionId)?.busy, false)
+    if (!busy) {
+      write()
+      return
+    }
+    // o turno do agente ainda roda (ex.: encerrou no meio da resposta): o marcador entra depois
+    // dele — nunca no meio de um passo; no máximo 5 min de espera
+    this.#flushPendingEnd()
+    const timer = setTimeout(() => this.#flushPendingEnd(), 5 * 60_000)
+    ;(timer as { unref?: () => void }).unref?.()
+    this.#pendingEnd = { sessionId: m.sessionId, write, timer }
+  }
+
+  /** App fechando: o marcador de fim adiado (turno ainda rodando) é gravado já. */
+  flushPendingMarkers(): void {
+    this.#flushPendingEnd()
+  }
+
+  #flushPendingEnd(): void {
+    const p = this.#pendingEnd
+    if (!p) return
+    this.#pendingEnd = null
+    clearTimeout(p.timer)
+    p.write()
+  }
+
+  /** Custo do LLM dos turnos da chamada (respostas com `meta.voice.callId`). */
+  #llmUsage(sessionId: string, callId: string): VoiceCallUsage['llm'] {
+    const out = { calls: 0, cost: 0, costed: 0 }
+    const msgs = safeCall(
+      () => this.#deps.sessionMessages?.(sessionId) ?? [],
+      [] as StoredMessage[]
+    )
+    for (const m of msgs) {
+      if (m.message.role !== 'assistant' || isDisplayOnly(m.meta)) continue
+      if (m.meta?.voice?.callId !== callId) continue
+      out.calls++
+      const c = m.meta.usage?.cost
+      if (typeof c === 'number' && Number.isFinite(c)) {
+        out.cost += c
+        out.costed++
+      }
+    }
+    return out
+  }
+
+  #writeMarker(sessionId: string, content: string, mark: VoiceCallMark): void {
+    try {
+      this.#deps.appendMarker?.(sessionId, content, {
+        synthetic: true,
+        kind: 'voice-call',
+        voiceCall: mark
+      })
+    } catch (e) {
+      console.warn(
+        '[clearchat] voz: marcador da chamada falhou:',
+        e instanceof Error ? e.message : e
+      )
+    }
+  }
+
+  // ---------------- end_call: desligar depois de a despedida tocar ----------------
+
+  /** O resultado ok de `end_call` chegou: a chamada cai quando a resposta terminar de tocar. */
+  #armHangup(toolCallId: string): void {
+    if (!this.#sessionId) return
+    let reason: string | null = null
+    try {
+      const msgs = this.#deps.sessionMessages?.(this.#sessionId) ?? []
+      for (const m of msgs) {
+        const tc =
+          m.message.role === 'assistant'
+            ? m.message.tool_calls?.find((t) => t.id === toolCallId)
+            : undefined
+        if (!tc) continue
+        const args = JSON.parse(tc.function.arguments || '{}') as { reason?: unknown }
+        if (typeof args.reason === 'string' && args.reason.trim())
+          reason = args.reason.trim().slice(0, 200)
+      }
+    } catch {
+      reason = null
+    }
+    this.#hangup = { reason, timer: null }
+    this.#emitTimeline({ ts: this.#now(), kind: 'hangup-armed', ...(reason ? { reason } : {}) })
+    this.#checkHangup()
+  }
+
+  /** O usuário voltou a falar (barge-in/fala nova): o desligamento pedido pelo agente é cancelado. */
+  #cancelHangup(why: string | null): void {
+    const h = this.#hangup
+    if (!h) return
+    this.#hangup = null
+    if (h.timer) clearTimeout(h.timer)
+    if (why) this.#emitTimeline({ ts: this.#now(), kind: 'hangup-cancelled', reason: why })
+  }
+
+  /**
+   * Desliga se o agente pediu e a despedida já tocou (resposta terminada, nada na síntese nem
+   * tocando). Com a resposta terminada mas o áudio ainda tocando, arma a espera máxima. True =
+   * a chamada caiu.
+   */
+  #checkHangup(): boolean {
+    const h = this.#hangup
+    if (!h || !this.#sessionId) return false
+    if (this.#machine.responseInFlight) return false
+    const audible =
+      this.#playbackActive ||
+      this.#synthRunning ||
+      this.#synthQueue.length > 0 ||
+      this.#machine.phase !== 'listening'
+    if (audible) {
+      if (!h.timer) {
+        const wait = this.#deps.hangupMaxWaitMs ?? 30_000
+        h.timer = setTimeout(() => {
+          if (this.#hangup === h) this.#hangUpNow()
+        }, wait)
+        ;(h.timer as { unref?: () => void }).unref?.()
+      }
+      return false
+    }
+    this.#hangUpNow()
+    return true
+  }
+
+  #hangUpNow(): void {
+    const h = this.#hangup
+    this.#hangup = null
+    if (h?.timer) clearTimeout(h.timer)
+    this.stop(undefined, { by: 'agent', note: h?.reason ?? null })
   }
 
   #now(): number {

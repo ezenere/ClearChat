@@ -35,7 +35,9 @@ import { setToolShellInfo } from '@shared/shellInfo'
 import { normalizeApprovalSettings, type ApprovalItemDecision } from '@shared/approvalPolicy'
 import { trackFailure, type SubFailure } from '../lib/subFailures'
 import type { UpdateStatus } from '@shared/updates'
+import type { VoiceMessageMeta } from '@shared/voiceCallMarks'
 import { createBranchSelects } from '../lib/branchSelects'
+import { loadVoiceSettings } from '../lib/voice/voiceSettings'
 import { canAutoOpen } from '../lib/fileSources'
 import { nextReasoningClock, type ReasoningClock } from '../lib/reasoning'
 import { VOICE_CALL_INACTIVE, type VoiceCallState } from '@shared/voice'
@@ -290,7 +292,9 @@ interface Actions {
     sessionId: string,
     text: string,
     attachments?: AttachmentInfo[],
-    skills?: string[]
+    skills?: string[],
+    /** `voice`: texto ditado no composer (`meta.voice` da mensagem). */
+    opts?: { voice?: VoiceMessageMeta }
   ): Promise<boolean>
   /** Entra na chamada de voz do chat (só sessão principal; erros legíveis viram toast). */
   startVoiceCall(sessionId: string): Promise<boolean>
@@ -539,6 +543,8 @@ export const useStore = create<Store>()((set, get) => ({
       tasks.push(g.loadMemoryCollections())
     }
     if (scopes.includes('skills')) set((s) => ({ skillsTick: s.skillsTick + 1 }))
+    // settings de áudio vindas do sync (1.5.0): relê o espelho único (Configurações → Áudio, chamada)
+    if (scopes.includes('voice')) tasks.push(loadVoiceSettings().catch(() => undefined))
     await Promise.all(tasks)
     // chat aberto: sessões novas (subagentes vindos do host)
     const v = get().view
@@ -894,7 +900,7 @@ export const useStore = create<Store>()((set, get) => ({
     if (chat) set((s) => ({ chats: s.chats.map((c) => (c.id === chatId ? withPending(chat) : c)) }))
   },
 
-  async send(sessionId, text, attachments, skills) {
+  async send(sessionId, text, attachments, skills, opts) {
     const session = get().sessions[sessionId]
     if (session) await get().flushConfig(session.chatId)
     const remote = !!session && get().chatHosts[session.chatId]?.mode === 'remote'
@@ -912,11 +918,13 @@ export const useStore = create<Store>()((set, get) => ({
     const res = await get()
       .run(
         () =>
-          skills?.length
-            ? api.agent.send(sessionId, text, attachments ?? [], skills)
-            : attachments?.length
-              ? api.agent.send(sessionId, text, attachments)
-              : api.agent.send(sessionId, text),
+          opts?.voice
+            ? api.agent.send(sessionId, text, attachments ?? [], skills ?? [], opts)
+            : skills?.length
+              ? api.agent.send(sessionId, text, attachments ?? [], skills)
+              : attachments?.length
+                ? api.agent.send(sessionId, text, attachments)
+                : api.agent.send(sessionId, text),
         remote ? 'O host não recebeu a mensagem' : 'Falha ao enviar'
       )
       .finally(() => {

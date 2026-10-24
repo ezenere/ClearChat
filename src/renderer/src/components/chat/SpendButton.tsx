@@ -9,8 +9,10 @@ import {
   formatIntPt,
   formatUsd,
   type ChatSpend,
-  type SpendTotals
+  type SpendTotals,
+  type VoiceSpend
 } from '../../lib/chatSpend'
+import { formatCallDuration } from '@shared/voiceCallMarks'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { Popover } from '../ui/layers'
@@ -129,6 +131,63 @@ function Section({
   )
 }
 
+/**
+ * "Chamadas de voz": as respostas dos turnos da chamada (fora de "Respostas" — nunca em dobro),
+ * transcrição/voz dos marcadores de fim e os tempos. A voz pelo preço de lista (≈) fica fora do total.
+ */
+function VoiceSection({ v }: { v: VoiceSpend }): React.JSX.Element {
+  const usd = formatUsd
+  const stt =
+    v.stt.apiRequests === 0
+      ? v.stt.localCalls
+        ? 'local (grátis)'
+        : '—'
+      : v.stt.costedRequests
+        ? `${usd(v.stt.cost)}${v.stt.costedRequests < v.stt.apiRequests ? ' + ?' : ''}`
+        : 'custo não informado'
+  const tts: string[] = []
+  if (v.tts.cost > 0) tts.push(usd(v.tts.cost))
+  if (v.tts.estimated > 0) tts.push(`≈ ${usd(v.tts.estimated)}`)
+  if (v.tts.elevenChars > 0) tts.push(`${formatIntPt(v.tts.elevenChars)} caracteres ElevenLabs`)
+  if (v.tts.unknownCalls > 0) tts.push('custo não informado')
+  if (!tts.length) tts.push(v.tts.localCalls ? 'local (grátis)' : '—')
+  return (
+    <Section
+      id="voice"
+      title="Chamadas de voz"
+      t={{ ...v.llm, cost: v.cost }}
+      detail={`${plural(v.calls, 'chamada', 'chamadas')} · ${formatCallDuration(v.durationMs)}${v.open ? ` · ${v.open} em andamento` : ''}`}
+    >
+      <div className="mt-0.5">
+        <Row
+          sub
+          testId="spend-voice-llm"
+          label={`Modelo (${plural(v.llm.calls, 'resposta', 'respostas')})`}
+          value={costText(v.llm)}
+        />
+        <Row sub testId="spend-voice-stt" label="Transcrição" value={stt} />
+        <Row
+          sub
+          testId="spend-voice-tts"
+          label={`Voz${v.tts.chars ? ` · ${formatIntPt(v.tts.chars)} caracteres` : ''}`}
+          value={tts.join(' · ')}
+        />
+        <Row
+          sub
+          testId="spend-voice-time"
+          label="Fala: você · voz"
+          value={`${formatCallDuration(v.userSpeechMs)} · ${formatCallDuration(v.ttsAudioMs)}`}
+        />
+        {v.tts.estimated > 0 && (
+          <p className="mt-0.5 pl-3 text-[11px] text-faint">
+            ≈ = estimativa pelo preço de lista da voz (fora do total).
+          </p>
+        )}
+      </div>
+    </Section>
+  )
+}
+
 function SpendPopoverBody({ spend }: { spend: ChatSpend }): React.JSX.Element {
   const [subsOpen, setSubsOpen] = useState(false)
   const { total } = spend
@@ -156,7 +215,13 @@ function SpendPopoverBody({ spend }: { spend: ChatSpend }): React.JSX.Element {
       <div className="min-h-0 flex-1 overflow-y-auto border-y border-border/50">
         <Section id="main" title="Respostas" t={spend.main}>
           {spend.main.calls > 0 && <TokenRows t={spend.main} id="main" />}
+          {spend.voice.llm.calls > 0 && (
+            <p data-testid="spend-main-voice-note" className="mt-0.5 pl-3 text-[11px] text-faint">
+              sem os turnos das chamadas de voz (em “Chamadas de voz”)
+            </p>
+          )}
         </Section>
+        {spend.voice.calls > 0 && <VoiceSection v={spend.voice} />}
         {(spend.perSubagent.length > 0 || spend.missingSessions > 0) && (
           <Section
             id="subagents"

@@ -310,6 +310,14 @@ export function Composer({
   const sendAfterRef = useRef(false)
   const [sendWaiting, setSendWaiting] = useState(false)
   const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /**
+   * O campo tem texto ditado (o desfecho do ditado inseriu algo): a mensagem enviada leva
+   * `meta.voice = { source: 'dictation' }` (mic discreto no balão). Zera quando o campo esvazia.
+   */
+  const dictatedRef = useRef(false)
+  useEffect(() => {
+    if (!text.trim()) dictatedRef.current = false
+  }, [text])
   /** Aviso do desfecho (final falhou/demorou depois do "Enviar"). */
   const [voiceNote, setVoiceNote] = useState<string | null>(null)
   /** Região viva (leitor de tela) depois do ditado: "Transcrição pronta" / "Ditado cancelado". */
@@ -446,6 +454,7 @@ export function Composer({
       let value = textRef.current
       if (plan.insert) {
         value = insertAtAnchor(plan.insert)
+        if (value.trim()) dictatedRef.current = true
         setAnnounce('Transcrição pronta')
         // a parcial entrou no campo: o card de erro (com "Inserir o texto parcial") sai
         if (settle === 'failed') dictation.clearError()
@@ -507,13 +516,22 @@ export function Composer({
     }
     const atts = ready.map((a) => a.info!)
     const skills = [...pendingSkills]
+    const dictated = dictatedRef.current && !!t
+    dictatedRef.current = false
     setText('')
     setConfirmKey(null)
     if (atts.length) clearAttachments(session.id)
     if (skills.length) setPendingSkills(session.id, [])
-    const ok = await send(session.id, t, atts, skills)
+    const ok = await send(
+      session.id,
+      t,
+      atts,
+      skills,
+      dictated ? { voice: { source: 'dictation' } } : undefined
+    )
     if (!ok) {
       setText(t)
+      dictatedRef.current = dictated
       if (skills.length) setPendingSkills(session.id, skills)
       if (atts.length) {
         // devolve os anexos ao composer

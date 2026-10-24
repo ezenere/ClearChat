@@ -22,7 +22,12 @@ export const SYNC_SETTING_KEYS: Record<string, string> = {
   // desde o protocolo 1.4.0: preferências que antes ficavam só no dispositivo
   smartApproveDefaults: 'smartApproveDefaults',
   autoTitle: 'autoTitle',
-  toolOutputSpillChars: 'toolOutputSpillChars'
+  toolOutputSpillChars: 'toolOutputSpillChars',
+  // desde o protocolo 1.5.0: settings de áudio (as partes do dispositivo ficam fora — records.ts)
+  audioInput: 'audioInput',
+  sttSettings: 'sttSettings',
+  ttsSettings: 'ttsSettings',
+  voiceCallDefaults: 'voiceCallDefaults'
 }
 
 const TABLES = `
@@ -127,7 +132,7 @@ CREATE TRIGGER IF NOT EXISTS sync_settings_ad AFTER DELETE ON settings WHEN ${AC
 END;`
 
 /** Versão dos triggers (recria quando muda — ex.: chaves novas em SYNC_SETTING_KEYS). */
-const TRIGGERS_VERSION = '2'
+const TRIGGERS_VERSION = '3'
 
 function triggerSql(): string {
   return [

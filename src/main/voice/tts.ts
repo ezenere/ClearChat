@@ -339,7 +339,13 @@ async function requestSpeech(
   const t0 = Date.now()
   for (let attempt = 0; ; attempt++) {
     // JSON `{ model, voice, input, response_format }` (voz ausente = a voz padrão da API)
-    const body: Record<string, string> = { model, input: text, response_format: requested }
+    // (+ campos extras do main — `params` do motor da GPU; nunca sobrescrevem os de cima)
+    const body: Record<string, unknown> = {
+      ...(api.extraBody ?? {}),
+      model,
+      input: text,
+      response_format: requested
+    }
     if (voice) body.voice = voice
     let res: Response
     try {

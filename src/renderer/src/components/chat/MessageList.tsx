@@ -87,6 +87,7 @@ import {
 import { useHostInfo } from '../sync/hooks'
 import { BranchSwitcher } from './BranchSwitcher'
 import { reasoningHeader } from '../../lib/reasoning'
+import { CallMarker, EndCallLine, VoiceBadge } from './VoiceMarks'
 
 // ---------- Bits ----------
 
@@ -591,7 +592,14 @@ function UserMessage({
             <MessageAttachments parts={msg.message.content} />
           )}
           {(text || !hasAttachments) && (
-            <div className="max-w-[85%] rounded-2xl rounded-br-md border border-border bg-elevated px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg shadow-[0_1px_0_rgb(255_255_255/0.03)_inset]">
+            <div
+              data-voice={msg.meta.voice?.source}
+              className={cn(
+                'max-w-[85%] rounded-2xl rounded-br-md border border-border bg-elevated px-4 py-2.5 text-[14px] leading-relaxed whitespace-pre-wrap text-fg shadow-[0_1px_0_rgb(255_255_255/0.03)_inset]',
+                // fala da chamada (transcrição): itálico; ditado é texto revisado — normal
+                msg.meta.voice?.source === 'call' && 'italic'
+              )}
+            >
               {text}
             </div>
           )}
@@ -627,6 +635,7 @@ function BubbleFooter({
     <div className="-mt-0.5 flex min-h-6 items-center justify-end gap-1.5 pr-1">
       {branch}
       {children}
+      <VoiceBadge voice={msg.meta.voice} role="user" />
       <MsgTime ts={msg.createdAt} />
     </div>
   )
@@ -1193,7 +1202,15 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
           }}
         />
       ) : (
-        content && <Markdown text={content} />
+        content &&
+        (msg.meta.voice?.source === 'call' ? (
+          // resposta falada na chamada: itálico (o texto é o que foi dito)
+          <div data-voice="call" className="italic">
+            <Markdown text={content} />
+          </div>
+        ) : (
+          <Markdown text={content} />
+        ))
       )}
       {msg.meta.interrupted && (
         <div className="mt-1.5 inline-flex items-center gap-1 rounded-md bg-white/[0.04] px-1.5 py-0.5 text-[11px] text-subtle">
@@ -1202,6 +1219,9 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
       )}
       {m.tool_calls?.map((tc) => {
         const result = ctx.results.get(tc.id)
+        // end_call (chamada de voz): linha compacta de sistema, sem card de tool
+        if (tc.function.name === 'end_call')
+          return <EndCallLine key={tc.id} call={tc} result={result} />
         // present_file: só os cards dos arquivos, sem o cabeçalho de tool (erro/cancelado → card normal)
         if (
           tc.function.name === 'present_file' &&
@@ -1250,7 +1270,10 @@ function AssistantMessage({ msg, ctx }: { msg: StoredMessage; ctx: Ctx }): React
                 : undefined
             }
           />
-          <MsgTime ts={msg.createdAt} className="ml-auto" />
+          <span className="ml-auto flex items-center gap-1.5">
+            <VoiceBadge voice={msg.meta.voice} role="assistant" />
+            <MsgTime ts={msg.createdAt} />
+          </span>
         </div>
       )}
     </div>
@@ -1300,7 +1323,12 @@ const DraftView = memo(function DraftView({
         <Markdown text={draft.content} streaming={!draft.toolCalls.length} />
       )}
       {draft.toolCalls.map((tc, i) =>
-        tc.name === 'present_file' && presentedFilesOf(tc.arguments) ? (
+        tc.name === 'end_call' ? (
+          <EndCallLine
+            key={tc.id || i}
+            call={{ function: { name: tc.name, arguments: tc.arguments } }}
+          />
+        ) : tc.name === 'present_file' && presentedFilesOf(tc.arguments) ? (
           <PresentFileCards key={tc.id || i} chatId={ctx.chatId} args={tc.arguments} pending />
         ) : (
           <ToolCard key={tc.id || i} call={tc} streaming sessionBusy chatId={ctx.chatId} />
@@ -1695,7 +1723,12 @@ export function MessageList({
   /** Mensagens cujo componente já mostra o ‹ i/n › (balão do usuário, rodapé do assistente). */
   const nativeSwitcher = (m: StoredMessage): boolean => {
     const role = m.message.role
-    if (isExtractionMessage(m.meta) || m.meta.kind === 'compaction' || m.meta.kind === 'error')
+    if (
+      isExtractionMessage(m.meta) ||
+      m.meta.kind === 'compaction' ||
+      m.meta.kind === 'error' ||
+      m.meta.kind === 'voice-call'
+    )
       return false
     if (role === 'assistant') return true
     if (role !== 'user' || m.meta.synthetic) return false
@@ -1715,6 +1748,8 @@ export function MessageList({
     if (m.meta.kind === 'compaction')
       return <CompactionCard key={m.id} msg={m} canEdit={canEdit} stale={old} />
     if (m.meta.kind === 'error') return <ErrorMessage key={m.id} msg={m} ctx={ctx} />
+    // marcador de início/fim da chamada de voz (só exibição)
+    if (m.meta.kind === 'voice-call') return <CallMarker key={m.id} msg={m} />
     if (role === 'user' && m.meta.kind === 'inter-chat')
       return <InterChatMessage key={m.id} msg={m} canEdit={canEdit} branch={ctx.switcher(m)} />
     if (role === 'user' && m.meta.kind === 'subagent-callback')

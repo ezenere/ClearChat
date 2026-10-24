@@ -8,6 +8,51 @@ import type { SttSettings } from '@shared/voice'
 import { connectionErrorText, isConnectionFailure } from '@shared/network'
 import { abortError } from '../tools/util'
 
+// ---------------- medição de uso (custos da chamada de voz) ----------------
+
+/** Uma request de transcrição pela API que deu certo (parcial, especulação, segmento ou final). */
+export interface SttApiUsage {
+  model: string
+  baseUrl: string
+  /** Endpoint na própria máquina (servidor local/GPU — grátis). */
+  local: boolean
+  /** Áudio enviado (ms; WAV medido pelo cabeçalho — outros formatos: null). */
+  audioMs: number | null
+  /** `usage.cost` devolvido pela API (OpenRouter); ausente = não informado. */
+  cost?: number
+}
+const sttUsageListeners = new Set<(u: SttApiUsage) => void>()
+/** Assina cada transcrição pela API (o main soma na chamada de voz ativa). Devolve o "desassinar". */
+export function onSttApiUsage(cb: (u: SttApiUsage) => void): () => void {
+  sttUsageListeners.add(cb)
+  return () => sttUsageListeners.delete(cb)
+}
+function reportSttUsage(u: SttApiUsage): void {
+  for (const cb of sttUsageListeners) {
+    try {
+      cb(u)
+    } catch {
+      /* medição nunca derruba a transcrição */
+    }
+  }
+}
+
+/** Duração (ms) de um WAV PCM pelo cabeçalho (byte rate); não-WAV → null. */
+function wavDurationMs(audio: Uint8Array, mime: string): number | null {
+  if (!/wav/i.test(mime) || audio.length < 44) return null
+  const dv = new DataView(audio.buffer, audio.byteOffset, audio.byteLength)
+  if (dv.getUint32(0, false) !== 0x52494646) return null
+  const byteRate = dv.getUint32(28, true)
+  return byteRate > 0 ? Math.round(((audio.length - 44) / byteRate) * 1000) : null
+}
+
+/** `usage.cost` (número finito ≥ 0) de uma resposta JSON; ausente → undefined. */
+export function sttUsageCost(json: unknown): number | undefined {
+  const u = json && typeof json === 'object' ? (json as { usage?: unknown }).usage : undefined
+  const c = u && typeof u === 'object' ? (u as { cost?: unknown }).cost : undefined
+  return typeof c === 'number' && Number.isFinite(c) && c >= 0 ? c : undefined
+}
+
 // ---------------- tipos ----------------
 
 /** Áudio a transcrever (bytes crus do gravador — wav/mp3/webm/…). */
@@ -298,9 +343,11 @@ export async function transcribeAudio(
   if (status < 200 || status >= 300) throw httpError(status, raw, url)
 
   let text: string | null = null
+  let cost: number | undefined
   try {
     const json = (raw.trim() ? JSON.parse(raw) : null) as { text?: unknown } | null
     if (typeof json?.text === 'string') text = json.text
+    cost = sttUsageCost(json)
   } catch {
     text = null
   }
@@ -310,6 +357,13 @@ export async function transcribeAudio(
       `resposta da API em formato inesperado (HTTP ${status} sem campo "text")`,
       { backend: 'api', status }
     )
+  reportSttUsage({
+    model,
+    baseUrl,
+    local: isLocalEndpoint(baseUrl),
+    audioMs: wavDurationMs(input.audio, input.mimeType),
+    ...(cost !== undefined ? { cost } : {})
+  })
   return { text, model, baseUrl, ms: Date.now() - t0 }
 }
 

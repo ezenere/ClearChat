@@ -8,7 +8,7 @@ import { statfs } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { dirname } from 'node:path'
 import os from 'node:os'
-import type { GpuInfo, GpuProbe } from '@shared/gpuVoice'
+import type { GpuComputeApp, GpuInfo, GpuProbe } from '@shared/gpuVoice'
 
 /** Resultado de um comando da sonda (null = não existe / não rodou). */
 export interface ProbeRun {
@@ -126,6 +126,53 @@ function vendorOf(name: string): GpuInfo['vendor'] {
   return 'other'
 }
 
+/**
+ * CSV do `nvidia-smi --query-compute-apps=pid,used_memory,gpu_uuid --format=csv,noheader,nounits`
+ * → processos com contexto CUDA. `used_memory` "[N/A]"/"[Not Supported]" (Windows WDDM) → null.
+ */
+export function parseComputeAppsCsv(csv: string): GpuComputeApp[] {
+  const out: GpuComputeApp[] = []
+  for (const line of csv.split(/\r?\n/)) {
+    if (!line.trim() || /^pid\s*,/i.test(line) || /no running/i.test(line)) continue
+    const [pid, used, uuid] = line.split(',').map((c) => c.trim())
+    const p = num(pid)
+    if (p === null || p <= 0) continue
+    const u = num((used ?? '').replace(/\s*MiB$/i, ''))
+    out.push({ pid: p, usedMb: u, gpuUuid: uuid && /^GPU-/i.test(uuid) ? uuid : null })
+  }
+  return out
+}
+
+/** Processos CUDA de todas as GPUs NVIDIA ([] sem driver / falha). */
+export async function probeComputeApps(
+  run: ProbeRunner = defaultProbeRunner
+): Promise<GpuComputeApp[]> {
+  const r = await run(
+    'nvidia-smi',
+    ['--query-compute-apps=pid,used_memory,gpu_uuid', '--format=csv,noheader,nounits'],
+    8000
+  )
+  return r && r.code === 0 ? parseComputeAppsCsv(r.stdout) : []
+}
+
+/**
+ * VRAM (MB) que os processos `pids` (o servidor do app) ocupam em cada GPU (por UUID; sem UUID →
+ * chave ''). Processo nosso sem `used_memory` informado conta como `fallbackMb(pid)`.
+ */
+export function ownVramByGpu(
+  apps: readonly GpuComputeApp[],
+  pids: ReadonlySet<number>,
+  fallbackMb: (pid: number) => number = () => 0
+): Map<string, number> {
+  const out = new Map<string, number>()
+  for (const a of apps) {
+    if (!pids.has(a.pid)) continue
+    const k = a.gpuUuid ?? ''
+    out.set(k, (out.get(k) ?? 0) + (a.usedMb ?? fallbackMb(a.pid)))
+  }
+  return out
+}
+
 /** NVIDIA pelo `nvidia-smi` (sem driver/sem GPU → []). */
 export async function probeNvidia(run: ProbeRunner = defaultProbeRunner): Promise<GpuInfo[]> {
   const fields = 'name,memory.total,memory.used,driver_version'
@@ -140,7 +187,18 @@ export async function probeNvidia(run: ProbeRunner = defaultProbeRunner): Promis
   if (!q || q.code !== 0) return []
   const head = await run('nvidia-smi', [], 8000)
   const cuda = head && head.code === 0 ? parseNvidiaSmiCudaVersion(head.stdout) : null
-  return parseNvidiaSmiCsv(q.stdout, cuda)
+  const gpus = parseNvidiaSmiCsv(q.stdout, cuda)
+  // UUIDs na mesma ordem (casam os processos do --query-compute-apps em máquinas multi-GPU)
+  const u = await run('nvidia-smi', ['--query-gpu=uuid', '--format=csv,noheader'], 8000)
+  const uuids =
+    u && u.code === 0
+      ? u.stdout
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => /^GPU-/i.test(l))
+      : []
+  if (uuids.length === gpus.length) gpus.forEach((g, i) => (g.uuid = uuids[i]))
+  return gpus
 }
 
 /** GPUs da máquina (NVIDIA detalhada + demais por SO, melhor esforço). */
@@ -211,9 +269,13 @@ export async function probeSystem(
   const platform = deps.platform ?? process.platform
   const arch = deps.arch ?? process.arch
   const [gpus, free] = await Promise.all([probeGpus(platform, arch, deps.run), diskFreeMb(baseDir)])
+  const computeApps = gpus.some((g) => g.vendor === 'nvidia')
+    ? await probeComputeApps(deps.run)
+    : []
   return {
     platform: { os: platform, arch, diskFreeMb: free },
     gpus,
-    ramMb: Math.round(os.totalmem() / 2 ** 20)
+    ramMb: Math.round(os.totalmem() / 2 ** 20),
+    computeApps
   }
 }

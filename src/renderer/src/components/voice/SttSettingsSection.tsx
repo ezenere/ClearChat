@@ -182,7 +182,7 @@ export function SttSettingsSection({
         </WarnNote>
       )}
 
-      {mode === 'gpu' && <GpuSttPanel stt={stt} status={gpuStatus} />}
+      {mode === 'gpu' && <GpuSttPanel stt={stt} status={gpuStatus} onCommit={onCommit} />}
 
       {usesApi && provider && (
         <div className="space-y-3" data-testid="stt-api">

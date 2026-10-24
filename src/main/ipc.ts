@@ -121,7 +121,9 @@ import {
   setVoiceSetting,
   syncLocalModelInstalled
 } from './voice'
-import { fetchVoicePreview, listVoiceCatalog } from './voice/voiceCatalog'
+import { cachedVoiceUnitPrice, fetchVoicePreview, listVoiceCatalog } from './voice/voiceCatalog'
+import { onSttApiUsage } from './voice/stt'
+import { audioDurationMs, sanitizeDictationMeta } from '@shared/voiceCallMarks'
 import type { VoiceCatalogRequest } from '@shared/voiceCatalog'
 import {
   clipVoiceId,
@@ -229,6 +231,20 @@ let voiceCallOwner: number | null = null
  * chamada de voz que ele abriu. Sem isso a sessão órfã segurava a vaga ("Já há uma transcrição…")
  * e a chamada seguia "ativa" sem ninguém ouvindo. Idempotente.
  */
+/**
+ * App fechando (antes do runner parar): a chamada ativa termina com o marcador de fim gravado já
+ * (o histórico não fica com uma chamada "em andamento" para sempre); marcador adiado também sai.
+ */
+export function shutdownVoiceCall(): void {
+  try {
+    if (voiceCallsRef?.state().active)
+      voiceCallsRef.stop(undefined, { by: 'user', note: 'o app foi fechado', immediate: true })
+    voiceCallsRef?.flushPendingMarkers()
+  } catch (e) {
+    console.warn('[clearchat] voz: fim da chamada ao fechar:', e instanceof Error ? e.message : e)
+  }
+}
+
 export function resetVoiceForWebContents(webContentsId: number, reason: string): void {
   const n = cancelTranscribeSessions(webContentsId)
   let callStopped = false
@@ -440,9 +456,36 @@ export function registerIpc(): void {
   const evalLogger = createEvalLogger(app.getPath('userData'), (e) =>
     console.log('[clearchat] voice-eval:', e)
   )
+  // custos/tempos da chamada: áudio de RESPOSTA gerado (frases; clipes pré-gerados não contam) —
+  // PCM em streaming pela taxa da utterance, WAV pelo cabeçalho
+  const pcmRates = new Map<string, number>()
+  const meterUtterance = (u: {
+    id: string
+    audio: Uint8Array
+    mime: string
+    kind?: string
+  }): void => {
+    if (!voiceCallsRef?.state().active || (u.kind && u.kind !== 'sentence')) return
+    const ms = audioDurationMs(u.audio, u.mime)
+    if (ms) voiceCallsRef.noteTtsAudio(ms)
+    const rate = /^audio\/pcm/i.test(u.mime) ? Number(/rate=(\d+)/i.exec(u.mime)?.[1] ?? 24_000) : 0
+    if (rate > 0) pcmRates.set(u.id, rate)
+  }
+  const meterChunk = (e: { id: string; pcm: Uint8Array; done: boolean }): void => {
+    const rate = pcmRates.get(e.id)
+    if (!rate) return
+    if (e.pcm.length) voiceCallsRef?.noteTtsAudio(Math.round((e.pcm.length / 2 / rate) * 1000))
+    if (e.done) pcmRates.delete(e.id)
+  }
   const ttsRelay = new TtsStreamRelay({
-    emitUtterance: (u) => sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u),
-    emitChunk: (e) => sendToWindows(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, e),
+    emitUtterance: (u) => {
+      meterUtterance(u)
+      sendToWindows(VOICE_CALL_UTTERANCE_CHANNEL, u)
+    },
+    emitChunk: (e) => {
+      meterChunk(e)
+      sendToWindows(VOICE_CALL_UTTERANCE_CHUNK_CHANNEL, e)
+    },
     // stream de TTS que caiu no meio da sentença: a chamada decide (fatal encerra)
     onStreamError: (e) => void voiceCallsRef?.voiceApiError('tts', e)
   })
@@ -478,8 +521,10 @@ export function registerIpc(): void {
   elevenCallRef = elevenCall
   // ---- [/tts-feed] ----
   const voiceCalls = new VoiceCallManager({
-    sendTurn: (sessionId, text) => {
-      // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas)
+    sendTurn: (sessionId, text, meta) => {
+      // mesmo caminho do composer (`agent.send` → gatedSend → runner.send; fila/⚡ respeitadas);
+      // o `meta.voice` da fala vai junto da mensagem (gatedSend só leva texto)
+      if (meta) runner.stashUserMeta(sessionId, text, meta)
       void gatedSend(sessionId, text, undefined, undefined).catch((e) =>
         voiceCalls.reportError(e instanceof Error ? e.message : String(e))
       )
@@ -546,10 +591,34 @@ export function registerIpc(): void {
       const v = getVoiceSettings()
       return { defaults: v.voiceCallDefaults, audioInput: v.audioInput, stt: v.stt, tts: v.tts }
     },
-    onEvent: (cb) => onAgentEvent(cb)
+    onEvent: (cb) => onAgentEvent(cb),
+    // marcadores de início/fim da chamada no histórico (só exibição — nunca vão à API)
+    appendMarker: (sessionId, content, meta) => {
+      runner.appendDisplayMessage(sessionId, content, meta)
+    },
+    sessionMessages: (sessionId) => messagesRepo.path(sessionId),
+    // preço de lista da voz (OpenRouter `/models`, já em cache pela tela de Áudio/início da chamada)
+    ttsUnitPrice: () => {
+      const api = getVoiceSettings().tts.api
+      return api.providerId && api.model
+        ? cachedVoiceUnitPrice('tts', api.providerId, api.model)
+        : null
+    }
   })
   voiceCallsRef = voiceCalls
-  setVoiceCallSource((chat, session) => voiceCalls.callContextFor(chat, session))
+  // custo da transcrição pela API (OpenRouter devolve `usage.cost`): soma na chamada ativa
+  onSttApiUsage((u) => {
+    if (voiceCalls.state().active) voiceCalls.noteSttApiUsage(u)
+  })
+  setVoiceCallSource((chat, session) => {
+    const call = voiceCalls.callContextFor(chat, session)
+    // "Modelo da chamada" com um provedor que não existe NESTE dispositivo (a config de voz
+    // sincroniza desde o protocolo 1.5.0) vale como "sem modelo próprio": o turno usa o modelo do
+    // chat — nunca falha a chamada nem cai noutro provedor (SYNC_PROTOCOL §4.3.2/§12)
+    return call?.model && !providersRepo.get(call.model.providerId)
+      ? { ...call, model: null }
+      : call
+  })
   // sonda o runtime local em segundo plano (processo do worker + onnxruntime + espeak-ng): o
   // "pronto" dos canais já sai com o binding real; ninguém espera por isto aqui
   void probeWhisperRuntime().then((r) => {
@@ -668,8 +737,15 @@ export function registerIpc(): void {
       sessionId: string,
       text: string,
       attachments?: AttachmentInfo[],
-      skills?: string[]
-    ) => gatedSend(sessionId, text, attachments, skills),
+      skills?: string[],
+      opts?: { voice?: unknown }
+    ) => {
+      // texto ditado no composer: `meta.voice` (só ditado é aceito do renderer)
+      const voice = sanitizeDictationMeta(opts?.voice)
+      if (voice && typeof sessionId === 'string' && typeof text === 'string')
+        runner.stashUserMeta(sessionId, text, { voice })
+      return gatedSend(sessionId, text, attachments, skills)
+    },
     [IPC.agent.forceSend]: (queuedId: string) =>
       gateById(
         (e) => e.host.findQueued(queuedId)?.chatId ?? null,
@@ -1048,7 +1124,9 @@ export function registerIpc(): void {
       opts?: { reuseSpeculative?: boolean; reusePartial?: boolean }
     ) => {
       const owner = ipcSenderId
-      return requireTranscribeSession(sessionId)
+      const ts = requireTranscribeSession(sessionId)
+      const audioMs = ts.audioMs
+      return ts
         .stop({
           reuseSpeculative: opts?.reuseSpeculative === true,
           // a chamada sempre pede; o ditado segue a setting (padrão ligado)
@@ -1056,6 +1134,17 @@ export function registerIpc(): void {
             typeof opts?.reusePartial === 'boolean'
               ? opts.reusePartial
               : getVoiceSettings().stt.reusePartialFinal !== false
+        })
+        .then((r) => {
+          // a final da fala da chamada: duração/modelo no `meta.voice` do turno e nos custos
+          if (voiceCalls.state().active && owner !== null && owner === voiceCallOwner)
+            voiceCalls.noteTranscript({
+              text: r.text,
+              model: r.model,
+              backend: r.backend,
+              audioMs: audioMs ?? 0
+            })
+          return r
         })
         .catch((e: unknown) => {
           // a final da chamada falhou (a sessão já repetiu a transitória uma vez): encerra
@@ -1270,6 +1359,13 @@ export function registerIpc(): void {
         const p = pid ? providersRepo.get(pid) : null
         if (p) void listModels(p).catch(() => undefined)
       }
+      // preço de lista da voz (custo ≈ no marcador de fim): a listagem de modelos de fala em cache
+      const ttsApi = getVoiceSettings().tts
+      if (ttsApi.backend === 'api' && ttsApi.api.providerId)
+        void listVoiceCatalog(
+          { capability: 'tts', providerId: ttsApi.api.providerId },
+          { provider: (id) => providersRepo.get(id) }
+        ).catch(() => undefined)
       return state
     },
     [IPC.voice.callStop]: () => {

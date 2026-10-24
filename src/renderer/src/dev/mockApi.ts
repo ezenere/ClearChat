@@ -69,6 +69,7 @@ import { isDisplayOnly } from '@shared/context'
 import { contentText } from '@shared/attachments'
 import { siblingBroadcastText, siblingMessageText } from '@shared/siblings'
 import { evaluateLists, isListItem, normalizeApprovalSettings } from '@shared/approvalPolicy'
+import { formatCallDuration, type VoiceCallMark } from '@shared/voiceCallMarks'
 import {
   createMemoryMock,
   extractionRequest,
@@ -957,6 +958,167 @@ export function createMockApi(scenario: string): ClearApi {
   }
   // ?scenario=spend → chat c2 com gasto conhecido (respostas com cache/raciocínio, uma sem custo,
   // juiz, subagente, coleta de contexto e título automático) — valores conferidos no E2E
+  // ?scenario=voice-history → chat com uma chamada de voz passada: marcadores de início/fim (com
+  // custos), falas em itálico com mic/alto-falante, end_call compacto e uma mensagem ditada
+  if (scenario === 'voice-history') {
+    const t0 = minAgo(45)
+    chats.unshift({
+      id: 'cv',
+      title: 'Revisão do deploy por voz',
+      config: cfg,
+      mainSessionId: 'sv',
+      createdAt: t0,
+      updatedAt: now - 30_000
+    })
+    sessions.push({
+      id: 'sv',
+      chatId: 'cv',
+      parentSessionId: null,
+      parentToolCallId: null,
+      depth: 0,
+      model: cfg.model,
+      title: 'Principal',
+      task: null,
+      status: 'idle',
+      createdAt: t0
+    })
+    const callId = 'call-mock-1'
+    const at = (min: number): number => t0 + min * 60_000
+    const sttModel = 'openai/whisper-large-v3-turbo'
+    const ttsModel = 'elevenlabs/eleven-flash-v2.5'
+    const voiceUser = (durationMs: number): StoredMessage['meta'] => ({
+      voice: { source: 'call' as const, callId, durationMs, sttModel }
+    })
+    const voiceBot = (spoken: true | 'partial' = true): StoredMessage['meta'] => ({
+      voice: { source: 'call' as const, callId, spoken, ttsModel }
+    })
+    const usage = (cost: number): NonNullable<StoredMessage['meta']['usage']> => ({
+      promptTokens: 2100,
+      completionTokens: 40,
+      cost
+    })
+    messages.push(
+      msg('sv', { role: 'user', content: 'Vou te ligar para revisar o deploy.' }, {}, at(0)),
+      msg(
+        'sv',
+        { role: 'assistant', content: 'Combinado — pode ligar quando quiser.' },
+        { model: cfg.model, usage: usage(0.0012) },
+        at(0.2)
+      ),
+      msg(
+        'sv',
+        { role: 'assistant', content: 'Chamada de voz iniciada' },
+        {
+          synthetic: true,
+          kind: 'voice-call',
+          voiceCall: { callId, phase: 'start', startedAt: at(1) }
+        },
+        at(1)
+      ),
+      msg(
+        'sv',
+        { role: 'user', content: 'Oi, você consegue ver se o deploy de ontem terminou?' },
+        voiceUser(3200),
+        at(1.2)
+      ),
+      msg(
+        'sv',
+        {
+          role: 'assistant',
+          content: 'Terminou sim. O deploy de ontem passou nos testes e está no ar.'
+        },
+        { model: cfg.model, usage: usage(0.0021), ...voiceBot() },
+        at(1.3)
+      ),
+      msg('sv', { role: 'user', content: 'E os logs de erro?' }, voiceUser(1400), at(2)),
+      msg(
+        'sv',
+        { role: 'assistant', content: 'Tem dois avisos de memória no worker,' },
+        { model: cfg.model, usage: usage(0.0019), interrupted: true, ...voiceBot('partial') },
+        at(2.1)
+      ),
+      msg('sv', { role: 'user', content: 'Beleza, obrigado, tchau!' }, voiceUser(1600), at(4.8)),
+      msg(
+        'sv',
+        {
+          role: 'assistant',
+          content: 'Por nada, até mais!',
+          tool_calls: [
+            {
+              id: 'tc-end-1',
+              type: 'function',
+              function: { name: 'end_call', arguments: '{"reason":"usuário se despediu"}' }
+            }
+          ]
+        },
+        { model: cfg.model, usage: usage(0.0017), ...voiceBot() },
+        at(4.9)
+      ),
+      msg(
+        'sv',
+        { role: 'tool', tool_call_id: 'tc-end-1', content: 'Chamada encerrada pelo agente.' },
+        { toolStatus: 'ok', durationMs: 1 },
+        at(4.9)
+      ),
+      msg(
+        'sv',
+        { role: 'assistant', content: 'Chamada encerrada · 4 min 12 s · pelo agente' },
+        {
+          synthetic: true,
+          kind: 'voice-call',
+          voiceCall: {
+            callId,
+            phase: 'end',
+            startedAt: at(1),
+            endedAt: at(1) + 252_000,
+            durationMs: 252_000,
+            endedBy: 'agent',
+            reason: 'usuário se despediu',
+            usage: {
+              turns: 3,
+              userSpeechMs: 6200,
+              stt: {
+                mode: 'api',
+                model: sttModel,
+                apiRequests: 9,
+                apiAudioMs: 14_000,
+                localRequests: 0,
+                cost: 0.0011,
+                costedRequests: 9
+              },
+              tts: {
+                backend: 'api',
+                model: ttsModel,
+                chars: 118,
+                audioMs: 9800,
+                cost: 0.0118,
+                estimated: true
+              },
+              llm: { calls: 3, cost: 0.0057, costed: 3 }
+            }
+          }
+        },
+        at(5.2)
+      ),
+      msg(
+        'sv',
+        { role: 'user', content: 'Agora me manda o resumo por escrito, por favor.' },
+        { voice: { source: 'dictation' } },
+        at(6)
+      ),
+      msg(
+        'sv',
+        {
+          role: 'assistant',
+          content:
+            '**Resumo do deploy**\n\n- Terminou ontem e passou nos testes.\n- Dois avisos de memória no worker (sem erro).'
+        },
+        { model: cfg.model, usage: usage(0.0024) },
+        at(6.1)
+      )
+    )
+  }
+
   if (scenario === 'spend') {
     const c2 = chats.find((c) => c.id === 'c2')!
     c2.config = {
@@ -1869,7 +2031,7 @@ export function createMockApi(scenario: string): ClearApi {
       }
     },
     agent: {
-      send: async (sid, text, atts) => {
+      send: async (sid, text, atts, _skills, opts) => {
         // agente ocupado → fila (chips acima do composer), como no backend
         const ss = sessions.find((x) => x.id === sid)
         if (ss && ['running', 'waiting', 'awaiting_approval'].includes(ss.status)) {
@@ -1899,6 +2061,9 @@ export function createMockApi(scenario: string): ClearApi {
             : text
         })
         m.parentId = leaf ? leaf.id : null
+        // texto ditado no composer: `meta.voice` como o main grava
+        if (opts?.voice?.source === 'dictation')
+          m.meta = { ...m.meta, voice: { source: 'dictation' } }
         messages.push(m)
         emit({ type: 'message-added', message: m })
         return { queued: false }
@@ -2783,6 +2948,19 @@ export function createMockApi(scenario: string): ClearApi {
               )
             return new Uint8Array(buf)
           }
+          const callMark = (sid: string, content: string, mark: VoiceCallMark): void => {
+            const ss = sessions.find((x) => x.id === sid)
+            const leaf = activeLeaf(sessionMsgs(sid), ss?.branchSel)
+            const m = msg(
+              sid,
+              { role: 'assistant', content },
+              { synthetic: true, kind: 'voice-call', voiceCall: mark },
+              Date.now()
+            )
+            m.parentId = leaf ? leaf.id : null
+            messages.push(m)
+            emit({ type: 'message-added', message: m })
+          }
           const speak = (sentences: number[]): void => {
             setState({ phase: 'speaking' })
             let at = 150
@@ -2814,8 +2992,16 @@ export function createMockApi(scenario: string): ClearApi {
                 active: true,
                 chatId: sessions.find((x) => x.id === sessionId)?.chatId ?? 'c1',
                 sessionId,
-                turnSilenceMs: resolveTurnSilenceMs(voiceCallDefaults.turn, audioInput)
+                turnSilenceMs: resolveTurnSilenceMs(voiceCallDefaults.turn, audioInput),
+                callId: `call-${Date.now()}`,
+                startedAt: Date.now()
               }
+              // marcador de início no histórico (como o main — mensagem só de exibição)
+              callMark(sessionId, 'Chamada de voz iniciada', {
+                callId: state.callId!,
+                phase: 'start',
+                startedAt: state.startedAt!
+              })
               // GPU local (como o main): motores não carregados → "Preparando a GPU…" (o microfone
               // só abre depois); falha no aquecimento encerra a chamada com o motivo
               const gpuIds = [
@@ -2860,6 +3046,22 @@ export function createMockApi(scenario: string): ClearApi {
             },
             stop: async () => {
               clearTimers()
+              if (state.active && state.sessionId && state.callId && state.startedAt) {
+                const endedAt = Date.now()
+                const durationMs = endedAt - state.startedAt
+                callMark(
+                  state.sessionId,
+                  `Chamada encerrada · ${formatCallDuration(durationMs)} · por você`,
+                  {
+                    callId: state.callId,
+                    phase: 'end',
+                    startedAt: state.startedAt,
+                    endedAt,
+                    durationMs,
+                    endedBy: 'user'
+                  }
+                )
+              }
               state = { ...VOICE_CALL_INACTIVE }
               voiceCallStateListeners.forEach((l) => l({ ...state }))
               return { ...state }

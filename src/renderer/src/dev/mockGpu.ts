@@ -14,6 +14,10 @@
 //                      (a chamada entra em "Preparando a GPU…" e o servidor liga sozinho)
 //   gpu-call-lowvram → gpu-call com só 2,1 GB de VRAM livre (aviso, a chamada segue)
 //   gpu-call-oom     → gpu-call em que o aquecimento estoura a VRAM (a chamada termina com o motivo)
+//   gpu-own-vram     → caso real: o servidor do app (OmniVoice + Whisper carregados) ocupa a VRAM e
+//                      sobra pouca livre — nenhum aviso de VRAM (a do app não conta; o carregado
+//                      nunca avisa) e o XTTS instalado mostra "o app libera … ao trocar"
+// A VRAM é recalculada a cada status (servidor ligado/parado muda a livre e os avisos).
 import { GPU_CC0_VOICES, gpuEnginesLabel } from '@shared/gpuVoice'
 import type {
   GpuCompat,
@@ -156,6 +160,17 @@ const ENGINES: EngineSpec[] = [
   }
 ]
 
+/** Grupo de processo de cada motor (como o backend: um processo por grupo). */
+const GROUP: Record<GpuEngineId, string> = {
+  omnivoice: 'omni',
+  'xtts-v2': 'xtts',
+  'vibevoice-realtime': 'vibe',
+  'qwen3-tts-0.6b': 'qwen',
+  'qwen3-tts-1.7b': 'qwen',
+  'whisper-large-v3-turbo': 'base'
+}
+const CTX_MB = 300
+
 const RTX: GpuInfo = {
   vendor: 'nvidia',
   name: 'NVIDIA GeForce RTX 3080 Ti',
@@ -175,7 +190,12 @@ const CC0_VOICES: GpuVoice[] = GPU_CC0_VOICES.map((c) => ({
 }))
 
 /** Compatibilidade do motor por cenário (as regras que o backend aplicaria). */
-function compatFor(spec: EngineSpec, scenario: string, gpu: GpuInfo | null): GpuCompat {
+function compatFor(
+  spec: EngineSpec,
+  scenario: string,
+  gpu: GpuInfo | null,
+  vram: { loaded: boolean; reclaimMb: number } = { loaded: false, reclaimMb: 0 }
+): GpuCompat {
   if (scenario === 'gpu-incompatible')
     return {
       level: 'blocked',
@@ -204,14 +224,15 @@ function compatFor(spec: EngineSpec, scenario: string, gpu: GpuInfo | null): Gpu
       ]
     }
   const total = gpu.vramTotalMb ?? 0
-  const free = gpu.vramFreeMb ?? total
+  // a VRAM do próprio servidor do app não conta (o app libera ao trocar); carregado nunca avisa
+  const free = (gpu.vramFreeMb ?? total) + vram.reclaimMb
   const gb = (mb: number): string => `${(mb / 1024).toFixed(1).replace('.', ',')} GB`
   if (spec.vramMb > total)
     return {
       level: 'blocked',
       reasons: [`precisa de ~${gb(spec.vramMb)} de VRAM; sua GPU tem ${gb(total)}`]
     }
-  if (spec.vramMb > free)
+  if (!vram.loaded && spec.vramMb > free)
     return {
       level: 'warn',
       reasons: [
@@ -279,10 +300,13 @@ export function createMockGpu(
               ]
             : scenario === 'gpu-call-lowvram'
               ? [{ ...RTX, vramFreeMb: 2150 }]
-              : [RTX]
+              : [{ ...RTX }]
   const nvidia = gpus.find((g) => g.vendor === 'nvidia') ?? null
+  /** VRAM livre com o servidor do app DESLIGADO (o status desconta o que ele ocupa). */
+  const freeIdle = scenario === 'gpu-own-vram' ? 9000 : (nvidia?.vramFreeMb ?? null)
   const callScenario = scenario.startsWith('gpu-call')
-  const installed = scenario === 'gpu-installed' || callScenario
+  const ownScenario = scenario === 'gpu-own-vram'
+  const installed = scenario === 'gpu-installed' || callScenario || ownScenario
   const cc0 = installed
   const userVoices: GpuVoice[] = []
   let voiceSeq = 0
@@ -300,7 +324,10 @@ export function createMockGpu(
     voices: [...spec.builtin, ...(spec.clones && cc0 ? CC0_VOICES.slice(0, 1) : [])],
     install: {
       state:
-        installed && (spec.id === 'omnivoice' || spec.id === 'whisper-large-v3-turbo')
+        installed &&
+        (spec.id === 'omnivoice' ||
+          spec.id === 'whisper-large-v3-turbo' ||
+          (ownScenario && spec.id === 'xtts-v2'))
           ? 'installed'
           : 'absent'
     },
@@ -342,7 +369,40 @@ export function createMockGpu(
         : { state: 'stopped', engines: [] }
   }
 
-  const snapshot = (): GpuStatus => structuredClone(status)
+  /** VRAM como o backend calcula: a do servidor do app à parte; carregado não avisa. */
+  const refreshVram = (): void => {
+    const nv = status.gpus.find((g) => g.vendor === 'nvidia')
+    const running = status.server.state === 'running' ? status.server.engines : []
+    const specOf = (id: string): EngineSpec | undefined => ENGINES.find((x) => x.id === id)
+    const own = running.length
+      ? running.reduce((n, id) => n + (specOf(id)?.vramMb ?? 0), CTX_MB)
+      : 0
+    const procGroup =
+      running.map((id) => GROUP[id as GpuEngineId]).find((g) => g && g !== 'base') ?? 'base'
+    if (nv && freeIdle != null) {
+      nv.vramFreeMb = Math.max(0, freeIdle - own)
+      nv.vramOwnMb = own || null
+    }
+    for (const e of status.engines) {
+      const spec = specOf(e.id)!
+      const loaded = running.includes(e.id)
+      const reclaimMb = spec.kind === 'tts' && running.length && procGroup !== GROUP[e.id] ? own : 0
+      const releases = reclaimMb
+        ? running.map((id) => specOf(id)?.label ?? id).filter((l) => l !== spec.label)
+        : []
+      e.vram = {
+        loaded,
+        availMb: nv?.vramFreeMb != null ? nv.vramFreeMb + reclaimMb : null,
+        releases
+      }
+      e.compat = compatFor(spec, scenario, nv ?? gpus[0] ?? null, { loaded, reclaimMb })
+    }
+  }
+
+  const snapshot = (): GpuStatus => {
+    refreshVram()
+    return structuredClone(status)
+  }
   const emit = (): void => {
     const s = snapshot()
     listeners.forEach((l) => l(s))
@@ -424,10 +484,10 @@ export function createMockGpu(
     const slow = scenario === 'gpu-installing'
     const ok = await runJob(
       [
-        { phase: 'baixando Python 3.11 (uv)', steps: 3 },
-        { phase: 'baixando PyTorch 2.8 (CUDA 12.8)', steps: slow ? 400 : 12 },
-        { phase: 'baixando bibliotecas dos motores', steps: 6 },
-        { phase: 'verificando a GPU (torch.cuda)', steps: 3 }
+        { phase: 'Baixando o Python portátil', steps: 3 },
+        { phase: 'Instalando o PyTorch (CUDA 12.8, ~3 GB)', steps: slow ? 400 : 12 },
+        { phase: 'Instalando a base (servidor local e bibliotecas de áudio)', steps: 6 },
+        { phase: 'Verificando o runtime', steps: 3 }
       ],
       (phase, pct, bytes) => {
         status.runtime.progress = { phase, pct, bytes }

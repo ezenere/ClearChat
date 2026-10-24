@@ -16,9 +16,14 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import {
   GPU_ENGINE_CATALOG,
+  GPU_ENGINE_PARAMS,
+  GPU_RUNTIME_VERSION,
+  XTTS_DEFAULT_SPEED,
   evaluateEngineCompat,
   evaluateRuntimeCompat,
   gpuEngineEntry,
+  normalizeGpuParamOverrides,
+  resolveGpuParams,
   type GpuInfo,
   type GpuProbe
 } from '../src/shared/gpuVoice.ts'
@@ -27,6 +32,8 @@ import {
   parseLspci,
   parseNvidiaSmiCsv,
   parseNvidiaSmiCudaVersion,
+  ownVramByGpu,
+  parseComputeAppsCsv,
   probeNvidia,
   type ProbeRunner
 } from '../src/main/voice/gpu/probe.ts'
@@ -110,7 +117,8 @@ test('probeNvidia: sem nvidia-smi → []; campo compute_cap desconhecido → rep
   const g = await probeNvidia(old)
   assert.equal(g[0].name, 'GeForce GTX 1060 6GB')
   assert.equal(g[0].cudaMax, '11.4')
-  assert.equal(calls.length, 3)
+  // compute_cap (falha) → sem ele → cabeçalho → UUIDs
+  assert.equal(calls.length, 4)
 })
 
 test('lspci: AMD/Intel/NVIDIA', () => {
@@ -565,18 +573,28 @@ test('servidor: falha ao iniciar → erro legível com o log; crash → 1 reiní
 
 // ---------------- gerenciador: endpoint → cliente de TTS; token fora da visão ----------------
 
-async function installedManager(): Promise<{
+async function installedManager(
+  opts: {
+    /** Sonda dinâmica (recebe o gerenciador: PIDs dos processos para o --query-compute-apps). */
+    probe?: (m: GpuVoiceManager) => GpuProbe
+    gpu?: Record<string, unknown>
+    stt?: Record<string, unknown>
+  } = {}
+): Promise<{
   m: GpuVoiceManager
   base: string
   tts: Record<string, unknown>
+  stt: Record<string, unknown>
 }> {
   const base = tmp('mgr')
   const ttsSettings: Record<string, unknown> = {
     backend: 'gpu',
     api: { providerId: null, baseUrl: '', apiKey: '', model: '', voice: null },
     local: null,
-    gpu: { engine: 'omnivoice', voice: 'cc0-faber', steps: 16 }
+    gpu: opts.gpu ?? { engine: 'omnivoice', voice: 'cc0-faber', steps: 16 }
   }
+  const sttSettings: Record<string, unknown> = opts.stt ?? { mode: 'gpu' }
+  let self: GpuVoiceManager | null = null
   const measured: Record<string, unknown> = {}
   const m = new GpuVoiceManager({
     baseDir: base,
@@ -588,12 +606,12 @@ async function installedManager(): Promise<{
     pythonDist: pyDist,
     pipCacheDir: join(base, 'pipcache'),
     getTts: () => normalizeTtsSettings(ttsSettings),
-    getStt: () => normalizeSttSettings({ mode: 'gpu' }),
+    getStt: () => normalizeSttSettings(sttSettings),
     readMeasured: () => measured as never,
     writeMeasured: (id, v) => {
       measured[id] = v
     },
-    probe: async () => probe(),
+    probe: async () => (opts.probe && self ? opts.probe(self) : probe()),
     server: {
       spec: (_g, engines, port, token) => ({
         python: process.execPath,
@@ -604,9 +622,10 @@ async function installedManager(): Promise<{
       healthTimeoutMs: 8000
     }
   })
+  self = m
   await m.installEngine('omnivoice')
   await m.installEngine('whisper-large-v3-turbo')
-  return { m, base, tts: ttsSettings }
+  return { m, base, tts: ttsSettings, stt: sttSettings }
 }
 
 test('gerenciador: backend gpu → servidor sobe sob demanda e o cliente de API faz streaming PCM', async () => {
@@ -878,4 +897,374 @@ test('server.py: sintaxe Python válida e sem F5 (quando há python3 no sistema)
   if (py === null) return t.skip('python3 ausente')
   assert.equal(py, 0)
   assert.ok(!/F5-TTS|\bf5\b|F5Engine/i.test(readFileSync(join(SERVER_DIR, 'server.py'), 'utf8')))
+})
+
+// ---------------- relatório real: instalação, VRAM do próprio app, parâmetros ----------------
+
+/** Runner falso que PARA no pip do torch até `release()` (instalação em andamento de verdade). */
+function gatedRunner(base: string): {
+  run: ProcessRunner
+  reached: Promise<void>
+  release: () => void
+} {
+  const inner = fakeRunner(base)
+  let reachedOk: () => void = () => undefined
+  const reached = new Promise<void>((r) => (reachedOk = r))
+  let release: () => void = () => undefined
+  const gate = new Promise<void>((r) => (release = r))
+  const run: ProcessRunner = async (cmd, args, o) => {
+    if (args.includes('pip') && args.some((a) => a.endsWith('torch.txt'))) {
+      o.onStdoutLine?.('Looking in indexes: https://download.pytorch.org/whl/cu128')
+      o.onStdoutLine?.('Collecting torch==2.8.0')
+      reachedOk()
+      await gate
+    }
+    return inner(cmd, args, o)
+  }
+  return { run, reached, release }
+}
+
+function bareManager(
+  base: string,
+  run: ProcessRunner,
+  fetchImpl = fakeFetch(pyTgz)
+): GpuVoiceManager {
+  return new GpuVoiceManager({
+    baseDir: base,
+    serverDir: SERVER_DIR,
+    platform: 'linux',
+    arch: 'x64',
+    run,
+    fetch: fetchImpl,
+    pythonDist: pyDist,
+    pipCacheDir: join(base, 'pipcache'),
+    getTts: () => normalizeTtsSettings({ backend: 'local' }),
+    getStt: () => normalizeSttSettings({ mode: 'api' }),
+    readMeasured: () => ({}),
+    writeMeasured: () => undefined,
+    probe: async () => probe()
+  })
+}
+
+test('instalação em andamento: nunca "incompleta"; fase do PyTorch; log ao vivo; termina "instalado" com a versão', async () => {
+  const base = tmp('inst-live')
+  const g = gatedRunner(base)
+  const m = bareManager(base, g.run)
+  const p = m.installRuntime()
+  await g.reached
+  // o Python já foi extraído e o registro do runtime ainda não existe (= "broken" em disco)
+  assert.ok(existsSync(join(base, 'gpu-runtime/python/.clearchat-python')))
+  assert.equal(m.installer.runtimeState(await m.installer.readState()), 'broken')
+  const during = await m.status()
+  assert.equal(during.runtime.state, 'installing')
+  assert.equal(during.runtime.error, null, 'erro de "incompleta" durante a instalação')
+  assert.match(during.runtime.progress?.phase ?? '', /PyTorch/)
+  assert.ok(typeof during.seq === 'number')
+  // a saída do pip chega ao install.log ENQUANTO ele roda (antes só no fim)
+  await new Promise((r) => setTimeout(r, 1300))
+  assert.match(
+    readFileSync(join(base, 'gpu-runtime/install.log'), 'utf8'),
+    /Collecting torch==2\.8\.0/
+  )
+  g.release()
+  await p
+  const after = await m.status()
+  assert.equal(after.runtime.state, 'installed')
+  assert.equal(after.runtime.version, GPU_RUNTIME_VERSION)
+  assert.equal(after.runtime.error, null)
+  assert.ok((after.seq ?? 0) > (during.seq ?? 0), 'seq crescente')
+  // a cópia não promete o modelo do whisper (só o pacote vem na base)
+  assert.doesNotMatch(
+    readFileSync(join(base, 'gpu-runtime/install.log'), 'utf8'),
+    /\(whisper, servidor\)/
+  )
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('instalar MOTOR sem runtime: o card do runtime fica "instalando" (com a fase) desde o início', async () => {
+  const base = tmp('inst-eng')
+  const g = gatedRunner(base)
+  const m = bareManager(base, g.run)
+  const p = m.installEngine('xtts-v2')
+  await g.reached
+  const s = await m.status()
+  assert.equal(s.runtime.state, 'installing')
+  assert.equal(s.runtime.error, null)
+  assert.match(s.runtime.progress?.phase ?? '', /PyTorch/)
+  const x = s.engines.find((e) => e.id === 'xtts-v2')!
+  assert.equal(x.install.state, 'installing')
+  assert.match(x.install.progress?.phase ?? '', /^Runtime: .*PyTorch/)
+  g.release()
+  await p
+  const done = await m.status()
+  assert.equal(done.runtime.state, 'installed')
+  assert.equal(done.engines.find((e) => e.id === 'xtts-v2')?.install.state, 'installed')
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('instalação interrompida → retoma sem baixar o Python de novo; versão antiga tem mensagem própria', async () => {
+  const base = tmp('inst-resume')
+  const failing = bareManager(base, fakeRunner(base, { failPip: 'torch.txt' }))
+  await assert.rejects(failing.installRuntime(), /PyTorch falhou/)
+  const s1 = await failing.status()
+  assert.equal(s1.runtime.state, 'broken')
+  assert.match(s1.runtime.error ?? '', /falhou/, 'o erro real da última tentativa')
+  assert.match(
+    failing.installer.runtimeProblem(await failing.installer.readState()) ?? '',
+    /interrompida.*continuar de onde parou/
+  )
+  let fetches = 0
+  const counting = (async (...a: Parameters<typeof fetch>) => {
+    fetches++
+    return fakeFetch(pyTgz)(...a)
+  }) as typeof fetch
+  const calls: string[] = []
+  const ok = bareManager(base, fakeRunner(base, { calls }), counting)
+  await ok.installRuntime()
+  assert.equal(fetches, 0, 'o Python portátil já extraído não é baixado de novo')
+  assert.ok(
+    calls.some((c) => c.includes('torch.txt')),
+    'o pip retoma (já satisfeito = rápido)'
+  )
+  assert.equal((await ok.status()).runtime.state, 'installed')
+  // registro de uma versão antiga do runtime
+  const st = JSON.parse(readFileSync(join(base, 'gpu-runtime/state.json'), 'utf8'))
+  st.runtime.version = 'py3.11.0-torch2.7.0-0'
+  writeFileSync(join(base, 'gpu-runtime/state.json'), JSON.stringify(st))
+  const old = await ok.status()
+  assert.equal(old.runtime.state, 'broken')
+  assert.match(old.runtime.error ?? '', /versão antiga \(py3\.11\.0-torch2\.7\.0-0\).*Reinstalar/)
+  rmSync(base, { recursive: true, force: true })
+})
+
+test('VRAM: --query-compute-apps (N/A do WDDM) e a VRAM do próprio servidor separada da livre', () => {
+  const apps = parseComputeAppsCsv(`1289, 111, GPU-aaa
+1500127, 1250, GPU-aaa
+1500581, 5404, GPU-aaa
+4242, [N/A], GPU-bbb
+garbage line
+`)
+  assert.deepEqual(
+    apps.map((a) => [a.pid, a.usedMb, a.gpuUuid]),
+    [
+      [1289, 111, 'GPU-aaa'],
+      [1500127, 1250, 'GPU-aaa'],
+      [1500581, 5404, 'GPU-aaa'],
+      [4242, null, 'GPU-bbb']
+    ]
+  )
+  assert.deepEqual(parseComputeAppsCsv('No running processes found'), [])
+  const own = ownVramByGpu(apps, new Set([1500127, 1500581, 4242]), () => 900)
+  assert.equal(own.get('GPU-aaa'), 6654, 'só os PIDs do servidor (o desktop fica de fora)')
+  assert.equal(own.get('GPU-bbb'), 900, 'sem número do driver → estimativa')
+  // regras: carregado nunca avisa; o que o app libera ao trocar conta como livre
+  const omni = gpuEngineEntry('omnivoice') // ~5,0 GB
+  const p = probe({}, [nv({ vramFreeMb: 3500 })])
+  const base = { runtimeInstalled: true, layerInstalled: true, installed: true }
+  assert.match(evaluateEngineCompat(omni, p, base).reasons.join(' '), /VRAM livre agora: 3,4 GB/)
+  const loaded = evaluateEngineCompat(omni, p, { ...base, vram: { loaded: true } })
+  assert.equal(loaded.level, 'ok')
+  assert.ok(!loaded.reasons.some((r) => /VRAM/.test(r)))
+  const swap = evaluateEngineCompat(omni, p, {
+    ...base,
+    vram: { reclaimMb: 5400, releases: ['XTTS-v2'] }
+  })
+  assert.equal(swap.level, 'ok', 'cabe liberando o XTTS')
+  const short = evaluateEngineCompat(omni, p, {
+    ...base,
+    vram: { reclaimMb: 600, releases: ['XTTS-v2'] }
+  })
+  assert.equal(short.level, 'warn')
+  assert.match(short.reasons[0], /3,4 GB \+ 0,6 GB que o app libera ao trocar \(XTTS-v2\)/)
+})
+
+test('gerenciador: motor carregado no servidor não avisa de VRAM; VRAM do app à parte; trocar de grupo libera o processo antigo', async () => {
+  const { m, base } = await installedManager({
+    probe: (mgr) => ({
+      platform: { os: 'linux', arch: 'x64', diskFreeMb: 100_000 },
+      gpus: [nv({ vramFreeMb: 2000, uuid: 'GPU-1' })],
+      ramMb: 32_000,
+      computeApps: [
+        { pid: 999_999, usedMb: 3000, gpuUuid: 'GPU-1' }, // outro programa (jogo)
+        ...mgr.server
+          .list()
+          .flatMap((p) => p.pids.map((pid) => ({ pid, usedMb: 5400, gpuUuid: 'GPU-1' })))
+      ]
+    })
+  })
+  try {
+    await m.installEngine('xtts-v2')
+    const cold = await m.status(true)
+    const omniCold = cold.engines.find((e) => e.id === 'omnivoice')!
+    assert.equal(omniCold.compat.level, 'warn', 'parado: 2 GB livres < 5 GB')
+    assert.equal(cold.gpus[0].vramOwnMb, 0)
+    await m.startServer(['omnivoice'])
+    const pids = m.server.list().flatMap((p) => p.pids)
+    assert.ok(pids.length >= 1, 'PIDs do processo conhecidos')
+    const hot = await m.status(true)
+    const omni = hot.engines.find((e) => e.id === 'omnivoice')!
+    assert.equal(omni.vram?.loaded, true)
+    assert.ok(
+      !omni.compat.reasons.some((r) => /VRAM livre/.test(r)),
+      omni.compat.reasons.join(' | ')
+    )
+    assert.equal(hot.gpus[0].vramOwnMb, 5400 * new Set(pids).size)
+    assert.ok(!('uuid' in hot.gpus[0]), 'UUID fora do status')
+    // XTTS (outro grupo): cabe liberando o OmniVoice — sem aviso, com o que será liberado
+    const x = hot.engines.find((e) => e.id === 'xtts-v2')!
+    assert.equal(x.vram?.loaded, false)
+    assert.deepEqual(x.vram?.releases, ['OmniVoice'])
+    assert.equal(x.vram?.availMb, 2000 + 5400 * new Set(pids).size)
+    assert.ok(!x.compat.reasons.some((r) => /VRAM livre/.test(r)))
+    // trocar para o XTTS para o processo do OmniVoice (um processo por vez na GPU)
+    await m.tts('xtts-v2')
+    assert.deepEqual(
+      m.server.list().map((p) => p.group),
+      ['xtts']
+    )
+  } finally {
+    await m.stopServer()
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('parâmetros por motor: faixas, só overrides nas settings, chegam ao corpo da fala; whisper por /v1/config', async () => {
+  // normalização / faixas
+  assert.deepEqual(
+    normalizeGpuParamOverrides('xtts-v2', { speed: 3, temperature: 'x', top_k: 50.4, junk: 1 }),
+    { speed: 1.5 }
+  )
+  assert.equal(resolveGpuParams('xtts-v2', {}).speed, XTTS_DEFAULT_SPEED)
+  assert.ok(XTTS_DEFAULT_SPEED > 1, 'XTTS um pouco mais rápido por padrão')
+  assert.deepEqual(
+    normalizeGpuParamOverrides('whisper-large-v3-turbo', {
+      beam_size: 9,
+      vad_filter: 'yes',
+      language: 'auto'
+    }),
+    { beam_size: 5, language: 'auto' }
+  )
+  for (const [id, specs] of Object.entries(GPU_ENGINE_PARAMS))
+    for (const sp of specs) {
+      assert.ok(sp.help.length > 20, `${id}.${sp.key} sem explicação`)
+      if (sp.kind === 'number') {
+        assert.ok(
+          sp.min! <= (sp.default as number) && (sp.default as number) <= sp.max!,
+          `${id}.${sp.key}`
+        )
+      }
+    }
+  const tts = normalizeTtsSettings({
+    backend: 'gpu',
+    gpu: {
+      engine: 'xtts-v2',
+      voice: null,
+      params: { 'xtts-v2': { speed: 1.3 }, nope: { a: 1 }, omnivoice: { guidance_scale: 2 } }
+    }
+  })
+  assert.deepEqual(tts.gpu?.params, { 'xtts-v2': { speed: 1.3 } })
+  assert.deepEqual(normalizeSttSettings({ mode: 'gpu', gpu: { params: { beam_size: 3 } } }).gpu, {
+    engine: 'whisper-large-v3-turbo',
+    params: { beam_size: 3 }
+  })
+  assert.equal(normalizeSttSettings({ mode: 'gpu' }).gpu?.params, undefined)
+
+  // de ponta a ponta (servidor falso grava os corpos)
+  const bodies = join(tmp('bodies'), 'b.jsonl')
+  process.env.FAKE_GPU_BODY_FILE = bodies
+  const gpu = { engine: 'omnivoice', voice: 'cc0-faber', params: { omnivoice: { speed: 1.2 } } }
+  const {
+    m,
+    base,
+    tts: ttsRaw
+  } = await installedManager({
+    gpu,
+    stt: { mode: 'gpu', gpu: { params: { beam_size: 3, vad_filter: true } } }
+  })
+  setGpuEndpointResolver(m)
+  const read = (): { url: string; body: Record<string, unknown> }[] =>
+    readFileSync(bodies, 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+  const lastSpeech = (): Record<string, unknown> =>
+    read()
+      .filter((x) => x.url === '/v1/audio/speech')
+      .at(-1)!.body
+  try {
+    const drain = async (settings: ReturnType<typeof normalizeTtsSettings>): Promise<void> => {
+      const r = await synthesizeStream({ text: 'Olá, tudo bem?', settings })
+      if (r.streaming) for await (const _ of r.chunks) void _
+    }
+    await drain(normalizeTtsSettings(ttsRaw))
+    assert.deepEqual(lastSpeech().params, { guidance_scale: 2, speed: 1.2 })
+    assert.equal(lastSpeech().model, 'omnivoice', 'campos extras não sobrescrevem o modelo')
+    const pids = m.server.list().flatMap((p) => p.pids)
+    // mudou o parâmetro → a PRÓXIMA fala já vai com ele, sem reiniciar o servidor
+    ;(ttsRaw.gpu as typeof gpu).params.omnivoice.speed = 0.9
+    await drain(normalizeTtsSettings(ttsRaw))
+    assert.equal(lastSpeech().params && (lastSpeech().params as { speed: number }).speed, 0.9)
+    assert.deepEqual(
+      m.server.list().flatMap((p) => p.pids),
+      pids,
+      'servidor não reiniciou'
+    )
+    // "Testar" do card usa os parâmetros atuais
+    await m.selfTest('omnivoice')
+    assert.equal((lastSpeech().params as { speed: number }).speed, 0.9)
+    // whisper: config enviada uma vez por processo (beam/VAD/idioma)
+    await m.stt()
+    await m.stt()
+    const cfgs = read().filter((x) => x.url === '/v1/config' && x.body.whisper)
+    assert.equal(cfgs.length, 1)
+    assert.deepEqual(cfgs[0].body.whisper, { beam_size: 3, vad_filter: true, language: 'pt' })
+  } finally {
+    delete process.env.FAKE_GPU_BODY_FILE
+    setGpuEndpointResolver(null)
+    await m.stopServer()
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('server.py: parâmetros limitados às faixas e frase longa do XTTS em trechos ≤ 180 (python3)', async (t) => {
+  const code = `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location("srv", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+long = "também rolou uma sequência intensa de lançamentos: " + ", ".join(f"o modelo número {i} da empresa {i}" for i in range(12)) + "."
+print(json.dumps({
+  "x": m.clamp_params("xtts-v2", {"speed": 9, "temperature": "abc", "top_k": 3.7}),
+  "d": m.clamp_params("xtts-v2", None),
+  "o": m.clamp_params("omnivoice", {"steps": 100}),
+  "w": m.whisper_config({"beam_size": 0, "vad_filter": True, "language": "xx"}),
+  "parts": [len(p) for p in m.split_long(long)],
+  "joined": " ".join(m.split_long(long)) == long,
+  "short": m.split_long("Oi, tudo bem?"),
+  "clean": m.XttsEngine.clean("um trecho cortado,"),
+}))`
+  const out = await new Promise<string | null>((res) => {
+    let o = ''
+    const c = spawn('python3', ['-I', '-c', code, join(SERVER_DIR, 'server.py')], {
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    c.stdout.on('data', (b: Buffer) => (o += b.toString()))
+    c.on('error', () => res(null))
+    c.on('close', (code) => res(code === 0 ? o : null))
+  })
+  if (out === null) return t.skip('python3 ausente')
+  const j = JSON.parse(out)
+  assert.deepEqual(j.x, {
+    speed: 1.5,
+    temperature: 0.75,
+    repetition_penalty: 10,
+    top_p: 0.85,
+    top_k: 3
+  })
+  assert.equal(j.d.speed, XTTS_DEFAULT_SPEED, 'padrão do servidor = padrão do app')
+  assert.deepEqual(j.o, { guidance_scale: 2, speed: 1, steps: 64 })
+  assert.deepEqual(j.w, { beam_size: 1, vad_filter: true, language: 'pt' })
+  assert.ok(j.parts.length > 1 && j.parts.every((n: number) => n <= 180), JSON.stringify(j.parts))
+  assert.equal(j.joined, true, 'nada se perde ao dividir')
+  assert.deepEqual(j.short, ['Oi, tudo bem?'])
+  assert.equal(j.clean, 'um trecho cortado')
 })

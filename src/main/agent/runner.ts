@@ -54,6 +54,7 @@ import { DEFAULT_COMPACT_PROMPT } from '@shared/defaults'
 import { clampToolOutput, LIMITS, TOOL_SPILL_SETTING } from '@shared/limits'
 import { applyVoiceCallChat } from '@shared/voice'
 import { spokenPrefix } from '@shared/voiceTurn'
+import { END_CALL_RESULT, type VoiceMessageMeta } from '@shared/voiceCallMarks'
 import {
   interChatHeader,
   interChatText,
@@ -357,6 +358,59 @@ function appendError(sessionId: string, error: string): void {
   }
 }
 
+/**
+ * Mensagem só de exibição (marcador da chamada de voz — `meta.kind 'voice-call'`): persistida e
+ * emitida como as demais, NUNCA enviada à API (`isDisplayOnly`). Null = não gravada.
+ */
+export function appendDisplayMessage(
+  sessionId: string,
+  content: string,
+  meta: MessageMeta
+): StoredMessage | null {
+  if (shuttingDown || !sessionsRepo.get(sessionId)) return null
+  try {
+    return append(sessionId, { role: 'assistant', content }, { ...meta, synthetic: true })
+  } catch (e) {
+    console.error('[clearchat] appendDisplayMessage', e)
+    return null
+  }
+}
+
+/**
+ * `meta.voice` da resposta do assistente num turno da chamada de voz (avaliado na hora de gravar —
+ * a chamada pode ter acabado no meio do passo). Vazio fora da chamada.
+ */
+function voiceReplyMeta(
+  chat: Chat,
+  session: Session,
+  content: string | null,
+  partial = false
+): Pick<MessageMeta, 'voice'> {
+  const call = voiceCallContextFor(chat, session)
+  if (!call?.callId) return {}
+  const voice: VoiceMessageMeta = { source: 'call', callId: call.callId }
+  if (content?.trim()) voice.spoken = partial ? 'partial' : true
+  if (call.ttsModel) voice.ttsModel = call.ttsModel
+  return { voice }
+}
+
+// ---- meta extra de uma mensagem do usuário (voz: chamada/ditado) — entregue a `send` ----
+const pendingUserMeta = new Map<string, { text: string; meta: MessageMeta; at: number }>()
+/**
+ * A próxima `send(sessionId, text)` com este texto grava `meta` junto (ex.: `meta.voice` da fala
+ * da chamada ou do ditado). Usado porque o envio passa pelo gate do sync (`gatedSend`), que só
+ * leva texto/anexos; expira em 30 s.
+ */
+export function stashUserMeta(sessionId: string, text: string, meta: MessageMeta): void {
+  pendingUserMeta.set(sessionId, { text, meta, at: Date.now() })
+}
+function takeUserMeta(sessionId: string, text: string): MessageMeta {
+  const p = pendingUserMeta.get(sessionId)
+  if (!p) return {}
+  pendingUserMeta.delete(sessionId)
+  return p.text === text && Date.now() - p.at < 30_000 ? p.meta : {}
+}
+
 /** Sessão + todos os descendentes (filhos antes dos pais na lista retornada). */
 function subtree(chatId: string, rootIds: string[]): Session[] {
   const all = sessionsRepo.list(chatId)
@@ -446,8 +500,9 @@ export function repairTail(
   let idx = -1
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i].message
-    // card da extração de memórias pode entrar no meio de um turno (só exibição): ignora
-    if (msgs[i].meta.kind === 'memory-extraction') continue
+    // card da extração de memórias / marcador da chamada de voz podem entrar no meio de um turno
+    // (só exibição): ignora
+    if (isDisplayOnly(msgs[i].meta)) continue
     if (m.role === 'assistant') {
       idx = i
       break
@@ -1014,7 +1069,8 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
             interrupted: true,
             model: acc.model ?? reqSession.model,
             durationMs: Date.now() - t0,
-            ...withReasoningMs(acc)
+            ...withReasoningMs(acc),
+            ...voiceReplyMeta(chat, session, acc.content, true)
           }
         )
       }
@@ -1051,10 +1107,13 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
     ...withReasoningMs(acc)
   }
   if (acc.usage) meta.usage = acc.usage
+  Object.assign(meta, voiceReplyMeta(chat, session, acc.content))
   append(session.id, assistant, meta)
 
   // ---- tools nativas ----
   if (calls.length) {
+    /** `end_call` rodou: o turno termina aqui (sem nova chamada ao modelo — a chamada vai cair). */
+    let hungUp = false
     for (const call of calls) {
       if (signal.aborted) break
       const r = await executeTool(
@@ -1085,9 +1144,11 @@ async function step(st: RunState, signal: AbortSignal): Promise<StepResult> {
         { role: 'tool', tool_call_id: call.id, content: r.parts?.length ? r.parts : r.content },
         tmeta
       )
+      if (call.function.name === 'end_call' && r.status === 'ok') hungUp = true
       if (r.status === 'cancelled' && signal.aborted) break
     }
     if (signal.aborted) return { kind: 'aborted', partial: '' }
+    if (hungUp) return { kind: 'final', text: acc.content }
     return { kind: 'continue' }
   }
 
@@ -1436,6 +1497,9 @@ async function executeTool(
   } catch (e) {
     return done({ content: `Erro: ${errMsg(e)}`, status: 'error' })
   }
+  // chamada de voz: `end_call` não pede aprovação (só encerra a chamada — o VoiceCallManager vê o
+  // resultado no histórico e desliga quando a resposta terminar de tocar)
+  if (name === 'end_call') return done({ content: END_CALL_RESULT, status: 'ok' })
 
   // Gate de aprovação (ver @shared/approvalPolicy): modo efetivo do item (always | smart | lists).
   // Tools que não são itens (leitura, process_stop…) rodam direto; ask_user nunca pede confirmação.
@@ -2897,8 +2961,9 @@ export function send(
   const attachments = validateAttachments(attachmentsInput)
   text = typeof text === 'string' ? text : ''
   if (!text.trim() && !attachments.length && !skillParts.length) throw new Error('Mensagem vazia.')
+  const meta = takeUserMeta(sessionId, text)
   return {
-    queued: !!deliverToSession(session, text, {}, true, attachments, skillParts).queuedId
+    queued: !!deliverToSession(session, text, meta, true, attachments, skillParts).queuedId
   }
 }
 
@@ -3028,10 +3093,14 @@ export async function amendVoiceTurn(
       continue
     }
     if (spoken === content) continue
+    const voice = m.meta.voice
+      ? { voice: { ...m.meta.voice, ...(spoken.trim() ? { spoken: 'partial' as const } : {}) } }
+      : {}
+    if (voice.voice && !spoken.trim()) delete voice.voice.spoken
     const updated = messagesRepo.update(
       m.id,
       { ...m.message, content: hasCalls && !spoken ? null : spoken },
-      { ...m.meta, interrupted: true }
+      { ...m.meta, interrupted: true, ...voice }
     )
     emit({ type: 'message-updated', message: updated })
     truncated++

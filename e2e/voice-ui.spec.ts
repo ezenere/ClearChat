@@ -969,6 +969,173 @@ app.on('window-all-closed', () => app.quit())
     await page.getByTestId('voice-call-button').waitFor({ timeout: 2000 })
   })
 
+  // ---------------- histórico da chamada (marcadores, falas, custos) ----------------
+
+  await step(
+    'histórico: marcadores de início/fim, falas em itálico com mic/alto-falante, end_call compacto, ditado discreto',
+    async () => {
+      await open('voice-history', 'Revisão do deploy por voz')
+      const markers = page.getByTestId('call-marker')
+      await markers.first().waitFor()
+      assert.equal(await markers.count(), 2, 'início + fim')
+      const start = page.locator('[data-testid=call-marker][data-phase=start]')
+      const end = page.locator('[data-testid=call-marker][data-phase=end]')
+      assert.match(await start.innerText(), /Chamada de voz · \d{2}:\d{2}/)
+      const endText = await end.innerText()
+      assert.match(endText, /Chamada encerrada · 4 min 12 s · pelo agente · ≈ \$0,02/)
+      // falas da chamada: itálico + ícone; ditado: ícone discreto, sem itálico
+      const info = await page.evaluate(() => {
+        const call = [...document.querySelectorAll<HTMLElement>('[data-voice=call]')]
+        const dict = [...document.querySelectorAll<HTMLElement>('[data-voice=dictation]')]
+        return {
+          call: call.length,
+          italic: call.every((e) => getComputedStyle(e).fontStyle === 'italic'),
+          dict: dict.length,
+          dictItalic: dict.some((e) => getComputedStyle(e).fontStyle === 'italic'),
+          badges: [...document.querySelectorAll<HTMLElement>('[data-testid=voice-badge]')].map(
+            (b) => b.dataset.source
+          )
+        }
+      })
+      assert.equal(info.call, 6, '3 falas do usuário + 3 respostas faladas')
+      assert(info.italic, 'falas da chamada em itálico')
+      assert.equal(info.dict, 1)
+      assert.equal(info.dictItalic, false, 'ditado sem itálico')
+      assert.equal(info.badges.filter((b) => b === 'call').length, 6)
+      assert.equal(info.badges.filter((b) => b === 'dictation').length, 1)
+      // end_call: linha compacta, sem card de tool; a resposta interrompida mantém o marcador
+      await page.getByTestId('end-call-line').waitFor()
+      assert.match(
+        await page.getByTestId('end-call-line').innerText(),
+        /Chamada encerrada pelo agente · usuário se despediu/
+      )
+      assert.equal(await page.getByText('Encerrar chamada', { exact: true }).count(), 0)
+      await page.getByText('Interrompida pelo usuário').waitFor()
+      await shot('voice-history-01-chat')
+      // tooltip do marcador de fim: detalhamento dos custos/tempos
+      await end.locator('span.rounded-full').hover()
+      const tip = page.getByTestId('call-marker-tip')
+      await tip.waitFor()
+      const t = await tip.innerText()
+      assert.match(
+        t,
+        /Transcrição \(openai\/whisper-large-v3-turbo\)\s+9 requests · 14 s · \$0,0011/
+      )
+      assert.match(t, /118 caracteres · ≈ \$0,01 \(preço de lista\)/)
+      assert.match(t, /Interjeições e preâmbulos\s+grátis/)
+      await shot('voice-history-02-marker-tooltip')
+      await page.mouse.move(5, 5)
+      // tooltip da fala: duração + modelo da transcrição
+      const badge = page.getByTestId('voice-badge').first()
+      await badge.scrollIntoViewIfNeeded()
+      await page.waitForTimeout(400)
+      await badge.hover()
+      await page.getByText(/Falado na chamada de voz · 3,2 s · transcrição/).waitFor()
+      await shot('voice-history-03-badge-tooltip')
+      await page.mouse.move(5, 5)
+      return endText.replace(/\s+/g, ' ')
+    }
+  )
+
+  await step('gasto: seção "Chamadas de voz" (turnos de voz fora de "Respostas")', async () => {
+    await page.getByTestId('spend-button').click()
+    const pop = page.getByTestId('spend-popover')
+    await pop.waitFor()
+    await pop.getByTestId('spend-voice').waitFor()
+    const v = await pop.getByTestId('spend-voice').innerText()
+    assert.match(v, /Chamadas de voz · 1 chamada · 4 min 12 s/)
+    assert.match(await pop.getByTestId('spend-voice-llm').innerText(), /3 respostas\)\s+\$0,0057/)
+    assert.match(await pop.getByTestId('spend-voice-stt').innerText(), /\$0,0011/)
+    assert.match(await pop.getByTestId('spend-voice-tts').innerText(), /118 caracteres\s+≈ \$0,01/)
+    // "Respostas" = só as 2 fora da chamada (0,0012 + 0,0024)
+    assert.match(await pop.getByTestId('spend-main').innerText(), /2 chamadas\s+\$0,0036/)
+    await pop.getByTestId('spend-main-voice-note').waitFor()
+    // total = 0,0036 + 0,0057 + 0,0011 (a voz ≈ fica fora)
+    assert.equal(await pop.getByTestId('spend-total').innerText(), '$0,01')
+    await pop.screenshot({ path: join(SHOTS, 'voice-history-04-spend.png') })
+    await page.keyboard.press('Escape')
+    return v.replace(/\s+/g, ' ').slice(0, 120)
+  })
+
+  await step('chamada ao vivo: relógio na barra + marcadores de início/fim no chat', async () => {
+    await open('chat', 'Script de backup')
+    const before = await page.getByTestId('call-marker').count()
+    await page.getByTestId('voice-call-button').click()
+    await page.getByTestId('voice-call-dock').waitFor()
+    const clock = page.getByTestId('voice-call-clock')
+    await clock.waitFor()
+    assert.match(await clock.innerText(), /^\d{2}:\d{2}$/)
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid=voice-call-clock]')?.textContent === '00:02',
+      undefined,
+      { timeout: 5000 }
+    )
+    await page.locator('[data-testid=call-marker][data-phase=start]').last().waitFor()
+    await page
+      .getByTestId('voice-call-dock')
+      .screenshot({ path: join(SHOTS, 'call-bar-clock.png') })
+    await page.getByTestId('voice-call-end').click()
+    await page.getByTestId('voice-call-dock').waitFor({ state: 'detached' })
+    await page.locator('[data-testid=call-marker][data-phase=end]').last().waitFor()
+    assert.equal(await page.getByTestId('call-marker').count(), before + 2)
+    assert.match(
+      await page.locator('[data-testid=call-marker][data-phase=end]').last().innerText(),
+      /Chamada encerrada · \d+ s · por você/
+    )
+    await shot('call-live-markers')
+  })
+
+  await step('ditado enviado: mic discreto no balão (sem itálico)', async () => {
+    await open('chat', 'Script de backup')
+    await page.getByTestId('voice-mic-button').click()
+    await recording().waitFor()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
+      undefined,
+      { timeout: 4000 }
+    )
+    await page.getByTestId('composer-send').click()
+    await page.waitForFunction(
+      (w) => document.querySelector('[data-testid=chat-scroller]')?.textContent?.includes(w),
+      MOCK_FINAL,
+      { timeout: 6000 }
+    )
+    const last = page.locator('[data-voice=dictation]').last()
+    await last.waitFor()
+    assert.match(await last.innerText(), /ditado simulado/)
+    assert.notEqual(await last.evaluate((e) => getComputedStyle(e).fontStyle), 'italic')
+    assert((await page.locator('[data-testid=voice-badge][data-source=dictation]').count()) >= 1)
+    // digitado sem ditado: sem ícone
+    await composer().fill('mensagem digitada sem voz')
+    await page.getByTestId('composer-send').click()
+    await page.getByText('mensagem digitada sem voz').waitFor()
+    const typedVoice = await page
+      .getByText('mensagem digitada sem voz')
+      .evaluate((e) => (e as HTMLElement).dataset.voice ?? null)
+    assert.equal(typedVoice, null)
+    await shot('dictation-badge')
+  })
+
+  await step('Voz (chat e Configurações): "O agente pode encerrar a chamada"', async () => {
+    await open('chat', 'Ideias de nomes para o app')
+    await panel(true)
+    await page.getByTestId('right-panel').getByRole('tab', { name: 'Voz' }).click()
+    const g = page.getByTestId('right-panel').getByTestId('voice-call-end-call')
+    await g.waitFor()
+    assert.equal(await g.getAttribute('data-effective'), 'on', 'padrão: ligado')
+    await g.locator('[data-value=off]').click()
+    assert.equal(await g.getAttribute('data-effective'), 'off')
+    await page
+      .getByTestId('right-panel')
+      .screenshot({ path: join(SHOTS, 'voice-tab-end-call.png') })
+    await g.locator('[data-value=inherit]').click()
+    await panel(false)
+    await openAudioSettings()
+    await page.getByRole('switch', { name: 'O agente pode encerrar a chamada' }).waitFor()
+    await page.keyboard.press('Escape')
+    await dialog().waitFor({ state: 'detached' })
+  })
+
   await app.close()
   const failed = results.filter((r) => !r.ok)
   console.log(`\n${results.length - failed.length}/${results.length} ok — screenshots em ${SHOTS}`)

@@ -936,6 +936,121 @@ async function main(): Promise<void> {
     }
   )
 
+  await step(
+    'áudio (protocolo 1.5.0): settings de voz, provedor ElevenLabs, voz do chat, ditado e marcadores da chamada de A chegam em B; o microfone fica local',
+    async () => {
+      const xi = (
+        await api(A, 'providers.create', {
+          name: 'ElevenLabs',
+          baseUrl: 'https://api.elevenlabs.io',
+          apiKey: 'xi-fake-1',
+          kind: 'elevenlabs'
+        })
+      ).id
+      const cur = await api<any>(A, 'voice.settings.get')
+      await api(A, 'voice.settings.set', 'audioInput', {
+        ...cur.audioInput,
+        deviceId: 'microfone-do-pc',
+        language: 'es-ES',
+        silenceStopMs: 3200
+      })
+      await api(A, 'voice.settings.set', 'ttsSettings', {
+        ...cur.ttsSettings,
+        backend: 'api',
+        api: { providerId: xi, model: 'eleven_flash_v2_5', voice: 'voz-do-pc' }
+      })
+      await api(A, 'voice.settings.set', 'voiceCallDefaults', {
+        ...cur.voiceCallDefaults,
+        endCall: false
+      })
+      // conteúdo de voz no chat que A hospeda: ditado + chamada (marcadores de início/fim)
+      await api(A, 'agent.send', chat.mainSessionId, 'texto ditado no PC', [], [], {
+        voice: { source: 'dictation', durationMs: 2100 }
+      })
+      await waitFor(
+        async () => (await texts(A, chat.mainSessionId)).includes('ok: texto ditado no PC'),
+        15_000,
+        'A respondeu ao ditado'
+      )
+      await api(A, 'voice.call.start', { sessionId: chat.mainSessionId })
+      await sleep(400)
+      await api(A, 'voice.call.stop')
+      const markersOf = async (i: Inst): Promise<any[]> =>
+        (await api<any[]>(i, 'sessions.messages', chat.mainSessionId)).filter(
+          (m) => m.meta?.kind === 'voice-call'
+        )
+      await waitFor(async () => (await markersOf(A)).length >= 2, 10_000, 'marcadores em A')
+      // voz do chat (chamada desligada neste chat) — depois da chamada
+      await api(A, 'chats.update', chat.id, {
+        config: {
+          voice: {
+            enabled: false,
+            model: null,
+            tools: null,
+            voicePrompt: 'fale como no PC',
+            fillers: null,
+            interjections: null
+          }
+        }
+      })
+      await settled(A)
+
+      const vB = await waitFor(
+        async () => {
+          const v = await api<any>(B, 'voice.settings.get')
+          return v.ttsSettings.api.providerId === xi && v.voiceCallDefaults.endCall === false && v
+        },
+        15_000,
+        'B recebeu as settings de voz'
+      )
+      assert(vB.ttsSettings.backend === 'api' && vB.ttsSettings.api.voice === 'voz-do-pc', 'fala')
+      assert(vB.audioInput.language === 'es-ES' && vB.audioInput.silenceStopMs === 3200, 'ditado')
+      assert(vB.audioInput.deviceId !== 'microfone-do-pc', 'o microfone de A não chega em B')
+      const provB = (await api<any[]>(B, 'providers.list')).find((p) => p.id === xi)
+      assert(provB?.kind === 'elevenlabs' && provB.apiKey === 'xi-fake-1', 'provedor de voz')
+      await waitFor(
+        async () => (await api<any>(B, 'chats.get', chat.id))?.config?.voice?.enabled === false,
+        15_000,
+        'B recebeu a voz do chat'
+      )
+      await waitFor(async () => (await markersOf(B)).length >= 2, 15_000, 'marcadores em B')
+      const msgsB = await api<any[]>(B, 'sessions.messages', chat.mainSessionId)
+      const dict = msgsB.find((m) => textOf(m.message.content) === 'texto ditado no PC')
+      assert(dict?.meta?.voice?.source === 'dictation', 'meta.voice do ditado')
+      const marks = await markersOf(B)
+      assert(
+        marks.some((m) => m.meta.voiceCall?.phase === 'start') &&
+          marks.some((m) => m.meta.voiceCall?.phase === 'end' && m.meta.voiceCall.usage),
+        'início e fim (com custos)'
+      )
+
+      // UI de B: Configurações → Áudio mostra o silêncio vindo do PC
+      await B.page.keyboard.press('Control+,')
+      await B.page.getByRole('dialog').getByRole('button', { name: 'Áudio', exact: true }).click()
+      const silence = B.page.getByLabel('Silêncio que encerra a gravação (ms)')
+      await waitFor(
+        async () => (await silence.inputValue()) === '3200',
+        10_000,
+        'Áudio de B atualizado'
+      )
+      await shot(B, '12-audio-sincronizado')
+      await B.page.keyboard.press('Escape')
+      // chat em B: marcadores e selo de ditado; aba Voz do painel com a chamada desligada
+      await openChatUi(B, 'Projeto compartilhado')
+      await B.page.getByTestId('call-marker').first().waitFor({ timeout: 10_000 })
+      assert((await B.page.getByTestId('call-marker').count()) >= 2, 'dois marcadores na tela')
+      await B.page.getByTestId('voice-badge').first().waitFor({ timeout: 10_000 })
+      if (!(await B.page.getByTestId('right-panel').isVisible()))
+        await B.page.getByRole('banner').getByRole('button', { name: 'Abrir painel' }).click()
+      await B.page.getByTestId('right-panel').getByRole('tab', { name: 'Voz' }).click()
+      const enabled = B.page.getByTestId('right-panel').getByTestId('voice-call-enabled')
+      await enabled.waitFor()
+      assert((await enabled.getAttribute('data-effective')) === 'off', 'chamada desligada no chat')
+      await shot(B, '13-voz-do-chat-sincronizada')
+      await B.page.getByRole('banner').getByRole('button', { name: 'Fechar painel' }).click()
+    }
+  )
+
   await step('Configurações → Conta (screenshot) e dispositivos', async () => {
     await B.page.keyboard.press('Control+,')
     await B.page.getByRole('button', { name: 'Conta' }).click()

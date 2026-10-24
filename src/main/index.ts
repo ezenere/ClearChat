@@ -3,7 +3,7 @@ import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { closeDb, getDb, getDbPath } from './db'
-import { registerIpc, resetVoiceForWebContents, shutdownGpuVoice } from './ipc'
+import { registerIpc, resetVoiceForWebContents, shutdownGpuVoice, shutdownVoiceCall } from './ipc'
 import { shutdownSttWorker } from './voice/sttWorkerHost'
 import { shutdownTtsWorker } from './voice/ttsWorkerHost'
 import { registerEventWindow } from './events'
@@ -221,6 +221,7 @@ app.on('before-quit', () => {
   cleanViewerTemp()
   shutdownUpdates()
   shutdownSync()
+  shutdownVoiceCall() // marcador de fim da chamada ativa antes de o runner parar de gravar
   shutdownRunner()
   shutdownSttWorker()
   shutdownTtsWorker()

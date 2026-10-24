@@ -11,9 +11,11 @@ import {
   defaultGpuVoice,
   engineAction,
   formatLatency,
+  formatGpuParam,
   formatMb,
   gpuCallPlan,
   gpuConfigFor,
+  gpuParamRows,
   gpuServerLine,
   gpuSttProblems,
   gpuTtsProblems,
@@ -24,9 +26,15 @@ import {
   pcm16ToWav,
   progressPct,
   sampleDurationProblem,
+  savedGpuParams,
+  setGpuParam,
   sortGpuEngines,
+  sttWithGpuParams,
+  ttsWithGpuParams,
   userVoicesOf
 } from '../src/renderer/src/lib/voice/gpu/gpuUi.ts'
+import { GPU_ENGINE_PARAMS, XTTS_DEFAULT_SPEED } from '@shared/gpuVoice'
+import { normalizeSttSettings, normalizeTtsSettings } from '@shared/voice'
 import type {
   GpuEngineStatus,
   GpuStatus,
@@ -747,4 +755,104 @@ test('ditado com transcrição gpu: liga o servidor (whisper) e mostra "preparan
   fakeGpu.startServer = () => Promise.reject(new Error('GPU sem memória'))
   await assert.rejects(prep.prepareGpuForDictation({ mode: 'gpu' }), /GPU sem memória/)
   assert.equal(prep.useGpuPrepare.getState().dictation, null)
+})
+
+test('parâmetros (UI): linhas com padrão, mudar/restaurar grava só overrides, por motor, sobrevive à troca de motor', () => {
+  const rows = gpuParamRows('xtts-v2', {})
+  assert.deepEqual(
+    rows.map((r) => r.spec.key),
+    GPU_ENGINE_PARAMS['xtts-v2'].map((s) => s.key)
+  )
+  const speed = rows.find((r) => r.spec.key === 'speed')!
+  assert.equal(speed.value, XTTS_DEFAULT_SPEED)
+  assert.equal(speed.changed, false)
+  assert.equal(speed.display, '1,15×')
+  // mudar: limitado à faixa; voltar ao padrão tira a chave
+  let o = setGpuParam('xtts-v2', {}, 'speed', 1.234)
+  assert.deepEqual(o, { speed: 1.23 })
+  o = setGpuParam('xtts-v2', o, 'speed', 9)
+  assert.deepEqual(o, { speed: 1.5 })
+  assert.equal(gpuParamRows('xtts-v2', o).find((r) => r.spec.key === 'speed')!.changed, true)
+  assert.deepEqual(setGpuParam('xtts-v2', o, 'speed', XTTS_DEFAULT_SPEED), {})
+  assert.deepEqual(setGpuParam('xtts-v2', o, 'nope', 1), o, 'chave desconhecida ignorada')
+  // settings: por motor; vazio remove; o normalizador compartilhado preserva
+  const base = normalizeTtsSettings({ backend: 'gpu', gpu: { engine: 'xtts-v2', voice: null } })
+  const t1 = ttsWithGpuParams(base, 'xtts-v2', { speed: 1.3 })
+  const t2 = ttsWithGpuParams(t1, 'omnivoice', { guidance_scale: 2.5 })
+  assert.deepEqual(normalizeTtsSettings(t2).gpu?.params, {
+    'xtts-v2': { speed: 1.3 },
+    omnivoice: { guidance_scale: 2.5 }
+  })
+  assert.deepEqual(savedGpuParams('xtts-v2', t2, null), { speed: 1.3 })
+  const t3 = ttsWithGpuParams(t2, 'xtts-v2', {})
+  assert.deepEqual(t3.gpu?.params, { omnivoice: { guidance_scale: 2.5 } })
+  assert.equal(ttsWithGpuParams(t3, 'omnivoice', {}).gpu?.params, undefined)
+  // trocar de motor não perde os parâmetros de nenhum
+  const xtts = engine({ id: 'xtts-v2', install: { state: 'installed' } })
+  const omni = engine({ id: 'omnivoice', install: { state: 'installed' } })
+  assert.deepEqual(gpuConfigFor(omni, t2.gpu).params, t2.gpu?.params)
+  assert.deepEqual(gpuConfigFor(xtts, gpuConfigFor(omni, t2.gpu)).params, t2.gpu?.params)
+  // whisper: sttSettings.gpu.params
+  const stt = sttWithGpuParams(normalizeSttSettings({ mode: 'gpu' }), {
+    beam_size: 3,
+    vad_filter: true,
+    language: 'pt'
+  })
+  assert.deepEqual(normalizeSttSettings(stt).gpu, {
+    engine: 'whisper-large-v3-turbo',
+    params: { beam_size: 3, vad_filter: true }
+  })
+  assert.deepEqual(savedGpuParams('whisper-large-v3-turbo', null, stt), {
+    beam_size: 3,
+    vad_filter: true
+  })
+  const lang = GPU_ENGINE_PARAMS['whisper-large-v3-turbo'].find((x) => x.key === 'language')!
+  assert.equal(formatGpuParam(lang, 'auto'), 'Detectar')
+  const vad = GPU_ENGINE_PARAMS['whisper-large-v3-turbo'].find((x) => x.key === 'vad_filter')!
+  assert.equal(formatGpuParam(vad, true), 'ligado')
+})
+
+test('gpuCallPlan: motor já carregado não "carrega de novo"; a VRAM que o app libera ao trocar conta', () => {
+  const omni = engine({
+    id: 'omnivoice',
+    vramMb: 5100,
+    install: { state: 'installed' },
+    vram: { loaded: false, availMb: 8500, releases: ['XTTS-v2'] }
+  })
+  const xtts = engine({
+    id: 'xtts-v2',
+    vramMb: 3700,
+    install: { state: 'installed' },
+    vram: { loaded: true, availMb: 3000, releases: [] }
+  })
+  const wh = engine({
+    id: 'whisper-large-v3-turbo',
+    vramMb: 1500,
+    install: { state: 'installed' },
+    vram: { loaded: true, availMb: 3000, releases: [] }
+  })
+  const st = status({
+    gpus: [
+      {
+        vendor: 'nvidia',
+        name: 'NVIDIA GeForce RTX 3080 Ti',
+        vramTotalMb: 12288,
+        vramFreeMb: 3000,
+        vramOwnMb: 5500,
+        driver: '615',
+        cudaMax: '13.4'
+      }
+    ],
+    engines: [omni, xtts, wh],
+    server: { state: 'running', engines: ['xtts-v2', 'whisper-large-v3-turbo'] }
+  })
+  // XTTS (carregado) + whisper: nada a carregar, nada a avisar mesmo com 3 GB livres
+  const warm = gpuCallPlan(TTS_GPU({ engine: 'xtts-v2', voice: null }), STT_GPU, st)!
+  assert.deepEqual(warm.toLoad, [])
+  assert.equal(warm.warning, null)
+  // trocar para o OmniVoice: 3 GB livres + 5,5 GB do XTTS que o app libera ≥ 5,1 GB → sem aviso
+  const swap = gpuCallPlan(TTS_GPU({ engine: 'omnivoice', voice: null }), STT_GPU, st)!
+  assert.deepEqual(swap.toLoad, ['omnivoice'])
+  assert.equal(swap.vramFreeMb, 8500)
+  assert.equal(swap.warning, null)
 })

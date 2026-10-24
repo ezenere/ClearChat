@@ -9,6 +9,9 @@
 //  - Coleta de contexto: chat.config.capturedContext (main + sessions) — `calls`/`cost` acumulados;
 //  - Título automático: meta.autoTitle.usage;
 //  - Compactação: meta.compactUsage (kind 'compaction'); extração de memória: meta.memoryExtraction.usage.
+//  - Chamadas de voz: as respostas dos turnos da chamada (meta.voice.source 'call') saem de
+//    "Respostas" e entram AQUI (nunca contadas duas vezes), com STT/TTS/tempos dos marcadores de
+//    fim (meta.voiceCall). A voz estimada pelo preço de lista (≈) fica FORA do total.
 import type { Chat, CapturedEntry, Session, StoredMessage, Usage } from '@shared/types'
 
 export interface SpendTotals {
@@ -40,8 +43,44 @@ export interface SubagentSpend {
   totals: SpendTotals
 }
 
+/** Chamadas de voz do chat (marcadores + respostas dos turnos de voz). */
+export interface VoiceSpend {
+  /** Chamadas (ids distintos nos marcadores). */
+  calls: number
+  /** Chamadas sem marcador de fim (em andamento). */
+  open: number
+  durationMs: number
+  userSpeechMs: number
+  ttsAudioMs: number
+  /** Respostas do modelo nos turnos da chamada (fora de `main`). */
+  llm: SpendTotals
+  stt: {
+    apiRequests: number
+    audioMs: number
+    cost: number
+    costedRequests: number
+    /** Chamadas com transcrição local/GPU (grátis). */
+    localCalls: number
+  }
+  tts: {
+    chars: number
+    /** Custo informado/calculado sem estimativa (entra no total). */
+    cost: number
+    /** Custo ≈ pelo preço de lista (fora do total). */
+    estimated: number
+    /** Caracteres na ElevenLabs direta (créditos). */
+    elevenChars: number
+    localCalls: number
+    /** Chamadas por API sem preço conhecido. */
+    unknownCalls: number
+  }
+  /** Custo que entra no total (LLM + STT informado + voz não estimada). */
+  cost: number
+}
+
 export interface ChatSpend {
   main: SpendTotals
+  voice: VoiceSpend
   subagents: SpendTotals
   perSubagent: SubagentSpend[]
   judge: SpendTotals
@@ -67,6 +106,41 @@ export const emptyTotals = (tokensKnown = true): SpendTotals => ({
 })
 
 const n = (v: number | undefined): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+
+export const emptyVoiceSpend = (): VoiceSpend => ({
+  calls: 0,
+  open: 0,
+  durationMs: 0,
+  userSpeechMs: 0,
+  ttsAudioMs: 0,
+  llm: emptyTotals(),
+  stt: { apiRequests: 0, audioMs: 0, cost: 0, costedRequests: 0, localCalls: 0 },
+  tts: { chars: 0, cost: 0, estimated: 0, elevenChars: 0, localCalls: 0, unknownCalls: 0 },
+  cost: 0
+})
+
+/** Soma o marcador de fim de uma chamada (STT/TTS/tempos — o LLM vem das respostas). */
+function addCallEnd(v: VoiceSpend, m: StoredMessage): void {
+  const mark = m.meta.voiceCall
+  if (!mark || mark.phase !== 'end') return
+  v.durationMs += n(mark.durationMs)
+  const u = mark.usage
+  if (!u) return
+  v.userSpeechMs += n(u.userSpeechMs)
+  v.ttsAudioMs += n(u.tts.audioMs)
+  if (u.stt.mode === 'local' || u.stt.mode === 'gpu' || (!u.stt.apiRequests && u.stt.localRequests))
+    v.stt.localCalls++
+  v.stt.apiRequests += n(u.stt.apiRequests)
+  v.stt.audioMs += n(u.stt.apiAudioMs)
+  v.stt.cost += n(u.stt.cost)
+  v.stt.costedRequests += n(u.stt.costedRequests)
+  if (u.tts.backend === 'local' || u.tts.backend === 'gpu') v.tts.localCalls++
+  else if (u.tts.backend === 'elevenlabs') v.tts.elevenChars += n(u.tts.chars)
+  else if (u.tts.cost == null) v.tts.unknownCalls++
+  v.tts.chars += n(u.tts.chars)
+  if (u.tts.estimated) v.tts.estimated += n(u.tts.cost)
+  else v.tts.cost += n(u.tts.cost)
+}
 
 /** Soma uma chamada (usage ausente = chamada sem tokens nem custo conhecidos). */
 export function addUsage(t: SpendTotals, u: Usage | undefined): void {
@@ -128,6 +202,7 @@ export function computeChatSpend(
 ): ChatSpend {
   const out: ChatSpend = {
     main: emptyTotals(),
+    voice: emptyVoiceSpend(),
     subagents: emptyTotals(),
     perSubagent: [],
     judge: emptyTotals(),
@@ -149,8 +224,21 @@ export function computeChatSpend(
       continue
     }
     const replies = isMain ? out.main : emptyTotals()
+    const callIds = new Set<string>()
+    const ended = new Set<string>()
     for (const m of list) {
-      if (isModelReply(m)) addUsage(replies, m.meta.usage)
+      if (isModelReply(m)) {
+        // turno da chamada de voz: vai para "Chamadas de voz" (não soma em "Respostas")
+        if (isMain && m.meta.voice?.source === 'call') addUsage(out.voice.llm, m.meta.usage)
+        else addUsage(replies, m.meta.usage)
+      }
+      if (m.meta.kind === 'voice-call' && m.meta.voiceCall) {
+        callIds.add(m.meta.voiceCall.callId)
+        if (m.meta.voiceCall.phase === 'end' && !ended.has(m.meta.voiceCall.callId)) {
+          ended.add(m.meta.voiceCall.callId)
+          addCallEnd(out.voice, m)
+        }
+      }
       const sa = m.meta.smartApprove
       // falha de request (HTTP/rede) sem usage: o provedor recusou, nada a cobrar
       if (sa && !(sa.fallback === 'error' && !sa.usage)) addUsage(out.judge, sa.usage)
@@ -163,6 +251,8 @@ export function computeChatSpend(
       )
         addUsage(out.memory, m.meta.memoryExtraction.usage)
     }
+    out.voice.calls += callIds.size
+    out.voice.open += [...callIds].filter((id) => !ended.has(id)).length
     if (!isMain) {
       addTotals(out.subagents, replies)
       out.perSubagent.push({
@@ -177,8 +267,13 @@ export function computeChatSpend(
   const cc = chat.config.capturedContext
   addCapture(out.capture, cc?.main)
   for (const e of Object.values(cc?.sessions ?? {})) addCapture(out.capture, e)
+  const v = out.voice
+  v.cost = v.llm.cost + v.stt.cost + v.tts.cost
+  // custo da voz/transcrição informado entra no total; as respostas contam como chamadas
+  out.total.cost += v.stt.cost + v.tts.cost
   for (const t of [
     out.main,
+    v.llm,
     out.subagents,
     out.judge,
     out.capture,

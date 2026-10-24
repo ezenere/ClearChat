@@ -159,7 +159,16 @@ export interface DivergenceDetails {
 
 /** O que mudou nas tabelas locais por causa do sync (o renderer recarrega). */
 export type SyncScope =
-  'providers' | 'presets' | 'settings' | 'chats' | 'memory' | 'skills' | 'approvals' | 'webSearch'
+  | 'providers'
+  | 'presets'
+  | 'settings'
+  | 'chats'
+  | 'memory'
+  | 'skills'
+  | 'approvals'
+  | 'webSearch'
+  /** Settings de áudio (`audioInput`, `sttSettings`, `ttsSettings`, `voiceCallDefaults` — 1.5.0). */
+  | 'voice'
 
 export interface TakeoverOptions {
   mode: 'next_turn' | 'force'

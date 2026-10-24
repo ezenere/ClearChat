@@ -70,6 +70,12 @@ export interface GpuEngineStatus {
   measured?: { firstAudioMs: number; rtf: number; at: string; wer?: number }
   /** OmniVoice: passos de difusão (padrão 16). */
   options?: { steps?: number }
+  /**
+   * VRAM vista pelo motor AGORA (aditivo): `loaded` = já carregado no servidor do app (nunca avisa
+   * de VRAM); `availMb` = livre agora + o que o app libera ao subir este motor (processos de outros
+   * grupos, parados ao trocar); `releases` = nomes curtos do que seria liberado.
+   */
+  vram?: { loaded: boolean; availMb: number | null; releases: string[] }
 }
 
 export interface GpuInfo {
@@ -82,9 +88,18 @@ export interface GpuInfo {
   cudaMax: string | null
   /** Compute capability (ex.: '8.6'), quando o nvidia-smi informa. Aditivo. */
   computeCap?: string | null
+  /** VRAM ocupada pelos processos do servidor do ClearChat nesta GPU (MB). Aditivo. */
+  vramOwnMb?: number | null
+  /** UUID da GPU (casa os processos do `--query-compute-apps`). Só na sonda do main. */
+  uuid?: string | null
 }
 
 export interface GpuStatus {
+  /**
+   * Número crescente do status (aditivo): o renderer descarta um status mais velho que chegue
+   * depois de um mais novo (um `status()` lento não sobrescreve o progresso já recebido).
+   */
+  seq?: number
   platform: { os: 'linux' | 'darwin' | 'win32'; arch: string; diskFreeMb: number }
   gpus: GpuInfo[]
   runtime: {
@@ -122,11 +137,18 @@ export interface TtsGpuConfig {
   voice: string | null
   /** Só OmniVoice: passos de difusão (16 padrão; 32 = mais qualidade, mais lento). */
   steps?: number
+  /**
+   * Parâmetros de inferência POR MOTOR (aditivo; só os diferentes do padrão são gravados — ver
+   * `GPU_ENGINE_PARAMS`). Vão no corpo de cada `/v1/audio/speech` (valem na próxima fala).
+   */
+  params?: Partial<Record<GpuTtsEngineId, GpuParamValues>>
 }
 
 /** Config da transcrição pela GPU (`sttSettings.gpu`). */
 export interface SttGpuConfig {
   engine: 'whisper-large-v3-turbo'
+  /** Parâmetros do whisper (aditivo; só os diferentes do padrão). Valem na próxima transcrição. */
+  params?: GpuParamValues
 }
 
 export const OMNIVOICE_DEFAULT_STEPS = 16
@@ -137,6 +159,274 @@ export const DEFAULT_STT_GPU: SttGpuConfig = { engine: GPU_STT_ENGINE_ID }
 export function normalizeOmniSteps(v: unknown): number | undefined {
   const n = typeof v === 'number' && Number.isFinite(v) ? Math.round(v) : NaN
   return Number.isNaN(n) ? undefined : Math.max(4, Math.min(64, n))
+}
+
+// ---------------- parâmetros de inferência por motor ----------------
+
+export type GpuParamValue = number | boolean | string
+export type GpuParamValues = Record<string, GpuParamValue>
+
+export interface GpuParamSpec {
+  key: string
+  label: string
+  /** Efeito em linguagem simples (o "?" da UI). */
+  help: string
+  kind: 'number' | 'boolean' | 'select'
+  default: GpuParamValue
+  min?: number
+  max?: number
+  step?: number
+  /** Casas decimais na UI (number). */
+  decimals?: number
+  options?: { value: string; label: string }[]
+  /** 'next' = vale na próxima fala/transcrição; 'restart' = só ao reiniciar o servidor. */
+  applies: 'next' | 'restart'
+}
+
+/**
+ * Velocidade padrão do XTTS-v2: o XTTS imita o ritmo da voz de referência e as vozes pt-BR CC0
+ * (datasets de leitura) são lidas devagar — medido em `gpu-tts-lab/out/xtts-speed/` (SPEC).
+ */
+export const XTTS_DEFAULT_SPEED = 1.15
+
+const num = (
+  key: string,
+  label: string,
+  def: number,
+  min: number,
+  max: number,
+  step: number,
+  help: string,
+  decimals = 2
+): GpuParamSpec => ({
+  key,
+  label,
+  help,
+  kind: 'number',
+  default: def,
+  min,
+  max,
+  step,
+  decimals,
+  applies: 'next'
+})
+
+/**
+ * Parâmetros editáveis de cada motor (padrões = os do servidor; o servidor também limita as
+ * faixas). Só o que a API de cada motor aceita em streaming: o `length_penalty` do XTTS não entra
+ * (só age em beam search, e o streaming usa 1 feixe); Qwen3-TTS e VibeVoice não têm controle de
+ * velocidade.
+ */
+export const GPU_ENGINE_PARAMS: Record<GpuEngineId, GpuParamSpec[]> = {
+  'xtts-v2': [
+    num(
+      'speed',
+      'Velocidade',
+      XTTS_DEFAULT_SPEED,
+      0.8,
+      1.5,
+      0.05,
+      'Ritmo da fala. O XTTS copia o ritmo da voz de referência (as vozes livres CC0 foram lidas devagar), por isso o padrão é um pouco acima de 1. Acima de ~1,3 pode embolar as sílabas.'
+    ),
+    num(
+      'temperature',
+      'Temperatura',
+      0.75,
+      0.1,
+      1,
+      0.05,
+      'Variação da entonação. Mais baixo = mais estável e monótono; mais alto = mais expressivo, com mais risco de trocar ou engolir palavras.'
+    ),
+    num(
+      'repetition_penalty',
+      'Penalidade de repetição',
+      10,
+      1,
+      20,
+      0.5,
+      'Evita que o modelo arraste ou repita sons. O padrão do XTTS em streaming é 10; valores baixos podem gerar gaguejos ou sílabas esticadas.',
+      1
+    ),
+    num(
+      'top_p',
+      'Top-p',
+      0.85,
+      0.1,
+      1,
+      0.05,
+      'Quantas alternativas o modelo considera a cada passo (soma de probabilidade). Mais baixo = fala mais "segura" e uniforme; mais alto = mais variada.'
+    ),
+    num(
+      'top_k',
+      'Top-k',
+      50,
+      1,
+      100,
+      1,
+      'Limite de alternativas por passo. Mais baixo = mais estável; mais alto = mais variado.',
+      0
+    )
+  ],
+  omnivoice: [
+    num(
+      'guidance_scale',
+      'Guidance (CFG)',
+      2,
+      1,
+      4,
+      0.1,
+      'Quanto o modelo segue o texto e a voz de referência. Mais alto = mais fiel e articulado (pode soar forçado); mais baixo = mais solto, com risco de errar palavras.',
+      1
+    ),
+    num(
+      'speed',
+      'Velocidade',
+      1,
+      0.7,
+      1.5,
+      0.05,
+      'Ritmo da fala (1 = a duração que o modelo estima pelo texto). Acima de 1 fala mais rápido.'
+    )
+  ],
+  'vibevoice-realtime': [
+    num(
+      'cfg_scale',
+      'Guidance (CFG)',
+      1.5,
+      1,
+      3,
+      0.1,
+      'Quanto o modelo segue a voz e o texto. Mais alto = mais nítido e fiel (às vezes artificial); mais baixo = mais natural, com mais erros de pronúncia.',
+      1
+    ),
+    num(
+      'ddpm_steps',
+      'Passos de difusão',
+      5,
+      2,
+      20,
+      1,
+      'Passos de refino de cada pedaço de áudio. Mais passos = um pouco mais limpo e mais lento (o 1º áudio demora mais).',
+      0
+    )
+  ],
+  'qwen3-tts-0.6b': [],
+  'qwen3-tts-1.7b': [],
+  'whisper-large-v3-turbo': [
+    num(
+      'beam_size',
+      'Beam size',
+      1,
+      1,
+      5,
+      1,
+      'Hipóteses avaliadas em paralelo. 1 = mais rápido (o padrão da chamada, parciais ao vivo); 3–5 = um pouco mais preciso em frases difíceis, mais lento.',
+      0
+    ),
+    {
+      key: 'vad_filter',
+      label: 'Filtro de silêncio (VAD)',
+      help: 'Corta trechos sem fala antes de transcrever. Ajuda com ruído de fundo e evita "legendas fantasmas" no silêncio, mas pode cortar o começo de palavras faladas baixo.',
+      kind: 'boolean',
+      default: false,
+      applies: 'next'
+    },
+    {
+      key: 'language',
+      label: 'Idioma',
+      help: 'Idioma da transcrição. "Português" é o mais rápido e preciso para pt-BR; "Detectar" deixa o whisper adivinhar a cada trecho (útil se você mistura idiomas, mas erra em frases curtas).',
+      kind: 'select',
+      default: 'pt',
+      options: [
+        { value: 'pt', label: 'Português' },
+        { value: 'en', label: 'Inglês' },
+        { value: 'es', label: 'Espanhol' },
+        { value: 'auto', label: 'Detectar' }
+      ],
+      applies: 'next'
+    }
+  ]
+}
+
+const QWEN_PARAMS: GpuParamSpec[] = [
+  num(
+    'temperature',
+    'Temperatura',
+    0.9,
+    0.1,
+    1.5,
+    0.05,
+    'Variação da entonação. Mais baixo = mais estável e monótono; mais alto = mais expressivo, com risco de laço ou palavras trocadas.'
+  ),
+  num(
+    'top_p',
+    'Top-p',
+    1,
+    0.1,
+    1,
+    0.05,
+    'Quantas alternativas o modelo considera a cada passo. Mais baixo = fala mais uniforme; 1 = sem corte.'
+  ),
+  num(
+    'top_k',
+    'Top-k',
+    50,
+    1,
+    100,
+    1,
+    'Limite de alternativas por passo. Mais baixo = mais estável; mais alto = mais variado.',
+    0
+  )
+]
+GPU_ENGINE_PARAMS['qwen3-tts-0.6b'] = QWEN_PARAMS
+GPU_ENGINE_PARAMS['qwen3-tts-1.7b'] = QWEN_PARAMS
+
+/** Um valor de parâmetro válido (limitado à faixa/opções) ou undefined quando inválido. */
+export function normalizeGpuParamValue(spec: GpuParamSpec, v: unknown): GpuParamValue | undefined {
+  if (spec.kind === 'boolean') return typeof v === 'boolean' ? v : undefined
+  if (spec.kind === 'select')
+    return typeof v === 'string' && spec.options?.some((o) => o.value === v) ? v : undefined
+  const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN
+  if (!Number.isFinite(n)) return undefined
+  const lo = spec.min ?? -Infinity
+  const hi = spec.max ?? Infinity
+  const d = spec.decimals ?? 2
+  const f = 10 ** d
+  return Math.round(Math.max(lo, Math.min(hi, n)) * f) / f
+}
+
+/** Só os parâmetros válidos e DIFERENTES do padrão (o que se grava nas settings). */
+export function normalizeGpuParamOverrides(id: GpuEngineId, raw: unknown): GpuParamValues {
+  const out: GpuParamValues = {}
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out
+  const src = raw as Record<string, unknown>
+  for (const spec of GPU_ENGINE_PARAMS[id] ?? []) {
+    const v = normalizeGpuParamValue(spec, src[spec.key])
+    if (v !== undefined && v !== spec.default) out[spec.key] = v
+  }
+  return out
+}
+
+/** Conjunto COMPLETO (padrões + overrides válidos) — o que vai para o servidor. */
+export function resolveGpuParams(id: GpuEngineId, overrides: unknown): GpuParamValues {
+  const o = normalizeGpuParamOverrides(id, overrides)
+  const out: GpuParamValues = {}
+  for (const spec of GPU_ENGINE_PARAMS[id] ?? []) out[spec.key] = o[spec.key] ?? spec.default
+  return out
+}
+
+/** `ttsSettings.gpu.params` normalizado (motores desconhecidos/vazios saem; null = nada). */
+export function normalizeTtsGpuParams(
+  raw: unknown
+): Partial<Record<GpuTtsEngineId, GpuParamValues>> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const out: Partial<Record<GpuTtsEngineId, GpuParamValues>> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!isGpuTtsEngineId(k)) continue
+    const o = normalizeGpuParamOverrides(k, v)
+    if (Object.keys(o).length) out[k] = o
+  }
+  return Object.keys(out).length ? out : null
 }
 
 // ---------------- catálogo ----------------
@@ -466,6 +756,17 @@ export interface GpuProbe {
   platform: { os: string; arch: string; diskFreeMb: number }
   gpus: GpuInfo[]
   ramMb: number
+  /**
+   * Processos com contexto CUDA (`nvidia-smi --query-compute-apps`): o main desconta da VRAM
+   * livre o que é do próprio servidor do app. `usedMb` null = o driver não informa (WDDM).
+   */
+  computeApps?: GpuComputeApp[]
+}
+
+export interface GpuComputeApp {
+  pid: number
+  usedMb: number | null
+  gpuUuid: string | null
 }
 
 /** "12.8" → 12.8 (null/lixo → null). */
@@ -575,7 +876,17 @@ export function evaluateRuntimeCompat(probe: GpuProbe): GpuCompat {
 export function evaluateEngineCompat(
   entry: GpuEngineCatalogEntry,
   probe: GpuProbe,
-  opts: { runtimeInstalled: boolean; layerInstalled: boolean; installed: boolean }
+  opts: {
+    runtimeInstalled: boolean
+    layerInstalled: boolean
+    installed: boolean
+    /**
+     * VRAM vista pelo motor (o servidor do próprio app): `loaded` = já carregado → nunca avisa de
+     * VRAM livre; `reclaimMb` = o que o app libera ao subir este motor (outros processos dele),
+     * somado à livre; `releases` = nomes do que seria liberado (para o texto).
+     */
+    vram?: { loaded?: boolean; reclaimMb?: number; releases?: string[] }
+  }
 ): GpuCompat {
   const rt = evaluateRuntimeCompat(probe)
   const reasons: string[] = []
@@ -602,10 +913,15 @@ export function evaluateEngineCompat(
       warn(
         `A GPU tem ${gb(nv.vramTotalMb)} de VRAM e este motor usa ~${gb(entry.vramMb)}: não cabe — vai faltar memória (ou rodar muito devagar).`
       )
-    else if (nv.vramFreeMb !== null && nv.vramFreeMb < entry.vramMb)
-      warn(
-        `VRAM livre agora: ${gb(nv.vramFreeMb)} (este motor usa ~${gb(entry.vramMb)}) — feche programas que usam a GPU antes da chamada.`
-      )
+    else if (nv.vramFreeMb !== null && !opts.vram?.loaded) {
+      const reclaim = Math.max(0, opts.vram?.reclaimMb ?? 0)
+      if (nv.vramFreeMb + reclaim < entry.vramMb)
+        warn(
+          reclaim > 0
+            ? `VRAM livre agora: ${gb(nv.vramFreeMb)} + ${gb(reclaim)} que o app libera ao trocar${opts.vram?.releases?.length ? ` (${opts.vram.releases.join(', ')})` : ''} — este motor usa ~${gb(entry.vramMb)}: feche programas que usam a GPU antes da chamada.`
+            : `VRAM livre agora: ${gb(nv.vramFreeMb)} (este motor usa ~${gb(entry.vramMb)}) — feche programas que usam a GPU antes da chamada.`
+        )
+    }
   }
   if (!opts.installed) {
     const need =

@@ -13,8 +13,10 @@ import {
   evaluateEngineCompat,
   evaluateRuntimeCompat,
   gpuEngineEntry,
+  gpuEngineShortLabel,
   gpuEnginesLabel,
   isGpuEngineId,
+  resolveGpuParams,
   type GpuEngineCatalogEntry,
   type GpuEngineGroup,
   type GpuEngineId,
@@ -37,7 +39,7 @@ import { synthesizeStream } from '../tts'
 import { transcribeAudio, type SttLocalBackend, type TranscribeAudioInput } from '../stt'
 import { GpuEndpointError, type GpuEndpoint, type GpuEndpointResolver } from './endpoint'
 import { GpuInstaller, isAbortError, type InstallProgress, type InstallerDeps } from './installer'
-import { probeSystem } from './probe'
+import { ownVramByGpu, probeSystem } from './probe'
 import { GpuServerManager, type ServerManagerDeps } from './server'
 import { GpuVoiceStore } from './voices'
 
@@ -101,7 +103,17 @@ type Op = {
   target: 'runtime' | GpuEngineId
   controller: AbortController
   progress: InstallProgress | null
+  /** Instalação de motor que começou sem o runtime pronto (instala o runtime antes). */
+  withRuntime: boolean
+  /** Progresso do runtime (próprio ou instalado junto de um motor). */
+  rtProgress: InstallProgress | null
 }
+
+/** Estado dos motores de um processo do servidor (`/health`). */
+type HealthMap = Map<GpuEngineGroup, Record<string, { state?: string }>>
+
+/** VRAM estimada do contexto CUDA de um processo (quando o driver não informa a do processo). */
+const CUDA_CONTEXT_MB = 300
 
 export class GpuVoiceManager implements GpuEndpointResolver {
   readonly installer: GpuInstaller
@@ -115,6 +127,11 @@ export class GpuVoiceManager implements GpuEndpointResolver {
   /** Fase legível da subida sob demanda (`server.phase` do status; null = nada em andamento). */
   private serverPhase: string | null = null
   private readonly omniSteps = new Map<GpuEngineGroup, number>()
+  /** Config do whisper já enviada a cada processo (`grupo:porta` → JSON dos parâmetros). */
+  private readonly whisperCfg = new Map<string, string>()
+  /** `/health` dos processos rodando (motores carregados), com validade curta. */
+  private healthCache: { at: number; v: HealthMap } | null = null
+  private seq = 0
 
   private readonly deps: GpuManagerDeps
 
@@ -126,7 +143,11 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     this.server = new GpuServerManager(
       {
         logDir: L.logs,
-        onChange: () => this.scheduleEmit(),
+        onChange: () => {
+          // processo subiu/caiu/parou: a VRAM livre e os motores carregados mudaram
+          this.invalidateLive()
+          this.scheduleEmit()
+        },
         log: deps.log,
         spec: (group, engines, port, token) => ({
           python: this.installer.pythonFor(group),
@@ -156,6 +177,42 @@ export class GpuVoiceManager implements GpuEndpointResolver {
 
   private currentSteps(): number {
     return this.deps.getTts().gpu?.steps ?? OMNIVOICE_DEFAULT_STEPS
+  }
+
+  /** Esquece a sonda e o `/health` em cache (próximo status relê VRAM e motores carregados). */
+  private invalidateLive(): void {
+    this.probeCache = null
+    this.healthCache = null
+  }
+
+  /** Motores de cada processo rodando (`/health`; cache de 3 s). */
+  private async health(): Promise<HealthMap> {
+    const now = Date.now()
+    if (this.healthCache && now - this.healthCache.at < 3000) return this.healthCache.v
+    const v: HealthMap = new Map()
+    await Promise.all(
+      this.server
+        .list()
+        .filter((p) => p.state === 'running' && p.port)
+        .map(async (p) => {
+          try {
+            const r = await (this.deps.server?.fetch ?? fetch)(
+              `http://127.0.0.1:${p.port}/health`,
+              {
+                headers: { Authorization: `Bearer ${this.server.token}` },
+                signal: AbortSignal.timeout(1500)
+              }
+            )
+            if (!r.ok) return
+            const j = (await r.json()) as { engines?: Record<string, { state?: string }> }
+            v.set(p.group, j.engines ?? {})
+          } catch {
+            /* processo ocupado/subindo: sem informação */
+          }
+        })
+    )
+    this.healthCache = { at: now, v }
+    return v
   }
 
   // ---------------- sonda / status ----------------
@@ -201,23 +258,28 @@ export class GpuVoiceManager implements GpuEndpointResolver {
   }
 
   async status(refreshProbe = false): Promise<GpuStatus> {
-    const [probe, state, stored] = await Promise.all([
+    const seq = ++this.seq
+    const [probe, state, stored, health] = await Promise.all([
       this.probe(refreshProbe),
       this.installer.readState(),
-      this.voices.list()
+      this.voices.list(),
+      this.health()
     ])
     const runtimeState = this.installer.runtimeState(state)
     const runtimeReady = runtimeState === 'installed'
     const measured = this.deps.readMeasured()
     const op = this.op
-    const runtimeInstalling =
-      !!op && (op.target === 'runtime' || (op.progress?.phase.startsWith('Runtime:') ?? false))
+    // instalando o runtime (sozinho ou antes de um motor): nada de "incompleta"/"com problema"
+    // enquanto a instalação roda — o estado em disco é parcial POR definição
+    const runtimeInstalling = !!op && (op.target === 'runtime' || (op.withRuntime && !runtimeReady))
     const whisperInstalled = this.installer.engineState(state, GPU_STT_ENGINE_ID) === 'installed'
+    const vram = this.vramView(probe, health)
     const engines: GpuEngineStatus[] = GPU_ENGINE_CATALOG.map((entry) => {
       const st = this.installer.engineState(state, entry.id)
       const installing = op?.target === entry.id
       const err = this.lastError?.target === entry.id ? this.lastError.message : null
       const m = measured[entry.id]
+      const ev = vram.engine(entry)
       return {
         id: entry.id,
         kind: entry.kind,
@@ -237,17 +299,19 @@ export class GpuVoiceManager implements GpuEndpointResolver {
             : {}),
           error:
             err ??
-            (st === 'broken'
+            (st === 'broken' && !runtimeInstalling
               ? 'arquivos do motor ausentes ou runtime incompleto — reinstale'
               : null)
         },
         compat: evaluateEngineCompat(entry, probe, {
           runtimeInstalled: runtimeReady,
           layerInstalled: this.installer.layerReady(state, entry.group),
-          installed: st === 'installed'
+          installed: st === 'installed',
+          vram: { loaded: ev.loaded, reclaimMb: ev.reclaimMb, releases: ev.releases }
         }),
         ...(m ? { measured: { ...m } } : {}),
-        ...(entry.id === 'omnivoice' ? { options: { steps: this.currentSteps() } } : {})
+        ...(entry.id === 'omnivoice' ? { options: { steps: this.currentSteps() } } : {}),
+        vram: { loaded: ev.loaded, availMb: ev.availMb, releases: ev.releases }
       }
     })
     const procs = this.server.list()
@@ -259,8 +323,9 @@ export class GpuVoiceManager implements GpuEndpointResolver {
           : procs.some((p) => p.state === 'error')
             ? 'error'
             : 'stopped'
-    const rtProg = op?.target === 'runtime' ? op.progress : null
+    const rtProg = runtimeInstalling ? (op?.rtProgress ?? null) : null
     return {
+      seq,
       platform: {
         os: (['linux', 'darwin', 'win32'].includes(probe.platform.os)
           ? probe.platform.os
@@ -268,7 +333,10 @@ export class GpuVoiceManager implements GpuEndpointResolver {
         arch: probe.platform.arch,
         diskFreeMb: probe.platform.diskFreeMb
       },
-      gpus: probe.gpus.map((g) => ({ ...g })),
+      gpus: probe.gpus.map(({ uuid, ...g }) => ({
+        ...g,
+        ...(g.vendor === 'nvidia' ? { vramOwnMb: vram.ownOf(uuid ?? null) } : {})
+      })),
       runtime: {
         state: runtimeInstalling ? 'installing' : runtimeState,
         version: state.runtime?.version ?? null,
@@ -285,9 +353,9 @@ export class GpuVoiceManager implements GpuEndpointResolver {
         error:
           this.lastError?.target === 'runtime'
             ? this.lastError.message
-            : runtimeState === 'broken'
-              ? 'instalação incompleta ou de uma versão antiga — clique em Instalar para concluir'
-              : null,
+            : runtimeInstalling
+              ? null
+              : this.installer.runtimeProblem(state),
         compat: evaluateRuntimeCompat(probe)
       },
       engines,
@@ -300,6 +368,79 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     }
   }
 
+  /**
+   * VRAM do ponto de vista do app: quanto cada processo do servidor ocupa (`--query-compute-apps`
+   * casado com os PIDs dos processos; sem número do driver → motores carregados + contexto), o que
+   * já está carregado e o que seria liberado ao subir cada motor (os processos de OUTROS grupos —
+   * `tts()` os para ao trocar).
+   */
+  private vramView(
+    probe: GpuProbe,
+    health: HealthMap
+  ): {
+    ownOf: (uuid: string | null) => number
+    engine: (e: GpuEngineCatalogEntry) => {
+      loaded: boolean
+      reclaimMb: number
+      availMb: number | null
+      releases: string[]
+    }
+  } {
+    const procs = this.server.list().filter((p) => p.state !== 'error')
+    const nv = probe.gpus
+      .filter((g) => g.vendor === 'nvidia')
+      .reduce<GpuProbe['gpus'][number] | null>(
+        (a, b) => (!a || (b.vramTotalMb ?? 0) > (a.vramTotalMb ?? 0) ? b : a),
+        null
+      )
+    const readyIn = (group: GpuEngineGroup): string[] =>
+      Object.entries(health.get(group) ?? {})
+        .filter(([, v]) => v?.state === 'ready')
+        .map(([k]) => k)
+    const apps = probe.computeApps ?? []
+    /** VRAM de um processo (MB) na melhor NVIDIA. */
+    const procMb = (p: (typeof procs)[number]): number => {
+      const pids = new Set(p.pids)
+      const est = (): number =>
+        CUDA_CONTEXT_MB +
+        readyIn(p.group).reduce(
+          (n, id) => n + (isGpuEngineId(id) ? gpuEngineEntry(id).vramMb : 0),
+          0
+        )
+      const by = ownVramByGpu(apps, pids, est)
+      if (!by.size) return 0
+      if (nv?.uuid) return (by.get(nv.uuid) ?? 0) + (by.get('') ?? 0)
+      return [...by.values()].reduce((a, b) => a + b, 0)
+    }
+    const perProc = procs.map((p) => ({ p, mb: procMb(p), ready: readyIn(p.group) }))
+    const allPids = new Set(procs.flatMap((p) => p.pids))
+    return {
+      ownOf: (uuid) => {
+        const by = ownVramByGpu(apps, allPids, () => 0)
+        return uuid
+          ? (by.get(uuid) ?? 0) + (by.get('') ?? 0)
+          : [...by.values()].reduce((a, b) => a + b, 0)
+      },
+      engine: (e) => {
+        const loaded = perProc.some((x) => x.ready.includes(e.id))
+        // whisper entra no processo que já roda (nada é liberado); um motor de fala sobe o processo
+        // do seu grupo e o app para os dos outros grupos
+        const others =
+          e.kind === 'stt' ? [] : perProc.filter((x) => x.p.group !== e.group && x.mb > 0)
+        const reclaimMb = others.reduce((n, x) => n + x.mb, 0)
+        const releases = [
+          ...new Set(
+            others.flatMap((x) =>
+              x.ready.length ? x.ready.map((id) => gpuEngineShortLabel(id)) : ['servidor ocioso']
+            )
+          )
+        ]
+        const free = nv?.vramFreeMb ?? null
+        return { loaded, reclaimMb, availMb: free === null ? null : free + reclaimMb, releases }
+      }
+    }
+  }
+
   // ---------------- instalação ----------------
 
   private async runOp(
@@ -307,7 +448,16 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     work: (op: Op) => Promise<void>
   ): Promise<void> {
     if (this.op) throw new Error('Já há uma instalação em andamento — aguarde ou cancele.')
-    const op: Op = { target, controller: new AbortController(), progress: null }
+    const withRuntime =
+      target !== 'runtime' && !this.installer.runtimeReady(await this.installer.readState())
+    if (this.op) throw new Error('Já há uma instalação em andamento — aguarde ou cancele.')
+    const op: Op = {
+      target,
+      controller: new AbortController(),
+      progress: null,
+      withRuntime,
+      rtProgress: null
+    }
     this.op = op
     this.lastError = null
     this.scheduleEmit()
@@ -340,7 +490,10 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     if (compat.level === 'blocked')
       throw new Error(`Não dá para instalar: ${compat.reasons.join(' ')}`)
     await this.runOp('runtime', (op) =>
-      this.installer.installRuntime(op.controller.signal, this.progress(op))
+      this.installer.installRuntime(op.controller.signal, (p) => {
+        op.rtProgress = p
+        this.progress(op)(p)
+      })
     )
   }
 
@@ -356,7 +509,9 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     if (compat.level === 'blocked')
       throw new Error(`Não dá para instalar: ${compat.reasons.join(' ')}`)
     await this.runOp(id, async (op) => {
-      await this.installer.installEngine(id, op.controller.signal, this.progress(op))
+      await this.installer.installEngine(id, op.controller.signal, this.progress(op), (p) => {
+        op.rtProgress = p
+      })
       // motores que só clonam (Qwen) precisam de uma voz: a referência CC0 pt-BR vem junto
       if (entry.clones && !entry.builtinVoices.length) {
         const voices = await this.voices.list()
@@ -463,10 +618,38 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     }
   }
 
+  /**
+   * Um processo por vez na GPU: ao subir o processo de um grupo, os dos OUTROS grupos (motores de
+   * fala que não são o escolhido agora, o whisper avulso do grupo base) saem e devolvem a VRAM — o
+   * whisper vai junto no processo novo. Processo no meio de uma síntese (`busy`) fica (sai sozinho
+   * quando ocioso).
+   */
+  private async releaseOtherGroups(group: GpuEngineGroup): Promise<void> {
+    const others = this.server.list().filter((p) => p.group !== group)
+    for (const p of others) {
+      if (p.state === 'running' && p.port) {
+        try {
+          const r = await (this.deps.server?.fetch ?? fetch)(`http://127.0.0.1:${p.port}/health`, {
+            headers: { Authorization: `Bearer ${this.server.token}` },
+            signal: AbortSignal.timeout(1500)
+          })
+          if (r.ok && ((await r.json()) as { busy?: boolean }).busy) continue
+        } catch {
+          /* sem resposta: para mesmo assim */
+        }
+      }
+      this.deps.log?.(`liberando a GPU: parando o processo ${p.group} para subir ${group}`)
+      await this.server.stop(p.group)
+    }
+  }
+
   /** Resolvedor da fala (usado por `voice/tts.ts` via `gpuTtsAsApi`). */
   async tts(engine: GpuTtsEngineId, opts: { steps?: number } = {}): Promise<GpuEndpoint> {
     await this.readyFor(engine)
     const entry = gpuEngineEntry(engine)
+    const cur = this.server.get(entry.group)
+    if (!cur || cur.state === 'error' || !cur.engines.includes(engine))
+      await this.releaseOtherGroups(entry.group)
     const port = await this.ensureGroup(
       entry.group,
       this.groupEngines(entry.group, await this.installedEngines())
@@ -491,12 +674,32 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     const prefer =
       tts.backend === 'gpu' ? gpuEngineEntry((tts.gpu ?? DEFAULT_TTS_GPU).engine).group : null
     const hit = running.find((p) => p.group === prefer) ?? running[0]
-    if (hit?.port) return this.endpoint(hit.port)
+    if (hit?.port) {
+      await this.pushWhisperConfig(hit.group, hit.port)
+      return this.endpoint(hit.port)
+    }
     const installed = await this.installedEngines()
     const group: GpuEngineGroup =
       prefer && tts.gpu && installed.has(tts.gpu.engine) ? prefer : 'base'
     const port = await this.ensureGroup(group, this.groupEngines(group, installed))
+    await this.pushWhisperConfig(group, port)
     return this.endpoint(port)
+  }
+
+  /** Parâmetros do whisper (beam/VAD/idioma) no processo — valem na próxima transcrição. */
+  private async pushWhisperConfig(group: GpuEngineGroup, port: number): Promise<void> {
+    const params = resolveGpuParams(GPU_STT_ENGINE_ID, this.deps.getStt().gpu?.params)
+    const key = `${group}:${port}`
+    const json = JSON.stringify(params)
+    if (this.whisperCfg.get(key) === json) return
+    try {
+      await this.post(port, '/v1/config', { whisper: params })
+      this.whisperCfg.set(key, json)
+    } catch (e) {
+      this.deps.log?.(
+        `config do whisper não aplicada: ${e instanceof Error ? e.message : String(e)}`
+      )
+    }
   }
 
   private async post(
@@ -613,12 +816,16 @@ export class GpuVoiceManager implements GpuEndpointResolver {
       if (failed.length) throw new GpuEndpointError(failed.join('; '), 'network')
     } finally {
       this.warming = false
+      // modelos carregados agora: a VRAM livre e os avisos mudam
+      this.invalidateLive()
       this.setPhase(null)
     }
   }
 
   async stopServer(): Promise<void> {
     await this.server.stopAll()
+    this.invalidateLive()
+    this.scheduleEmit()
   }
 
   /** Saída do app. */
@@ -714,6 +921,7 @@ export class GpuVoiceManager implements GpuEndpointResolver {
     if (!isGpuEngineId(id)) throw new Error(`Motor desconhecido: ${String(id)}.`)
     const result = id === GPU_STT_ENGINE_ID ? await this.selfTestStt() : await this.selfTestTts(id)
     this.deps.writeMeasured(id, { ...result, at: new Date().toISOString() })
+    this.invalidateLive()
     this.scheduleEmit()
     return result
   }
@@ -725,7 +933,13 @@ export class GpuVoiceManager implements GpuEndpointResolver {
       backend: 'gpu',
       api: { ...DEFAULT_TTS_API },
       local: null,
-      gpu: { engine: id, voice, steps: this.currentSteps() }
+      // os parâmetros de AGORA (o "Testar" do card mede com eles)
+      gpu: {
+        engine: id,
+        voice,
+        steps: this.currentSteps(),
+        ...(cur.gpu?.params ? { params: cur.gpu.params } : {})
+      }
     }
   }
 

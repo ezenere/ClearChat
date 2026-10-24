@@ -1,8 +1,10 @@
 // Configurações → Áudio → "Modo avançado (GPU local)" (fechado por padrão, badge "avançado"):
 // hardware detectado (só os fatos; a compatibilidade fica no card de cada motor — uma linha curta no
-// topo só quando NADA roda), runtime (Python + PyTorch, baixado sob demanda), motores de
-// voz/transcrição (um card por motor), status do servidor local (só leitura: ele liga sozinho na
-// chamada/ditado/"Testar voz" e desliga ocioso; "Parar agora" discreto) e "Minhas vozes".
+// topo só quando NADA roda), runtime (Python + PyTorch + servidor, baixado sob demanda — os
+// modelos, inclusive o Whisper, são instalados à parte), motores em DUAS seções — "Voz (TTS)" e
+// "Transcrição (STT)" — com um card por motor (e "Parâmetros" por motor), status do servidor local
+// (só leitura: ele liga sozinho na chamada/ditado/"Testar voz" e desliga ocioso; "Parar agora"
+// discreto) e "Minhas vozes".
 // Tudo é baixar-para-usar; a checagem de hardware AVISA quando algo pode não rodar bem (instalar
 // pede confirmação) e só BLOQUEIA o que é incompatível de verdade. Contrato: `window.api.voice.gpu`
 // (tipos espelhados em `lib/voice/gpu/types.ts`); status compartilhado em `useGpuStatus`.
@@ -19,7 +21,8 @@ import {
   X
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import type { TtsSettings } from '@shared/voice'
+import type { SttSettings, TtsSettings } from '@shared/voice'
+import type { GpuParamValues } from '@shared/gpuVoice'
 import { errorMessage } from '../../../lib/api'
 import { cn } from '../../../lib/format'
 import {
@@ -29,7 +32,10 @@ import {
   gpuServerLine,
   hardwareVerdict,
   RUNTIME_TYPICAL_MB,
+  savedGpuParams,
   sortGpuEngines,
+  sttWithGpuParams,
+  ttsWithGpuParams,
   type HardwareVerdict
 } from '../../../lib/voice/gpu/gpuUi'
 import {
@@ -37,9 +43,11 @@ import {
   fromGpuTts,
   gpuApi,
   type GpuEngineId,
+  type GpuEngineStatus,
   type GpuInfo,
   type GpuSelfTestResult,
-  type GpuStatus
+  type GpuStatus,
+  type GpuTtsEngineId
 } from '../../../lib/voice/gpu/types'
 import {
   patchGpuStatus,
@@ -68,10 +76,15 @@ const OS_LABEL: Record<GpuStatus['platform']['os'], string> = {
 
 export function GpuModeSection({
   tts,
-  onCommitTts
+  onCommitTts,
+  stt,
+  onCommitStt
 }: {
   tts: TtsSettings
   onCommitTts: (next: TtsSettings) => Promise<boolean>
+  /** Transcrição (parâmetros do whisper em `sttSettings.gpu.params`); ausente = sem editor. */
+  stt?: SttSettings
+  onCommitStt?: (next: SttSettings) => Promise<boolean>
 }): React.JSX.Element {
   const { status, available, loading, error, expanded, reveal, revealTarget } = useGpuStatus()
   const root = useRef<HTMLElement>(null)
@@ -165,6 +178,8 @@ export function GpuModeSection({
               loading={loading}
               tts={tts}
               onCommitTts={onCommitTts}
+              stt={stt ?? null}
+              onCommitStt={onCommitStt}
               enginesRef={engines}
             />
           )}
@@ -179,20 +194,32 @@ function GpuModeBody({
   loading,
   tts,
   onCommitTts,
+  stt,
+  onCommitStt,
   enginesRef
 }: {
   status: GpuStatus
   loading: boolean
   tts: TtsSettings
   onCommitTts: (next: TtsSettings) => Promise<boolean>
+  stt: SttSettings | null
+  onCommitStt?: (next: SttSettings) => Promise<boolean>
   enginesRef: React.RefObject<HTMLDivElement | null>
 }): React.JSX.Element {
   const verdict = hardwareVerdict(status)
   const runtimeInstalled = status.runtime.state === 'installed'
   const busy = gpuBusy(status)
   const list = sortGpuEngines(status.engines)
+  const ttsList = list.filter((e) => e.kind === 'tts')
+  const sttList = list.filter((e) => e.kind === 'stt')
   const whisper = status.engines.find((e) => e.id === 'whisper-large-v3-turbo')
   const gtts = asGpuTts(tts)
+  const nvidia = status.gpus
+    .filter((g) => g.vendor === 'nvidia')
+    .reduce<GpuInfo | null>(
+      (a, b) => (!a || (b.vramTotalMb ?? 0) > (a.vramTotalMb ?? 0) ? b : a),
+      null
+    )
 
   const installEngine = async (id: GpuEngineId): Promise<void> => {
     const gpu = gpuApi()
@@ -249,50 +276,91 @@ function GpuModeBody({
             : { engine: 'omnivoice' as const, voice: null, steps }
     void onCommitTts(fromGpuTts({ ...gtts, gpu }))
   }
+  /** Parâmetros de um motor: fala → `ttsSettings.gpu.params[id]`; whisper → `sttSettings.gpu.params`. */
+  const saveParams = (e: GpuEngineStatus, next: GpuParamValues): void => {
+    if (e.kind === 'stt') {
+      if (stt && onCommitStt) void onCommitStt(sttWithGpuParams(stt, next))
+      return
+    }
+    void onCommitTts(fromGpuTts(ttsWithGpuParams(gtts, e.id as GpuTtsEngineId, next)))
+  }
+  /** "Restaurar padrão" num commit só (OmniVoice: parâmetros + passos 16). */
+  const restoreParams = (e: GpuEngineStatus): void => {
+    if (e.kind === 'stt') return saveParams(e, {})
+    const t = ttsWithGpuParams(gtts, e.id as GpuTtsEngineId, {})
+    void onCommitTts(
+      fromGpuTts(e.id === 'omnivoice' && t.gpu ? { ...t, gpu: { ...t.gpu, steps: 16 } } : t)
+    )
+  }
+  const card = (e: GpuEngineStatus): React.JSX.Element => (
+    <GpuEngineCard
+      key={e.id}
+      engine={e}
+      runtimeInstalled={runtimeInstalled}
+      otherBusy={busy && e.install.state !== 'installing'}
+      steps={gtts.gpu?.steps}
+      onInstall={() => installEngine(e.id)}
+      onCancel={cancel}
+      onRemove={() => removeEngine(e.id)}
+      onSelfTest={() => selfTest(e.id)}
+      onSteps={e.id === 'omnivoice' ? saveSteps : undefined}
+      params={savedGpuParams(e.id, gtts, stt)}
+      onParams={e.kind === 'stt' && !(stt && onCommitStt) ? undefined : (n) => saveParams(e, n)}
+      onRestoreParams={() => restoreParams(e)}
+      vramFreeMb={nvidia?.vramFreeMb ?? null}
+    />
+  )
 
   return (
     <>
       <HardwareCard status={status} verdict={verdict} loading={loading} />
       <RuntimeCard status={status} verdict={verdict} onCancel={cancel} />
       {runtimeInstalled && <ServerLine status={status} />}
-      <div ref={enginesRef} className="space-y-2" data-testid="gpu-engines">
-        <div className="flex items-baseline gap-2">
-          <span className="text-[13px] font-medium text-fg/90">Motores</span>
-          <HelpTip label="Motores da GPU" wide>
-            <p>
-              Cada motor é um download separado. Os de voz aparecem em Fala (TTS) → Backend “Local
-              (GPU)”; o whisper aparece em Transcrição (STT) → Modo “Local (GPU)”.
-            </p>
-            <p>
-              “Testar” sintetiza (ou transcreve) uma frase curta no servidor local e mede o tempo
-              até o 1º áudio e a velocidade (vezes o tempo real). As latências variam com a GPU e
-              com o que mais estiver usando a placa.
-            </p>
-            <p>
-              Licenças: os pesos “não comercial” (CPML, CC-BY-NC, “research only”) servem para uso
-              pessoal; confira o link de cada um antes de usar em trabalho pago.
-            </p>
-          </HelpTip>
-          {!runtimeInstalled && verdict.level !== 'blocked' && (
-            <span className="text-[11.5px] text-subtle">
-              instalar um motor baixa o runtime junto
-            </span>
-          )}
+      <div ref={enginesRef} className="space-y-4" data-testid="gpu-engines">
+        <div className="space-y-2" data-testid="gpu-engines-tts">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="text-[13px] font-medium text-fg/90">Voz (TTS)</span>
+            <HelpTip label="Motores de voz da GPU" wide>
+              <p>
+                Motores que FALAM as respostas. Cada um é um download separado (pesos do Hugging
+                Face). Instalados, aparecem em Fala (TTS) → Provedor “Local (GPU)”, onde você
+                escolhe o motor e a voz.
+              </p>
+              <p>
+                “Testar” sintetiza uma frase curta no servidor local e mede o tempo até o 1º áudio e
+                a velocidade (vezes o tempo real); “Parâmetros” ajusta velocidade, entonação etc. de
+                cada motor (vale na próxima fala).
+              </p>
+              <p>
+                Licenças: os pesos “não comercial” (CPML, CC-BY-NC, “research only”) servem para uso
+                pessoal; confira o link de cada um antes de usar em trabalho pago.
+              </p>
+            </HelpTip>
+            {!runtimeInstalled && verdict.level !== 'blocked' && (
+              <span className="text-[11.5px] text-subtle">
+                instalar um motor baixa o runtime junto
+              </span>
+            )}
+          </div>
+          {ttsList.map(card)}
         </div>
-        {list.map((e) => (
-          <GpuEngineCard
-            key={e.id}
-            engine={e}
-            runtimeInstalled={runtimeInstalled}
-            otherBusy={busy && e.install.state !== 'installing'}
-            steps={gtts.gpu?.steps}
-            onInstall={() => installEngine(e.id)}
-            onCancel={cancel}
-            onRemove={() => removeEngine(e.id)}
-            onSelfTest={() => selfTest(e.id)}
-            onSteps={e.id === 'omnivoice' ? saveSteps : undefined}
-          />
-        ))}
+        <div className="space-y-2" data-testid="gpu-engines-stt">
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="text-[13px] font-medium text-fg/90">Transcrição (STT)</span>
+            <HelpTip label="Transcrição na GPU" wide>
+              <p>
+                O modelo que ESCUTA (ditado, chamada e a transcrição automática das suas vozes). É
+                um download à parte do runtime (~1,6 GB): o runtime só traz a biblioteca
+                faster-whisper, não o modelo.
+              </p>
+              <p>
+                Instalado, aparece em Transcrição (STT) → Provedor “Local (GPU)”. “Testar”
+                transcreve uma frase gravada e mede o tempo por frase.
+              </p>
+            </HelpTip>
+          </div>
+          {sttList.map(card)}
+        </div>
       </div>
       <GpuUserVoices status={status} whisperInstalled={whisper?.install.state === 'installed'} />
     </>
@@ -316,8 +384,10 @@ function HardwareCard({
       <div className="flex items-center gap-2">
         <span className="text-[13px] font-medium text-fg/90">Hardware</span>
         <HelpTip label="Hardware">
-          Lido do sistema (nvidia-smi / informações do sistema) ao abrir esta seção. “VRAM livre” é
-          a memória da placa sem uso agora — o desktop, o navegador e jogos ocupam parte dela.
+          Lido do sistema (nvidia-smi / informações do sistema) ao abrir esta seção e quando o
+          servidor local liga ou desliga. “VRAM livre” é a memória da placa sem uso agora — o
+          desktop, o navegador e jogos ocupam parte dela. A parte do servidor do próprio ClearChat
+          aparece separada e não conta contra os motores (o app a libera ao trocar de motor).
         </HelpTip>
         <IconButton
           size="xs"
@@ -350,9 +420,14 @@ function HardwareCard({
               <span className="font-medium text-fg/85">{g.name}</span>
               <span className="text-subtle">{VENDOR[g.vendor]}</span>
               {g.vramTotalMb != null && (
-                <span>
+                <span data-testid="gpu-vram">
                   VRAM {formatMb(g.vramTotalMb)}
-                  {g.vramFreeMb != null ? ` (${formatMb(g.vramFreeMb)} livres)` : ''}
+                  {g.vramFreeMb != null ? ` (${formatMb(g.vramFreeMb)} livres` : ''}
+                  {g.vramFreeMb != null && g.vramOwnMb
+                    ? ` · ${formatMb(g.vramOwnMb)} com o servidor do ClearChat)`
+                    : g.vramFreeMb != null
+                      ? ')'
+                      : ''}
                 </span>
               )}
               {g.vramTotalMb == null && g.vendor === 'apple' && <span>memória unificada</span>}
@@ -437,9 +512,16 @@ function RuntimeCard({
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-[13px] font-medium text-fg/90">Runtime</span>
-        <HelpTip label="Runtime da GPU">
-          Python + PyTorch (CUDA) + as bibliotecas dos motores, instalados numa pasta própria do app
-          (não mexe no Python do sistema). Um download só, compartilhado por todos os motores.
+        <HelpTip label="Runtime da GPU" wide>
+          <p>
+            Python + PyTorch (CUDA) + o servidor local e as bibliotecas de áudio, numa pasta própria
+            do app (não mexe no Python do sistema). Um download só, compartilhado por todos os
+            motores.
+          </p>
+          <p>
+            Não inclui nenhum modelo: cada motor de voz e a transcrição (Whisper) são instalados à
+            parte, nas seções abaixo.
+          </p>
         </HelpTip>
         <Badge
           tone={rt.state === 'installed' ? 'success' : rt.state === 'broken' ? 'danger' : 'neutral'}
