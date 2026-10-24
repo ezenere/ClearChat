@@ -3,6 +3,9 @@
 // provedor. O valor é o par { providerId, model } — o mesmo id em dois provedores são duas opções.
 // `requires` (capacidades que o histórico do chat exige — @shared/modelCompat) desabilita os
 // modelos que declaradamente não as têm, com o motivo no tooltip; desconhecido nunca desabilita.
+// `source` troca a fonte (padrão: provedores de chat + `models` do store) — Configurações → Áudio
+// usa o mesmo seletor para os modelos de transcrição/fala (catálogo de voz por provedor), com a
+// meta à direita própria (`meta`: latência medida/pt-BR em vez de contexto/preço).
 import {
   AlertTriangle,
   AudioLines,
@@ -18,7 +21,15 @@ import {
   Settings2,
   Wrench
 } from 'lucide-react'
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode
+} from 'react'
 import type { ModelRef } from '@shared/models'
 import { compatLabel, compatReason, modelCompat, type ChatCapability } from '@shared/modelCompat'
 import { isChatProvider, providerKind } from '@shared/providerKinds'
@@ -35,6 +46,8 @@ import {
   scrollToRow,
   stickyHeader,
   visibleRange,
+  type PickerModels,
+  type PickerProvider,
   type PickerRow
 } from '../../lib/modelPicker'
 import { useStore } from '../../store'
@@ -69,13 +82,27 @@ function priceLine(m: { promptPrice?: number; completionPrice?: number }): strin
   return `${ip ?? '–'} / ${op ?? '–'}`
 }
 
+/** Fonte alternativa de provedores/modelos (ex.: catálogo de voz de Configurações → Áudio). */
+export interface ModelPickerSource {
+  providers: PickerProvider[]
+  models: Record<string, PickerModels | undefined>
+  /** Carrega a lista do provedor (`force` = ignora o cache — "Recarregar"/"tentar de novo"). */
+  load: (providerId: string, force?: boolean) => void
+}
+
 export function ModelPicker({
   value,
   onChange,
   autoFocus,
   className,
   placeholder = 'Escolha um modelo…',
-  requires
+  requires,
+  source,
+  meta,
+  badges,
+  testId = 'model-picker',
+  label,
+  emptyText = 'Nenhum provedor configurado.'
 }: {
   value: ModelRef | null
   onChange: (ref: ModelRef) => void
@@ -84,12 +111,32 @@ export function ModelPicker({
   placeholder?: string
   /** Capacidades exigidas pelo histórico do chat (vazio/ausente = sem restrição). */
   requires?: readonly ChatCapability[]
+  /** Fonte própria (padrão: provedores de chat + modelos do store). */
+  source?: ModelPickerSource
+  /** Meta à direita da linha (padrão: contexto + preço). */
+  meta?: (providerId: string, m: ModelInfo) => ReactNode
+  /** Badges depois do nome (padrão: tools/visão/PDF/áudio). */
+  badges?: (providerId: string, m: ModelInfo) => ReactNode
+  testId?: string
+  /** aria-label do gatilho (combobox). */
+  label?: string
+  /** Texto da lista sem provedores (com o atalho "Adicionar" → Configurações → Provedores). */
+  emptyText?: string
 }): React.JSX.Element {
   // só provedores de chat (os de voz — ElevenLabs — não têm modelos de LLM)
   const allProviders = useStore((s) => s.providers)
-  const providers = useMemo(() => allProviders.filter(isChatProvider), [allProviders])
-  const models = useStore((s) => s.models)
-  const loadModels = useStore((s) => s.loadModels)
+  const chatProviders = useMemo(() => allProviders.filter(isChatProvider), [allProviders])
+  const storeModels = useStore((s) => s.models)
+  const storeLoad = useStore((s) => s.loadModels)
+  const providers: PickerProvider[] = source?.providers ?? chatProviders
+  const models = source?.models ?? storeModels
+  const loadModels = useMemo(
+    () =>
+      source
+        ? (id: string, force?: boolean): void => source.load(id, force)
+        : (id: string, force?: boolean): void => void storeLoad(id, force),
+    [source, storeLoad]
+  )
   const setSettingsOpen = useStore((s) => s.setSettingsOpen)
 
   const [open, setOpen] = useState(false)
@@ -139,14 +186,14 @@ export function ModelPicker({
     const req = reqKey ? (reqKey.split(',') as ChatCapability[]) : []
     if (!req.length) return undefined
     return (providerId: string, m: ModelInfo): ModelDisabled | null => {
-      const p = providers.find((x) => x.id === providerId)
+      const p = chatProviders.find((x) => x.id === providerId)
       if (!p) return null
       const pk = providerKind(p)
       const { missing } = modelCompat(req, m, pk)
       const reason = compatReason(missing, pk)
       return reason ? { reason: `${reason}.`, label: compatLabel(missing) } : null
     }
-  }, [reqKey, providers])
+  }, [reqKey, chatProviders])
 
   const rows = useMemo(
     () => buildPickerRows({ providers, models, query, collapsed, selected, disabledReason }),
@@ -347,16 +394,23 @@ export function ModelPicker({
                 >
                   {m.name ?? m.id}
                 </span>
-                {m.supportsTools && (
+                {badges ? badges(r.providerId, m) : null}
+                {!badges && m.supportsTools && (
                   <Wrench
                     aria-label="tools"
                     className="size-2.5 shrink-0 text-subtle"
                     strokeWidth={2.25}
                   />
                 )}
-                {vision && <Eye aria-label="visão" className="size-3 shrink-0 text-subtle" />}
-                {pdf && <FileText aria-label="PDF" className="size-3 shrink-0 text-subtle" />}
-                {audio && <AudioLines aria-label="áudio" className="size-3 shrink-0 text-subtle" />}
+                {!badges && vision && (
+                  <Eye aria-label="visão" className="size-3 shrink-0 text-subtle" />
+                )}
+                {!badges && pdf && (
+                  <FileText aria-label="PDF" className="size-3 shrink-0 text-subtle" />
+                )}
+                {!badges && audio && (
+                  <AudioLines aria-label="áudio" className="size-3 shrink-0 text-subtle" />
+                )}
               </span>
               <span className="block truncate font-mono text-[10.5px] text-subtle">{m.id}</span>
             </span>
@@ -367,6 +421,10 @@ export function ModelPicker({
               >
                 <TriangleAlert className="size-3 shrink-0" />
                 <span className="truncate">{off.label}</span>
+              </span>
+            ) : meta ? (
+              <span className="flex shrink-0 items-center gap-1 text-right text-[10.5px] leading-tight text-subtle tabular-nums">
+                {meta(r.providerId, m)}
               </span>
             ) : (
               (m.contextLength || price) && (
@@ -464,7 +522,10 @@ export function ModelPicker({
         aria-haspopup="listbox"
         tabIndex={0}
         autoFocus={autoFocus}
-        data-testid="model-picker"
+        aria-label={label}
+        data-testid={testId}
+        data-value={selected?.model ?? ''}
+        data-provider-id={selected?.providerId ?? ''}
         onClick={() => (open ? setOpen(false) : openList())}
         onKeyDown={(e) => {
           if (!open && (e.key === 'Enter' || e.key === 'ArrowDown' || e.key === ' ')) {
@@ -571,7 +632,7 @@ export function ModelPicker({
           >
             {providers.length === 0 ? (
               <div className="flex items-center gap-2 px-3 py-3 text-xs text-subtle">
-                Nenhum provedor configurado.
+                {emptyText}
                 <button
                   type="button"
                   onClick={() => {

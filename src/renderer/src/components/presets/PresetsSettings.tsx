@@ -1,6 +1,7 @@
 // Configurações → Personas: lista, criar, editar (mesmos editores do painel), duplicar, apagar e
 // definir a padrão do Novo chat.
 import {
+  AudioLines,
   ArrowLeft,
   BrainCircuit,
   Copy,
@@ -157,12 +158,13 @@ export function PresetsList({
 
 // ---------------- editor ----------------
 
-type EditorTab = 'model' | 'chat' | 'tools' | 'memory'
+type EditorTab = 'model' | 'chat' | 'tools' | 'memory' | 'voice'
 const EDITOR_TABS: { id: EditorTab; label: string; icon: typeof Sparkles }[] = [
   { id: 'model', label: 'Modelo', icon: Sparkles },
   { id: 'chat', label: 'Chat', icon: MessageSquareText },
   { id: 'tools', label: 'Tools', icon: Wrench },
-  { id: 'memory', label: 'Memória', icon: BrainCircuit }
+  { id: 'memory', label: 'Memória', icon: BrainCircuit },
+  { id: 'voice', label: 'Voz', icon: AudioLines }
 ]
 
 function PresetChatEditor({
@@ -219,7 +221,6 @@ function PresetChatEditor({
         <RootOptions cfg={cfg} patch={patch} />
       </CollapsibleSection>
       <SignatureSection cfg={cfg} patch={patch} />
-      <VoiceCallConfigSection cfg={cfg} patch={patch} scope="persona" />
       <ContextSettingsSection cfg={cfg} patch={patch} knownWindow={window} />
     </>
   )
@@ -382,6 +383,8 @@ export function PresetEditor({
           />
         ) : tab === 'tools' ? (
           <ToolsEditor cfg={cfg} patch={patch} onOpenMemory={() => setTab('memory')} />
+        ) : tab === 'voice' ? (
+          <VoiceCallConfigSection cfg={cfg} patch={patch} scope="persona" defaultOpen />
         ) : (
           <MemorySection cfg={cfg} patch={patch} />
         )}

@@ -1,0 +1,7 @@
+# ClearChat — Modo avançado (GPU local): camada vibe
+# Gerado de um ambiente que funcionou (Python 3.11.17, torch 2.8.0+cu128). Não editar à mão sem testar.
+transformers==4.51.3
+tokenizers==0.21.4
+diffusers==0.39.0
+ml_collections==1.1.0
+absl-py==2.5.1

@@ -28,7 +28,14 @@ import { DEFAULT_STT_SETTINGS, type SttSettings } from '../src/shared/voice.ts'
 const sttSettings = (over: Partial<SttSettings> = {}): SttSettings => ({
   ...DEFAULT_STT_SETTINGS,
   ...over,
-  api: { ...DEFAULT_STT_SETTINGS.api, apiKey: 'sk-test', ...(over.api ?? {}) }
+  // endpoint já resolvido pelo main (provedor Groq cadastrado → endereço + chave)
+  api: {
+    ...DEFAULT_STT_SETTINGS.api,
+    providerId: 'p-groq',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    apiKey: 'sk-test',
+    ...(over.api ?? {})
+  }
 })
 
 const bytes = (n: number, fill = 1): Uint8Array => new Uint8Array(n).fill(fill)

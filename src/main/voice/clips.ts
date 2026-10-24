@@ -90,7 +90,7 @@ export interface VoiceClip {
 export interface ClipsManifest {
   /** Voz dona do cache (mesmo id de `clipVoiceId`). */
   voiceId: string
-  backend: 'api' | 'local'
+  backend: 'api' | 'local' | 'gpu'
   /** Motor local ('kokoro'); null no backend de API. */
   engine: string | null
   /** Modelo/voz usados (informativo; nunca guarda chave de API). */
@@ -137,7 +137,9 @@ export function clipVoiceId(settings: TtsSettings): string {
   const raw =
     settings.backend === 'local'
       ? `local-${settings.local?.engine ?? 'kokoro'}-${settings.local?.voice ?? 'padrao'}`
-      : `api-${(settings.api.voice ?? '').trim() || 'padrao'}`
+      : settings.backend === 'gpu'
+        ? `gpu-${settings.gpu?.engine ?? 'omnivoice'}-${settings.gpu?.voice ?? 'padrao'}`
+        : `api-${(settings.api.voice ?? '').trim() || 'padrao'}`
   const safe = raw
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/\.{2,}/g, '-')
@@ -170,12 +172,21 @@ export async function clipsHash(
     phrases: clipPhraseSet(fillerPool),
     post: CLIP_POSTPROCESS,
     backend: settings.backend,
-    engine: settings.backend === 'local' ? (settings.local?.engine ?? null) : null,
+    engine:
+      settings.backend === 'local'
+        ? (settings.local?.engine ?? null)
+        : settings.backend === 'gpu'
+          ? (settings.gpu?.engine ?? null)
+          : null,
     voice:
       settings.backend === 'local'
         ? (settings.local?.voice ?? null)
-        : (settings.api.voice ?? null) || null,
-    model: settings.backend === 'api' ? settings.api.model : null
+        : settings.backend === 'gpu'
+          ? (settings.gpu?.voice ?? null)
+          : (settings.api.voice ?? null) || null,
+    model: settings.backend === 'api' ? settings.api.model : null,
+    // OmniVoice: os passos mudam o som → clipes novos (ausente nos outros backends: hash igual ao de antes)
+    ...(settings.backend === 'gpu' && settings.gpu?.steps ? { steps: settings.gpu.steps } : {})
   })
   const hasher = await createSHA256()
   return hasher.update(payload).digest('hex')
@@ -223,7 +234,7 @@ export async function loadClips(baseDir: string, voiceId: string): Promise<Clips
   }
   const m = parsed as Record<string, unknown>
   if (m.voiceId !== voiceId) return null
-  if (m.backend !== 'api' && m.backend !== 'local') return null
+  if (m.backend !== 'api' && m.backend !== 'local' && m.backend !== 'gpu') return null
   if (typeof m.hash !== 'string' || !/^[0-9a-f]{64}$/.test(m.hash)) return null
   if (typeof m.generatedAt !== 'string') return null
   if (typeof m.model !== 'string') return null
@@ -352,7 +363,12 @@ async function generateClipsLocked(
       opts.onProgress?.({ done, total, id: `${cls}_${n}` })
     }
   }
-  const engine = opts.settings.backend === 'local' ? (opts.settings.local?.engine ?? null) : null
+  const engine =
+    opts.settings.backend === 'local'
+      ? (opts.settings.local?.engine ?? null)
+      : opts.settings.backend === 'gpu'
+        ? (opts.settings.gpu?.engine ?? null)
+        : null
   const manifest: ClipsManifest = {
     voiceId,
     backend: opts.settings.backend,
@@ -360,7 +376,9 @@ async function generateClipsLocked(
     model:
       opts.settings.backend === 'local'
         ? (opts.settings.local?.voice ?? '')
-        : opts.settings.api.model,
+        : opts.settings.backend === 'gpu'
+          ? (opts.settings.gpu?.engine ?? '')
+          : opts.settings.api.model,
     hash,
     generatedAt: new Date().toISOString(),
     clips: entries

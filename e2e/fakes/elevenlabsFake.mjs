@@ -36,6 +36,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
  *   (handshake 403)
  * - `idleCloseMs` (fecha o socket ocioso — simula o `inactivity_timeout`)
  * - `dropOnFirstFlush` (derruba a 1ª conexão no 1º flush, antes do áudio — testa o reenvio)
+ * - `alignment` (padrão true): alinhamento de caracteres junto do áudio, como o da ElevenLabs
  */
 export async function startElevenLabsFake(opts = {}) {
   const state = {
@@ -62,7 +63,8 @@ export async function startElevenLabsFake(opts = {}) {
     chunkDelayMs: opts.chunkDelayMs ?? 5,
     mode: opts.mode ?? 'ok',
     idleCloseMs: opts.idleCloseMs ?? 0,
-    dropOnFirstFlush: !!opts.dropOnFirstFlush
+    dropOnFirstFlush: !!opts.dropOnFirstFlush,
+    alignment: opts.alignment !== false
   }
   /** Requests REST recebidas (método, caminho, query, headers, corpo). */
   const requests = []
@@ -211,23 +213,33 @@ export async function startElevenLabsFake(opts = {}) {
       [...contexts.values()].filter((c) => c.started && !c.finalSent && !c.dropped).length
 
     async function generate(cid, ctx, text) {
-      // gera áudio para `text` (sequencial por contexto)
+      // gera áudio para `text` (sequencial por contexto). Alinhamento como o da ElevenLabs: cada
+      // frame traz os chars que COMEÇAM nele, com tempos relativos ao 1º deles (blocos
+      // consecutivos — cada um começa onde o anterior terminou); frame sem começo de char vai sem
+      // alinhamento. `alignment: false` nas opções desliga (proxy/modelo sem alinhamento).
       ctx.queue = (ctx.queue ?? Promise.resolve()).then(async () => {
         await sleep(state.firstAudioDelayMs)
-        const total = text.length * state.samplesPerChar
+        const spc = state.samplesPerChar
+        const msPerChar = (spc / 24000) * 1000
+        const total = text.length * spc
         let sent = 0
+        let nextChar = 0
         while (sent < total) {
           if (ctx.dropped || ws.readyState !== 1) return
           const n = Math.min(state.chunkSamples, total - sent)
-          const chars = text.slice(0, 3).split('')
+          const chars = []
+          while (nextChar < text.length && nextChar * spc < sent + n) chars.push(text[nextChar++])
           send({
             audio: sine(n, ctx.sentSamples).toString('base64'),
             contextId: cid,
-            alignment: {
-              chars,
-              charStartTimesMs: chars.map((_, i) => i * 10),
-              charDurationsMs: chars.map(() => 10)
-            },
+            alignment:
+              state.alignment && chars.length
+                ? {
+                    chars,
+                    charStartTimesMs: chars.map((_, i) => i * msPerChar),
+                    charDurationsMs: chars.map(() => msPerChar)
+                  }
+                : null,
             normalizedAlignment: null
           })
           ctx.sentSamples += n

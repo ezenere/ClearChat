@@ -1,16 +1,16 @@
 // Ditado por voz (renderer): funções PURAS do rascunho de transcrição — ponto de inserção do texto
 // final (onde estava o cursor quando o ditado começou, ajustado às edições feitas durante a
-// gravação), espaçamento da inserção e mensagens legíveis das falhas de captura. Sem DOM/React —
-// testado em `e2e/voiceDictation.test.ts`.
+// gravação), espaçamento da inserção, a prévia "digitado + ditado" mostrada no campo durante a
+// gravação, o desfecho do ditado (✓/×/enviar) e mensagens legíveis das falhas de captura. Sem
+// DOM/React — testado em `e2e/voiceDictation.test.ts`.
 //
-// A parcial ao vivo NÃO entra no texto editável: o Composer a mostra num "fantasma" fora da
-// textarea (`voice-partial`). Assim o usuário pode digitar durante a gravação sem corromper o
-// rascunho (antes a parcial + `▌` viviam dentro do valor e uma digitação no fim quebrava a
-// separação). No stop, o texto final é inserido no ponto de inserção com `insertDictationText`
-// (o Composer usa `execCommand('insertText')`, que preserva o desfazer) — o envio é SEMPRE manual.
-
-/** Cursor visual do rascunho falado (parcial ao vivo, no fantasma do Composer). */
-export const DICTATION_CURSOR = '▌'
+// Durante a gravação o Composer troca a textarea por um ESPELHO somente-leitura (`voice-draft`)
+// com o texto digitado (cor normal) + o ditado no ponto de inserção (translúcido — `voice-partial`;
+// "Ouvindo…" em itálico enquanto nada foi transcrito). O valor da textarea não muda até o desfecho
+// (nada de parcial dentro do texto editável — o bug antigo de rascunho corrompido não volta).
+// No ✓ (ou ao soltar a tecla do PTT) o texto final é inserido no ponto de inserção com
+// `insertDictationText` (o Composer usa `execCommand('insertText')`, que preserva o desfazer); o ×
+// descarta; "Enviar" durante a gravação conclui e envia (`planDictationCommit`).
 
 /**
  * Junta o texto falado ao rascunho digitado, com UM espaço de separação quando necessário
@@ -69,6 +69,15 @@ export function rebaseDictationAnchor(
   return { start, end }
 }
 
+/** Espaços que a inserção precisa: antes, quando o anterior não é espaço; depois, quando o
+ * seguinte não é espaço nem pontuação de fechamento. */
+function dictationSpacing(before: string, after: string): { lead: string; trail: string } {
+  return {
+    lead: before && !/\s/.test(before) ? ' ' : '',
+    trail: after && !/[\s.,;:!?)\]}…]/.test(after) ? ' ' : ''
+  }
+}
+
 /**
  * Insere `spoken` em `value` substituindo `[start, end)`, com espaçamento natural: espaço antes
  * quando o caractere anterior não é espaço; espaço depois quando o seguinte não é espaço nem
@@ -84,10 +93,10 @@ export function insertDictationText(
   const e = Math.max(s, Math.min(value.length, end))
   const text = spoken.trim()
   if (!text) return { value, insert: '', start: s, end: e, caret: e }
-  const before = s > 0 ? value[s - 1] : ''
-  const after = e < value.length ? value[e] : ''
-  const lead = before && !/\s/.test(before) ? ' ' : ''
-  const trail = after && !/[\s.,;:!?)\]}…]/.test(after) ? ' ' : ''
+  const { lead, trail } = dictationSpacing(
+    s > 0 ? value[s - 1] : '',
+    e < value.length ? value[e] : ''
+  )
   const insert = lead + text + trail
   return {
     value: value.slice(0, s) + insert + value.slice(e),
@@ -96,6 +105,105 @@ export function insertDictationText(
     end: e,
     caret: s + insert.length
   }
+}
+
+/** Prévia do campo durante o ditado, em pedaços (o `spoken` é o trecho translúcido). */
+export interface DictationPreview {
+  /** Texto digitado antes do ponto de inserção (cor normal). */
+  before: string
+  /** Espaço de separação antes do ditado ('' ou ' '). */
+  lead: string
+  /** O que está sendo ditado (parcial) — ou o marcador ("Ouvindo…") quando ainda não há texto. */
+  spoken: string
+  /** Espaço de separação depois do ditado ('' ou ' '). */
+  trail: string
+  /** Texto digitado depois do ponto de inserção (a seleção do início some — será substituída). */
+  after: string
+}
+
+/**
+ * O que o campo mostra durante a gravação: o rascunho ATUAL com `spoken` no ponto de inserção (a
+ * âncora do início do ditado, ajustada por `rebaseDictationAnchor`) e o mesmo espaçamento que
+ * `insertDictationText` vai usar — `before + lead + spoken + trail + after` é exatamente o valor
+ * que o ✓ produz com a mesma fala (o texto não "pula" ao concluir). `spoken` vazio → sem espaços.
+ */
+export function dictationPreview(
+  value: string,
+  anchor: DictationAnchor | null,
+  spoken: string
+): DictationPreview {
+  const at = rebaseDictationAnchor(anchor, value)
+  const s = Math.max(0, Math.min(value.length, at.start))
+  const e = Math.max(s, Math.min(value.length, at.end))
+  const text = spoken.trim()
+  const { lead, trail } = text
+    ? dictationSpacing(s > 0 ? value[s - 1] : '', e < value.length ? value[e] : '')
+    : { lead: '', trail: '' }
+  return { before: value.slice(0, s), lead, spoken: text, trail, after: value.slice(e) }
+}
+
+/** Como um fluxo de ditado terminou (`UseDictationOptions.onSettled`). */
+export type DictationSettle =
+  /** Transcrição final pronta (`onFinal` recebeu o texto). */
+  | 'final'
+  /** Nada foi transcrito (silêncio/sem áudio). */
+  | 'empty'
+  /** A final falhou (a parcial, se houver, fica recuperável). */
+  | 'failed'
+  /** × / Esc / bloqueio / troca de chat: tudo descartado. */
+  | 'cancelled'
+
+/** O que o Composer faz quando o ditado termina. */
+export interface DictationCommitPlan {
+  /** Texto a inserir no ponto de inserção (final, ou a parcial quando a final falhou ao enviar). */
+  insert: string | null
+  /** Envia o campo depois da inserção. */
+  send: boolean
+  /** Aviso visível (ex.: final falhou ao enviar — a parcial entrou, confira e envie). */
+  note: string | null
+}
+
+/** A final falhou depois de "Enviar": a parcial entra no campo e NADA é enviado. */
+export const SEND_FINAL_FAILED_NOTE =
+  'A transcrição final falhou — o texto parcial entrou no campo. Confira e envie.'
+/** A final demorou mais que o prazo do "Enviar": ela entra quando chegar, sem enviar sozinha. */
+export const SEND_FINAL_SLOW_NOTE =
+  'A transcrição está demorando — o texto entra no campo quando chegar. Confira e envie.'
+/** Quanto "Enviar" durante a gravação espera a final antes de desistir de enviar sozinho. */
+export const SEND_FINAL_TIMEOUT_MS = 10_000
+
+/**
+ * Desfecho do ditado no Composer (puro): `final` → o texto entra no ponto de inserção e, se o
+ * usuário pediu "Enviar" (e o prazo não estourou), o campo inteiro (digitado + final) é enviado;
+ * `empty` + "Enviar" → envia o que já estava digitado (se houver); `failed` + "Enviar" → a parcial
+ * entra no campo com um aviso e NADA é enviado (nunca sai mensagem com a fala incompleta sem o
+ * usuário ver); `failed` sem "Enviar" → o card de erro oferece "Inserir o texto parcial";
+ * `cancelled` → nada muda.
+ */
+export function planDictationCommit(input: {
+  settle: DictationSettle
+  /** Texto final (`settle: 'final'`). */
+  final?: string
+  /** Última parcial (para `failed`). */
+  partial?: string
+  /** O usuário apertou "Enviar" (ou Enter) durante a gravação e o prazo ainda vale. */
+  sendRequested: boolean
+  /** Há algo para enviar além do ditado (texto digitado/anexos/skills). */
+  hasOther: boolean
+}): DictationCommitPlan {
+  const { settle, sendRequested } = input
+  if (settle === 'final') {
+    const text = (input.final ?? '').trim()
+    return { insert: text || null, send: sendRequested && (!!text || input.hasOther), note: null }
+  }
+  if (settle === 'empty') return { insert: null, send: sendRequested && input.hasOther, note: null }
+  if (settle === 'failed') {
+    const partial = (input.partial ?? '').trim()
+    if (sendRequested && partial)
+      return { insert: partial, send: false, note: SEND_FINAL_FAILED_NOTE }
+    return { insert: null, send: false, note: null }
+  }
+  return { insert: null, send: false, note: null }
 }
 
 /** Falha de captura com o `name` do DOMException (o `message` do OverconstrainedError vem vazio). */

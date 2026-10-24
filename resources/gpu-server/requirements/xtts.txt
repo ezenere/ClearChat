@@ -1,0 +1,4 @@
+# ClearChat — Modo avançado (GPU local): camada xtts (coqui-tts)
+# Gerado de um ambiente que funcionou (Python 3.11.17, torch 2.8.0+cu128). Não editar à mão sem testar.
+coqui-tts==0.28.0
+transformers==4.57.3

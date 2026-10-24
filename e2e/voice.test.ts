@@ -106,25 +106,21 @@ test('audioInput: booleanos explícitos valem, strings aparadas, null = padrão 
 
 // ---------------- transcrição (STT) ----------------
 
-test('sttSettings: modo validado, endpoint padrão Groq, local null = nenhum instalado', () => {
+test('sttSettings: modo validado, sem provedor por padrão, local null = nenhum instalado', () => {
   const s = normalizeSttSettings({ mode: 'hybrid', livePartials: false })
   assert.equal(s.mode, 'hybrid')
   assert.equal(s.livePartials, false)
   assert.deepEqual(s.api, DEFAULT_STT_SETTINGS.api)
   assert.equal(s.local, null)
-  // modo desconhecido → padrão; campos do endpoint completados/limpos
+  assert.equal(s.api.providerId, null, 'sem provedor escolhido por padrão')
+  // modo desconhecido → padrão; só provedor + modelo (baseUrl/apiKey antigos são descartados)
   const t = normalizeSttSettings({
     mode: 'wat',
     api: { providerId: '  ', baseUrl: ' https://exemplo.test/v1 ', apiKey: ' sk-x ', model: 'w' },
     local: { engine: 'vosk', model: ' pt ', installed: true }
   })
   assert.equal(t.mode, 'api')
-  assert.deepEqual(t.api, {
-    providerId: null,
-    baseUrl: 'https://exemplo.test/v1',
-    apiKey: 'sk-x',
-    model: 'w'
-  })
+  assert.deepEqual(t.api, { providerId: null, model: 'w' })
   assert.deepEqual(t.local, { engine: 'vosk', model: 'pt', installed: true })
 })
 
@@ -151,7 +147,7 @@ test('ttsSettings: backend padrão local; local padrão = Kokoro não instalado;
   const s = normalizeTtsSettings({ backend: 'api', api: { voice: ' shimmer ' } })
   assert.equal(s.backend, 'api')
   assert.equal(s.api.voice, 'shimmer')
-  assert.equal(s.api.baseUrl, '')
+  assert.equal('baseUrl' in s.api || 'apiKey' in s.api, false, 'endereço/chave nunca gravados')
   const l = normalizeTtsSettings({ local: { voice: ' bf_emma ' } })
   assert.deepEqual(l.local, { engine: 'kokoro', voice: 'bf_emma', installed: false })
   // voz vazia → a voz padrão; engine desconhecida → kokoro; backend desconhecido → padrão

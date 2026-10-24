@@ -1,0 +1,7 @@
+# ClearChat — Modo avançado (GPU local): camada omni
+# Gerado de um ambiente que funcionou (Python 3.11.17, torch 2.8.0+cu128). Não editar à mão sem testar.
+transformers==5.20.2
+tokenizers==0.23.3
+huggingface_hub==1.33.0
+tensorboardX==2.6.5
+webdataset==1.0.2

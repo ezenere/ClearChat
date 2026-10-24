@@ -58,9 +58,13 @@ export function ChatTab({ chat }: { chat: Chat }): React.JSX.Element {
       <ContextSection chat={chat} />
       <RootSection chat={chat} />
       <SignatureSection cfg={chat.config} patch={patch} />
-      <VoiceCallConfigSection cfg={chat.config} patch={patch} />
     </>
   )
+}
+
+/** Aba Voz: chamada de voz deste chat (liga/desliga, modelo e parâmetros, tools e prompt do modo voz). */
+export function VoiceTab({ chat }: { chat: Chat }): React.JSX.Element {
+  return <VoiceCallConfigSection cfg={chat.config} patch={usePatch(chat)} defaultOpen />
 }
 
 function ChatInfoSection({ chat }: { chat: Chat }): React.JSX.Element {

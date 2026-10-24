@@ -430,6 +430,11 @@ test('BAR_ITEMS: prioridades distintas onde importam e níveis começando no com
   assert.ok(p('context-meter') > p('model-pill'))
   assert.ok(p('model-pill') > p('spend'))
   assert.ok(p('spend') > p('composer-hint'))
+  // composer: o ícone do host e o </> recolhem antes do grupo de voz, que nunca some (só a seta)
+  assert.ok(p('voice-controls') > p('composer-host'))
+  assert.ok(p('composer-host') > p('composer-info'))
+  assert.ok(p('composer-info') > p('composer-hint'))
+  assert.deepEqual(BAR_ITEMS['voice-controls'].levels, [0, 1])
 })
 
 test('planCollapse: tudo cabe → completo; aperta → menor prioridade desce primeiro', () => {

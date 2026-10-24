@@ -1,0 +1,4 @@
+# ClearChat — Modo avançado (GPU local): torch (índice cu128 no Linux/Windows; PyPI no macOS)
+# Gerado de um ambiente que funcionou (Python 3.11.17, torch 2.8.0+cu128). Não editar à mão sem testar.
+torch==2.8.0
+torchaudio==2.8.0

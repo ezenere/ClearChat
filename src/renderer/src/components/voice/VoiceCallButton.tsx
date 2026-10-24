@@ -7,7 +7,8 @@
 // OUTRO dispositivo (host remoto): desabilitado com o motivo no tooltip (o turno de voz roda no
 // host; o ditado continua valendo). Antes de entrar, `voiceCallReadiness` confere STT/TTS (e, com
 // `voice.runtime.status()`, os runtimes locais — espeak-ng etc.) — o que faltar vira toast com o
-// caminho em Configurações → Áudio (nunca uma chamada que falha calada).
+// caminho em Configurações → Áudio (nunca uma chamada que falha calada). Com fala/transcrição na
+// GPU local, o status da GPU entra na pré-checagem (runtime, motor, servidor).
 // Testids: `voice-call-button` (com `voice-call-button-active` quando na chamada).
 import { Phone, PhoneOff } from 'lucide-react'
 import { useState } from 'react'
@@ -17,11 +18,21 @@ import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { voiceCallReadiness } from '../../lib/voice/callReadiness'
+import { gpuApi, type SttSettingsGpu, type TtsSettingsGpu } from '../../lib/voice/gpu/types'
+import { gpuCallPlan } from '../../lib/voice/gpu/gpuUi'
+import { useVoiceCallRuntime } from '../../lib/voice/voiceCallRuntime'
 import { loadVoiceSettings, useVoiceSettings } from '../../lib/voice/voiceSettings'
 import { useHostInfo } from '../sync/hooks'
 import { Tip } from '../ui/Tooltip'
 
-export function VoiceCallButton({ session }: { session: Session }): React.JSX.Element | null {
+export function VoiceCallButton({
+  session,
+  className
+}: {
+  session: Session
+  /** Classes extras do botão (no grupo de voz do composer: segmento do `[ telefone | mic | ˅ ]`). */
+  className?: string
+}): React.JSX.Element | null {
   const defaults = useVoiceSettings((s) => s.view.voiceCallDefaults)
   const call = useStore((s) => s.voiceCall)
   const startVoiceCall = useStore((s) => s.startVoiceCall)
@@ -55,13 +66,31 @@ export function VoiceCallButton({ session }: { session: Session }): React.JSX.El
     try {
       const view = await loadVoiceSettings()
       // probe dos runtimes locais (whisper/onnxruntime/espeak-ng) só quando algum motor local conta
-      const needsLocal = view.ttsSettings.backend === 'local' || view.sttSettings.mode !== 'api'
+      const sttMode = (view.sttSettings as SttSettingsGpu).mode
+      const ttsBackend = (view.ttsSettings as TtsSettingsGpu).backend
+      const needsLocal =
+        ttsBackend !== 'api' || sttMode === 'local' || sttMode === 'hybrid' || sttMode === 'gpu'
       const runtime = needsLocal ? await api.voice?.runtime?.status().catch(() => null) : null
-      const problems = voiceCallReadiness(view, runtime)
+      // modo GPU (avançado): runtime/motor/servidor da GPU local
+      const needsGpu = ttsBackend === 'gpu' || sttMode === 'gpu'
+      const gpu = needsGpu
+        ? await (gpuApi()
+            ?.status()
+            .catch(() => null) ?? null)
+        : null
+      // provedores cadastrados: sem provedor de STT/TTS a pré-checagem aponta Áudio/Provedores
+      const providers = useStore.getState().providers
+      const problems = voiceCallReadiness(view, runtime, gpu, providers)
       if (problems.length) {
         toast(`Chamada de voz indisponível — ${problems.join(' ')}`, 'error')
         return
       }
+      // GPU local: aviso de uso da GPU e da VRAM livre agora (pouca = avisa, não barra) para a barra
+      // mostrar no "Preparando a GPU…" — o main sobe/aquece o servidor antes do microfone abrir
+      useVoiceCallRuntime.setState({
+        gpuCall: needsGpu ? gpuCallPlan(view.ttsSettings, view.sttSettings, gpu) : null,
+        gpuWarningClosed: false
+      })
       await startVoiceCall(session.id)
     } finally {
       setChecking(false)
@@ -100,7 +129,8 @@ export function VoiceCallButton({ session }: { session: Session }): React.JSX.El
           className={cn(
             'flex size-7 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
             mine && 'voice-call-button-active bg-accent/15 text-accent-strong hover:bg-accent/25',
-            (busy || remote || off) && 'opacity-40'
+            (busy || remote || off) && 'opacity-40',
+            className
           )}
         >
           {mine ? <PhoneOff className="size-4" /> : <Phone className="size-4" />}

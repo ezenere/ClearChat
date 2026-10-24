@@ -5,24 +5,34 @@
 // `wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/multi-stream-input?model_id=…
 // &output_format=pcm_24000&inactivity_timeout=…[&language_code=pt][&auto_mode=true]`, chave no
 // header `xi-api-key` (e também em `xi_api_key` no 1º frame — campo documentado). Um socket por
-// chamada, UM CONTEXTO POR SENTENÇA (multi-context): o contexto abre com
+// chamada, UM CONTEXTO POR RESPOSTA (multi-context): o contexto abre com
 // `{ text: ' ', context_id, generation_config: { chunk_length_schedule } [, voice_settings] }`,
 // recebe o texto em pedaços (`{ text, context_id }` — palavras inteiras, sempre terminando em
-// espaço), fecha com `{ text: resto, context_id, flush: true }` + `{ context_id, close_context: true }`
-// e o servidor devolve `{ audio: base64 PCM16 24 kHz, contextId, alignment? }` … `{ isFinal: true,
-// contextId }`. Barge-in: `close_context` nos contextos que ainda não geraram e, se algum já estava
-// gerando, o socket é derrubado (o `close_context` deixa o flush terminar — derrubar para tudo na
-// hora); a próxima fala reconecta. O servidor fecha o socket ocioso depois de `inactivity_timeout`
-// (pedimos 180 s, o máximo) — reconexão preguiçosa na próxima fala, e contexto que perdeu o socket
-// antes de receber áudio é reenviado UMA vez num socket novo.
+// espaço), cada sentença cortada faz `{ text: resto, context_id, flush: true }` (gera já, SEM fechar
+// — a próxima sentença continua no mesmo contexto, com a prosódia da anterior) e o fim da resposta
+// fecha com `{ context_id, close_context: true }`; o servidor devolve `{ audio: base64 PCM16 24 kHz,
+// contextId, alignment }` … `{ isFinal: true, contextId }`. O alinhamento reparte o áudio contínuo
+// de volta em utterances por sentença (`alignedSegments.ts`). Barge-in: `close_context` no contexto
+// e, se ele ainda estava gerando, o socket é derrubado (o `close_context` deixa o flush terminar —
+// derrubar para tudo na hora); a próxima fala reconecta. O servidor fecha o socket ocioso depois de
+// `inactivity_timeout` (pedimos 180 s, o máximo) — reconexão preguiçosa na próxima fala, e contexto
+// que perdeu o socket antes de receber áudio é reenviado UMA vez num socket novo.
 //
 // `ElevenLabsCallTts` é o encaixe com a chamada (`TtsTextFeed`): `begin()` (turno novo — pré-abre o
-// socket), `partial(texto)` (a sentença ainda incompleta cresce — vai ao contexto atual palavra a
-// palavra, antes de a sentença fechar), `cut(sentença)` (o cortador fechou a sentença → flush do
-// contexto já começa a gerar), `reset()` (barge-in/parar) e `synth(sentença, signal)` (o `synth` da
-// chamada via `TtsStreamRelay` — pega o contexto daquela sentença e devolve o stream PCM).
+// socket), `partial(texto)` (a sentença ainda incompleta cresce — vai ao contexto da resposta palavra
+// a palavra, antes de a sentença fechar), `cut(sentença)` (o cortador fechou a sentença → flush: o
+// contexto já começa a gerar), `end()` (a resposta acabou → close_context), `reset()`
+// (barge-in/parar) e `synth(sentença, signal)` (o `synth` da chamada via `TtsStreamRelay` — a fatia
+// daquela sentença no áudio da resposta).
 import { abortError } from '../tools/util'
 import { TtsError, type TtsPcmStream } from './tts'
+import {
+  AlignedPcmSegmenter,
+  isSpeechUnit,
+  parseAlignment,
+  speechUnits,
+  type ElevenLabsAlignment
+} from './alignedSegments'
 import type { TtsSettings } from '@shared/voice'
 import {
   ELEVENLABS_OUTPUT_FORMAT,
@@ -65,11 +75,12 @@ const defaultWsFactory: WsFactory = (url, init) => {
 // ---------------- configuração ----------------
 
 /**
- * `chunk_length_schedule` (chars acumulados antes de cada geração; 50–500). O padrão da
- * ElevenLabs é [120, 160, 250, 290]; aqui o 1º trecho sai com 50 chars (a frase longa começa a
- * falar antes de fechar) — cada sentença ainda termina com `flush`, então frase curta não espera.
+ * `chunk_length_schedule` (chars acumulados antes de cada geração; 50–500) — o padrão da
+ * ElevenLabs. Cada sentença cortada faz `flush`, então a geração quase sempre sai na fronteira da
+ * sentença (frase curta não espera); o limiar só vale para frase longa ainda incompleta. Um 1º
+ * limiar de 50 chars gerava pedaços no meio da frase (pior prosódia) — trocado em 2026-10-23.
  */
-export const ELEVENLABS_CHUNK_SCHEDULE: readonly number[] = [50, 120, 160, 290]
+export const ELEVENLABS_CHUNK_SCHEDULE: readonly number[] = [120, 160, 250, 290]
 
 /** Ociosidade antes de o servidor fechar o socket (máximo documentado: 180 s). */
 export const ELEVENLABS_WS_INACTIVITY_S = 180
@@ -175,6 +186,24 @@ export class ElevenLabsContext {
   text = ''
   /** Recebeu `flush` (o servidor está gerando o resto). */
   flushed = false
+  /** `close_context` enviado (o servidor manda o `isFinal` depois do último áudio). */
+  closeSent = false
+  /**
+   * Contexto de RESPOSTA (`ElevenLabsCallTts`): aceita texto depois de um `flush` (vários flushes,
+   * um por sentença) e só fecha no `close()`.
+   */
+  multi = false
+  /** Contexto de resposta com todo o texto já transformado em áudio (nada gerando agora). */
+  settled = false
+  /**
+   * Destino do áudio no lugar da fila de `stream()` (contexto de resposta → segmentador por
+   * alinhamento). Com sink, `stream()` não é usado.
+   */
+  sink: {
+    audio(pcm: Uint8Array, alignment: ElevenLabsAlignment | null): void
+    final(): void
+    error(e: unknown): void
+  } | null = null
   /** Recebeu o `isFinal` (todo o áudio chegou). */
   final = false
   aborted = false
@@ -208,10 +237,46 @@ export class ElevenLabsContext {
 
   /** Acrescenta texto (sem flush). Vazio/só espaços → nada. */
   send(text: string): void {
-    if (this.done || this.flushed || !text) return
+    if (this.done || this.closeSent || (this.flushed && !this.multi) || !text) return
     this.text += text
     this.firstTextAt ??= this.#sock.now()
     this.#sock.frame(this, { text, context_id: this.id })
+  }
+
+  /**
+   * Contexto de resposta: entrega `tail` com `flush` (o buffer gera já — fim de uma sentença) sem
+   * fechar; o tempo máximo sem áudio fica armado até `settle()` (todo o texto já tem áudio).
+   */
+  flush(tail = ''): void {
+    if (this.done || this.closeSent) return
+    const t = tail && !/\s$/.test(tail) ? `${tail} ` : tail
+    this.text += t
+    this.flushed = true
+    this.settled = false
+    this.firstTextAt ??= this.#sock.now()
+    this.flushAt ??= this.#sock.now()
+    this.#sock.frame(this, { text: t || ' ', context_id: this.id, flush: true })
+    this.#arm()
+  }
+
+  /** Contexto de resposta: fim do texto → `close_context` (o servidor manda o `isFinal`). */
+  close(): void {
+    if (this.done || this.closeSent) return
+    this.closeSent = true
+    if (!this.flushed) {
+      // nada foi gerado: só descarta (o servidor não manda isFinal de contexto sem flush)
+      this.abort()
+      return
+    }
+    this.#sock.frame(this, { context_id: this.id, close_context: true })
+    this.#arm()
+  }
+
+  /** Todo o texto entregue já tem áudio (contexto de resposta ocioso): desarma o tempo máximo. */
+  settle(): void {
+    if (this.closeSent || this.done) return
+    this.settled = true
+    this.#clearTimer()
   }
 
   /** Último pedaço + `flush` (gera já) + `close_context` (o servidor manda o `isFinal`). */
@@ -227,6 +292,7 @@ export class ElevenLabsContext {
     }
     this.text += t
     this.flushed = true
+    this.closeSent = true
     this.firstTextAt ??= this.#sock.now()
     this.flushAt = this.#sock.now()
     this.#sock.frame(this, { text: t || ' ', context_id: this.id, flush: true })
@@ -242,6 +308,11 @@ export class ElevenLabsContext {
     this.#queue.length = 0
     this.#sock.release(this, true)
     this.#notify()
+    try {
+      this.sink?.error(abortError())
+    } catch {
+      /* o destino nunca derruba o socket */
+    }
   }
 
   /** Stream PCM16 mono 24 kHz do contexto (consumidor único). */
@@ -289,11 +360,29 @@ export class ElevenLabsContext {
 
   // ---- entrada do socket ----
 
-  /** @internal áudio base64 do servidor. */
-  pushAudio(b64: string): void {
+  /** @internal áudio base64 do servidor (+ o alinhamento de caracteres que veio junto). */
+  pushAudio(b64: string, alignment: ElevenLabsAlignment | null = null): void {
     if (this.done) return
     const bytes = Buffer.from(b64, 'base64')
     const pcm = this.#aligner.push(new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.length))
+    if (this.sink) {
+      if (pcm.length && this.firstAudioAt == null) {
+        this.firstAudioAt = this.#sock.now()
+        try {
+          this.onFirstAudio?.(this)
+        } catch {
+          /* instrumentação nunca derruba o áudio */
+        }
+      }
+      this.audioBytes += pcm.length
+      if (pcm.length && this.#timer) this.#arm()
+      try {
+        this.sink.audio(pcm, alignment)
+      } catch {
+        /* o destino nunca derruba o socket */
+      }
+      return
+    }
     if (!pcm.length) return
     if (this.firstAudioAt == null) {
       this.firstAudioAt = this.#sock.now()
@@ -316,6 +405,11 @@ export class ElevenLabsContext {
     this.#clearTimer()
     this.#sock.release(this, false)
     this.#notify()
+    try {
+      this.sink?.final()
+    } catch {
+      /* o destino nunca derruba o socket */
+    }
   }
 
   /** @internal falha (erro do servidor, queda, tempo). */
@@ -329,6 +423,11 @@ export class ElevenLabsContext {
     this.#clearTimer()
     this.#sock.release(this, false)
     this.#notify()
+    try {
+      this.sink?.error(e)
+    } catch {
+      /* o destino nunca derruba o socket */
+    }
   }
 
   /** (Re)arma o tempo máximo sem áudio depois do flush. */
@@ -418,7 +517,8 @@ export class ElevenLabsSocket {
 
   /** Algum contexto está gerando (flush enviado, sem `isFinal`)? */
   get generating(): boolean {
-    for (const c of this.#live.values()) if (c.flushed && !c.done && c.started) return true
+    for (const c of this.#live.values())
+      if (c.flushed && !c.done && c.started && !(c.multi && c.settled)) return true
     return false
   }
 
@@ -588,7 +688,9 @@ export class ElevenLabsSocket {
     const ctx = cid ? this.#live.get(cid) : undefined
     const hasAudio = typeof j.audio === 'string' && j.audio.length > 0
     const isFinal = j.isFinal === true || j.is_final === true
-    if (hasAudio) ctx?.pushAudio(j.audio as string)
+    // alinhamento do texto ORIGINAL (o `normalizedAlignment` tem números/abreviações por extenso)
+    const alignment = parseAlignment(j.alignment)
+    if (hasAudio || alignment) ctx?.pushAudio(hasAudio ? (j.audio as string) : '', alignment)
     if (isFinal) {
       ctx?.markFinal()
       return
@@ -659,7 +761,7 @@ export class ElevenLabsSocket {
         const frames: Record<string, unknown>[] = []
         if (c.text)
           frames.push({ text: c.text, context_id: c.id, ...(c.flushed ? { flush: true } : {}) })
-        if (c.flushed) frames.push({ context_id: c.id, close_context: true })
+        if (c.closeSent) frames.push({ context_id: c.id, close_context: true })
         c.pendingFrames = frames
         this.#waiting.unshift(c)
       }
@@ -728,27 +830,29 @@ export class ElevenLabsSocket {
  * Todos são best-effort (nunca lançam): sem eles o `synth(sentença)` sozinho também funciona.
  */
 export interface TtsTextFeed {
-  /** Turno novo (ou início da chamada): pré-abre a conexão; descarta a sentença parcial anterior. */
+  /** Turno novo (ou início da chamada): pré-abre a conexão; a resposta anterior termina de gerar. */
   begin(): void
   /** Texto da sentença ainda incompleta (cresce a cada delta do LLM). */
   partial(text: string): void
   /** O cortador fechou esta sentença (vai virar `synth(text)` em seguida, na ordem). */
   cut(sentence: string): void
+  /** A resposta acabou (o turno do agente terminou): nada mais vem para o contexto atual. */
+  end?(): void
   /** Barge-in/parar/turno retido: descarta tudo o que ainda não tocou. */
   reset(): void
   /** Fim da chamada: fecha a conexão. */
   close(): void
 }
 
-/** Latência de uma sentença/turno no WebSocket. */
+/** Latência de uma resposta no WebSocket. */
 export interface ElevenLabsLatency {
-  /** Contexto (sentença) que recebeu o 1º áudio. */
+  /** Contexto (resposta) que recebeu o 1º áudio. */
   contextId: string
-  /** 1º texto entregue → 1º áudio da sentença (ms). */
+  /** 1º texto entregue → 1º áudio do contexto (ms). */
   firstTextToAudioMs: number
-  /** Flush → 1º áudio (ms; null = o áudio chegou antes do flush). */
+  /** 1º flush → 1º áudio (ms; null = o áudio chegou antes do flush). */
   flushToAudioMs: number | null
-  /** 1º texto do TURNO → 1º áudio do turno (só na 1ª sentença do turno; senão null). */
+  /** 1º texto do TURNO → 1º áudio do turno (só no 1º contexto do turno; senão null). */
   turnMs: number | null
   /** Chars entregues no contexto até o 1º áudio. */
   chars: number
@@ -759,28 +863,75 @@ export interface ElevenLabsCallOptions {
   config(): ElevenLabsSocketOptions | null
   /** Instrumentação (1º texto → 1º áudio). */
   onLatency?(l: ElevenLabsLatency): void
-}
-
-/** O que foi entregue ao contexto da sentença em construção. */
-interface PartialSentence {
-  ctx: ElevenLabsContext
-  sent: string
+  /** Ociosidade antes de fechar o contexto da resposta (padrão `ELEVENLABS_TURN_IDLE_CLOSE_MS`). */
+  idleCloseMs?: number
 }
 
 /**
- * Encaixe da chamada com o WebSocket da ElevenLabs: a sentença ainda incompleta vai ao contexto
- * palavra a palavra (`partial`), o corte faz o flush (`cut`) e o `synth(sentença)` pega o contexto
- * daquela sentença (ou abre um na hora, com o texto inteiro, quando os ganchos não vieram — ex.:
- * frases retidas que voltam). Ordem/concorrência/descartes são da chamada + `TtsStreamRelay`.
+ * Sem texto novo por este tempo depois da última sentença cortada → o contexto da resposta fecha
+ * (pausa longa do LLM, ex.: tools rodando). O texto que vier depois abre um contexto novo.
+ */
+export const ELEVENLABS_TURN_IDLE_CLOSE_MS = 2000
+
+/** Respostas mantidas para o `synth` achar a fatia (a atual + as anteriores ainda tocando). */
+const MAX_TURNS = 3
+
+/** Uma sentença cortada dentro do contexto da resposta. */
+interface TurnSegment {
+  text: string
+  index: number
+  claimed: boolean
+  cutAt: number
+}
+
+/** Uma resposta: um contexto, o segmentador por alinhamento e o texto entregue/cortado. */
+interface Turn {
+  ctx: ElevenLabsContext
+  seg: AlignedPcmSegmenter
+  /** Texto bruto entregue ao contexto (sempre termina em espaço). */
+  sent: string
+  /** Sentenças cortadas, cada uma seguida de um espaço. */
+  cutText: string
+  sentUnits: number
+  cutUnits: number
+  /** Unidades entregues até o último flush (o que o servidor está gerando). */
+  flushedUnits: number
+  segments: TurnSegment[]
+  idleTimer: ReturnType<typeof setTimeout> | null
+}
+
+/**
+ * O que falta entregar de `target` dado o que já foi (`sent`): normalmente um sufixo direto; se os
+ * espaços divergirem (corte forçado numa quebra de linha, espaços duplos), pelas unidades de fala.
+ */
+export function unsentSuffix(sent: string, target: string): string {
+  if (target.startsWith(sent)) return target.slice(sent.length)
+  if (sent.startsWith(target) || sent.trimEnd() === target.trimEnd()) return ''
+  const n = speechUnits(sent)
+  let seen = 0
+  let i = 0
+  for (; i < target.length && seen < n; i++) if (isSpeechUnit(target[i])) seen++
+  if (seen < n) return ''
+  while (i < target.length && !/\s/.test(target[i])) i++ // o resto do token já foi entregue
+  return target.slice(i).replace(/^\s+/, '')
+}
+
+/** O texto como o contexto o registra (pedaço com flush ganha espaço final). */
+const withSpace = (t: string): string => (t && !/\s$/.test(t) ? `${t} ` : t)
+
+/**
+ * Encaixe da chamada com o WebSocket da ElevenLabs: UM contexto por resposta. A sentença ainda
+ * incompleta vai palavra a palavra (`partial`), cada corte faz `flush` sem fechar (`cut`) e o
+ * `synth(sentença)` devolve a FATIA daquela sentença no áudio contínuo do contexto (repartido pelo
+ * alinhamento — `AlignedPcmSegmenter`). Prosódia contínua entre as frases, sem fila de contextos;
+ * a chamada segue com uma utterance por sentença (histórico/barge-in/ordem iguais). Sentença que a
+ * resposta não tem (nova tentativa depois de uma falha) → contexto avulso com o texto inteiro.
  */
 export class ElevenLabsCallTts implements TtsTextFeed {
   readonly #o: ElevenLabsCallOptions
   #sock: ElevenLabsSocket | null = null
-  #cur: PartialSentence | null = null
-  /** Sentenças cortadas (com flush feito) esperando o `synth`, na ordem. */
-  #ready: { text: string; ctx: ElevenLabsContext }[] = []
-  /** Texto entregue além do corte (corte forçado no meio do que já foi): pular no próximo. */
-  #carry = ''
+  /** Respostas recentes (a última é a atual quando o contexto dela ainda aceita texto). */
+  #turns: Turn[] = []
   #turnFirstTextAt: number | null = null
   #turnReported = false
 
@@ -793,11 +944,16 @@ export class ElevenLabsCallTts implements TtsTextFeed {
     return this.#sock
   }
 
+  /** Segmentador da resposta atual (diagnóstico/testes). */
+  get segmenter(): AlignedPcmSegmenter | null {
+    return this.#current()?.seg ?? null
+  }
+
   begin(): void {
     const sock = this.#socket()
     if (!sock) return
-    this.#dropCurrent()
-    this.#carry = ''
+    // a resposta anterior termina de gerar o que já foi cortado (pode ainda estar tocando)
+    this.#endCurrent()
     this.#turnFirstTextAt = null
     this.#turnReported = false
     sock.warm()
@@ -806,18 +962,21 @@ export class ElevenLabsCallTts implements TtsTextFeed {
   partial(text: string): void {
     const sock = this.#socket()
     if (!sock) return
-    const r = this.#stripCarry(text.replace(/^\s+/, ''), false)
-    if (r == null) return
+    const rest = text.replace(/^\s+/, '')
+    if (!rest) return
+    const cur = this.#current()
+    const target = (cur?.cutText ?? '') + rest
     // só palavras inteiras (o pedaço sempre termina em espaço — recomendação da ElevenLabs)
-    const m = /^[\s\S]*\s/.exec(r)
+    const m = /^[\s\S]*\s/.exec(target)
     const words = m ? m[0] : ''
-    if (!words.trim()) return
-    if (!this.#cur) this.#cur = { ctx: this.#newContext(sock), sent: '' }
-    const cur = this.#cur
-    if (words.length > cur.sent.length && words.startsWith(cur.sent)) {
-      cur.ctx.send(words.slice(cur.sent.length))
-      cur.sent = words
-    }
+    const add = unsentSuffix(cur?.sent ?? '', words)
+    if (!add.trim()) return
+    const turn = cur ?? this.#open(sock)
+    this.#clearIdle(turn)
+    turn.ctx.send(add)
+    turn.sent += add
+    turn.sentUnits += speechUnits(add)
+    turn.seg.setTailOpen(turn.sentUnits > turn.cutUnits)
   }
 
   cut(sentence: string): void {
@@ -825,33 +984,31 @@ export class ElevenLabsCallTts implements TtsTextFeed {
     if (!sock) return
     const s = sentence.trim()
     if (!s) return
-    const body = this.#stripCarry(s, true)
-    const cur = this.#cur
-    this.#cur = null
-    if (body == null) {
-      // a sentença inteira já foi falada pelo contexto anterior (corte forçado): nada a enviar
-      return
-    }
-    let ctx: ElevenLabsContext
-    if (cur && !cur.ctx.done && body.startsWith(cur.sent)) {
-      ctx = cur.ctx
-      ctx.finish(body.slice(cur.sent.length))
-    } else if (cur && !cur.ctx.done && cur.sent.startsWith(body)) {
-      // corte forçado DENTRO do que já foi entregue: o resto entregue vira "carry"
-      ctx = cur.ctx
-      this.#carry = cur.sent.slice(body.length).trim()
-      ctx.finish('')
-    } else {
-      cur?.ctx.abort()
-      ctx = this.#newContext(sock)
-      ctx.finish(body)
-    }
-    this.#ready.push({ text: s, ctx })
+    const turn = this.#current() ?? this.#open(sock)
+    this.#clearIdle(turn)
+    const target = `${turn.cutText}${s} `
+    const add = withSpace(unsentSuffix(turn.sent, target))
+    turn.ctx.flush(add)
+    turn.sent += add
+    turn.sentUnits += speechUnits(add)
+    turn.flushedUnits = turn.sentUnits
+    turn.cutText = target
+    const units = speechUnits(s)
+    turn.cutUnits += units
+    const index = turn.seg.addSegment(units)
+    turn.segments.push({ text: s, index, claimed: false, cutAt: sock.now() })
+    turn.seg.setTailOpen(turn.sentUnits > turn.cutUnits)
+    this.#armIdle(turn)
+  }
+
+  end(): void {
+    this.#endCurrent()
   }
 
   /**
-   * `synth` da chamada (via `TtsStreamRelay.synth`): o contexto já cortado desta sentença, ou um
-   * novo com o texto inteiro. Sentenças cortadas antes desta e nunca pedidas são descartadas.
+   * `synth` da chamada (via `TtsStreamRelay.synth`): a fatia desta sentença no áudio da resposta
+   * (sentenças cortadas antes dela e nunca pedidas são descartadas), ou um contexto avulso com o
+   * texto inteiro quando a resposta não a tem (nova tentativa depois de uma falha).
    */
   synth(text: string, signal?: AbortSignal): TtsPcmStream {
     const s = text.trim()
@@ -862,37 +1019,57 @@ export class ElevenLabsCallTts implements TtsTextFeed {
       })
     if (!s)
       throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
-    const i = this.#ready.findIndex((r) => r.text === s && !r.ctx.aborted && !r.ctx.error)
-    let ctx: ElevenLabsContext
-    if (i >= 0) {
-      for (const skipped of this.#ready.splice(0, i)) skipped.ctx.abort()
-      ctx = this.#ready.shift()!.ctx
-    } else {
-      ctx = this.#newContext(sock)
-      ctx.finish(s)
+    const model = this.#o.config()?.modelId ?? ''
+    for (const turn of this.#turns) {
+      const i = turn.segments.findIndex((x) => !x.claimed && x.text === s)
+      if (i < 0) continue
+      for (const skipped of turn.segments.slice(0, i)) {
+        if (skipped.claimed) continue
+        skipped.claimed = true
+        turn.seg.drop(skipped.index)
+      }
+      const item = turn.segments[i]
+      item.claimed = true
+      if (turn.ctx.error || turn.ctx.aborted) break // a resposta falhou: contexto avulso
+      return {
+        streaming: true,
+        sampleRate: ELEVENLABS_SAMPLE_RATE,
+        model,
+        backend: 'api',
+        t0: item.cutAt,
+        chunks: turn.seg.stream(item.index, signal)
+      }
     }
-    return ctx.stream(signal, this.#o.config()?.modelId ?? '')
+    const ctx = this.#newContext(sock)
+    ctx.finish(s)
+    return ctx.stream(signal, model)
   }
 
   reset(): void {
     const sock = this.#sock
-    this.#dropCurrent()
-    for (const r of this.#ready) r.ctx.abort()
-    this.#ready = []
-    this.#carry = ''
+    // medido ANTES de descartar (o contexto descartado sai da conta do socket)
+    const generating = !!sock?.generating
+    for (const t of this.#turns) {
+      this.#clearIdle(t)
+      t.ctx.abort()
+      t.seg.abort()
+    }
+    this.#turns = []
     if (!sock) return
-    // algum contexto ainda gerando (flush em curso não para com close_context): derruba o socket
-    // — o próximo turno reconecta (begin pré-abre)
-    if (sock.generating) {
+    // contexto ainda gerando (flush em curso não para com close_context): derruba o socket — o
+    // próximo turno reconecta (begin pré-abre)
+    if (generating) {
       sock.close()
       this.#sock = null
     }
   }
 
   close(): void {
-    this.#dropCurrent()
-    for (const r of this.#ready) r.ctx.abort()
-    this.#ready = []
+    for (const t of this.#turns) {
+      this.#clearIdle(t)
+      t.seg.abort()
+    }
+    this.#turns = []
     this.#sock?.close()
     this.#sock = null
   }
@@ -917,6 +1094,48 @@ export class ElevenLabsCallTts implements TtsTextFeed {
     return this.#sock
   }
 
+  /** Resposta que ainda aceita texto (null = a próxima entrega abre um contexto novo). */
+  #current(): Turn | null {
+    const t = this.#turns.at(-1)
+    return t && !t.ctx.done && !t.ctx.closeSent ? t : null
+  }
+
+  #open(sock: ElevenLabsSocket): Turn {
+    const ctx = this.#newContext(sock)
+    ctx.multi = true
+    const seg = new AlignedPcmSegmenter({ sampleRate: ELEVENLABS_SAMPLE_RATE })
+    const turn: Turn = {
+      ctx,
+      seg,
+      sent: '',
+      cutText: '',
+      sentUnits: 0,
+      cutUnits: 0,
+      flushedUnits: 0,
+      segments: [],
+      idleTimer: null
+    }
+    ctx.sink = {
+      audio: (pcm, alignment) => {
+        if (alignment) seg.pushAlignment(alignment)
+        if (pcm.length) seg.pushPcm(pcm)
+        // tudo o que foi pedido já tem áudio: nada gerando (o tempo máximo sem áudio desarma)
+        if (turn.flushedUnits && seg.alignedUnits >= turn.flushedUnits) ctx.settle()
+      },
+      final: () => seg.finish(),
+      error: (e) => {
+        if (e instanceof Error && e.name === 'AbortError') seg.abort()
+        else seg.fail(e)
+      }
+    }
+    this.#turns.push(turn)
+    while (this.#turns.length > MAX_TURNS) {
+      const old = this.#turns.shift()!
+      this.#clearIdle(old)
+    }
+    return turn
+  }
+
   #newContext(sock: ElevenLabsSocket): ElevenLabsContext {
     const ctx = sock.context()
     ctx.onFirstAudio = (c) => this.#reportLatency(c)
@@ -924,6 +1143,29 @@ export class ElevenLabsCallTts implements TtsTextFeed {
     // conexão quando o socket ainda não estava aberto)
     this.#turnFirstTextAt ??= sock.now()
     return ctx
+  }
+
+  /** Fecha o contexto da resposta atual (o já cortado termina de gerar; o resto cai fora). */
+  #endCurrent(): void {
+    const t = this.#current()
+    if (!t) return
+    this.#clearIdle(t)
+    t.ctx.close()
+  }
+
+  #armIdle(t: Turn): void {
+    this.#clearIdle(t)
+    if (t.sentUnits > t.cutUnits) return // sentença seguinte já chegando
+    t.idleTimer = setTimeout(() => {
+      t.idleTimer = null
+      if (this.#current() === t && t.sentUnits <= t.cutUnits) t.ctx.close()
+    }, this.#o.idleCloseMs ?? ELEVENLABS_TURN_IDLE_CLOSE_MS)
+    t.idleTimer.unref?.()
+  }
+
+  #clearIdle(t: Turn): void {
+    if (t.idleTimer) clearTimeout(t.idleTimer)
+    t.idleTimer = null
   }
 
   #reportLatency(c: ElevenLabsContext): void {
@@ -939,30 +1181,12 @@ export class ElevenLabsCallTts implements TtsTextFeed {
       chars: c.text.length
     })
   }
-
-  /**
-   * Tira o "carry" (texto já falado por um corte forçado) do começo; null = o texto inteiro ainda
-   * está dentro dele. `consume` (no corte) zera o carry; nos parciais ele fica até o corte.
-   */
-  #stripCarry(t: string, consume: boolean): string | null {
-    const carry = this.#carry
-    if (!carry) return t
-    if (consume) this.#carry = ''
-    if (t.startsWith(carry)) return t.slice(carry.length).replace(/^\s+/, '') || null
-    if (carry.startsWith(t.trim())) return null
-    this.#carry = '' // divergiu: esquece
-    return t
-  }
-
-  #dropCurrent(): void {
-    this.#cur?.ctx.abort()
-    this.#cur = null
-  }
 }
 
 /**
  * Opções do WebSocket para a fala atual — null quando a chamada NÃO deve usar o WebSocket da
- * ElevenLabs (backend local, outro provedor, sem chave, ou modelo que o WebSocket não aceita —
+ * ElevenLabs (backend local, outro provedor, sem chave, interruptor "Streaming por WebSocket"
+ * desligado — `api.elevenLabsWs === false` —, ou modelo que o WebSocket não aceita —
  * esses seguem o `synth` por sentença via REST `/stream`).
  */
 export function elevenLabsCallOptions(
@@ -970,6 +1194,8 @@ export function elevenLabsCallOptions(
   extra: Partial<ElevenLabsSocketOptions> = {}
 ): ElevenLabsSocketOptions | null {
   if (tts.backend !== 'api' || !isElevenLabsEndpoint(tts.api)) return null
+  // "Streaming por WebSocket" desligado em Áudio → Fala: HTTP por frase
+  if (tts.api.elevenLabsWs === false) return null
   let cfg: ElevenLabsConfig
   try {
     cfg = elevenLabsConfig(tts.api)

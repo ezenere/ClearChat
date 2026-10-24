@@ -7,6 +7,7 @@ import {
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_CALL_UTTERANCE_CHUNK_CHANNEL,
+  VOICE_GPU_PROGRESS_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
@@ -20,6 +21,7 @@ import {
   type VoicePartialEvent
 } from '@shared/ipc'
 import type { VoiceCallState } from '@shared/voice'
+import type { GpuStatus } from '@shared/gpuVoice'
 import type { AgentEvent } from '@shared/types'
 
 const invoke = ipcRenderer.invoke.bind(ipcRenderer)
@@ -207,6 +209,23 @@ const api: FullClearApi = {
     },
     runtime: {
       status: () => invoke(IPC.voice.runtimeStatus)
+    },
+    // "Modo avançado (GPU local)": URL/token do servidor nunca passam por aqui
+    gpu: {
+      status: () => invoke(IPC.voice.gpuStatus),
+      installRuntime: () => invoke(IPC.voice.gpuInstallRuntime),
+      removeRuntime: () => invoke(IPC.voice.gpuRemoveRuntime),
+      installEngine: (id) => invoke(IPC.voice.gpuInstallEngine, id),
+      removeEngine: (id) => invoke(IPC.voice.gpuRemoveEngine, id),
+      cancel: () => invoke(IPC.voice.gpuCancel),
+      selfTest: (id) => invoke(IPC.voice.gpuSelfTest, id),
+      startServer: (ids) => invoke(IPC.voice.gpuStartServer, ids),
+      stopServer: () => invoke(IPC.voice.gpuStopServer),
+      addUserVoice: (input) => invoke(IPC.voice.gpuAddUserVoice, input),
+      removeUserVoice: (id) => invoke(IPC.voice.gpuRemoveUserVoice, id),
+      downloadCc0Voice: (input) => invoke(IPC.voice.gpuDownloadCc0Voice, input),
+      transcribe: (input) => invoke(IPC.voice.gpuTranscribe, input),
+      log: () => invoke(IPC.voice.gpuLog)
     }
   },
   sync: {
@@ -269,6 +288,13 @@ const api: FullClearApi = {
     ipcRenderer.on(VOICE_MODELS_PROGRESS_CHANNEL, listener)
     return () => {
       ipcRenderer.removeListener(VOICE_MODELS_PROGRESS_CHANNEL, listener)
+    }
+  },
+  onVoiceGpuProgress: (cb) => {
+    const listener = (_e: IpcRendererEvent, event: GpuStatus): void => cb(event)
+    ipcRenderer.on(VOICE_GPU_PROGRESS_CHANNEL, listener)
+    return () => {
+      ipcRenderer.removeListener(VOICE_GPU_PROGRESS_CHANNEL, listener)
     }
   },
   onVoiceTtsClipsProgress: (cb) => {

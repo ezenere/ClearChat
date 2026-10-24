@@ -1,8 +1,8 @@
 // Settings de áudio (`src/main/voice.ts`) no repositório REAL (db.ts/repo.ts com o módulo
 // `electron` substituído por stub — padrão de e2e/branches.test.ts): round-trip normalizado dos 4
-// grupos, proteção da apiKey (PROTECTED_SETTINGS + máscara em get/set — a chave real nunca sai do
-// main) e escrita por cima do valor mascarado preservando a chave real (espelho de
-// webSearchApiKeys). Rodar: npm run test:unit
+// grupos; stt/tts guardam só provedor/modelo/voz/opções (`baseUrl`/`apiKey` nunca são gravados) e
+// os serviços do main recebem endereço e chave do provedor cadastrado — a visão do renderer nunca
+// os leva. Rodar: npm run test:unit
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { registerHooks } from 'node:module'
@@ -12,10 +12,9 @@ import { join } from 'node:path'
 import { PROTECTED_SETTINGS } from '../src/shared/webSearchSettings.ts'
 import {
   DEFAULT_AUDIO_INPUT,
+  DEFAULT_STT_SETTINGS,
   DEFAULT_TTS_SETTINGS,
-  DEFAULT_VOICE_CALL_DEFAULTS,
-  type SttSettings,
-  type TtsSettings
+  DEFAULT_VOICE_CALL_DEFAULTS
 } from '../src/shared/voice.ts'
 
 const TMP = mkdtempSync(join(process.env.CLEARCHAT_TEST_TMP || tmpdir(), 'clearchat-voice-'))
@@ -51,19 +50,16 @@ after(async () => {
   if (repoMod) (await import('../src/main/db.ts')).closeDb()
 })
 
-const realSttKey = async (): Promise<string> =>
-  (await repo()).settingsRepo.get<SttSettings>('sttSettings')?.api.apiKey ?? ''
-const realTtsKey = async (): Promise<string> =>
-  (await repo()).settingsRepo.get<TtsSettings>('ttsSettings')?.api.apiKey ?? ''
+/** O JSON gravado no banco (sem normalizar) de uma setting. */
+const rawSetting = async (key: string): Promise<string> =>
+  JSON.stringify((await repo()).settingsRepo.get(key) ?? null)
 
 // ---------------- proteção ----------------
 
-test('PROTECTED_SETTINGS cobre as settings com chave (stt/tts/webSearch) e não as demais', () => {
+test('PROTECTED_SETTINGS: só as chaves dos buscadores (stt/tts não guardam chave)', () => {
   assert.ok(PROTECTED_SETTINGS.includes('webSearchApiKeys'))
-  assert.ok(PROTECTED_SETTINGS.includes('sttSettings'))
-  assert.ok(PROTECTED_SETTINGS.includes('ttsSettings'))
-  assert.ok(!PROTECTED_SETTINGS.includes('audioInput'))
-  assert.ok(!PROTECTED_SETTINGS.includes('voiceCallDefaults'))
+  for (const k of ['sttSettings', 'ttsSettings', 'audioInput', 'voiceCallDefaults'])
+    assert.ok(!PROTECTED_SETTINGS.includes(k), k)
 })
 
 // ---------------- round-trip normalizado ----------------
@@ -108,99 +104,67 @@ test('voiceCallDefaults: parcial completa com os padrões; get devolve o gravado
   assert.deepEqual(v.getVoiceSettingsView().voiceCallDefaults, saved)
 })
 
-// ---------------- apiKey: máscara + preservação ----------------
+// ---------------- stt/tts: só provedor + modelo/voz/opções ----------------
 
-test('sttSettings: a chave real fica no banco; get/set devolvem a máscara', async () => {
+test('sttSettings/ttsSettings: baseUrl/apiKey vindos no set não são gravados nem devolvidos', async () => {
   const v = await voice()
-  const saved = v.setVoiceSetting('sttSettings', {
-    api: { apiKey: 'gsk-abcdefghijklmnop', model: 'm1' }
+  const stt = v.setVoiceSetting('sttSettings', {
+    api: { providerId: 'p-x', baseUrl: 'https://a/v1', apiKey: 'gsk-SECRET-1', model: 'm1' }
   })
-  assert.equal(saved.api.apiKey, 'gsk-…mnop', 'set devolve mascarado')
-  assert.equal(saved.api.model, 'm1')
-  assert.equal(await realSttKey(), 'gsk-abcdefghijklmnop', 'chave real gravada no banco')
-  assert.equal(
-    v.getVoiceSettingsView().sttSettings.api.apiKey,
-    'gsk-…mnop',
-    'get devolve mascarado'
-  )
-  assert.equal(
-    v.getVoiceSettings().stt.api.apiKey,
-    'gsk-abcdefghijklmnop',
-    'o main (sessão de transcrição) lê a chave real'
-  )
-  assert.deepEqual(
-    v.setVoiceSetting('sttSettings', saved),
-    saved,
-    'set com os valores do get = no-op'
-  )
-})
-
-test('sttSettings: escrever por cima do valor mascarado preserva a chave real', async () => {
-  const v = await voice()
-  v.setVoiceSetting('sttSettings', { api: { apiKey: 'gsk-SECRETKEY123456', model: 'm1' } })
-  // a UI ecoa o grupo com a MÁSCARA no lugar da chave (formulário) e mexe em outra coisa
-  const view = v.getVoiceSettingsView().sttSettings
-  assert.equal(view.api.apiKey, 'gsk-…3456')
-  const saved = v.setVoiceSetting('sttSettings', { ...view, api: { ...view.api, model: 'm2' } })
-  assert.equal(saved.api.model, 'm2')
-  assert.equal(await realSttKey(), 'gsk-SECRETKEY123456', 'a chave real não foi apagada')
-  // escrever a própria chave real também preserva (sem efeito)
-  const saved2 = v.setVoiceSetting('sttSettings', {
-    api: { apiKey: 'gsk-SECRETKEY123456', model: 'm3' }
-  })
-  assert.equal(saved2.api.model, 'm3')
-  assert.equal(await realSttKey(), 'gsk-SECRETKEY123456')
-})
-
-test("sttSettings: '' e null removem a chave; ausente/lixo preservam; string nova substitui", async () => {
-  const v = await voice()
-  const KEY = 'gsk-KEEPME9876543210'
-  // campo ausente → preserva
-  v.setVoiceSetting('sttSettings', { api: { apiKey: KEY } })
-  v.setVoiceSetting('sttSettings', { api: { model: 'x' } })
-  assert.equal(await realSttKey(), KEY, 'apiKey ausente preserva a chave')
-  // lixo (não-string) → preserva
-  v.setVoiceSetting('sttSettings', { api: { apiKey: 123 } })
-  assert.equal(await realSttKey(), KEY, 'apiKey lixo não apaga a chave')
-  // grupo inteiro lixo → vai aos padrões, mas a chave sobrevive
-  v.setVoiceSetting('sttSettings', 'garbage')
-  assert.equal(await realSttKey(), KEY, 'grupo lixo não apaga a chave')
-  // string nova (aparada) → substitui
-  const saved = v.setVoiceSetting('sttSettings', { api: { apiKey: '  gsk-newkey-0000001111  ' } })
-  assert.equal(await realSttKey(), 'gsk-newkey-0000001111')
-  assert.equal(saved.api.apiKey, 'gsk-…1111')
-  // '' e null removem (ação explícita de limpar, como em webSearch.setKey)
-  v.setVoiceSetting('sttSettings', { api: { apiKey: '' } })
-  assert.equal(await realSttKey(), '')
-  v.setVoiceSetting('sttSettings', { api: { apiKey: KEY } })
-  v.setVoiceSetting('sttSettings', { api: { apiKey: null } })
-  assert.equal(await realSttKey(), '')
-  assert.equal(v.getVoiceSettingsView().sttSettings.api.apiKey, '', 'sem chave → máscara vazia')
-})
-
-test('ttsSettings: mesma proteção da apiKey (máscara + preservação) e local: null preservado', async () => {
-  const v = await voice()
-  const saved = v.setVoiceSetting('ttsSettings', {
+  assert.deepEqual(stt.api, { providerId: 'p-x', model: 'm1' })
+  const tts = v.setVoiceSetting('ttsSettings', {
     backend: 'api',
-    api: { apiKey: 'tvly-abcdefghijkl', model: 't1' }
-  })
-  assert.equal(saved.api.apiKey, 'tvly-…ijkl')
-  assert.equal(await realTtsKey(), 'tvly-abcdefghijkl')
-  const view = v.getVoiceSettingsView().ttsSettings
-  const saved2 = v.setVoiceSetting('ttsSettings', {
-    ...view,
-    api: { ...view.api, model: 't2' },
+    api: {
+      providerId: 'p-y',
+      baseUrl: 'https://b/v1',
+      apiKey: 'sk-SECRET-2',
+      providerKind: 'elevenlabs',
+      model: 't1',
+      voice: 'v1',
+      elevenLabsWs: false
+    },
     local: null
   })
-  assert.equal(saved2.api.model, 't2')
-  assert.equal(saved2.local, null, 'local: null = limpeza explícita preservada')
-  assert.equal(await realTtsKey(), 'tvly-abcdefghijkl', 'escrita por cima da máscara preserva')
-  // sem apiKey no form → preserva; vazio → remove
-  v.setVoiceSetting('ttsSettings', { api: {} })
-  assert.equal(await realTtsKey(), 'tvly-abcdefghijkl')
-  v.setVoiceSetting('ttsSettings', { api: { apiKey: '' } })
-  assert.equal(await realTtsKey(), '')
-  assert.deepEqual(v.setVoiceSetting('ttsSettings', 42), DEFAULT_TTS_SETTINGS, 'lixo → padrões')
+  assert.deepEqual(tts.api, { providerId: 'p-y', model: 't1', voice: 'v1', elevenLabsWs: false })
+  assert.equal(tts.local, null, 'local: null = limpeza explícita preservada')
+  for (const raw of [await rawSetting('sttSettings'), await rawSetting('ttsSettings')]) {
+    assert.ok(!/SECRET|baseUrl|apiKey|providerKind/.test(raw), raw)
+  }
+  assert.ok(!/SECRET|baseUrl|apiKey/.test(JSON.stringify(v.getVoiceSettingsView())))
+  // lixo → padrões
+  assert.deepEqual(v.setVoiceSetting('ttsSettings', 42), DEFAULT_TTS_SETTINGS)
+  assert.deepEqual(v.setVoiceSetting('sttSettings', 42), DEFAULT_STT_SETTINGS)
+})
+
+test('baseUrl/apiKey gravados por build de desenvolvimento: descartados na leitura (sem provedor = sem endpoint)', async () => {
+  const v = await voice()
+  const r = await repo()
+  r.settingsRepo.set('sttSettings', {
+    mode: 'api',
+    api: {
+      providerId: null,
+      baseUrl: 'https://api.groq.com/openai/v1',
+      apiKey: 'gsk-OLD',
+      model: 'm'
+    }
+  })
+  r.settingsRepo.set('ttsSettings', {
+    backend: 'api',
+    api: { providerId: null, baseUrl: 'http://localhost:8880/v1', apiKey: 'OLD', model: 't' }
+  })
+  const view = v.getVoiceSettingsView()
+  assert.deepEqual(view.sttSettings.api, { providerId: null, model: 'm' })
+  assert.deepEqual(view.ttsSettings.api, { providerId: null, model: 't', voice: null })
+  // os serviços também não recebem esse endereço: sem provedor, sem endereço/chave
+  const eff = v.getVoiceSettings()
+  assert.equal(eff.stt.api.baseUrl, undefined)
+  assert.equal(eff.stt.api.apiKey, undefined)
+  assert.equal(eff.tts.api.baseUrl, undefined)
+  // a próxima escrita regrava sem os campos antigos
+  v.setVoiceSetting('sttSettings', view.sttSettings)
+  assert.ok(!/OLD|baseUrl/.test(await rawSetting('sttSettings')))
+  v.setVoiceSetting('ttsSettings', { backend: 'local' })
+  v.setVoiceSetting('sttSettings', {})
 })
 
 test('setVoiceSetting: grupo desconhecido é erro legível', async () => {
@@ -219,26 +183,19 @@ test('providerId: serviços usam baseUrl/chave do provedor salvo; a visão nunca
     baseUrl: 'https://openrouter.ai/api/v1/',
     apiKey: providerKey
   })
-  const view = v.setVoiceSetting('ttsSettings', {
+  v.setVoiceSetting('ttsSettings', {
     backend: 'api',
-    api: {
-      providerId: p.id,
-      baseUrl: 'https://openrouter.ai/api/v1',
-      apiKey: '',
-      model: 'elevenlabs/eleven-flash-v2.5',
-      voice: 'sarah'
-    }
+    api: { providerId: p.id, model: 'elevenlabs/eleven-flash-v2.5', voice: 'sarah' }
   })
   v.setVoiceSetting('sttSettings', {
     mode: 'hybrid',
-    api: { providerId: p.id, baseUrl: '', apiKey: '', model: 'openai/whisper-large-v3-turbo' }
+    api: { providerId: p.id, model: 'openai/whisper-large-v3-turbo' }
   })
   // a setting guarda só o id — nunca a chave do provedor (nem mascarada)
-  assert.equal(await realTtsKey(), '')
-  assert.equal(view.api.apiKey, '')
   const json = JSON.stringify(v.getVoiceSettingsView())
   assert.equal(json.includes('PROVIDERSECRET'), false)
   assert.equal(json.includes(providerKey.slice(-4)), false, 'nem a máscara da chave do provedor')
+  assert.equal((await rawSetting('ttsSettings')).includes('PROVIDERSECRET'), false)
   // os serviços do main recebem o endpoint efetivo
   const eff = v.getVoiceSettings()
   assert.equal(eff.tts.api.baseUrl, 'https://openrouter.ai/api/v1')
@@ -246,24 +203,41 @@ test('providerId: serviços usam baseUrl/chave do provedor salvo; a visão nunca
   assert.equal(eff.tts.api.model, 'elevenlabs/eleven-flash-v2.5')
   assert.equal(eff.stt.api.baseUrl, 'https://openrouter.ai/api/v1')
   assert.equal(eff.stt.api.apiKey, providerKey)
-  // provedor apagado → volta aos campos próprios (endpoint avulso)
+  // provedor apagado → sem endpoint (o cliente recusa com "escolha um provedor")
   r.providersRepo.delete(p.id)
   const after = v.getVoiceSettings()
-  assert.equal(after.tts.api.apiKey, '')
-  assert.equal(after.stt.api.baseUrl, 'https://api.groq.com/openai/v1')
+  assert.equal(after.tts.api.baseUrl, undefined)
+  assert.equal(after.stt.api.apiKey, undefined)
   // limpa para os demais testes
   v.setVoiceSetting('ttsSettings', { backend: 'local' })
   v.setVoiceSetting('sttSettings', {})
 })
 
-test('resolveVoiceEndpoint: puro — sem providerId/provedor sem baseUrl mantém o avulso', async () => {
+test('provedor local sem chave (localhost, OpenAI-compatível): endereço resolvido, chave vazia', async () => {
+  const v = await voice()
+  const r = await repo()
+  const p = r.providersRepo.create({
+    name: 'Servidor local',
+    kind: 'openai',
+    baseUrl: 'http://127.0.0.1:8765/v1',
+    apiKey: ''
+  })
+  v.setVoiceSetting('sttSettings', { api: { providerId: p.id, model: 'whisper-1' } })
+  const eff = v.getVoiceSettings().stt.api
+  assert.equal(eff.baseUrl, 'http://127.0.0.1:8765/v1')
+  assert.equal(eff.apiKey, '')
+  r.providersRepo.delete(p.id)
+  v.setVoiceSetting('sttSettings', {})
+})
+
+test('resolveVoiceEndpoint: puro — só o provedor dá endereço/chave; sem ele, nada (nem campos antigos)', async () => {
   const { resolveVoiceEndpoint } = await voice()
-  const api = { providerId: null, baseUrl: 'https://a/v1', apiKey: 'k', model: 'm' }
-  assert.equal(
-    resolveVoiceEndpoint(api, () => ({ baseUrl: 'x', apiKey: 'y' })),
-    api
+  const stale = { providerId: null, baseUrl: 'https://a/v1', apiKey: 'k', model: 'm' }
+  assert.deepEqual(
+    resolveVoiceEndpoint(stale, () => ({ baseUrl: 'x', apiKey: 'y' })),
+    { providerId: null, model: 'm' }
   )
-  const withId = { ...api, providerId: 'p1' }
+  const withId = { providerId: 'p1', model: 'm' }
   assert.deepEqual(
     resolveVoiceEndpoint(withId, () => null),
     withId
@@ -274,10 +248,6 @@ test('resolveVoiceEndpoint: puro — sem providerId/provedor sem baseUrl mantém
   )
   assert.deepEqual(
     resolveVoiceEndpoint(withId, () => ({ baseUrl: 'https://p/v1', apiKey: ' s ' })),
-    {
-      ...withId,
-      baseUrl: 'https://p/v1',
-      apiKey: 's'
-    }
+    { ...withId, baseUrl: 'https://p/v1', apiKey: 's' }
   )
 })

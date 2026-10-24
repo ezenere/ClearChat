@@ -14,6 +14,7 @@ import {
   synthesizeElevenLabs,
   synthesizeElevenLabsStream
 } from './elevenlabs'
+import { GpuEndpointError, gpuTtsAsApi } from './gpu/endpoint'
 
 // ---------------- tipos ----------------
 
@@ -54,7 +55,7 @@ export type TtsErrorKind =
   | 'http' // demais 4xx/5xx (ou resposta 2xx sem áudio)
   | 'network' // conexão — ECONNREFUSED/DNS/reset…
   | 'timeout' // tempo esgotado
-  | 'config' // sem baseUrl/modelo ou motor local indisponível
+  | 'config' // sem provedor/modelo ou motor local indisponível
 
 /** Erro de síntese com categoria, status HTTP e backend de origem (mensagem legível em pt-BR). */
 export class TtsError extends Error {
@@ -178,7 +179,7 @@ function httpError(status: number, raw: string, url: string): TtsError {
  * áudio (wav/mp3). Chave no header `Authorization: Bearer …` quando há chave (servidores locais
  * compatíveis não exigem chave); a chave nunca é devolvida ao chamador. Erros → `TtsError`
  * legível (`kind`/`status`): `auth` (401/403), `quota` (429/402), `http` (demais 4xx/5xx e
- * resposta 2xx sem áudio), `network`, `timeout` (padrão 60 s) e `config` (sem baseUrl/modelo).
+ * resposta 2xx sem áudio), `network`, `timeout` (padrão 60 s) e `config` (sem provedor/modelo).
  * Abort do `signal` propaga como `AbortError`.
  */
 export async function synthesize(
@@ -189,11 +190,29 @@ export async function synthesize(
   if (!text)
     throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
   const format: TtsFormat = input.format ?? 'wav'
+  // backend `gpu` (Modo avançado): o servidor local vira um endpoint de API (URL/token do main)
+  input = { ...input, settings: await resolveGpuSettings(input.settings) }
   if (input.settings.backend === 'local') return synthesizeLocal(text, input.settings, format, opts)
   // ElevenLabs direta (provedor `elevenlabs` / host elevenlabs.io): REST próprio, sempre WAV 24 kHz
   if (isElevenLabsEndpoint(input.settings.api))
     return synthesizeElevenLabs(text, input.settings.api, opts)
   return synthesizeApi(text, input.settings, format, opts)
+}
+
+/**
+ * Backend `gpu` → settings de API apontando para o servidor local da GPU (o `GpuVoiceManager` sobe
+ * o processo do motor se preciso). Falha de prontidão vira `TtsError` (`config` = motor/runtime
+ * ausente ou bloqueado — fatal na chamada; `network` = servidor não subiu — transitória).
+ */
+async function resolveGpuSettings(settings: TtsSettings): Promise<TtsSettings> {
+  if (settings.backend !== 'gpu') return settings
+  try {
+    return await gpuTtsAsApi(settings)
+  } catch (e) {
+    if (e instanceof GpuEndpointError)
+      throw new TtsError(e.kind, e.message, { backend: 'api', cause: e })
+    throw e
+  }
 }
 
 async function synthesizeLocal(
@@ -292,15 +311,18 @@ async function requestSpeech(
   opts: TtsSynthesizeOptions
 ): Promise<SpeechResponse> {
   const api = settings.api
-  const baseUrl = api.baseUrl.trim().replace(/\/+$/, '')
+  // endereço/chave resolvidos pelo main a partir do provedor cadastrado (ou do servidor da GPU)
+  const baseUrl = (api.baseUrl ?? '').trim().replace(/\/+$/, '')
   const model = api.model.trim()
   if (!baseUrl)
-    throw new TtsError('config', 'endereço da API de síntese de fala não configurado', {
-      backend: 'api'
-    })
+    throw new TtsError(
+      'config',
+      'nenhum provedor de fala escolhido — escolha um em Configurações → Áudio',
+      { backend: 'api' }
+    )
   if (!model)
     throw new TtsError('config', 'modelo de síntese de fala não configurado', { backend: 'api' })
-  const key = api.apiKey.trim()
+  const key = (api.apiKey ?? '').trim()
   const url = `${baseUrl}/audio/speech`
   const timeoutMs = opts.timeoutMs ?? TTS_DEFAULT_TIMEOUT_MS
   const timeout = AbortSignal.timeout(timeoutMs)
@@ -458,6 +480,7 @@ export async function synthesizeStream(
   const text = input.text.trim()
   if (!text)
     throw new TtsError('config', 'texto para a síntese de fala está vazio', { backend: 'api' })
+  input = { ...input, settings: await resolveGpuSettings(input.settings) }
   if (input.settings.backend === 'local')
     return { streaming: false, result: await synthesizeLocal(text, input.settings, 'wav', opts) }
   if (isElevenLabsEndpoint(input.settings.api))

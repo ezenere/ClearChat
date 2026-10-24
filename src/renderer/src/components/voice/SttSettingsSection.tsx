@@ -1,43 +1,31 @@
-// Configurações → Áudio → Transcrição (STT): modo (API/Local/Híbrido); nos modos com API, o
-// PROVEDOR (um dos cadastrados em Provedores que serve transcrição, ou "Endpoint personalizado" no
-// avançado) e o MODELO listado por ele (descoberta no main, com correção de apelidos); nos modos
-// com motor local, o motor e o catálogo de modelos locais (no híbrido: qual modelo local faz as
-// parciais/especulação e a reserva). A chave do provedor nunca passa pela tela.
-import { useCallback, useState } from 'react'
+// Configurações → Áudio → Transcrição (STT). PROVEDOR = um dos cadastrados em Configurações →
+// Provedores que serve transcrição (OpenRouter, Groq, OpenAI, servidor local OpenAI-compatível…) ou
+// as opções embutidas "Local — whisper.cpp" e "Local (GPU)" (Modo avançado, whisper large-v3-turbo;
+// só escolhível com ele instalado). Com provedor: MODELO no mesmo seletor do chat (agrupado por
+// provedor) e "Motor local nas parciais e como reserva" (= modo híbrido). Endereço e chave ficam
+// só no provedor cadastrado — a chave nunca passa pela tela.
+import { useCallback } from 'react'
 import type { VoiceModelInfo, VoiceRuntimeStatus } from '@shared/ipc'
-import type { SttMode, SttSettings } from '@shared/voice'
-import { STT_LOCAL_PARTIAL_MAX_MODEL_BYTES } from '@shared/voice'
+import type { ModelRef } from '@shared/models'
+import type { SttSettings } from '@shared/voice'
+import { DEFAULT_STT_GPU, STT_LOCAL_PARTIAL_MAX_MODEL_BYTES } from '@shared/voice'
 import { voiceProviderSupport, type VoiceProviderSupport } from '@shared/voiceCatalog'
-import { useVoiceCatalog } from '../../lib/voice/useVoiceCatalog'
+import { useVoiceCatalogs } from '../../lib/voice/useVoiceCatalogs'
 import type { LocalModelAction } from '../../lib/voice/modelList'
-import { Label, Switch } from '../ui/controls'
-import { Select } from '../ui/Select'
-import { ApiInfo, C, HelpTip } from '../ui/Tooltip'
+import { ToggleRow } from '../panel/fields'
+import { Label } from '../ui/controls'
+import { ApiInfo, C } from '../ui/Tooltip'
+import { AudioSection, WarnNote } from './audioUi'
+import { LocalEnginePanel, VoiceModelField, VoiceSourceSelect } from './voiceSettingsParts'
 import {
-  ApiKeyField,
-  BaseUrlField,
-  CustomEndpointDisclosure,
-  LocalEnginePanel,
-  VoiceModelField,
-  VoiceProviderSelect
-} from './voiceSettingsParts'
-import {
-  CUSTOM_ENDPOINT,
   effectiveFamily,
+  GPU_SOURCE,
+  LOCAL_SOURCE,
+  providerMissing,
   type ProviderOption
 } from '../../lib/voice/voiceSettingsHelpers'
-
-const STT_MODE_LABELS: Record<SttMode, { label: string; description: string }> = {
-  api: { label: 'API', description: 'Provedor remoto (OpenRouter, Groq, OpenAI…)' },
-  local: {
-    label: 'Local',
-    description: 'Motor no dispositivo (whisper.cpp) — o áudio nunca sai do computador'
-  },
-  hybrid: {
-    label: 'Híbrido',
-    description: 'API na transcrição final; motor local nas parciais e como reserva'
-  }
-}
+import { useGpuStatus } from '../../lib/voice/gpu/useGpuStatus'
+import { GpuSectionLink, GpuSttPanel } from './gpu/GpuBackendPanels'
 
 /** Modelo de transcrição sugerido ao trocar de provedor (o id que a família usa). */
 const STT_DEFAULT_MODEL: Record<VoiceProviderSupport, string> = {
@@ -69,41 +57,26 @@ export function SttSettingsSection({
   modelProgress: Record<string, { bytes: number; total: number }>
   modelError: string | null
   runtime: VoiceRuntimeStatus | null
-  /** Grava `sttSettings` (a máscara da chave no valor = preserva a chave salva). */
+  /** Grava `sttSettings`. */
   onCommit: (next: SttSettings) => Promise<boolean>
   onModelAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
   onDismissModelError: () => void
 }): React.JSX.Element {
-  const usesApi = stt.mode !== 'local'
-  const usesLocal = stt.mode !== 'api'
+  const mode = stt.mode
+  const usesApi = mode === 'api' || mode === 'hybrid'
+  const usesLocal = mode === 'local' || mode === 'hybrid'
   const provider = providers.find((p) => p.id === stt.api.providerId) ?? null
-  const providerValue = provider ? provider.id : CUSTOM_ENDPOINT
-  const isCustom = !provider
-  const [advancedOpen, setAdvancedOpen] = useState<boolean | null>(null)
-  const advanced = advancedOpen ?? isCustom
-  const catalog = useVoiceCatalog(
-    'stt',
-    provider?.id ?? null,
-    usesApi,
-    isCustom ? stt.api.baseUrl : ''
-  )
-  const family = effectiveFamily(provider, stt.api.baseUrl)
+  const missing = usesApi && providerMissing(stt.api, providers)
+  const catalogs = useVoiceCatalogs('stt', usesApi ? (provider?.id ?? null) : null)
+  const family = effectiveFamily(provider)
+  const { status: gpuStatus, available: gpuAvailable } = useGpuStatus()
+  const whisperReady =
+    gpuStatus?.engines.find((e) => e.id === 'whisper-large-v3-turbo')?.install.state === 'installed'
 
-  const saveApi = (patch: Partial<SttSettings['api']>): void => {
-    void onCommit({ ...stt, api: { ...stt.api, ...patch } })
-  }
-  // estável para o efeito de correção de apelido do campo de modelo
-  const commitModel = useCallback(
-    (model: string) => void onCommit({ ...stt, api: { ...stt.api, model } }),
-    [onCommit, stt]
-  )
-
-  const pickProvider = (v: string): void => {
-    if (v === CUSTOM_ENDPOINT) {
-      setAdvancedOpen(true)
-      saveApi({ providerId: null })
-      return
-    }
+  const pickSource = (v: string): void => {
+    if (v === LOCAL_SOURCE) return void onCommit({ ...stt, mode: 'local' })
+    if (v === GPU_SOURCE)
+      return void onCommit({ ...stt, mode: 'gpu', gpu: stt.gpu ?? { ...DEFAULT_STT_GPU } })
     const p = providers.find((x) => x.id === v)
     const fam = p ? voiceProviderSupport(p) : null
     const model = modelFitsFamily(stt.api.model, fam)
@@ -111,9 +84,21 @@ export function SttSettingsSection({
       : fam
         ? STT_DEFAULT_MODEL[fam]
         : stt.api.model
-    setAdvancedOpen(false)
-    saveApi({ providerId: v, model })
+    void onCommit({
+      ...stt,
+      mode: mode === 'hybrid' ? 'hybrid' : 'api',
+      api: { ...stt.api, providerId: v, model }
+    })
   }
+  // estável para o efeito de correção de apelido do campo de modelo
+  const pickModel = useCallback(
+    (ref: ModelRef) =>
+      void onCommit({
+        ...stt,
+        api: { ...stt.api, providerId: ref.providerId, model: ref.model }
+      }),
+    [onCommit, stt]
+  )
 
   const local = stt.local
   const localModel = local ? models.find((m) => m.id === local.model) : undefined
@@ -128,228 +113,167 @@ export function SttSettingsSection({
       : null
 
   return (
-    <section className="border-t border-border pt-4" data-testid="stt-section">
-      <div className="mb-3 flex items-baseline gap-2">
-        <span className="text-[13px] font-medium text-fg/90">Transcrição (STT)</span>
-        <HelpTip label="Transcrição de voz em texto">
+    <AudioSection
+      title="Transcrição (STT)"
+      testId="stt-section"
+      help={
+        <>
           <p>
-            O áudio gravado no ditado e na chamada de voz vira texto por um provedor de API (um dos
-            cadastrados em Configurações → Provedores — OpenRouter, Groq, OpenAI…) ou pelo motor
-            local (whisper.cpp). Híbrido usa a API na transcrição final e o motor local nas
-            parciais/fim de turno e como reserva quando a API falha.
+            O áudio do ditado e da chamada de voz vira texto por um provedor cadastrado em
+            Configurações → Provedores (OpenRouter, Groq, OpenAI ou um servidor local
+            OpenAI-compatível — localhost pode ficar sem chave), pelo motor local (whisper.cpp) ou
+            pela GPU (Modo avançado).
           </p>
-          <p className="mt-2">
+          <p>
             A chave do provedor fica no processo principal e nunca chega à tela. Os modelos vêm da
-            lista do próprio provedor (OpenRouter: modelos de transcrição do{' '}
-            <C>/models?output_modalities=transcription</C>).
+            lista do próprio provedor (OpenRouter: <C>/models?output_modalities=transcription</C>).
           </p>
-        </HelpTip>
-        {usesApi && (
+        </>
+      }
+      info={
+        usesApi ? (
           <SttApiInfo
             stt={stt}
-            baseUrl={provider?.baseUrl ?? stt.api.baseUrl}
+            baseUrl={provider?.baseUrl ?? ''}
             language={language}
             family={family}
           />
-        )}
-      </div>
-      <div className="space-y-4">
-        <div>
-          <Label>Modo</Label>
-          <Select
-            value={stt.mode}
-            label="Modo de transcrição"
-            className="h-8 w-full max-w-[360px]"
-            menuMinWidth={360}
-            onChange={(mode) => void onCommit({ ...stt, mode })}
-            options={(['api', 'local', 'hybrid'] as SttMode[]).map((m) => ({
-              value: m,
-              label: STT_MODE_LABELS[m].label,
-              description: STT_MODE_LABELS[m].description
-            }))}
-          />
-        </div>
-
-        {usesApi && (
-          <div className="space-y-3" data-testid="stt-api">
-            <div>
-              <Label help="Provedores de Configurações → Provedores que servem transcrição (o endpoint e a chave vêm do provedor). Servidor fora da lista (ex.: whisper local OpenAI-compatível): Endpoint personalizado.">
-                Provedor
-              </Label>
-              <VoiceProviderSelect
-                capability="stt"
-                providers={providers}
-                value={providerValue}
-                onChange={pickProvider}
-                testId="stt-provider"
-              />
-              {stt.api.providerId && !provider && (
-                <p className="mt-1 text-[11px] text-warning" role="alert">
-                  O provedor escolhido não existe mais — usando o endpoint personalizado abaixo.
-                </p>
-              )}
-            </div>
-            <div>
-              <Label help="Modelo de transcrição do provedor (lista do provedor). Um id sem o prefixo do OpenRouter (ex.: whisper-large-v3-turbo) é corrigido sozinho para o id listado (openai/whisper-large-v3-turbo).">
-                Modelo
-              </Label>
-              <VoiceModelField
-                capability="stt"
-                state={catalog}
-                value={stt.api.model}
-                onCommit={commitModel}
-                testId="stt-model"
-                placeholder={
-                  family === 'openrouter'
-                    ? 'openai/whisper-large-v3-turbo'
-                    : 'whisper-large-v3-turbo'
+        ) : undefined
+      }
+    >
+      <div>
+        <Label help="Provedores de Configurações → Provedores que servem transcrição (o endpoint e a chave vêm de lá), o motor local whisper.cpp (no computador) ou a GPU (Modo avançado, abaixo).">
+          Provedor
+        </Label>
+        <VoiceSourceSelect
+          capability="stt"
+          providers={providers}
+          value={
+            mode === 'local' ? LOCAL_SOURCE : mode === 'gpu' ? GPU_SOURCE : (provider?.id ?? null)
+          }
+          onChange={pickSource}
+          local={{
+            label: 'Local — whisper.cpp',
+            description: 'No computador (CPU) — o áudio nunca sai daqui'
+          }}
+          gpu={
+            gpuAvailable || mode === 'gpu'
+              ? {
+                  enabled: whisperReady,
+                  description: whisperReady
+                    ? 'Whisper large-v3-turbo na sua placa de vídeo (Modo avançado)'
+                    : 'Instale o Whisper no Modo avançado (GPU local), abaixo'
                 }
-              />
-            </div>
-            <CustomEndpointDisclosure
-              open={advanced}
-              onToggle={() => setAdvancedOpen(!advanced)}
-              testId="stt-advanced"
-            >
-              {isCustom ? (
-                <>
-                  <div>
-                    <Label help="Base OpenAI-compatível (o app chama {baseUrl}/audio/transcriptions). Ex.: servidor whisper local, Groq sem cadastrar provedor.">
-                      Endpoint (baseUrl)
-                    </Label>
-                    <BaseUrlField
-                      value={stt.api.baseUrl}
-                      onCommit={(baseUrl) => saveApi({ baseUrl })}
-                      testId="stt-base-url"
-                      placeholder="https://api.groq.com/openai/v1"
-                      label="Endpoint de transcrição (baseUrl)"
-                    />
-                  </div>
-                  <div>
-                    <Label help="Chave do endpoint personalizado (header Authorization: Bearer). A máscara da chave salva aparece no campo vazio; cole uma chave nova e clique em Salvar, ou em Remover (X). Endpoint local pode ficar sem chave.">
-                      Chave de API
-                    </Label>
-                    <ApiKeyField
-                      mask={stt.api.apiKey}
-                      onSave={(key) =>
-                        onCommit({ ...stt, api: { ...stt.api, apiKey: key as string } })
-                      }
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-wrap items-center gap-2 text-[11px] text-subtle">
-                  <span>
-                    Usando o provedor “{provider.name}”. Para um servidor fora dos Provedores:
-                  </span>
-                  <button
-                    type="button"
-                    data-testid="stt-use-custom"
-                    onClick={() => pickProvider(CUSTOM_ENDPOINT)}
-                    className="rounded px-1 text-accent-strong underline-offset-2 hover:underline"
-                  >
-                    usar endpoint personalizado
-                  </button>
-                </div>
-              )}
-            </CustomEndpointDisclosure>
-            <div className="flex items-center gap-2">
-              <Label
-                className="mb-0"
-                help="Melhor-esforço enquanto você fala: o texto parcial aparece no composer (fora do texto editável) e a transcrição final entra no rascunho ao parar. No modo API cada parcial é uma request extra ao provedor; no Híbrido elas vêm do motor local quando pronto."
-              >
-                Parciais ao vivo
-              </Label>
-              <Switch
-                checked={stt.livePartials}
-                label="Parciais ao vivo"
-                onChange={(livePartials) => void onCommit({ ...stt, livePartials })}
-              />
-            </div>
-            {stt.livePartials && (
-              <div className="flex items-center gap-2">
-                <Label
-                  className="mb-0"
-                  help="Ditado: quando a última parcial já transcreveu a fala inteira desde a última pausa, ela vira o texto final na hora (sem esperar outra transcrição). Desligado: a final sempre transcreve de novo (um pouco mais precisa, mais lenta). A chamada de voz sempre aproveita."
-                >
-                  Final rápida (usar a parcial)
-                </Label>
-                <Switch
-                  checked={stt.reusePartialFinal !== false}
-                  label="Final rápida (usar a parcial)"
-                  onChange={(reusePartialFinal) => void onCommit({ ...stt, reusePartialFinal })}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {!usesApi && (
-          <div className="flex items-center gap-2">
-            <Label
-              className="mb-0"
-              help="Melhor-esforço enquanto você fala: o motor local transcreve em janelas (só modelos até o base)."
-            >
-              Parciais ao vivo
-            </Label>
-            <Switch
-              checked={stt.livePartials}
-              label="Parciais ao vivo"
-              onChange={(livePartials) => void onCommit({ ...stt, livePartials })}
-            />
-          </div>
-        )}
-        {!usesApi && stt.livePartials && localPartialsOff && localModel && (
-          <p className="-mt-1 text-[11px] text-warning" role="note" data-testid="stt-partials-off">
-            Parciais desligadas para este modelo ({localModel.name}): ele é grande demais para
-            transcrever enquanto você fala — o texto aparece nas pausas e quando você parar. Para
-            ver o texto ao vivo, use o ggml-base ou o ggml-tiny.
+              : null
+          }
+          testId="stt-provider"
+        />
+        {gpuAvailable && !whisperReady && mode !== 'gpu' && (
+          <p className="mt-1.5 text-[11.5px] text-subtle" data-testid="stt-gpu-hint">
+            Local (GPU): instale o Whisper large-v3-turbo no{' '}
+            <GpuSectionLink testId="stt-gpu-install-link" /> para transcrever na placa de vídeo.
           </p>
         )}
-
-        {usesLocal && (
-          <LocalEnginePanel
-            local={local}
-            models={models}
-            progress={modelProgress}
-            error={modelError}
-            title={stt.mode === 'hybrid' ? 'Motor local (parciais e reserva)' : 'Motor local'}
-            help={
-              stt.mode === 'hybrid'
-                ? 'No Híbrido o motor local faz as parciais ao vivo e a transcrição especulativa do fim de turno da chamada, e transcreve quando a API falha por rede/cota/5xx. Um modelo pequeno (base) basta. Os arquivos ficam em userData/models.'
-                : undefined
-            }
-            onEngine={(engine) =>
-              void onCommit({
-                ...stt,
-                local: {
-                  engine,
-                  model: stt.local?.engine === engine ? stt.local.model : '',
-                  // `installed` espelha o disco para o engine escolhido (a verdade é o disco)
-                  installed: models.some(
-                    (m) => m.kind === 'stt' && m.engine === engine && m.state === 'installed'
-                  )
-                }
-              })
-            }
-            onAction={onModelAction}
-            onDismissError={onDismissModelError}
-            runtimeProblem={runtimeProblem}
-          >
-            <p
-              className={`mt-1.5 text-[11px] ${local?.installed && localModel ? 'text-subtle' : 'text-warning'}`}
-              data-testid="stt-local-current"
-            >
-              {local?.installed && localModel
-                ? `Modelo local em uso: ${localModel.name}${stt.mode === 'hybrid' ? ' (parciais, especulação e reserva)' : ''}.`
-                : stt.mode === 'hybrid'
-                  ? 'Nenhum modelo local instalado — as parciais vão pela API (melhor-esforço) e não há reserva se a API falhar.'
-                  : 'Nenhum modelo local instalado — baixe um abaixo para transcrever no computador.'}
-            </p>
-          </LocalEnginePanel>
-        )}
       </div>
-    </section>
+
+      {missing && (
+        <WarnNote testId="stt-provider-missing">
+          O provedor escolhido não existe mais — escolha outro acima.
+        </WarnNote>
+      )}
+
+      {mode === 'gpu' && <GpuSttPanel stt={stt} status={gpuStatus} />}
+
+      {usesApi && provider && (
+        <div className="space-y-3" data-testid="stt-api">
+          <div>
+            <Label help="Modelos de transcrição dos provedores cadastrados, agrupados por provedor (escolher um de outro grupo troca o provedor). Um id sem o prefixo do OpenRouter (ex.: whisper-large-v3-turbo) é corrigido sozinho para o id listado. Os lentos para a chamada têm o badge “lento”.">
+              Modelo
+            </Label>
+            <VoiceModelField
+              capability="stt"
+              catalogs={catalogs}
+              providers={providers}
+              value={{ providerId: stt.api.providerId, model: stt.api.model }}
+              onChange={pickModel}
+              testId="stt-model"
+            />
+          </div>
+          <ToggleRow
+            label="Motor local nas parciais e como reserva"
+            checked={mode === 'hybrid'}
+            onChange={(v) => void onCommit({ ...stt, mode: v ? 'hybrid' : 'api' })}
+            help="Híbrido: a API faz a transcrição final; o motor local (whisper.cpp) faz as parciais ao vivo e a transcrição especulativa do fim de turno da chamada, e transcreve quando a API falha por rede/cota/5xx. Um modelo pequeno (base) basta."
+          />
+        </div>
+      )}
+
+      <ToggleRow
+        label="Parciais ao vivo"
+        checked={stt.livePartials}
+        onChange={(livePartials) => void onCommit({ ...stt, livePartials })}
+        help={
+          mode === 'gpu'
+            ? 'Melhor-esforço enquanto você fala: o whisper da GPU transcreve em janelas (rápido o bastante para o large-v3-turbo).'
+            : mode === 'local'
+              ? 'Melhor-esforço enquanto você fala: o motor local transcreve em janelas (só modelos até o base).'
+              : 'Melhor-esforço enquanto você fala: o texto parcial aparece no composer (fora do texto editável) e a transcrição final entra no rascunho ao parar. Só pela API, cada parcial é uma request extra ao provedor; com o motor local como reserva, elas vêm dele quando pronto.'
+        }
+        status={
+          mode === 'local' && stt.livePartials && localPartialsOff && localModel ? (
+            <span className="text-warning" data-testid="stt-partials-off">
+              Desligadas para {localModel.name}: grande demais para transcrever enquanto você fala —
+              o texto aparece nas pausas. Use o ggml-base ou o ggml-tiny para ver ao vivo.
+            </span>
+          ) : undefined
+        }
+      />
+      {usesApi && stt.livePartials && (
+        <ToggleRow
+          label="Final rápida (usar a parcial)"
+          checked={stt.reusePartialFinal !== false}
+          onChange={(reusePartialFinal) => void onCommit({ ...stt, reusePartialFinal })}
+          help="Ditado: quando a última parcial já transcreveu a fala inteira desde a última pausa, ela vira o texto final na hora (sem esperar outra transcrição). Desligado: a final sempre transcreve de novo (um pouco mais precisa, mais lenta). A chamada de voz sempre aproveita."
+        />
+      )}
+
+      {usesLocal && (
+        <LocalEnginePanel
+          local={local}
+          models={models}
+          progress={modelProgress}
+          error={modelError}
+          title={mode === 'hybrid' ? 'Motor local (parciais e reserva)' : 'Motor local'}
+          onEngine={(engine) =>
+            void onCommit({
+              ...stt,
+              local: {
+                engine,
+                model: stt.local?.engine === engine ? stt.local.model : '',
+                // `installed` espelha o disco para o engine escolhido (a verdade é o disco)
+                installed: models.some(
+                  (m) => m.kind === 'stt' && m.engine === engine && m.state === 'installed'
+                )
+              }
+            })
+          }
+          onAction={onModelAction}
+          onDismissError={onDismissModelError}
+          runtimeProblem={runtimeProblem}
+        >
+          <p
+            className={`mt-1.5 text-[11.5px] ${local?.installed && localModel ? 'text-subtle' : 'text-warning'}`}
+            data-testid="stt-local-current"
+          >
+            {local?.installed && localModel
+              ? `Modelo local em uso: ${localModel.name}${mode === 'hybrid' ? ' (parciais, especulação e reserva)' : ''}.`
+              : mode === 'hybrid'
+                ? 'Nenhum modelo local instalado — as parciais vão pela API (melhor-esforço) e não há reserva se a API falhar.'
+                : 'Nenhum modelo local instalado — baixe um abaixo para transcrever no computador.'}
+          </p>
+        </LocalEnginePanel>
+      )}
+    </AudioSection>
   )
 }
 
@@ -381,14 +305,14 @@ function SttApiInfo({
       ].join('\n')}
       codeLabel={
         family === 'openrouter'
-          ? 'Modos API e Híbrido · OpenRouter (a chave do provedor entra no header)'
-          : 'Modos API e Híbrido (a chave entra no header)'
+          ? 'Com provedor de API · OpenRouter (a chave do provedor entra no header)'
+          : 'Com provedor de API (a chave entra no header; servidor local pode ficar sem)'
       }
     >
       <p>
-        Só o áudio gravado e esses campos saem do app. Com <C>Parciais ao vivo</C> no modo API, o
+        Só o áudio gravado e esses campos saem do app. Com <C>Parciais ao vivo</C> só pela API, o
         mesmo request é repetido em janelas enquanto você fala (melhor-esforço); a transcrição final
-        manda o áudio inteiro. No modo <C>Local</C> nada sai do computador.
+        manda o áudio inteiro. Com o motor local ou a GPU nada sai do computador.
       </p>
     </ApiInfo>
   )

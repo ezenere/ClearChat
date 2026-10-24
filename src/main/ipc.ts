@@ -9,6 +9,7 @@ import {
   VOICE_CALL_UTTERANCE_CANCEL_CHANNEL,
   VOICE_CALL_UTTERANCE_CHANNEL,
   VOICE_CALL_UTTERANCE_CHUNK_CHANNEL,
+  VOICE_GPU_PROGRESS_CHANNEL,
   VOICE_MODELS_PROGRESS_CHANNEL,
   VOICE_PARTIAL_CHANNEL,
   VOICE_TTS_CLIPS_PROGRESS_CHANNEL,
@@ -115,10 +116,8 @@ import type {
   MemoryPatch
 } from '@shared/memory'
 import {
-  getVoiceCustomEndpoint,
   getVoiceSettings,
   getVoiceSettingsView,
-  migrateVoiceProviderLinks,
   setVoiceSetting,
   syncLocalModelInstalled
 } from './voice'
@@ -168,6 +167,19 @@ import {
 } from './voice/ttsLocal'
 import { VoiceCallManager } from './voice/call'
 import { isBusyStatus } from './voice/turnMachine'
+import { dirname } from 'path'
+import { GpuVoiceManager, type GpuMeasured } from './voice/gpu/manager'
+import { setGpuEndpointResolver } from './voice/gpu/endpoint'
+import { prepareGpuForCall } from './voice/gpu/callPrep'
+import {
+  gpuEnginesLabel,
+  isGpuEngineId,
+  isGpuTtsEngineId,
+  type GpuEngineId
+} from '@shared/gpuVoice'
+// servidor do modo GPU: script Python pequeno no pacote (desempacotado do asar — roda com o Python
+// baixado pelo app; `requirements/` fica ao lado)
+import gpuServerScript from '../../resources/gpu-server/server.py?asset&asarUnpack'
 
 type Handler = (...args: never[]) => unknown
 
@@ -305,13 +317,53 @@ async function voiceRuntimeStatus(): Promise<VoiceRuntimeStatus> {
             ? `o motor '${v.tts.local.engine}' ainda não tem runtime nesta versão`
             : 'nenhum motor local de fala escolhido'
         }
+  // modo GPU (avançado): runtime + motor instalados, sem bloqueio de hardware
+  const gpu =
+    gpuManagerRef && (v.tts.backend === 'gpu' || v.stt.mode === 'gpu')
+      ? await gpuManagerRef.readiness().catch(() => null)
+      : null
   return {
     whisper: { available: whisper.available, reason: whisper.reason },
     onnxruntime: { available: onnx.available, reason: onnx.reason },
     espeak: espeak.available ? espeak : { available: false, reason: espeakMissingError().message },
     sttLocal: { available: sttReady, reason: sttReason },
-    ttsLocal
+    ttsLocal,
+    ...(gpu ? gpu : {})
   }
+}
+
+// ---- "Modo avançado (GPU local)" — SPEC → "Áudio → Modo avançado (GPU local)" ----
+
+/** Gerenciador do modo GPU (criado no `registerIpc`; parado no `before-quit`). */
+let gpuManagerRef: GpuVoiceManager | null = null
+/** Geração da chamada (start/stop): o preparo da GPU de uma chamada encerrada não mexe na nova. */
+let gpuCallGen = 0
+/** Setting local (não sincroniza) com o último autoteste de cada motor da GPU. */
+const GPU_MEASURED_SETTING = 'gpuVoiceMeasured'
+
+/** Saída do app: derruba os processos do servidor da GPU e cancela instalações. */
+export function shutdownGpuVoice(): void {
+  gpuManagerRef?.shutdown()
+}
+
+function createGpuManager(): GpuVoiceManager {
+  const readMeasured = (): Partial<Record<GpuEngineId, GpuMeasured>> => {
+    const raw = settingsRepo.get(GPU_MEASURED_SETTING)
+    return raw && typeof raw === 'object' ? (raw as Partial<Record<GpuEngineId, GpuMeasured>>) : {}
+  }
+  return new GpuVoiceManager({
+    baseDir: app.getPath('userData'),
+    serverDir: dirname(gpuServerScript),
+    // testes reais: cache de pip existente (só acelera os downloads; a instalação é do zero)
+    pipCacheDir: process.env['CLEARCHAT_GPU_PIP_CACHE'] || undefined,
+    getTts: () => getVoiceSettings().tts,
+    getStt: () => getVoiceSettings().stt,
+    readMeasured,
+    writeMeasured: (id, m) =>
+      settingsRepo.set(GPU_MEASURED_SETTING, { ...readMeasured(), [id]: m }),
+    onStatus: (s) => sendToWindows(VOICE_GPU_PROGRESS_CHANNEL, s),
+    log: (m) => console.log(`[clearchat] gpu: ${m}`)
+  })
 }
 
 /** Sugestões livres de vozes para endpoints OpenAI-compatíveis (o campo aceita qualquer id). */
@@ -382,13 +434,6 @@ function runDeps(): RunDeps {
 
 export function registerIpc(): void {
   presetsRepo.seed()
-  // Áudio: endpoint avulso de STT/TTS → provedor cadastrado (uma vez; SPEC → "Áudio → Provedor…")
-  try {
-    const changed = migrateVoiceProviderLinks()
-    if (changed.length) console.log('[clearchat] áudio: settings ligadas a provedores:', changed)
-  } catch (e) {
-    console.warn('[clearchat] áudio: migração de provedores falhou:', e)
-  }
   // ---- chamada de voz meia-duplex: o dono do turno no main + os overrides de request ----
   // (o renderer é o "sensor": captura/silêncio/reprodução — SPEC → "Chamada de voz (meia-duplex)")
   // decisões de filler/interjeição também viram linhas no log de avaliação (modo sombra/calibração)
@@ -442,7 +487,8 @@ export function registerIpc(): void {
     // TTS por sentença: com endpoint que devolve PCM progressivo (OpenRouter/ElevenLabs) a
     // sentença começa a tocar com ~200 ms de áudio e o resto segue em `voice:call:utterance-chunk`
     // (`TtsStreamRelay`); motor local / wav / mp3 → bytes completos, como antes
-    // [tts-feed] ElevenLabs direta com modelo de WebSocket → o contexto da sentença no socket
+    // [tts-feed] ElevenLabs direta com modelo de WebSocket → a fatia da sentença no áudio da
+    // resposta (um contexto por resposta, repartido pelo alinhamento)
     synth: (text, signal) =>
       ttsRelay.synth(signal, async (s) =>
         elevenOpts()
@@ -485,14 +531,16 @@ export function registerIpc(): void {
     classifyError: (e, source) => {
       const v = getVoiceSettings()
       const local = source === 'stt' ? v.stt.mode === 'local' : v.tts.backend === 'local'
+      const onGpu = source === 'stt' ? v.stt.mode === 'gpu' : v.tts.backend === 'gpu'
       const base = source === 'stt' ? v.stt.api.baseUrl : v.tts.api.baseUrl
-      return classifyVoiceError(e, source, voiceProviderLabel(base, local))
+      return classifyVoiceError(e, source, onGpu ? 'GPU local' : voiceProviderLabel(base, local))
     },
     onCallEnded: () => ttsRelay.abortAll(),
     // sem motor local configurado, o veredito do fim de turno sai pela API (lento)
     slowSpeculation: () => {
       const stt = getVoiceSettings().stt
-      return stt.mode !== 'local' && !stt.local
+      // GPU local: whisper em ~0,1 s — veredito rápido como o motor local
+      return stt.mode !== 'local' && stt.mode !== 'gpu' && !stt.local
     },
     settings: () => {
       const v = getVoiceSettings()
@@ -507,6 +555,9 @@ export function registerIpc(): void {
   void probeWhisperRuntime().then((r) => {
     if (!r.available) console.warn(`[clearchat] STT local indisponível: ${r.reason}`)
   })
+  // modo GPU: gerenciador + resolvedor do endpoint usado por `voice/tts.ts` (backend 'gpu')
+  const gpu = (gpuManagerRef ??= createGpuManager())
+  setGpuEndpointResolver(gpu)
   const handlers: Record<string, Handler> = {
     // ---- providers ----
     [IPC.providers.list]: () => providersRepo.list(),
@@ -952,26 +1003,33 @@ export function registerIpc(): void {
         }
       ),
     // ---- voz: settings de áudio + sessão de transcrição (SPEC → "Áudio") ----
-    // (as chaves de API de stt/tts não passam por aqui nem pelo settings genérico:
-    //  PROTECTED_SETTINGS; saem mascaradas e só o main usa a chave real)
+    // (stt/tts guardam só provedor/modelo/voz: a chave do provedor fica no main — `getVoiceSettings`)
     [IPC.voice.settingsGet]: () => getVoiceSettingsView(),
-    [IPC.voice.settingsSet]: (kind: VoiceSettingKind, value: unknown) =>
-      setVoiceSetting(kind, value),
+    [IPC.voice.settingsSet]: (kind: VoiceSettingKind, value: unknown) => {
+      const saved = setVoiceSetting(kind, value)
+      // modo GPU: nada mais escolhido → os processos do servidor saem (VRAM de volta)
+      if (kind === 'ttsSettings' || kind === 'sttSettings') void gpu.onSettingsChanged()
+      return saved
+    },
     [IPC.voice.transcribeStart]: async (language?: string) => {
       const owner = ipcSenderId // antes de qualquer await
       const v = getVoiceSettings()
       const lang =
         typeof language === 'string' && language.trim() ? language : v.audioInput.language
-      const [models] = await Promise.all([
+      const gpuMode = v.stt.mode === 'gpu'
+      const [models, gpuReady] = await Promise.all([
         listLocalModels(localModelsBaseDir()),
+        gpuMode ? gpu.sttReady() : false,
         // "pronto" = modelo instalado + binding que carrega de verdade (probe memoizado)
-        v.stt.mode !== 'api' ? probeWhisperRuntime() : null
+        v.stt.mode !== 'api' && !gpuMode ? probeWhisperRuntime() : null
       ])
       return startTranscribeSession(
         { settings: v.stt, language: lang },
         {
+          // modo GPU: o whisper do servidor local entra como o motor "local" da sessão
+          ...(gpuMode ? { local: gpu.sttBackend(gpuReady) } : {}),
           // coerência installed/hasLocalReady: a presença real de modelo instalado vem do disco
-          hasLocalReady: deriveHasLocalReady(v.stt.local, models),
+          hasLocalReady: gpuMode ? gpuReady : deriveHasLocalReady(v.stt.local, models),
           onPartial: (e) => sendToWindows(VOICE_PARTIAL_CHANNEL, e),
           // erro fatal de parcial/segmento/especulação na chamada: encerra já (a final falharia)
           onError: (e) => {
@@ -1096,18 +1154,27 @@ export function registerIpc(): void {
       const voice = clip(input?.voice)
       const model = clip(input?.model)
       const settings =
-        saved.backend === 'api'
+        saved.backend === 'gpu'
           ? {
               ...saved,
-              api: {
-                ...saved.api,
-                voice: voice ?? saved.api.voice,
-                model: model ?? saved.api.model
+              gpu: {
+                ...(saved.gpu ?? { engine: 'omnivoice' as const, voice: null }),
+                ...(voice ? { voice } : {}),
+                ...(isGpuTtsEngineId(model) ? { engine: model } : {})
               }
             }
-          : saved.local && voice
-            ? { ...saved, local: { ...saved.local, voice } }
-            : saved
+          : saved.backend === 'api'
+            ? {
+                ...saved,
+                api: {
+                  ...saved.api,
+                  voice: voice ?? saved.api.voice,
+                  model: model ?? saved.api.model
+                }
+              }
+            : saved.local && voice
+              ? { ...saved, local: { ...saved.local, voice } }
+              : saved
       return synthesize(
         { text: clip(input?.text) ?? TTS_TEST_PHRASE, settings, format: 'wav' },
         { local: ttsLocalEngine() }
@@ -1118,10 +1185,10 @@ export function registerIpc(): void {
       listVoiceCatalog(
         {
           capability: input?.capability === 'stt' ? 'stt' : 'tts',
-          providerId: typeof input?.providerId === 'string' ? input.providerId : null,
+          providerId: typeof input?.providerId === 'string' ? input.providerId : '',
           refresh: input?.refresh === true
         },
-        { provider: (id) => providersRepo.get(id), customEndpoint: getVoiceCustomEndpoint }
+        { provider: (id) => providersRepo.get(id) }
       ),
     [IPC.voice.catalogPreview]: (input: { url: string }) =>
       fetchVoicePreview(typeof input?.url === 'string' ? input.url : ''),
@@ -1159,15 +1226,41 @@ export function registerIpc(): void {
     },
 
     // ---- chamada de voz (meia-duplex) — SPEC → "Áudio → Chamada de voz (meia-duplex)" ----
-    [IPC.voice.callStart]: (input: { sessionId: string }) => {
+    [IPC.voice.callStart]: async (input: { sessionId: string }) => {
       const sessionId = input && typeof input.sessionId === 'string' ? input.sessionId.trim() : ''
       if (!sessionId) throw new Error('Sessão não informada (esperado { sessionId }).')
       const owner = ipcSenderId
+      // modo GPU: os motores já estão carregados? (senão a chamada entra em "Preparando a GPU…")
+      const gpuEngines = gpu.selectedEngines()
+      const gpuWarm = gpuEngines.length ? await gpu.isWarm(gpuEngines).catch(() => false) : true
       // chamada órfã de um renderer que sumiu sem avisar (ex.: crash antes do hook): o mesmo dono
       // pedindo de novo reabre; outro dono ainda vivo segue recusado pelo manager
       if (voiceCalls.state().active && owner !== null && voiceCallOwner === owner) voiceCalls.stop()
-      const state = voiceCalls.start(sessionId)
+      let state = voiceCalls.start(sessionId)
       voiceCallOwner = owner
+      const gen = ++gpuCallGen
+      if (!gpuWarm) {
+        // liga sozinho: sobe + aquece ANTES do microfone abrir (o estado devolvido já vem com
+        // `preparing` — o renderer não abre a captura); falha encerra a chamada com o motivo
+        state = voiceCalls.setPreparing(`Iniciando ${gpuEnginesLabel(gpuEngines)}…`)
+        const t0 = Date.now()
+        void prepareGpuForCall({
+          engines: gpuEngines,
+          isWarm: async () => false,
+          start: (ids, onPhase) => gpu.startServer([...ids], { onPhase }),
+          setPreparing: (text) => void voiceCalls.setPreparing(text),
+          stillActive: () => {
+            const st = voiceCalls.state()
+            return gen === gpuCallGen && st.active && st.sessionId === sessionId
+          },
+          fail: (reason) => {
+            ttsRelay.abortAll()
+            voiceCalls.stop(reason)
+          }
+        }).then((r) =>
+          console.log(`[clearchat] gpu: preparo da chamada ${r} em ${Date.now() - t0} ms`)
+        )
+      }
       // o /models do provedor do chat e do modelo da chamada em cache: a política de raciocínio do
       // turno de voz (desligar/mínimo) depende dos metadados do modelo
       const session = sessionsRepo.get(sessionId)
@@ -1181,11 +1274,31 @@ export function registerIpc(): void {
     },
     [IPC.voice.callStop]: () => {
       voiceCallOwner = null
+      gpuCallGen++
       ttsRelay.abortAll()
       return voiceCalls.stop()
     },
     [IPC.voice.callGetState]: () => voiceCalls.state(),
     [IPC.voice.runtimeStatus]: () => voiceRuntimeStatus(),
+    // ---- modo avançado (GPU local): URL/token do servidor nunca saem do main ----
+    [IPC.voice.gpuStatus]: () => gpu.status(true),
+    [IPC.voice.gpuInstallRuntime]: () => gpu.installRuntime(),
+    [IPC.voice.gpuRemoveRuntime]: () => gpu.removeRuntime(),
+    [IPC.voice.gpuInstallEngine]: (id: unknown) => gpu.installEngine(id),
+    [IPC.voice.gpuRemoveEngine]: (id: unknown) => gpu.removeEngine(id),
+    [IPC.voice.gpuCancel]: () => gpu.cancel(),
+    [IPC.voice.gpuSelfTest]: (id: unknown) => {
+      if (!isGpuEngineId(id)) throw new Error(`Motor desconhecido: ${String(id)}.`)
+      return gpu.selfTest(id)
+    },
+    [IPC.voice.gpuStartServer]: (ids?: unknown) => gpu.startServer(ids),
+    [IPC.voice.gpuStopServer]: () => gpu.stopServer(),
+    [IPC.voice.gpuAddUserVoice]: (input: { name: unknown; audio: unknown; transcript?: unknown }) =>
+      gpu.addUserVoice(input),
+    [IPC.voice.gpuRemoveUserVoice]: (id: unknown) => gpu.removeUserVoice(id),
+    [IPC.voice.gpuDownloadCc0Voice]: (input?: { id?: unknown }) => gpu.downloadCc0Voice(input),
+    [IPC.voice.gpuTranscribe]: (input: { audio: unknown }) => gpu.transcribe(input),
+    [IPC.voice.gpuLog]: () => gpu.logText(),
     [IPC.voice.callMute]: (input: { muted: boolean }) => voiceCalls.mute(!!input?.muted),
     [IPC.voice.callSpeechBegin]: (input?: { dropped?: unknown }) => {
       const dropped = Array.isArray(input?.dropped)

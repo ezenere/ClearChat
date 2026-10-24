@@ -1,0 +1,23 @@
+# ClearChat — Modo avançado (GPU local): ambiente base (whisper + servidor + dependências de áudio comuns)
+# Gerado de um ambiente que funcionou (Python 3.11.17, torch 2.8.0+cu128). Não editar à mão sem testar.
+faster-whisper==1.2.1
+ctranslate2==4.8.3
+fastapi==0.162.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+soundfile==0.14.0
+numpy==2.4.6
+nvidia-ml-py==13.615.71
+huggingface_hub==0.36.2
+av==18.1.0
+tokenizers==0.22.2
+librosa==0.11.0
+scipy==1.17.1
+numba==0.68.0
+llvmlite==0.50.0
+accelerate==1.12.0
+einops==0.8.2
+safetensors==0.8.0
+soxr==1.1.0
+pydub==0.25.1
+regex==2026.9.29

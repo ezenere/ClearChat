@@ -11,6 +11,7 @@ import type {
   VoiceCallState
 } from './voice'
 import type { VoiceCatalogRequest, VoiceCatalogView } from './voiceCatalog'
+import type { GpuEngineId, GpuSelfTestResult, GpuStatus } from './gpuVoice'
 import type {
   ChatHostInfo,
   CloudSkill,
@@ -260,7 +261,22 @@ export const IPC = {
     callInterjectionObserved: 'voice:call:interjection-observed',
     callBackchannel: 'voice:call:backchannel',
     callGetState: 'voice:call:get-state',
-    runtimeStatus: 'voice:runtime:status'
+    runtimeStatus: 'voice:runtime:status',
+    // "Modo avançado (GPU local)" — SPEC → "Áudio → Modo avançado (GPU local)"
+    gpuStatus: 'voice:gpu:status',
+    gpuInstallRuntime: 'voice:gpu:install-runtime',
+    gpuRemoveRuntime: 'voice:gpu:remove-runtime',
+    gpuInstallEngine: 'voice:gpu:install-engine',
+    gpuRemoveEngine: 'voice:gpu:remove-engine',
+    gpuCancel: 'voice:gpu:cancel',
+    gpuSelfTest: 'voice:gpu:self-test',
+    gpuStartServer: 'voice:gpu:start-server',
+    gpuStopServer: 'voice:gpu:stop-server',
+    gpuAddUserVoice: 'voice:gpu:add-user-voice',
+    gpuRemoveUserVoice: 'voice:gpu:remove-user-voice',
+    gpuDownloadCc0Voice: 'voice:gpu:download-cc0-voice',
+    gpuTranscribe: 'voice:gpu:transcribe',
+    gpuLog: 'voice:gpu:log'
   }
 } as const
 
@@ -272,6 +288,8 @@ export const VOICE_PARTIAL_CHANNEL = 'voice:partial'
 export const VOICE_MODELS_PROGRESS_CHANNEL = 'voice:models:progress'
 /** Canal main → renderer com o progresso da geração de clipes de voz (`TtsClipProgressEvent`). */
 export const VOICE_TTS_CLIPS_PROGRESS_CHANNEL = 'voice:tts:clips:progress'
+/** Canal main → renderer com o status completo do modo GPU durante instalações/servidor (`GpuStatus`). */
+export const VOICE_GPU_PROGRESS_CHANNEL = 'voice:gpu:progress'
 /** Canal main → renderer com o estado da chamada de voz (`VoiceCallState`). */
 export const VOICE_CALL_STATE_CHANNEL = 'voice:call:state'
 /** Canal main → renderer com uma utterance falada da chamada (`VoiceCallUtteranceEvent`). */
@@ -462,8 +480,8 @@ export interface WebSearchTestResult {
 
 /**
  * As 4 settings de áudio pelas CHAVES de setting (o discriminador de `voice:settings:set`).
- * `sttSettings.api.apiKey` e `ttsSettings.api.apiKey` saem do main SEMPRE mascarados
- * (`maskKey`, ex. 'gsk-…abcd'); a chave real nunca chega ao renderer.
+ * `sttSettings.api`/`ttsSettings.api` têm só o provedor (`providerId`), o modelo, a voz e as
+ * opções — endereço e chave ficam no provedor cadastrado e nunca chegam ao renderer.
  */
 export interface VoiceSettingsMap {
   audioInput: AudioInputSettings
@@ -472,7 +490,7 @@ export interface VoiceSettingsMap {
   voiceCallDefaults: VoiceCallDefaults
 }
 export type VoiceSettingKind = keyof VoiceSettingsMap
-/** O que `voice:settings:get` devolve (= `VoiceSettingsMap`, com as chaves de API mascaradas). */
+/** O que `voice:settings:get` devolve (= `VoiceSettingsMap`). */
 export type VoiceSettingsView = VoiceSettingsMap
 
 /** Parcial ao vivo de uma sessão de transcrição (canal `voice:partial`, assinada por `onVoicePartial`). */
@@ -528,13 +546,9 @@ export interface VoiceSpeculativeView {
 /** Uma sessão de transcrição por vez; `start` devolve o id usado em push/stop/cancel. */
 export interface VoiceApi {
   settings: {
-    /** Os 4 grupos completos e normalizados (chaves de API mascaradas). */
+    /** Os 4 grupos completos e normalizados. */
     get(): Promise<VoiceSettingsView>
-    /**
-     * Normaliza, grava um grupo e devolve o valor gravado (chave de API mascarada).
-     * `api.apiKey`: ausente/igual à máscara ou à chave atual = preserva a chave salva;
-     * `null`/`''` = remove; outra string = nova chave.
-     */
+    /** Normaliza, grava um grupo e devolve o valor gravado. */
     set<K extends VoiceSettingKind>(kind: K, value: unknown): Promise<VoiceSettingsMap[K]>
   }
   transcribe: {
@@ -674,6 +688,42 @@ export interface VoiceApi {
     /** Sonda (memoizado) whisper.cpp/onnxruntime/espeak-ng e o "pronto" local de STT e TTS. */
     status(): Promise<VoiceRuntimeStatus>
   }
+  /**
+   * "Modo avançado (GPU local)" (SPEC → "Áudio → Modo avançado (GPU local)"): sonda de hardware,
+   * runtime Python/torch e motores baixados sob demanda para `<userData>/gpu-runtime`, servidor
+   * local (127.0.0.1 + token por sessão — URL/token nunca chegam aqui) e vozes de clonagem.
+   * Progresso no evento `voice:gpu:progress` (`onVoiceGpuProgress`, `GpuStatus` completo).
+   */
+  gpu?: VoiceGpuApi
+}
+
+/** `window.api.voice.gpu` — ações resolvem quando terminam; a UI relê `status()`/o evento. */
+export interface VoiceGpuApi {
+  status(): Promise<GpuStatus>
+  /** Baixa o Python portátil + torch + base (whisper/servidor). Cancelável por `cancel()`. */
+  installRuntime(): Promise<void>
+  removeRuntime(): Promise<void>
+  /** Camada de pacotes do motor + pesos (instala o runtime antes, se faltar). */
+  installEngine(id: GpuEngineId): Promise<void>
+  removeEngine(id: GpuEngineId): Promise<void>
+  /** Cancela a instalação/download em andamento (resolve mesmo sem nada em andamento). */
+  cancel(): Promise<void>
+  /** Frase pt-BR fixa pelo caminho de áudio do app (+ transcrição de volta com o whisper, se instalado). */
+  selfTest(id: GpuEngineId): Promise<GpuSelfTestResult>
+  /** Sobe os processos dos motores (padrão: os escolhidos em Fala/Transcrição). */
+  startServer(ids?: string[]): Promise<void>
+  stopServer(): Promise<void>
+  /** Voz do usuário: WAV PCM16 mono (o renderer decodifica; 24 kHz) de 3–30 s (ideal 6–10 s). */
+  addUserVoice(input: { name: string; audio: ArrayBuffer; transcript?: string }): Promise<{
+    id: string
+  }>
+  removeUserVoice(id: string): Promise<void>
+  /** Baixa uma referência pt-BR CC0 (padrão: Faber). */
+  downloadCc0Voice(input?: { id?: string }): Promise<{ id: string }>
+  /** Transcreve uma amostra (WAV) com o whisper da GPU (transcrição automática da voz de clonagem). */
+  transcribe(input: { audio: ArrayBuffer }): Promise<{ text: string }>
+  /** Últimas linhas do log da instalação e do servidor. */
+  log(): Promise<string>
 }
 
 /** Resultado de um probe de runtime local (`voice:runtime:status`). */
@@ -699,6 +749,10 @@ export interface VoiceRuntimeStatus {
   sttLocal: VoiceRuntimeCheck
   /** TTS local pronto agora: onnxruntime + espeak-ng + modelo e voz do Kokoro instalados. */
   ttsLocal: VoiceRuntimeCheck
+  /** Fala pela GPU local pronta (runtime + motor instalados, sem bloqueio de hardware). Aditivo. */
+  gpuTts?: VoiceRuntimeCheck
+  /** Transcrição pela GPU local pronta (runtime + whisper instalados). Aditivo. */
+  gpuStt?: VoiceRuntimeCheck
 }
 
 /** Estado do modelo local no disco (espelho de `LocalModelState` em `src/main/voice/models.ts`). */
@@ -787,7 +841,7 @@ export interface TtsClipInfo {
 export interface TtsClipsView {
   /** Voz dona do cache (diretório em `userData/voice-clips`). */
   voiceId: string
-  backend: 'api' | 'local'
+  backend: 'api' | 'local' | 'gpu'
   /** Motor local ('kokoro'); null no backend de API. */
   engine: string | null
   model: string
@@ -1181,6 +1235,8 @@ export interface ClearApi {
   onVoicePartial?(cb: (e: VoicePartialEvent) => void): () => void
   /** Progresso de downloads de modelos locais (canal `voice:models:progress`); unsubscribe como em `onEvent`. */
   onVoiceModelProgress?(cb: (e: VoiceModelProgressEvent) => void): () => void
+  /** Status do modo GPU durante instalações/servidor (canal `voice:gpu:progress`); unsubscribe como em `onEvent`. */
+  onVoiceGpuProgress?(cb: (e: GpuStatus) => void): () => void
   /** Progresso da geração de clipes de voz (canal `voice:tts:clips:progress`); unsubscribe como em `onEvent`. */
   onVoiceTtsClipsProgress?(cb: (e: TtsClipProgressEvent) => void): () => void
   /** Estado da chamada de voz (canal `voice:call:state`); unsubscribe como em `onEvent`. */
@@ -1268,6 +1324,7 @@ export type FullClearApi = ClearApi &
       | 'voice'
       | 'onVoicePartial'
       | 'onVoiceModelProgress'
+      | 'onVoiceGpuProgress'
       | 'onVoiceTtsClipsProgress'
       | 'onVoiceCallState'
       | 'onVoiceCallUtterance'

@@ -2,7 +2,6 @@
 // API (só no main; o renderer recebe a máscara) e o intervalo mínimo entre pesquisas.
 // Puro (main, renderer e testes). Ver SPEC.md → web_search.
 import { LIMITS } from './limits'
-import { STT_SETTINGS_SETTING, TTS_SETTINGS_SETTING } from './voice'
 
 // ---------------- intervalo mínimo entre pesquisas ----------------
 
@@ -123,15 +122,10 @@ export const SEARCH_ENGINES_SETTING = 'webSearchEngines'
 export const SEARCH_KEYS_SETTING = 'webSearchApiKeys'
 /**
  * Settings que o settings:get/set genérico do renderer não pode ler nem escrever (a chave real
- * nunca sai do main por aqui; os domínios dedicados — `webSearch:*` e `voice:settings:*` — devolvem
- * máscaras e só gravam por cima do valor mascarado sem apagar a chave). Os grupos `sttSettings` e
- * `ttsSettings` guardam `api.apiKey` no JSON (`src/shared/voice.ts`).
+ * nunca sai do main por aqui; o domínio dedicado `webSearch:*` devolve máscaras e só grava por
+ * cima do valor mascarado sem apagar a chave).
  */
-export const PROTECTED_SETTINGS: readonly string[] = [
-  SEARCH_KEYS_SETTING,
-  STT_SETTINGS_SETTING,
-  TTS_SETTINGS_SETTING
-]
+export const PROTECTED_SETTINGS: readonly string[] = [SEARCH_KEYS_SETTING]
 
 export function defaultOptions(id: SearchEngineId): EngineOptions {
   if (!isApiEngine(id)) return {}

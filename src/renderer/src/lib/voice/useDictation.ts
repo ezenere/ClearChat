@@ -19,10 +19,17 @@ import type { VoiceApi } from '@shared/ipc'
 import { api, errorMessage } from '../api'
 import { useStore } from '../../store'
 import { usePushToTalk, type StopReason } from '../audio/usePushToTalk'
-import { captureErrorText, MIC_FALLBACK_NOTICE, MIC_LOST_TEXT } from './dictation'
+import {
+  captureErrorText,
+  MIC_FALLBACK_NOTICE,
+  MIC_LOST_TEXT,
+  type DictationSettle
+} from './dictation'
 import { loadVoiceSettings, saveVoiceSetting, useVoiceSettings } from './voiceSettings'
+import { prepareGpuForDictation, useDictationGpuPreparing } from './gpu/gpuPrepare'
 
 export type { StopReason } from '../audio/usePushToTalk'
+export type { DictationSettle } from './dictation'
 
 /** Estado do ditado na UI (um por vez). */
 export type DictationState = 'idle' | 'starting' | 'recording' | 'stopping'
@@ -32,6 +39,11 @@ const MOCK = import.meta.env.VITE_CLEAR_MOCK === '1'
 export interface UseDictationOptions {
   /** Texto final transcrito (rascunho normal editável). Nunca é enviado automaticamente. */
   onFinal: (text: string) => void
+  /**
+   * Fim de cada fluxo (depois do `onFinal`, quando houver): `final` | `empty` | `failed` |
+   * `cancelled` — o Composer decide aí o desfecho do "Enviar" durante a gravação.
+   */
+  onSettled?: (settle: DictationSettle) => void
   /**
    * UI do ditado escondida/bloqueada (chamada de voz, pergunta/retry pendente, host offline,
    * Configurações abertas): a tecla do PTT fica desligada e uma gravação em curso é CANCELADA.
@@ -70,6 +82,11 @@ export interface DictationControls {
   reload: () => void
   /** `window.api.voice` existe (sem ele o botão de microfone não aparece). */
   available: boolean
+  /**
+   * Ditado na GPU local esperando o servidor subir (auto-start da GPU): o campo mostra
+   * "Preparando a GPU…" antes do "Ouvindo…". Opcional — preenchido pelo auto-start da GPU.
+   */
+  preparingGpu?: boolean
   start: () => Promise<void>
   /** Para e transcreve (texto final → `onFinal`). */
   stop: () => Promise<void>
@@ -131,6 +148,11 @@ export function useDictation(options: UseDictationOptions): DictationControls {
   const genRef = useRef(0)
   const mountedRef = useRef(true)
   const mockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** A sessão de transcrição falhou ao nascer neste fluxo (fim sem sessão = falha, não silêncio). */
+  const sessionFailedRef = useRef(false)
+  const settle = useCallback((s: DictationSettle): void => {
+    if (mountedRef.current) optionsRef.current.onSettled?.(s)
+  }, [])
 
   // ---- settings de entrada (recarrega ao fechar as Configurações — a tela Áudio grava por lá) ----
   const settingsOpen = useStore((s) => s.settingsOpen)
@@ -159,6 +181,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
         sessionIdRef.current = id
         return id
       } catch (err) {
+        sessionFailedRef.current = true
         setErrorState(errorMessage(err))
         return null
       }
@@ -196,61 +219,68 @@ export function useDictation(options: UseDictationOptions): DictationControls {
   }, [])
 
   // ---- fim da captura (qualquer motivo): transcreve o final ou descarta (cancel) ----
-  const handleStopped = useCallback(async (reason: StopReason): Promise<void> => {
-    // o flag de cancelamento é consumido aqui (um cancel tardio não pode poluir o fluxo seguinte)
-    const doCancel =
-      cancelRef.current ||
-      reason === 'unmount' ||
-      (reason === 'ptt-release' && suspendedRef.current) ||
-      !mountedRef.current
-    cancelRef.current = false
-    if (mockTimerRef.current) clearTimeout(mockTimerRef.current)
-    mockTimerRef.current = null
-    const pending = sessionPromiseRef.current
-    sessionPromiseRef.current = null
-    const id = pending ? await pending : sessionIdRef.current
-    // a parcial CONTINUA visível ("finalizando…") até a final chegar — nunca some ao parar
-    if (reason === 'device-lost' && mountedRef.current) setNotice(MIC_LOST_TEXT)
-    const v = voiceRef.current
-    if (!id || !v) {
-      sessionIdRef.current = null
-      if (mountedRef.current) setPartial('')
-      return
-    }
-    if (doCancel) {
-      sessionIdRef.current = null
-      if (mountedRef.current) setPartial('')
-      await v.transcribe.cancel(id).catch(() => {})
-      return
-    }
-    const token = { id, cancelled: false }
-    finalizeRef.current = token
-    setFinalizing(true)
-    try {
-      await pushChainRef.current
-      if (token.cancelled) return
-      // segmentos já transcritos em segundo plano: a final é só o trecho depois da última pausa
-      // (ou nenhuma request, quando a parcial já cobre a fala inteira — `reusePartialFinal`)
-      const result = await v.transcribe.stop(id)
-      sessionIdRef.current = null
-      // "Cancelar" (ou desmontagem/bloqueio) durante o "Transcrevendo…": descarta o texto
-      if (token.cancelled || !mountedRef.current) return
-      // a final substitui a parcial no mesmo lugar (sem piscar vazio)
-      if (result.text) optionsRef.current.onFinal(result.text)
-      setPartial('')
-    } catch (err) {
-      sessionIdRef.current = null
-      if (!token.cancelled && mountedRef.current) {
-        setErrorState(errorMessage(err))
-        // o texto parcial fica na tela e pode ser inserido (nada do que foi dito se perde)
-        if (partialRef.current.trim()) setPartialRecoverable(true)
-        else setPartial('')
+  const handleStopped = useCallback(
+    async (reason: StopReason): Promise<void> => {
+      // o flag de cancelamento é consumido aqui (um cancel tardio não pode poluir o fluxo seguinte)
+      const doCancel =
+        cancelRef.current ||
+        reason === 'unmount' ||
+        (reason === 'ptt-release' && suspendedRef.current) ||
+        !mountedRef.current
+      cancelRef.current = false
+      if (mockTimerRef.current) clearTimeout(mockTimerRef.current)
+      mockTimerRef.current = null
+      const pending = sessionPromiseRef.current
+      sessionPromiseRef.current = null
+      const id = pending ? await pending : sessionIdRef.current
+      // a parcial CONTINUA visível ("finalizando…") até a final chegar — nunca some ao parar
+      if (reason === 'device-lost' && mountedRef.current) setNotice(MIC_LOST_TEXT)
+      const v = voiceRef.current
+      if (!id || !v) {
+        sessionIdRef.current = null
+        if (mountedRef.current) setPartial('')
+        settle(doCancel ? 'cancelled' : sessionFailedRef.current ? 'failed' : 'empty')
+        return
       }
-    } finally {
-      if (finalizeRef.current === token) finalizeRef.current = null
-      if (!token.cancelled && mountedRef.current) setFinalizing(false)
-    }
-  }, [])
+      if (doCancel) {
+        sessionIdRef.current = null
+        if (mountedRef.current) setPartial('')
+        settle('cancelled')
+        await v.transcribe.cancel(id).catch(() => {})
+        return
+      }
+      const token = { id, cancelled: false }
+      finalizeRef.current = token
+      setFinalizing(true)
+      try {
+        await pushChainRef.current
+        if (token.cancelled) return
+        // segmentos já transcritos em segundo plano: a final é só o trecho depois da última pausa
+        // (ou nenhuma request, quando a parcial já cobre a fala inteira — `reusePartialFinal`)
+        const result = await v.transcribe.stop(id)
+        sessionIdRef.current = null
+        // "Cancelar" (ou desmontagem/bloqueio) durante o "Transcrevendo…": descarta o texto
+        if (token.cancelled || !mountedRef.current) return
+        // a final substitui a parcial no mesmo lugar (sem piscar vazio)
+        if (result.text) optionsRef.current.onFinal(result.text)
+        setPartial('')
+        settle(result.text?.trim() ? 'final' : 'empty')
+      } catch (err) {
+        sessionIdRef.current = null
+        if (!token.cancelled && mountedRef.current) {
+          setErrorState(errorMessage(err))
+          // o texto parcial fica guardado e pode ser inserido (nada do que foi dito se perde)
+          if (partialRef.current.trim()) setPartialRecoverable(true)
+          else setPartial('')
+          settle('failed')
+        }
+      } finally {
+        if (finalizeRef.current === token) finalizeRef.current = null
+        if (!token.cancelled && mountedRef.current) setFinalizing(false)
+      }
+    },
+    [settle]
+  )
 
   // ---- captura (real): chunks PCM16 → push em ordem na sessão ----
   const onPcmChunk = useCallback(
@@ -304,6 +334,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     setPartial('')
     setPartialRecoverable(false)
     cancelRef.current = false
+    sessionFailedRef.current = false
     const v = voiceRef.current
     if (!v) {
       setErrorState('API de voz indisponível neste build.')
@@ -314,6 +345,12 @@ export function useDictation(options: UseDictationOptions): DictationControls {
       // settings FRESH nesta gravação (a tela Configurações → Áudio pode ter mudado tudo)
       const all = await loadVoiceSettings()
       settingsRef.current = all.audioInput
+      // transcrição na GPU local: o servidor liga sozinho (whisper aquecido) em paralelo à
+      // gravação — o áudio espera na sessão; falha ao subir vira o erro do ditado
+      void prepareGpuForDictation(all.sttSettings).catch((err: unknown) => {
+        if (gen === genRef.current && mountedRef.current)
+          setErrorState(`Transcrição (GPU local): ${errorMessage(err)}`)
+      })
       if (gen !== genRef.current) return // stop/cancel enquanto carregava
       if (MOCK) {
         if (mockMicOpen(settingsRef.current.deviceId)) setNotice(MIC_FALLBACK_NOTICE)
@@ -333,10 +370,11 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     } catch (err) {
       await dropSession()
       setErrorState(captureErrorText(err as Error))
+      settle('failed')
     } finally {
       setStarting(false)
     }
-  }, [state, ensureSession, dropSession, pttStart, pttClearError, handleStopped])
+  }, [state, ensureSession, dropSession, pttStart, pttClearError, handleStopped, settle])
 
   const stop = useCallback(async (): Promise<void> => {
     genRef.current++
@@ -356,10 +394,14 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     setPartial('')
     setPartialRecoverable(false)
     // "Transcrevendo…": o token descarta o texto e a sessão é cancelada no main
-    if (abortFinalize()) return
+    if (abortFinalize()) {
+      settle('cancelled')
+      return
+    }
     if (MOCK) {
       if (!mockRecording) {
         await dropSession()
+        settle('cancelled')
         return
       }
       cancelRef.current = true
@@ -369,6 +411,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     }
     if (pttState === 'idle' && !starting) {
       await dropSession()
+      settle('cancelled')
       return
     }
     cancelRef.current = true
@@ -377,8 +420,18 @@ export function useDictation(options: UseDictationOptions): DictationControls {
     if (sessionPromiseRef.current) {
       cancelRef.current = false
       await dropSession()
+      settle('cancelled')
     }
-  }, [mockRecording, handleStopped, dropSession, pttStop, pttState, starting, abortFinalize])
+  }, [
+    mockRecording,
+    handleStopped,
+    dropSession,
+    pttStop,
+    pttState,
+    starting,
+    abortFinalize,
+    settle
+  ])
 
   // UI bloqueada no meio da gravação (pergunta/retry, chamada, host offline): descarta
   const cancelLatest = useRef(cancel)
@@ -424,6 +477,8 @@ export function useDictation(options: UseDictationOptions): DictationControls {
   }, [])
   const clearNotice = useCallback(() => setNotice(null), [])
 
+  // auto-start da GPU (transcrição `gpu`): "preparando a GPU…" — texto em `useDictationGpuPreparing()`
+  const gpuPreparing = useDictationGpuPreparing()
   return useMemo(
     () => ({
       state,
@@ -439,6 +494,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
       updateSettings,
       reload,
       available: !!voice,
+      preparingGpu: !!gpuPreparing,
       start,
       stop,
       cancel
@@ -457,6 +513,7 @@ export function useDictation(options: UseDictationOptions): DictationControls {
       updateSettings,
       reload,
       voice,
+      gpuPreparing,
       start,
       stop,
       cancel

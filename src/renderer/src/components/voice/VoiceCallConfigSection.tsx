@@ -27,12 +27,15 @@ import { VoiceCallModelEditor } from './VoiceCallModelEditor'
 export function VoiceCallConfigSection({
   cfg,
   patch,
-  scope = 'chat'
+  scope = 'chat',
+  defaultOpen = false
 }: {
   cfg: ChatConfig
   patch: (p: Partial<ChatConfig>) => void
   /** Texto dos rótulos ("neste chat" × "nesta persona"). */
   scope?: 'chat' | 'persona'
+  /** Aberta por padrão (na aba própria "Voz"). */
+  defaultOpen?: boolean
 }): React.JSX.Element {
   const defaults = useVoiceSettings((s) => s.view.voiceCallDefaults)
   const globalEnabled = defaults.enabled
@@ -86,6 +89,7 @@ export function VoiceCallConfigSection({
       id={`voice-call-${scope}`}
       title="Chamada de voz"
       section="voice-call"
+      defaultOpen={defaultOpen}
       summary={{ text: summary, changed }}
       warning={!enabled ? `Chamada de voz desligada ${where}` : undefined}
       help={

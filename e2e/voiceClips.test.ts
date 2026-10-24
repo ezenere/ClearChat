@@ -40,18 +40,19 @@ const localSettings = (voice = 'pf_dora'): TtsSettings =>
     local: { engine: 'kokoro', voice, installed: true }
   })
 
-const apiSettings = (over: Partial<TtsSettings['api']> = {}): TtsSettings =>
-  normalizeTtsSettings({
-    backend: 'api',
-    api: {
-      providerId: null,
-      baseUrl: 'https://tts.example/v1',
-      apiKey: 'sk-test',
-      model: 'tts-model',
-      voice: 'alloy',
-      ...over
-    }
-  })
+/** Settings de fala por API com o endpoint já RESOLVIDO pelo main (provedor → endereço + chave). */
+const apiSettings = (over: Partial<TtsSettings['api']> = {}): TtsSettings => {
+  const api = {
+    providerId: 'p-tts',
+    baseUrl: 'https://tts.example/v1',
+    apiKey: 'sk-test',
+    model: 'tts-model',
+    voice: 'alloy',
+    ...over
+  }
+  const stored = normalizeTtsSettings({ backend: 'api', api })
+  return { ...stored, api: { ...stored.api, baseUrl: api.baseUrl, apiKey: api.apiKey } }
+}
 
 /** Motor local fake: cada chamada vira um "wav" com o tamanho pedido, e conta chamadas. */
 function fakeEngine(): { backend: TtsLocalBackend; calls: TtsLocalInput[] } {

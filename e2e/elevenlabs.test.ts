@@ -18,6 +18,7 @@ import {
   DEFAULT_TTS_SETTINGS,
   DEFAULT_VOICE_CALL_DEFAULTS,
   normalizeTtsSettings,
+  ttsCallTransport,
   type TtsSettings
 } from '@shared/voice'
 import {
@@ -127,7 +128,11 @@ const ttsSettings = (baseUrl: string, over: Partial<TtsSettings['api']> = {}): T
       ...over
     }
   })
-  return { ...s, api: { ...s.api, providerKind: 'elevenlabs' } }
+  // como o `getVoiceSettings` resolve o provedor (base/chave/tipo não são gravados nas settings)
+  return {
+    ...s,
+    api: { ...s.api, baseUrl, apiKey: KEY, ...over, providerKind: 'elevenlabs' }
+  }
 }
 
 const socketOpts = (
@@ -198,6 +203,35 @@ test('config: detecção por providerKind ou host; sem chave → TtsError config
   )
   assert.equal(elevenLabsCallOptions({ ...ttsSettings('https://x'), backend: 'local' }), null)
   assert.equal(elevenLabsCallOptions(DEFAULT_TTS_SETTINGS), null)
+})
+
+test('"Streaming por WebSocket": desligado força HTTP por frase; o indicador da UI espelha o main', () => {
+  const on = ttsSettings('https://api.elevenlabs.io')
+  assert.equal(on.api.elevenLabsWs, undefined, 'ausente = ligado (não grava o padrão)')
+  assert.ok(elevenLabsCallOptions(on))
+  const off = ttsSettings('https://api.elevenlabs.io', { elevenLabsWs: false })
+  assert.equal(off.api.elevenLabsWs, false, 'o false explícito sobrevive ao normalizador')
+  assert.equal(elevenLabsCallOptions(off), null)
+  // lixo/true não gravam nada (padrão = ligado)
+  assert.equal(
+    normalizeTtsSettings({ backend: 'api', api: { elevenLabsWs: 'não' } }).api.elevenLabsWs,
+    undefined
+  )
+  // indicador puro (@shared/voice) = a mesma decisão
+  assert.deepEqual(ttsCallTransport(on.api, 'elevenlabs'), { ws: true, reason: null, toggle: true })
+  assert.deepEqual(ttsCallTransport(off.api, 'elevenlabs'), {
+    ws: false,
+    reason: 'desligado por você',
+    toggle: true
+  })
+  const v4 = ttsCallTransport({ model: 'eleven_v4_turbo' }, 'elevenlabs')
+  assert.deepEqual(v4, { ws: false, reason: 'o v4 Turbo não suporta WebSocket', toggle: false })
+  assert.equal(
+    elevenLabsCallOptions(ttsSettings('https://api.elevenlabs.io', { model: 'eleven_v4_turbo' })),
+    null
+  )
+  assert.match(ttsCallTransport({ model: 'x' }, 'openrouter').reason ?? '', /OpenRouter/)
+  assert.equal(ttsCallTransport({ model: 'x' }, 'openai').ws, false)
 })
 
 test('WS URL: multi-stream-input, pcm_24000, model/language/inactivity — a chave NUNCA vai na URL', () => {
@@ -426,12 +460,17 @@ test('WS: texto em streaming palavra a palavra → flush → PCM; protocolo vali
     el.partial('Olá meu amigo, tudo be')
     el.cut('Olá meu amigo, tudo bem?')
     const s = el.synth('Olá meu amigo, tudo bem?')
+    // o corte faz flush SEM fechar (a próxima sentença continuaria no mesmo contexto); o fim da
+    // resposta fecha
+    await waitFor(() => fake.flushCount === 1, 2000, 'flush')
+    assert.ok(!fake.connections[0].frames.some((f) => f.close_context), 'sem close no corte')
+    el.end()
     const pcm = await collect(s.chunks)
     assert.equal(pcm.length, pcmBytes('Olá meu amigo, tudo bem?'))
     const frames = fake.connections[0].frames
     assert.equal(frames[0].text, ' ', 'init com espaço')
     assert.equal(frames[0].context_id, 'c1')
-    assert.deepEqual(frames[0].generation_config, { chunk_length_schedule: [50, 120, 160, 290] })
+    assert.deepEqual(frames[0].generation_config, { chunk_length_schedule: [120, 160, 250, 290] })
     assert.equal(frames[0].xi_api_key, KEY, 'chave no 1º frame (campo documentado)')
     assert.equal(fake.connections[0].headerKey, KEY, 'e no header xi-api-key')
     assert.deepEqual(
@@ -464,16 +503,16 @@ test('WS: frase longa gera áudio ANTES do corte (chunk_length_schedule); senten
   const el = new ElevenLabsCallTts({ config: () => socketOpts(fake) })
   try {
     el.begin()
-    const long = 'Esta é uma frase bem comprida que passa dos cinquenta caracteres antes de'
+    const long =
+      'Esta é uma frase bem comprida, que passa dos cento e vinte caracteres do primeiro limiar ' +
+      'do chunk_length_schedule antes de'
     el.partial(long)
     await waitFor(() => el.socket?.liveCount === 1 && fake.connections[0]?.frames.length >= 2, 2000)
-    // o fake gerou o 1º trecho com ≥ 50 chars (sem flush)
-    await waitFor(
-      () =>
-        fake.connections[0].frames.some((f) => typeof f.text === 'string' && f.text.length > 40),
-      2000
-    )
+    // o fake gerou o 1º trecho com ≥ 120 chars (sem flush)
+    await waitFor(() => (el.segmenter?.alignedUnits ?? 0) > 50, 2000, 'áudio antes do corte')
+    assert.equal(fake.flushCount, 0)
     el.cut(`${long} terminar.`)
+    el.end()
     const pcm = await collect(el.synth(`${long} terminar.`).chunks)
     // o fake gera o 1º trecho e o resto em separado (o espaço da emenda não vira áudio)
     assert.ok(Math.abs(pcm.length - pcmBytes(`${long} terminar.`)) <= 480, `${pcm.length}`)
@@ -500,6 +539,7 @@ test('WS → TtsStreamRelay: começo (pré-buffer) + pedaços em voice:call:utte
   try {
     const text = 'Uma resposta com tamanho suficiente para passar do pré-buffer de duzentos ms.'
     el.cut(text)
+    el.end()
     const head = await relay.synth(new AbortController().signal, async (s) => el.synth(text, s))
     assert.equal(head.mime, 'audio/pcm;rate=24000')
     relay.emitUtterance({ id: 'u1', audio: head.audio, mime: head.mime })
@@ -641,6 +681,7 @@ test('WS: queda no meio (antes do áudio) → reenvio do contexto num socket nov
   try {
     el.partial('Uma frase que vai ')
     el.cut('Uma frase que vai cair e voltar.')
+    el.end()
     const pcm = await collect(el.synth('Uma frase que vai cair e voltar.').chunks)
     assert.equal(pcm.length, pcmBytes('Uma frase que vai cair e voltar.'))
     assert.equal(fake.connections.length, 2)
@@ -655,13 +696,15 @@ test('WS: queda no meio (antes do áudio) → reenvio do contexto num socket nov
   }
 })
 
-test('WS: no máximo 2 contextos gerando ao mesmo tempo (os demais esperam a vez, na ordem)', async () => {
+test('WS: no máximo 2 contextos gerando ao mesmo tempo (contextos avulsos esperam a vez, na ordem)', async () => {
   const fake = await startElevenLabsFake({ chunkDelayMs: 10 })
   const el = new ElevenLabsCallTts({ config: () => socketOpts(fake) })
   try {
+    // sem cut (nova tentativa depois de falha): cada synth abre um contexto avulso
     const texts = ['Primeira frase.', 'Segunda frase.', 'Terceira frase.', 'Quarta frase.']
-    for (const t of texts) el.cut(t)
-    for (const t of texts) assert.equal((await collect(el.synth(t).chunks)).length, pcmBytes(t))
+    const streams = texts.map((t) => el.synth(t))
+    for (let i = 0; i < texts.length; i++)
+      assert.equal((await collect(streams[i].chunks)).length, pcmBytes(texts[i]))
     assert.ok(fake.maxActive <= 2, `maxActive=${fake.maxActive}`)
     assert.deepEqual(fake.protocolErrors, [])
   } finally {
@@ -868,6 +911,11 @@ test('ponta a ponta: deltas do LLM → socket (palavra a palavra) → PCM no rel
       type: 'message-added',
       message: { id: 'm2', sessionId: 's1', message: { role: 'assistant', content: answer } }
     } as unknown as AgentEvent)
+    // o turno do agente terminou: o contexto da resposta fecha (a última frase termina)
+    emit({
+      type: 'session-updated',
+      session: { id: 's1', status: 'idle' }
+    } as unknown as AgentEvent)
     await waitFor(
       () =>
         utts.length >= 2 &&
@@ -893,6 +941,12 @@ test('ponta a ponta: deltas do LLM → socket (palavra a palavra) → PCM no rel
       .filter((f) => typeof f.text === 'string' && f.text !== ' ')
     assert.ok(textFrames.length > sentences.length + 1, 'texto entrou aos pedaços (antes do corte)')
     assert.equal(fake.connections.length, 1)
+    // UM contexto para a resposta inteira (prosódia contínua), um flush por sentença
+    const ctxIds = new Set(fake.connections[0].frames.map((f) => f.context_id).filter(Boolean))
+    assert.equal(ctxIds.size, 1, `contextos: ${[...ctxIds].join(',')}`)
+    assert.equal(fake.flushCount, sentences.length)
+    // a 1ª frase NÃO cortou na vírgula ("Claro, posso…" ficou inteira)
+    assert.match(sentences[0], /^Claro, posso te contar uma coisa interessante\.$/)
     assert.deepEqual(fake.protocolErrors, [])
     m.stop()
   } finally {

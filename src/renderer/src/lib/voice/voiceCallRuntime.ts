@@ -3,6 +3,7 @@
 // uma única vez em `App` por `VoiceCallController`) publica aqui; a barra da chamada — que ocupa o
 // lugar do composer do chat da chamada — só lê e chama as ações.
 import { create } from 'zustand'
+import type { GpuCallPlan } from './gpu/gpuUi'
 
 /** Clipes de interjeição/filler da voz atual (sem eles os atos de fala curta não tocam). */
 export type VoiceClipsState = 'unknown' | 'missing' | 'ok' | 'generating'
@@ -22,6 +23,15 @@ export interface VoiceCallRuntime {
    * (`partial`), a especulativa da pausa (`speculative`) e a final enviada (`final`); '' = nada.
    */
   live: { text: string; state: 'partial' | 'speculative' | 'final' | null }
+  /**
+   * Chamada com fala/transcrição na GPU local: o plano da pré-checagem (`gpuCallPlan` — aviso de uso
+   * da GPU e VRAM livre × necessária) para a barra mostrar na fase "Preparando a GPU…"; null = sem GPU.
+   */
+  gpuCall: GpuCallPlan | null
+  /** O aviso "a chamada vai usar sua GPU" já foi dispensado nesta sessão do app ("Entendi"). */
+  gpuNoticeSeen: boolean
+  /** O aviso de pouca VRAM foi fechado nesta chamada. */
+  gpuWarningClosed: boolean
   toggleMute: () => Promise<void>
   setVolume: (volume: number) => void
   clearError: () => void
@@ -35,6 +45,9 @@ export const useVoiceCallRuntime = create<VoiceCallRuntime>(() => ({
   clips: 'unknown',
   clipsProgress: null,
   live: { text: '', state: null },
+  gpuCall: null,
+  gpuNoticeSeen: false,
+  gpuWarningClosed: false,
   toggleMute: async () => {},
   setVolume: () => {},
   clearError: () => {},

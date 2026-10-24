@@ -3,8 +3,9 @@
 // rede externa: microfone INJETADO (getUserMedia/enumerateDevices trocados por um stream
 // sintético — o microfone real nunca é aberto; as flags de fake device do Chromium são ignoradas
 // neste Electron/Linux) + servidor FALSO de STT
-// (`e2e/fakes/sttServer.ts`) respondendo `/audio/transcriptions` com transcrição fixa (o
-// `sttSettings` é apontado para ele). userData isolado (`CLEARCHAT_USER_DATA`); nenhuma chave real.
+// (`e2e/fakes/sttServer.ts`) respondendo `/audio/transcriptions` com transcrição fixa (cadastrado
+// em Configurações → Provedores como OpenAI-compatível em localhost, com chave, e escolhido em
+// Áudio → Transcrição). userData isolado (`CLEARCHAT_USER_DATA`); nenhuma chave real.
 //
 // Uso:
 //   unset ELECTRON_RUN_AS_NODE
@@ -12,12 +13,13 @@
 //   CLEARCHAT_E2E_DIR=/tmp/algum-dir node e2e/voice-dictation.spec.ts
 //   (ou: npm run test:e2e:voice)
 //
-// Cobre: botão de microfone no composer (clique inicia/para), chevron com menu de microfone
-// (Padrão do sistema + dispositivo injetado), gravação com o áudio injetado → parciais
-// (no fantasma `voice-partial`, FORA da textarea) → Parar gravação → texto final no rascunho
-// editável (envio SEMPRE manual — a mensagem não sai sozinha), Esc cancela descartando, o request
+// Cobre: grupo [ telefone | mic | ˅ ] no composer, chevron com menu de microfone (Padrão do
+// sistema + dispositivo injetado), gravação com o áudio injetado → parciais (no campo do ditado
+// `voice-draft`, translúcidas depois do texto digitado — a textarea não muda) → ✓ concluir → texto
+// final no rascunho editável (o ✓ não envia), Esc cancela descartando, "Enviar" durante a gravação
+// conclui e envia digitado + final, o request
 // multipart chega ao servidor falso (file/model/language/response_format + Authorization da chave
-// salva) e o microfone salvo inexistente cai no padrão com aviso (OverconstrainedError simulado).
+// do provedor) e o microfone salvo inexistente cai no padrão com aviso (OverconstrainedError simulado).
 import {
   _electron as electron,
   type ElectronApplication,
@@ -139,8 +141,11 @@ const composer = (): Locator => page.locator('[data-testid="composer-column"] te
 const dialog = (): Locator => page.locator('[role="dialog"]')
 const composerValue = (): Promise<string> => composer().inputValue()
 const micButton = (): Locator => page.getByTestId('voice-mic-button')
-const stopButton = (): Locator => page.getByTestId('voice-stop-button')
+const finishButton = (): Locator => page.getByTestId('voice-finish-button')
 const waveform = (): Locator => page.getByTestId('voice-waveform')
+/** Gravando de verdade (captura aberta), não só "abrindo o microfone". */
+const recording = (): Locator =>
+  page.locator('[data-testid="voice-recording"][data-state="recording"]')
 
 async function main(): Promise<void> {
   rmSync(BASE, { recursive: true, force: true })
@@ -235,25 +240,39 @@ async function main(): Promise<void> {
       await page.getByRole('button', { name: /^Configurações/ }).click()
       await page.getByRole('button', { name: 'Áudio', exact: true }).click()
       await page.getByTestId('audio-settings').waitFor()
-      // STT: endpoint do servidor falso (commit no blur de cada campo)
-      await page.getByTestId('stt-base-url').fill(stt!.url)
-      await page.getByTestId('stt-base-url').press('Tab')
-      await page.getByTestId('stt-model').fill('whisper-large-v3-turbo')
-      await page.getByTestId('stt-model').press('Tab')
-      await page.getByTestId('stt-api-key').fill(STT_KEY)
-      // padrão de "Pesquisa na web": Salvar explícito; o campo volta vazio com a máscara no
-      // placeholder (a chave sai MASCARADA do main — nunca em claro)
-      await page.getByTestId('stt-api-key-save').click()
-      const keyField = page.getByTestId('stt-api-key')
+      // STT: o servidor falso é cadastrado em Configurações → Provedores (OpenAI-compatível em
+      // localhost, com chave) — a aba Áudio só escolhe entre os provedores cadastrados
+      await dialog().getByRole('button', { name: 'Provedores', exact: true }).click()
+      await dialog()
+        .getByRole('button', { name: /Adicionar provedor/ })
+        .click()
+      await dialog().locator('input.field').nth(0).fill('STT falso')
+      await dialog().locator('input.field').nth(1).fill(stt!.url)
+      await dialog().locator('input[type="password"]').fill(STT_KEY)
+      await dialog().getByRole('button', { name: 'Adicionar', exact: true }).click()
+      await dialog().getByText('STT falso').first().waitFor()
+      await dialog().getByRole('button', { name: 'Áudio', exact: true }).click()
+      await page.getByTestId('audio-settings').waitFor()
+      await page.getByRole('button', { name: 'Provedor da transcrição', exact: true }).click()
+      await page
+        .locator('div.shadow-popover')
+        .last()
+        .getByRole('button')
+        .filter({ hasText: /^STT falso/ })
+        .first()
+        .click()
       await waitFor(
         async () =>
-          (await keyField.inputValue()) === '' &&
-          ((await keyField.getAttribute('placeholder')) ?? '').includes('…'),
+          (await page.getByTestId('stt-model').getAttribute('data-value')) ===
+          'whisper-large-v3-turbo',
         5000,
-        'máscara no placeholder'
+        'modelo padrão no provedor novo'
       )
-      const masked = ((await keyField.getAttribute('placeholder')) ?? '').split(' — ')[0]
-      assert(masked.includes('…') && masked.endsWith(STT_KEY.slice(-4)), `máscara: ${masked}`)
+      // a chave fica no provedor (main); a visão das settings de voz não tem chave nenhuma
+      const provs = await call<any[]>('providers.list')
+      const fake = provs.find((p) => p.name === 'STT falso')
+      assert(fake && fake.baseUrl === stt!.url.replace(/\/+$/, ''), 'provedor do STT falso')
+      const masked = `${STT_KEY.slice(0, 3)}…${STT_KEY.slice(-4)}`
       // tecla do push-to-talk: captura a próxima tecla e mostra a atual
       await page.getByTestId('ptt-key-capture').click()
       await page.keyboard.press('F8')
@@ -272,10 +291,10 @@ async function main(): Promise<void> {
       await page.keyboard.press('Escape')
       await dialog().waitFor({ state: 'detached' })
       const view = await call<any>('voice.settings.get')
-      assert(view.sttSettings.api.apiKey === masked, 'máscara estável no get')
+      assert(view.sttSettings.api.providerId === fake.id, 'STT aponta para o provedor cadastrado')
       assert(!JSON.stringify(view).includes(STT_KEY), 'chave em claro no get')
       assert(view.audioInput.silenceStopMs === 0, `silenceStopMs ${view.audioInput.silenceStopMs}`)
-      return `máscara ${masked} · baseUrl ${stt!.url}`
+      return `provedor ${fake.name} (${masked}) · baseUrl ${stt!.url}`
     }
   )
 
@@ -298,43 +317,65 @@ async function main(): Promise<void> {
     return `${n} microfone(s)`
   })
 
+  await step('composer: [ telefone | mic | ˅ ] num grupo só, antes do enviar', async () => {
+    const kids = await page
+      .getByTestId('voice-group')
+      .evaluate((g) =>
+        [...g.children].map(
+          (c) =>
+            (c as HTMLElement).dataset.testid ??
+            (c.querySelector('[data-testid]') as HTMLElement | null)?.dataset.testid
+        )
+      )
+    assert(
+      JSON.stringify(kids) ===
+        JSON.stringify(['voice-call-button', 'voice-mic-button', 'voice-mic-menu-button']),
+      `segmentos: ${kids.join(' | ')}`
+    )
+    return kids.join(' | ')
+  })
+
   await step(
-    'clicar mic → grava (microfone injetado) → parciais no rascunho → parar → texto final',
+    'clicar mic → grava (microfone injetado) → parciais translúcidas depois do digitado → ✓ → texto final',
     async () => {
+      await composer().fill('Digitado:')
       await micButton().click()
       // estado real "gravando" (depois do start assíncrono da captura)
-      await page.locator('[data-testid="voice-mic-button"][aria-pressed="true"]').waitFor({
-        timeout: 15_000
-      })
+      await recording().waitFor({ timeout: 15_000 })
       await waveform().waitFor({ timeout: 10_000 })
-      await stopButton().waitFor({ timeout: 10_000 })
-      // o botão de enviar vira "Parar gravação"
-      assert(
-        (await page.getByRole('button', { name: 'Enviar' }).count()) === 0,
-        'envio ainda visível'
-      )
-      // parcial ao vivo aparece no fantasma (fora da textarea — o rascunho editável não muda)
+      await finishButton().waitFor({ timeout: 10_000 })
+      const draft = page.getByTestId('voice-draft')
+      await draft.waitFor()
+      // sem texto ainda: "Ouvindo…" depois do digitado; nada de título "Gravando"
+      const first = await draft.innerText()
+      assert(/^Digitado: (Ouvindo…|ISTO)/.test(first), `campo do ditado: "${first}"`)
+      assert(!/Gravando/.test(await page.locator('body').innerText()), 'título "Gravando"')
+      // parcial ao vivo no campo (translúcida), depois do digitado; a textarea não muda
       const ghost = page.getByTestId('voice-partial')
       await waitFor(
         async () =>
           ((await ghost.innerText().catch(() => '')) || '').includes(STT_TEXT.slice(0, 8)),
         20_000,
-        'parcial no fantasma'
+        'parcial no campo'
       )
       await shot('gravando')
       const partial = (await ghost.innerText()).trim()
-      assert(!(await composerValue()).includes('▌'), 'parcial vazou para a textarea')
-      assert(partial.includes(STT_TEXT.slice(0, 8)), `parcial inesperada: ${partial}`)
+      assert((await composerValue()) === 'Digitado:', 'parcial vazou para a textarea')
+      assert(
+        (await page.getByTestId('voice-recording').getAttribute('data-has-text')) === 'true',
+        'mic roxo com texto'
+      )
       const chat = (await call<any[]>('chats.list'))[0]
       const before = (await call<any[]>('sessions.messages', chat.mainSessionId)).length
-      await stopButton().click()
-      // texto final vira rascunho normal (sem ▌)
+      await finishButton().click()
+      // texto final vira rascunho normal, no ponto de inserção
       await waitFor(
-        async () => (await composerValue()) === STT_TEXT,
+        async () => (await composerValue()) === `Digitado: ${STT_TEXT}`,
         20_000,
         'texto final no rascunho'
       )
-      // envio é SEMPRE manual: nada saiu sozinho
+      await draft.waitFor({ state: 'detached', timeout: 5000 })
+      // ✓ não envia
       const after = (await call<any[]>('sessions.messages', chat.mainSessionId)).length
       assert(after === before, `mensagem saiu sozinha (${before} → ${after})`)
       await shot('rascunho-final')
@@ -374,15 +415,47 @@ async function main(): Promise<void> {
   await step('Esc cancela a gravação e descarta (rascunho intacto)', async () => {
     const before = await composerValue()
     await micButton().click()
-    await page.locator('[data-testid="voice-mic-button"][aria-pressed="true"]').waitFor({
-      timeout: 15_000
-    })
+    await recording().waitFor({ timeout: 15_000 })
     await waveform().waitFor({ timeout: 10_000 })
     await page.keyboard.press('Escape')
     await waveform().waitFor({ state: 'detached', timeout: 10_000 })
-    assert(!(await composerValue()).includes('▌'), 'parcial sobrou após cancelar')
+    await page.getByTestId('voice-draft').waitFor({ state: 'detached', timeout: 5000 })
     assert((await composerValue()) === before, `rascunho mudou: "${await composerValue()}"`)
     await shot('cancelado')
+  })
+
+  await step('Enviar durante a gravação → conclui e envia digitado + final', async () => {
+    await composer().fill('Enviado:')
+    const chat = (await call<any[]>('chats.list'))[0]
+    const before = (await call<any[]>('sessions.messages', chat.mainSessionId)).length
+    await micButton().click()
+    await recording().waitFor({ timeout: 15_000 })
+    await waitFor(
+      async () =>
+        (
+          (await page
+            .getByTestId('voice-partial')
+            .innerText()
+            .catch(() => '')) || ''
+        ).includes(STT_TEXT.slice(0, 8)),
+      20_000,
+      'parcial no campo'
+    )
+    await page.getByTestId('composer-send').click()
+    const want = `Enviado: ${STT_TEXT}`
+    const sent = await waitFor(
+      async () => {
+        const msgs = await call<any[]>('sessions.messages', chat.mainSessionId)
+        return msgs.length > before
+          ? msgs.find((m) => m.message?.role === 'user' && m.message?.content === want)
+          : null
+      },
+      20_000,
+      'mensagem enviada com o texto final'
+    )
+    await page.getByTestId('voice-draft').waitFor({ state: 'detached', timeout: 5000 })
+    assert((await composerValue()) === '', 'campo limpo')
+    return `enviada: "${sent.message.content}"`
   })
 
   await step('microfone salvo inexistente → cai no padrão do sistema com aviso', async () => {
@@ -393,9 +466,7 @@ async function main(): Promise<void> {
     })
     // as settings do composer são relidas no início de cada gravação
     await micButton().click()
-    await page.locator('[data-testid="voice-mic-button"][aria-pressed="true"]').waitFor({
-      timeout: 15_000
-    })
+    await recording().waitFor({ timeout: 15_000 })
     const notice = page.getByTestId('voice-notice')
     await notice.waitFor({ timeout: 10_000 })
     const txt = await notice.innerText()

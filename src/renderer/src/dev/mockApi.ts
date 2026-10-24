@@ -2,6 +2,7 @@
 // Carregado apenas quando o renderer é buildado com VITE_CLEAR_MOCK=1 (ver main.tsx).
 import { DEFAULT_CHAT_CONFIG } from '@shared/defaults'
 import { createMockVoiceCatalog } from './mockVoiceCatalog'
+import { createMockGpu } from './mockGpu'
 import { providerKind } from '@shared/providerKinds'
 import {
   defaultSkillsSettings,
@@ -190,6 +191,16 @@ export function createMockApi(scenario: string): ClearApi {
             kind: 'openai',
             baseUrl: 'http://localhost:1234/v1',
             apiKey: '',
+            headers: {},
+            createdAt: now
+          },
+          // Groq cadastrado (OpenAI-compatível com chave) — o provedor padrão da transcrição no mock
+          {
+            id: 'p4',
+            name: 'Groq',
+            kind: 'openai',
+            baseUrl: 'https://api.groq.com/openai/v1',
+            apiKey: 'gsk_mock_0000000000000000abcd',
             headers: {},
             createdAt: now
           },
@@ -1715,7 +1726,7 @@ export function createMockApi(scenario: string): ClearApi {
     }, 900)
   }
 
-  return {
+  const mockApi: ClearApi = {
     sync: {
       status: () => delay(syncStatus()),
       probeServer: noSync,
@@ -2308,8 +2319,8 @@ export function createMockApi(scenario: string): ClearApi {
           )
       }
     })(),
-    // Áudio/voz (mock): settings com a chave ECOADA mascarada (escrever por cima da máscara
-    // preserva a chave real — mesmo contrato do main) e transcrição falsa com parciais ao vivo.
+    // Áudio/voz (mock): settings só com provedor/modelo/voz (endereço e chave ficam no provedor —
+    // mesmo contrato do main) e transcrição falsa com parciais ao vivo.
     voice: ((): VoiceApi => {
       // Cenários de áudio (falhas simuladas do microfone — a captura é pulada no mock, então o
       // ditado/chamada consultam `window.__clearMockMic`):
@@ -2317,7 +2328,7 @@ export function createMockApi(scenario: string): ClearApi {
       //   ?scenario=voice-mic-denied  → permissão negada (NotAllowedError)
       //   ?scenario=voice-mic-lost    → o microfone some 1,5 s depois de começar a gravar
       //   ?scenario=voice-call-fail   → `voice.call.start` recusa (erro legível)
-      //   ?scenario=voice-not-ready   → STT sem chave e Kokoro não instalado (pré-checagem da chamada)
+      //   ?scenario=voice-not-ready   → STT sem provedor e Kokoro não instalado (pré-checagem da chamada)
       //   ?scenario=voice-no-espeak   → `runtime.status` sem espeak-ng (TTS local não pronto)
       //   ?scenario=voice-tts-fail    → "Testar voz" falha (401 legível)
       //   ?scenario=voice-alias       → STT no OpenRouter com o id sem prefixo (corrigido na UI)
@@ -2338,13 +2349,13 @@ export function createMockApi(scenario: string): ClearApi {
         ...DEFAULT_AUDIO_INPUT,
         deviceId: scenario === 'voice-mic-missing' ? 'mic-usb-desconectado' : null
       }
-      // pronto para a chamada por padrão (chave de STT fake + Kokoro "instalado")
+      // pronto para a chamada por padrão (STT no Groq cadastrado + Kokoro "instalado")
       let stt: SttSettings = {
         ...DEFAULT_STT_SETTINGS,
         api:
           scenario === 'voice-alias'
             ? { ...DEFAULT_STT_SETTINGS.api, providerId: 'p1', model: 'whisper-large-v3-turbo' }
-            : { ...DEFAULT_STT_SETTINGS.api, apiKey: ready ? 'gsk_mock_0000000000000000abcd' : '' }
+            : { ...DEFAULT_STT_SETTINGS.api, providerId: ready ? 'p4' : null }
       }
       let tts: TtsSettings = {
         ...DEFAULT_TTS_SETTINGS,
@@ -2368,54 +2379,44 @@ export function createMockApi(scenario: string): ClearApi {
           ? { ...DEFAULT_TTS_SETTINGS.local, installed: ready }
           : null
       }
+      // ?scenario=gpu-call* → Fala e Transcrição na GPU local (OmniVoice + CC0 Faber; whisper)
+      if (scenario.startsWith('gpu-call')) {
+        tts = { ...tts, backend: 'gpu', gpu: { engine: 'omnivoice', voice: 'cc0-faber' } }
+        stt = { ...stt, mode: 'gpu', gpu: { engine: 'whisper-large-v3-turbo' } }
+      }
       let voiceCallDefaults = { ...DEFAULT_VOICE_CALL_DEFAULTS }
       const asObj = (v: unknown): Record<string, unknown> | null =>
         v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null
-      /** Chave: `null`/`''` remove; igual à máscara / ausente / lixo preserva; outra string = nova. */
-      const nextKey = (current: string, raw: unknown): string => {
-        if (raw === null || raw === '') return ''
-        const t = typeof raw === 'string' ? raw.trim() : null
-        if (t === null) return current
-        if (!t) return ''
-        return t === (maskKey(current) ?? '') ? current : t
-      }
-      const masked = <T extends SttSettings | TtsSettings>(s: T): T => ({
-        ...s,
-        api: { ...s.api, apiKey: maskKey(s.api.apiKey) ?? '' }
-      })
       const view = (): VoiceSettingsMap => ({
         audioInput: normalizeAudioInput(audioInput),
-        sttSettings: masked(stt),
-        ttsSettings: masked(tts),
+        sttSettings: stt,
+        ttsSettings: tts,
         voiceCallDefaults: normalizeVoiceCallDefaults(voiceCallDefaults)
       })
+      /**
+       * Backend/modo 'gpu' + `gpu` (Modo avançado): mantidos mesmo que o normalizador compartilhado
+       * ainda não os conheça (o backend da GPU acrescenta ao `voice.ts`).
+       */
+      const keepGpu = <T extends object>(
+        norm: T,
+        raw: Record<string, unknown> | null,
+        field: 'backend' | 'mode'
+      ): T => {
+        if (!raw) return norm
+        const out = { ...norm } as Record<string, unknown>
+        if (raw[field] === 'gpu') out[field] = 'gpu'
+        if ('gpu' in raw && !('gpu' in norm && (norm as { gpu?: unknown }).gpu))
+          out.gpu = raw.gpu ?? null
+        return out as T
+      }
       const apply = (kind: string, value: unknown): unknown => {
         const raw = asObj(value)
         if (kind === 'audioInput') return (audioInput = normalizeAudioInput(value))
         if (kind === 'voiceCallDefaults')
           return (voiceCallDefaults = normalizeVoiceCallDefaults(value))
-        if (kind === 'sttSettings') {
-          const api = asObj(raw?.api)
-          stt = normalizeSttSettings({
-            ...(raw ?? {}),
-            api: {
-              ...(api ?? {}),
-              apiKey: nextKey(stt.api.apiKey, api && 'apiKey' in api ? api.apiKey : undefined)
-            }
-          })
-          return masked(stt)
-        }
-        if (kind === 'ttsSettings') {
-          const api = asObj(raw?.api)
-          tts = normalizeTtsSettings({
-            ...(raw ?? {}),
-            api: {
-              ...(api ?? {}),
-              apiKey: nextKey(tts.api.apiKey, api && 'apiKey' in api ? api.apiKey : undefined)
-            }
-          })
-          return masked(tts)
-        }
+        if (kind === 'sttSettings') return (stt = keepGpu(normalizeSttSettings(value), raw, 'mode'))
+        if (kind === 'ttsSettings')
+          return (tts = keepGpu(normalizeTtsSettings(value), raw, 'backend'))
         throw new Error(`Grupo de settings desconhecido: ${kind}`)
       }
       // transcrição falsa: parciais ao vivo em timers + texto final fixo (sem áudio de verdade)
@@ -2461,11 +2462,19 @@ export function createMockApi(scenario: string): ClearApi {
             if (active?.id !== sessionId) throw new Error('Sessão de transcrição desconhecida.')
             active.timers.forEach(clearTimeout)
             active = null
+            // E2E: `window.__clearMockSttFinal = 'fail'` simula a final que falha (parcial recuperável)
+            if (
+              (window as unknown as { __clearMockSttFinal?: string }).__clearMockSttFinal === 'fail'
+            )
+              return delay(null, 500).then(() => {
+                throw new Error('Serviço de transcrição fora do ar (mock).')
+              })
             return delay(
               {
                 text: MOCK_FINAL,
                 model: stt.api.model,
-                baseUrl: stt.api.baseUrl,
+                baseUrl:
+                  providers.find((p) => p.id === stt.api.providerId)?.baseUrl ?? 'mock://stt',
                 ms: 320,
                 backend: 'api' as const,
                 fellBack: false
@@ -2643,8 +2652,13 @@ export function createMockApi(scenario: string): ClearApi {
             return {
               audio: fakeWav(),
               mime: format === 'mp3' ? 'audio/mpeg' : 'audio/wav',
-              model: tts.backend === 'api' ? tts.api.model || 'mock-tts' : 'kokoro (mock)',
-              backend: tts.backend,
+              model:
+                tts.backend === 'api'
+                  ? tts.api.model || 'mock-tts'
+                  : tts.backend === 'gpu'
+                    ? `${tts.gpu?.engine ?? 'gpu'} (mock)`
+                    : 'kokoro (mock)',
+              backend: tts.backend === 'gpu' ? 'local' : tts.backend,
               ms: 350
             }
           }
@@ -2802,6 +2816,32 @@ export function createMockApi(scenario: string): ClearApi {
                 sessionId,
                 turnSilenceMs: resolveTurnSilenceMs(voiceCallDefaults.turn, audioInput)
               }
+              // GPU local (como o main): motores não carregados → "Preparando a GPU…" (o microfone
+              // só abre depois); falha no aquecimento encerra a chamada com o motivo
+              const gpuIds = [
+                ...(tts.backend === 'gpu' ? [tts.gpu?.engine ?? 'omnivoice'] : []),
+                ...(stt.mode === 'gpu' ? ['whisper-large-v3-turbo' as const] : [])
+              ]
+              if (gpuIds.length && !gpu.isWarm(gpuIds)) {
+                state = { ...state, preparing: 'Iniciando…' }
+                const still = (): boolean => state.active && state.sessionId === sessionId
+                void gpu
+                  .warm(gpuIds, (t) => {
+                    if (still()) setState({ preparing: t })
+                  })
+                  .then(() => {
+                    if (still()) setState({ preparing: null })
+                  })
+                  .catch((e: unknown) => {
+                    if (!still()) return
+                    clearTimers()
+                    state = {
+                      ...VOICE_CALL_INACTIVE,
+                      error: `a GPU local não ficou pronta — ${(e as Error).message}. Feche programas que usam a GPU e tente de novo, ou use uma voz na nuvem (Configurações → Áudio)`
+                    }
+                    voiceCallStateListeners.forEach((l) => l({ ...state }))
+                  })
+              }
               voiceCallStateListeners.forEach((l) => l({ ...state }))
               // ?scenario=voice-call-api-error → os créditos da voz acabam no meio da chamada: o main
               // encerra a chamada com o motivo (estado inativo + error)
@@ -2850,11 +2890,7 @@ export function createMockApi(scenario: string): ClearApi {
           }
         })(),
         // descoberta de modelos/vozes (dados reais do OpenRouter recortados — `mockVoiceCatalog.ts`)
-        catalog: createMockVoiceCatalog(
-          () => providers,
-          (cap) => (cap === 'stt' ? stt.api.baseUrl : tts.api.baseUrl),
-          delay
-        ),
+        catalog: createMockVoiceCatalog(() => providers, delay),
         // probe dos runtimes locais (mock): tudo carregável, salvo ?scenario=voice-no-espeak
         runtime: {
           status: async (): Promise<VoiceRuntimeStatus> => {
@@ -3028,6 +3064,12 @@ export function createMockApi(scenario: string): ClearApi {
       return () => listeners.delete(cb)
     }
   }
+  // Modo avançado (GPU local): `voice.gpu` + `onVoiceGpuProgress` (`mockGpu.ts`, cenários `gpu-*`;
+  // os demais cenários usam o `gpu-ok` — RTX 3080 Ti com o runtime ausente)
+  const gpu = createMockGpu(scenario.startsWith('gpu-') ? scenario : 'gpu-ok', delay)
+  Object.assign(mockApi.voice ?? {}, { gpu: gpu.api })
+  Object.assign(mockApi, { onVoiceGpuProgress: gpu.onProgress })
+  return mockApi
 }
 
 const LONG_REASONING = `O usuário quer paginar uma lista grande no SQLite. A resposta óbvia é LIMIT/OFFSET, mas OFFSET fica linear: para pular 100 mil linhas o SQLite precisa percorrer 100 mil linhas do índice antes de devolver a primeira. Em listas que crescem, a página 2000 vira um gargalo.

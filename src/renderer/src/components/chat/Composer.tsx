@@ -1,18 +1,18 @@
 import {
   ArrowUp,
+  Check,
   Info,
   Lightbulb,
   Mic,
-  MicOff,
   Paperclip,
   Square,
   TriangleAlert,
   X,
   Zap
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { modalityWarning } from '@shared/attachments'
-import type { QueuedMessage, Session } from '@shared/types'
+import type { Chat, QueuedMessage, Session } from '@shared/types'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/format'
 import { splitInterChatText } from '@shared/interChat'
@@ -26,7 +26,7 @@ import {
 } from '../../store'
 import { ComposerInfo, QueueInfo } from '../apiDocs'
 import { Tip } from '../ui/Tooltip'
-import { AutoTextarea } from '../ui/controls'
+import { AutoTextarea, Spinner } from '../ui/controls'
 import { ComposerAttachmentChip } from './Attachments'
 import { useAttachmentSupport } from './attachmentSupport'
 import { useHistoryIncompatibility } from '../../lib/chatCompat'
@@ -48,14 +48,18 @@ import { ModelPill } from './ModelPill'
 import { SpendButton } from './SpendButton'
 import { BarLevelsContext, barAttrs, useBarCollapse, useBarLevel } from '../../lib/useBarCollapse'
 import { useDictation } from '../../lib/voice/useDictation'
+import { useDictationGpuPreparing } from '../../lib/voice/gpu/gpuPrepare'
 import {
-  DICTATION_CURSOR,
   insertDictationText,
+  planDictationCommit,
   rebaseDictationAnchor,
-  type DictationAnchor
+  SEND_FINAL_SLOW_NOTE,
+  SEND_FINAL_TIMEOUT_MS,
+  type DictationAnchor,
+  type DictationSettle
 } from '../../lib/voice/dictation'
-import { MicButton } from '../voice/MicControls'
-import { VoiceCallButton } from '../voice/VoiceCallButton'
+import { DictationDraft } from '../voice/DictationDraft'
+import { VoiceGroup } from '../voice/MicControls'
 import { VoiceCallDock, VoiceCallElsewhere } from '../voice/VoiceCallDock'
 import { Waveform } from '../voice/Waveform'
 
@@ -90,29 +94,22 @@ function ComposerStatus({ text }: { text: string }): React.JSX.Element {
   )
 }
 
-/**
- * Mic do ditado + menu do microfone + telefone da chamada; barra apertada (coluna estreita) deixa
- * só o mic e, no limite, nada (a tecla do PTT e Configurações → Áudio continuam; na chamada a
- * barra da chamada substitui o composer). Durante a gravação o mic nunca some.
- */
-function VoiceControls({
-  dictation,
-  session,
-  showMic
-}: {
-  dictation: ReturnType<typeof useDictation>
-  session: Session
-  showMic: boolean
-}): React.JSX.Element {
-  const level = useBarLevel('voice-controls')
-  // gravando/transcrevendo: o mic fica sempre (parar/estado visível)
-  const idle = dictation.state === 'idle'
-  const compact = level > 0 && idle
-  const hidden = level > 1 && idle
+/** Ícone do host (local/remoto, só com sync) — recolhível: some antes do grupo de voz. */
+function ComposerHost({ chat }: { chat: Chat }): React.JSX.Element {
+  const level = useBarLevel('composer-host')
   return (
-    <span {...barAttrs('voice-controls', level)} className="flex shrink-0 items-center gap-2">
-      {showMic && !hidden && <MicButton dictation={dictation} compact={compact} />}
-      {!compact && <VoiceCallButton session={session} />}
+    <span {...barAttrs('composer-host', level)} className="flex shrink-0 empty:hidden">
+      {level < 2 && <HostIndicator chat={chat} />}
+    </span>
+  )
+}
+
+/** `</>` "Sua mensagem" (o que vai para a API) — recolhível: some antes do grupo de voz. */
+function ComposerApiInfo({ running }: { running: boolean }): React.JSX.Element {
+  const level = useBarLevel('composer-info')
+  return (
+    <span {...barAttrs('composer-info', level)} className="flex shrink-0 empty:hidden">
+      {level < 2 && <ComposerInfo running={running} />}
     </span>
   )
 }
@@ -264,6 +261,8 @@ export function Composer({
   // skills desligadas no chat → os chips somem (e nada é enviado)
   const skillsOn = !!chat && skillsConfigOf(chat.config).enabled
   const pendingSkills = skillsOn ? pendingSkillsRaw : []
+  const ready = pending.filter((a) => a.status === 'ready' && a.info)
+  const loading = pending.some((a) => a.status === 'loading')
   const { supportOf, tooltip: attachTip } = useAttachmentSupport(session)
   /** O histórico tem mídia/tools que o modelo atual não aceita (trocado fora do seletor). */
   const historyWarning = useHistoryIncompatibility(session)
@@ -297,56 +296,183 @@ export function Composer({
     },
     [session.id]
   )
-  /** Cursor/seleção quando o ditado começou: o texto final entra AÍ (ajustado às edições). */
+  /** Cursor/seleção quando o ditado começou: o texto final entra AÍ. */
   const anchorRef = useRef<DictationAnchor | null>(null)
-  /**
-   * Texto final do ditado: entra no ponto de inserção (seleção do início do ditado, ajustada ao
-   * que foi digitado durante a gravação) via `execCommand('insertText')` — fica no histórico de
-   * desfazer da textarea (Ctrl+Z); sem a textarea (ou se o comando falhar), grava direto no estado.
-   */
-  const insertFinal = (spoken: string): void => {
-    const current = textRef.current
-    const at = rebaseDictationAnchor(anchorRef.current, current)
-    anchorRef.current = null
-    const r = insertDictationText(current, at.start, at.end, spoken)
-    if (!r.insert) return
-    const ta = ref.current
-    if (ta && ta.value === current) {
-      ta.focus()
-      ta.setSelectionRange(r.start, r.end)
-      if (document.execCommand('insertText', false, r.insert)) {
-        ta.setSelectionRange(r.caret, r.caret)
-        return
-      }
-    }
-    textRef.current = r.value
-    setText(r.value)
+  /** Card do composer (foco "dentro do composer" ao começar/terminar o ditado). */
+  const cardRef = useRef<HTMLDivElement>(null)
+  /** Espelho do campo durante o ditado (focável: Esc cancela, Enter conclui e envia). */
+  const draftRef = useRef<HTMLDivElement>(null)
+  /** Desfecho do ditado esperando a textarea voltar (o final é inserido no layout effect). */
+  const pendingFinalRef = useRef<string | null>(null)
+  const settleRef = useRef<DictationSettle | null>(null)
+  const [commitTick, setCommitTick] = useState(0)
+  /** "Enviar" durante a gravação: conclui e envia quando a final chegar (dentro do prazo). */
+  const sendAfterRef = useRef(false)
+  const [sendWaiting, setSendWaiting] = useState(false)
+  const sendTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  /** Aviso do desfecho (final falhou/demorou depois do "Enviar"). */
+  const [voiceNote, setVoiceNote] = useState<string | null>(null)
+  /** Região viva (leitor de tela) depois do ditado: "Transcrição pronta" / "Ditado cancelado". */
+  const [announce, setAnnounce] = useState('')
+  /** Ponto de inserção do ditado em curso (o espelho mostra o ditado AÍ). */
+  const [draftAnchor, setDraftAnchor] = useState<DictationAnchor | null>(null)
+  const clearSendWait = (): void => {
+    sendAfterRef.current = false
+    if (sendTimerRef.current) clearTimeout(sendTimerRef.current)
+    sendTimerRef.current = null
+    setSendWaiting(false)
   }
-  /** Ditado por voz: a parcial ao vivo fica num fantasma FORA da textarea; o final entra no rascunho. */
+  useEffect(
+    () => () => {
+      if (sendTimerRef.current) clearTimeout(sendTimerRef.current)
+    },
+    []
+  )
+  /**
+   * Ditado por voz: durante a gravação o campo vira um espelho (digitado + ditado translúcido) e a
+   * textarea não muda; o desfecho (✓/×/Enviar) chega por `onFinal`/`onSettled` e é aplicado no
+   * layout effect abaixo, com a textarea de volta.
+   */
   const dictation = useDictation({
-    onFinal: insertFinal,
+    onFinal: (spoken) => {
+      pendingFinalRef.current = spoken
+      setCommitTick((n) => n + 1)
+    },
+    onSettled: (settle) => {
+      settleRef.current = settle
+      setCommitTick((n) => n + 1)
+    },
     // UI do ditado escondida/bloqueada → tecla do PTT desligada e gravação em curso cancelada
     suspended: callActive || blocked || hostOffline || settingsOpen
   })
+  /** Auto-start da GPU (transcrição `gpu`): o mic já grava enquanto o servidor sobe. */
+  const gpuPrep = useDictationGpuPreparing()
+  const preparingGpu = !!dictation.preparingGpu || !!gpuPrep
+  const gpuText = preparingGpu ? gpuPrep?.text || 'Preparando a GPU…' : null
   const dictating = dictation.state !== 'idle'
-  const wasDictating = useRef(false)
-  useEffect(() => {
-    if (dictating && !wasDictating.current) {
+  /** Ditado em andamento (inclui o "Preparando a GPU…" do auto-start): campo espelho + barra da gravação. */
+  const voiceActive = (dictating || preparingGpu) && !blocked
+  const hasSpoken = !!dictation.partial.trim()
+  const focusInComposer = (): boolean => {
+    const a = document.activeElement
+    return !a || a === document.body || !!cardRef.current?.contains(a)
+  }
+  // início do ditado: guarda o ponto de inserção e põe o foco no espelho (Esc/Enter funcionam)
+  const wasVoiceActive = useRef(false)
+  useLayoutEffect(() => {
+    if (voiceActive && !wasVoiceActive.current) {
       const ta = ref.current
       const t = textRef.current
       anchorRef.current = ta
         ? { text: t, start: ta.selectionStart ?? t.length, end: ta.selectionEnd ?? t.length }
         : { text: t, start: t.length, end: t.length }
+      setDraftAnchor(anchorRef.current)
+      setVoiceNote(null)
+      if (focusInComposer()) draftRef.current?.focus({ preventScroll: true })
     }
-    wasDictating.current = dictating
-  }, [dictating])
+    wasVoiceActive.current = voiceActive
+  }, [voiceActive])
+
+  /**
+   * Insere o texto no ponto de inserção (seleção do início do ditado) via
+   * `execCommand('insertText')` — fica no histórico de desfazer da textarea (Ctrl+Z); sem a
+   * textarea (ou se o comando falhar), grava direto no estado. Devolve o valor novo.
+   */
+  const insertAtAnchor = (spoken: string): string => {
+    const current = textRef.current
+    const at = rebaseDictationAnchor(anchorRef.current, current)
+    anchorRef.current = null
+    const r = insertDictationText(current, at.start, at.end, spoken)
+    if (!r.insert) return current
+    const ta = ref.current
+    textRef.current = r.value
+    if (ta && ta.value === current) {
+      ta.focus()
+      ta.setSelectionRange(r.start, r.end)
+      if (document.execCommand('insertText', false, r.insert)) {
+        ta.setSelectionRange(r.caret, r.caret)
+        return r.value
+      }
+    }
+    setText(r.value)
+    return r.value
+  }
+  /** × / Esc: descarta o ditado (o campo volta como estava, com o foco e a seleção do início). */
+  const cancelDictation = (): void => {
+    clearSendWait()
+    void dictation.cancel()
+  }
+  /** ✓: para a gravação; o texto final entra no campo como texto normal. */
+  const finishDictation = (): void => {
+    if (dictation.state === 'recording') void dictation.stop()
+  }
+  /** Enviar durante a gravação: conclui (espera a final, com prazo) e envia o campo inteiro. */
+  const finishAndSend = (): void => {
+    if (sendAfterRef.current) return
+    if (dictation.state !== 'recording' && dictation.state !== 'stopping') return
+    sendAfterRef.current = true
+    setSendWaiting(true)
+    sendTimerRef.current = setTimeout(() => {
+      sendTimerRef.current = null
+      if (!sendAfterRef.current) return
+      // a final demorou: entra no campo quando chegar, sem enviar sozinha
+      clearSendWait()
+      setVoiceNote(SEND_FINAL_SLOW_NOTE)
+    }, SEND_FINAL_TIMEOUT_MS)
+    if (dictation.state === 'recording') void dictation.stop()
+  }
+  const submitRef = useRef<(force?: boolean, override?: string) => Promise<void>>(async () => {})
+  // desfecho do ditado, com a textarea de volta (o espelho já saiu neste commit)
+  useLayoutEffect(() => {
+    if (voiceActive) return
+    const settle = settleRef.current
+    const final = pendingFinalRef.current
+    if (settle === null && final === null) return
+    settleRef.current = null
+    pendingFinalRef.current = null
+    const sendRequested = sendAfterRef.current
+    clearSendWait()
+    const plan = planDictationCommit({
+      // final sem desfecho = "Inserir o texto parcial" do card de erro
+      settle: final !== null ? 'final' : (settle ?? 'empty'),
+      final: final ?? '',
+      partial: dictation.partial,
+      sendRequested,
+      hasOther: !!textRef.current.trim() || ready.length > 0 || pendingSkills.length > 0
+    })
+    // fora da fase de commit: o `input` do execCommand precisa do flushSync do React (dentro do
+    // layout effect o React "restaura" o valor antigo e o Chromium perde o desfazer da textarea)
+    queueMicrotask(() => {
+      let value = textRef.current
+      if (plan.insert) {
+        value = insertAtAnchor(plan.insert)
+        setAnnounce('Transcrição pronta')
+        // a parcial entrou no campo: o card de erro (com "Inserir o texto parcial") sai
+        if (settle === 'failed') dictation.clearError()
+      } else if (settle === 'cancelled' || settle === 'empty') {
+        if (settle === 'cancelled') setAnnounce('Ditado cancelado')
+        // o campo volta como estava, com o foco e a seleção do início
+        const ta = ref.current
+        const a = anchorRef.current
+        anchorRef.current = null
+        if (ta && focusInComposer()) {
+          ta.focus()
+          if (a && ta.value === a.text) ta.setSelectionRange(a.start, a.end)
+        }
+      } else if (settle === 'failed' && focusInComposer()) {
+        // a âncora fica para o "Inserir o texto parcial" do card de erro
+        ref.current?.focus()
+      }
+      if (plan.note) setVoiceNote(plan.note)
+      if (plan.send) void submitRef.current(false, value)
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- refs/estado lidos no desfecho
+  }, [commitTick, voiceActive])
 
   useEffect(() => {
     if (autoFocus) ref.current?.focus()
   }, [autoFocus, session.id])
 
-  const ready = pending.filter((a) => a.status === 'ready' && a.info)
-  const loading = pending.some((a) => a.status === 'loading')
   const warnings = useMemo(() => {
     const out = new Set<string>()
     if (historyWarning) out.add(historyWarning)
@@ -360,11 +486,21 @@ export function Composer({
   const confirming = !!warnKey && confirmKey === warnKey
   const canSend =
     !dictating && !loading && (!!text.trim() || ready.length > 0 || pendingSkills.length > 0)
+  /** Enviar durante o ditado = concluir + enviar (só com a gravação de pé ou finalizando). */
+  const canSendVoice =
+    !loading && !sendWaiting && (dictation.state === 'recording' || dictation.state === 'stopping')
 
-  const submit = async (force = false): Promise<void> => {
-    const t = text.trim()
+  /** Envia o campo (`override`: o valor recém-inserido pelo desfecho do ditado). */
+  const submit = async (force = false, override?: string): Promise<void> => {
+    const t = (override ?? text).trim()
+    // durante o ditado, "Enviar" conclui a transcrição e envia o campo inteiro depois
+    if (override === undefined && dictating) {
+      finishAndSend()
+      return
+    }
+    const can = !loading && (!!t || ready.length > 0 || pendingSkills.length > 0)
     // composer escondido pela chamada de voz deste chat: nada é enviado por atalho
-    if (!canSend || dictating || callHere) return
+    if (!can || callHere) return
     if (warnings.length && !force) {
       setConfirmKey(warnKey)
       return
@@ -399,6 +535,9 @@ export function Composer({
       }
     }
   }
+  useEffect(() => {
+    submitRef.current = submit
+  })
 
   return (
     <div className="relative px-8 pb-5">
@@ -442,19 +581,34 @@ export function Composer({
             </>
           ) : (
             <div
+              ref={cardRef}
+              data-testid="composer-card"
+              data-voice={voiceActive ? dictation.state : undefined}
               className={cn(
                 'group relative rounded-2xl border border-border bg-surface shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7)] transition-[border-color,box-shadow] duration-150',
                 'focus-within:border-border-strong focus-within:shadow-[0_8px_30px_-12px_rgb(0_0_0/0.7),0_0_0_3px_rgb(139_92_246/0.08)]'
               )}
-              onClick={() => ref.current?.focus()}
+              onClick={() => (voiceActive ? draftRef.current : ref.current)?.focus()}
               onKeyDown={(e) => {
-                // Esc com o foco no composer cancela a gravação em andamento (descarta)
-                if (dictating && e.key === 'Escape') {
+                // Esc com o foco no composer cancela o ditado em andamento (descarta)
+                if (voiceActive && e.key === 'Escape') {
                   e.preventDefault()
-                  void dictation.cancel()
+                  cancelDictation()
                 }
               }}
             >
+              {/* leitor de tela: "Ouvindo" / "Transcrição pronta" / "Ditado cancelado" */}
+              <span role="status" aria-live="polite" data-testid="voice-live" className="sr-only">
+                {voiceActive
+                  ? gpuText
+                    ? gpuText
+                    : dictation.state === 'recording'
+                      ? 'Ouvindo'
+                      : dictation.state === 'stopping'
+                        ? 'Finalizando a transcrição'
+                        : ''
+                  : announce}
+              </span>
               {question && <QuestionForm key={question.id} request={question} />}
               {!question && retry && <RetryForm key={retry.id} request={retry} />}
               {!blocked && (pending.length > 0 || pendingSkills.length > 0) && (
@@ -541,7 +695,17 @@ export function Composer({
                   className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-danger/30 bg-danger/[0.06] px-2.5 py-1.5 text-[12px] text-danger"
                 >
                   <TriangleAlert className="size-3.5 shrink-0" />
-                  <span className="min-w-0 flex-1">{dictation.error}</span>
+                  <span className="min-w-0 flex-1">
+                    {dictation.error}
+                    {dictation.partialRecoverable && dictation.partial && (
+                      <span
+                        data-testid="voice-recoverable-partial"
+                        className="mt-0.5 block truncate text-subtle italic"
+                      >
+                        “{dictation.partial}”
+                      </span>
+                    )}
+                  </span>
                   {dictation.partialRecoverable && (
                     <button
                       type="button"
@@ -562,6 +726,44 @@ export function Composer({
                   </button>
                 </div>
               )}
+              {!blocked && voiceNote && (
+                <div
+                  role="status"
+                  data-testid="voice-send-note"
+                  onClick={(e) => e.stopPropagation()}
+                  className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-warning/25 bg-warning/[0.06] px-2.5 py-1.5 text-[12px] text-warning"
+                >
+                  <Info className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1">{voiceNote}</span>
+                  <button
+                    type="button"
+                    aria-label="Dispensar aviso do ditado"
+                    onClick={() => setVoiceNote(null)}
+                    className="shrink-0 rounded-md p-1 transition-colors hover:bg-warning/15"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              )}
+              {voiceActive && (
+                // durante o ditado: digitado + ditado (translúcido) no mesmo campo, somente leitura
+                <DictationDraft
+                  ref={draftRef}
+                  text={text}
+                  anchor={draftAnchor}
+                  partial={dictation.partial}
+                  state={dictation.state}
+                  // sem parcial ainda: "Preparando a GPU…" antes do "Ouvindo…"
+                  gpuText={dictation.state === 'stopping' ? null : gpuText}
+                  onKeyDown={(e) => {
+                    // Enter conclui e envia (como o botão de enviar); Shift+Enter não faz nada
+                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      e.preventDefault()
+                      if (canSendVoice) finishAndSend()
+                    }
+                  }}
+                />
+              )}
               {!blocked && (
                 <AutoTextarea
                   ref={ref}
@@ -569,15 +771,11 @@ export function Composer({
                   minRows={1}
                   maxRows={14}
                   placeholder={
-                    dictating
-                      ? dictation.state === 'recording'
-                        ? 'Gravando… (Esc cancela)'
-                        : 'Transcrevendo…'
-                      : busy
-                        ? 'Enviar para a fila…'
-                        : session.depth > 0
-                          ? 'Mensagem ao subagente…'
-                          : 'Mensagem…'
+                    busy
+                      ? 'Enviar para a fila…'
+                      : session.depth > 0
+                        ? 'Mensagem ao subagente…'
+                        : 'Mensagem…'
                   }
                   onChange={(e) => setText(e.target.value)}
                   onPaste={(e) => {
@@ -588,190 +786,267 @@ export function Composer({
                   }}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                      // enquanto grava, Enter não envia (vira quebra de linha)
-                      if (dictating) return
                       e.preventDefault()
                       void submit()
                     }
                   }}
-                  className="block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none"
+                  // durante o ditado o espelho toma o lugar (o valor fica intocado até o desfecho)
+                  readOnly={voiceActive}
+                  aria-hidden={voiceActive || undefined}
+                  className={cn(
+                    'block w-full bg-transparent px-4 pt-3.5 pb-1 text-[14px] leading-6 outline-none',
+                    voiceActive && 'hidden'
+                  )}
                 />
-              )}
-              {!blocked && (dictating || (dictation.partialRecoverable && !!dictation.partial)) && (
-                // parcial ao vivo FORA do texto editável (digitar durante a gravação é seguro)
-                <div
-                  data-testid="voice-partial"
-                  data-state={dictation.state}
-                  aria-live="polite"
-                  className="mx-4 mb-1 flex items-start gap-1.5 text-[13px] leading-6 text-subtle italic"
-                >
-                  <Mic className="mt-1 size-3.5 shrink-0 animate-pulse-soft text-accent-strong" />
-                  <span
-                    className={cn(
-                      'min-w-0 break-words',
-                      dictation.state === 'stopping' && dictation.partial && 'opacity-70'
-                    )}
-                  >
-                    {dictation.partial ||
-                      (dictation.state === 'stopping' ? 'Transcrevendo…' : 'Ouvindo…')}
-                    {/* parando: o texto já transcrito fica (esmaecido) até a final substituí-lo */}
-                    {dictation.state === 'stopping' && dictation.partial && (
-                      <span
-                        data-testid="voice-partial-finalizing"
-                        className="ml-1.5 text-faint not-italic"
-                      >
-                        · finalizando…
-                      </span>
-                    )}
-                    {dictating && (
-                      <span className="text-accent-strong not-italic">{DICTATION_CURSOR}</span>
-                    )}
-                  </span>
-                </div>
               )}
               <BarLevelsContext.Provider value={barLevels}>
                 <div
                   ref={barRef}
                   data-testid="composer-toolbar"
+                  data-mode={voiceActive ? 'dictation' : 'normal'}
                   data-bar-clip
                   className="flex items-center gap-2 overflow-x-clip px-2.5 pb-2.5"
                 >
-                  {!blocked && (
-                    <Tip label={attachTip}>
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          void pickFiles(session.id)
-                        }}
-                        className="flex size-7 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
-                        aria-label="Anexar arquivos"
-                      >
-                        <Paperclip className="size-4" />
-                      </button>
-                    </Tip>
-                  )}
-                  {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
-                  {!blocked && (
-                    <VoiceControls dictation={dictation} session={session} showMic={!callActive} />
-                  )}
-                  {!blocked && dictating && (
-                    <Waveform
-                      level={dictation.level}
-                      recording={dictation.state === 'recording'}
-                      simulate={import.meta.env.VITE_CLEAR_MOCK === '1'}
-                      className="h-5 w-20 shrink-0"
-                    />
-                  )}
-                  {chat && <HostIndicator chat={chat} />}
-                  <span className="flex shrink-0 items-center gap-1.5 text-[11px] whitespace-nowrap text-faint">
-                    <ComposerInfo running={busy} />
-                    {busy ? (
-                      <ComposerStatus
-                        text={
-                          question || session.status === 'awaiting_input'
-                            ? 'Aguardando sua resposta'
-                            : retry || session.status === 'awaiting_retry'
-                              ? 'Aguardando sua decisão (falha de conexão)'
-                              : session.status === 'awaiting_approval'
-                                ? 'Aguardando aprovação'
-                                : session.status === 'waiting'
-                                  ? 'Aguardando subagentes'
-                                  : compaction?.state === 'running'
-                                    ? 'Compactando conversa…'
-                                    : 'Trabalhando…'
+                  {voiceActive ? (
+                    // ditado: [ mic | waveform | … | (parar agente) | [ × | ✓ ] | enviar ]
+                    <>
+                      <span
+                        role="img"
+                        data-testid="voice-recording"
+                        data-state={dictation.state}
+                        data-has-text={hasSpoken ? 'true' : 'false'}
+                        aria-label={
+                          gpuText
+                            ? 'Preparando a GPU para o ditado'
+                            : hasSpoken
+                              ? 'Ditando — transcrevendo'
+                              : 'Ditando — ouvindo'
                         }
-                      />
-                    ) : (
-                      <ComposerHint />
-                    )}
-                  </span>
-                  <div data-bar-spacer className="min-w-0 flex-1" />
-                  <div className="flex shrink-0 items-center gap-1">
-                    {chat && (
-                      <ModelPill
-                        providerId={sessionProviderId(
-                          chat.config,
-                          session.depth > 0 ? session : null
+                        className={cn(
+                          'flex size-7 shrink-0 items-center justify-center',
+                          hasSpoken ? 'text-accent-strong' : 'text-subtle'
                         )}
-                        model={session.depth > 0 ? session.model : chat.config.model}
+                      >
+                        {gpuText && !hasSpoken ? (
+                          <Spinner className="size-3.5" />
+                        ) : (
+                          <Mic
+                            className={cn(
+                              'size-4',
+                              dictation.state === 'recording' && 'animate-pulse-soft'
+                            )}
+                          />
+                        )}
+                      </span>
+                      <Waveform
+                        level={dictation.level}
+                        recording={dictation.state === 'recording'}
+                        simulate={import.meta.env.VITE_CLEAR_MOCK === '1'}
+                        className="h-5 w-20 min-w-6 shrink"
                       />
-                    )}
-                    {chat && <ContextMeter chat={chat} session={session} />}
-                    {chat && <SpendButton chat={chat} />}
-                    {busy && (
-                      <Tip label={dictating ? 'Parar o agente' : 'Parar'}>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            void run(() => api.agent.stop(session.id), 'Falha ao parar')
-                          }}
-                          className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
-                          aria-label={dictating ? 'Parar o agente' : 'Parar'}
-                          data-testid="agent-stop-button"
+                      <div data-bar-spacer className="min-w-0 flex-1" />
+                      <div className="flex shrink-0 items-center gap-1">
+                        {busy && (
+                          <Tip label="Parar o agente">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void run(() => api.agent.stop(session.id), 'Falha ao parar')
+                              }}
+                              className="mr-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
+                              aria-label="Parar o agente"
+                              data-testid="agent-stop-button"
+                            >
+                              <Square className="size-3" fill="currentColor" />
+                            </button>
+                          </Tip>
+                        )}
+                        <div
+                          role="group"
+                          aria-label="Ditado"
+                          data-testid="voice-dictation-actions"
+                          className="flex h-8 shrink-0 items-stretch divide-x divide-border overflow-hidden rounded-xl border border-border bg-elevated/40"
                         >
-                          <Square className="size-3" fill="currentColor" />
-                        </button>
-                      </Tip>
-                    )}
-                    {!blocked && dictating && (
-                      <>
-                        <Tip label="Cancelar gravação (Esc)">
-                          <button
-                            type="button"
-                            data-testid="voice-cancel-button"
-                            aria-label="Cancelar gravação"
-                            onClick={(e) => {
-                              e.stopPropagation()
-                              void dictation.cancel()
-                            }}
-                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl text-subtle transition-colors hover:bg-hover hover:text-fg"
+                          <Tip label="Cancelar — descarta o que foi ditado" shortcut="Esc">
+                            <button
+                              type="button"
+                              data-testid="voice-cancel-button"
+                              aria-label="Cancelar ditado"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                cancelDictation()
+                              }}
+                              className="flex w-8 items-center justify-center text-subtle transition-colors hover:bg-hover hover:text-fg focus-visible:bg-hover focus-visible:outline-none"
+                            >
+                              <X className="size-4" />
+                            </button>
+                          </Tip>
+                          <Tip
+                            label={
+                              dictation.state === 'stopping'
+                                ? 'Finalizando a transcrição…'
+                                : 'Concluir — o texto ditado entra no campo'
+                            }
                           >
-                            <X className="size-4" />
-                          </button>
-                        </Tip>
+                            <button
+                              type="button"
+                              data-testid="voice-finish-button"
+                              data-state={dictation.state}
+                              aria-label={
+                                dictation.state === 'stopping'
+                                  ? 'Finalizando a transcrição'
+                                  : 'Concluir transcrição'
+                              }
+                              disabled={dictation.state !== 'recording'}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                finishDictation()
+                              }}
+                              className="flex w-8 items-center justify-center text-accent-strong transition-colors hover:bg-accent/15 focus-visible:bg-accent/15 focus-visible:outline-none disabled:text-faint disabled:hover:bg-transparent"
+                            >
+                              {dictation.state === 'stopping' ? (
+                                <Spinner className="size-3.5" />
+                              ) : (
+                                <Check className="size-4" strokeWidth={2.25} />
+                              )}
+                            </button>
+                          </Tip>
+                        </div>
                         <Tip
                           label={
-                            dictation.state === 'stopping'
-                              ? 'Transcrevendo…'
-                              : 'Parar gravação e transcrever'
+                            sendWaiting
+                              ? 'Concluindo a transcrição para enviar…'
+                              : busy
+                                ? 'Concluir a transcrição e adicionar à fila'
+                                : 'Concluir a transcrição e enviar'
                           }
+                          shortcut="Enter"
                         >
-                          {/* vermelho + MicOff: distinto do "Parar o agente" (quadrado neutro) */}
                           <button
                             type="button"
-                            data-testid="voice-stop-button"
-                            aria-label="Parar gravação"
-                            disabled={dictation.state === 'stopping'}
+                            data-testid="composer-send"
+                            data-waiting={sendWaiting ? 'true' : undefined}
+                            disabled={!canSendVoice}
                             onClick={(e) => {
                               e.stopPropagation()
-                              void dictation.stop()
+                              finishAndSend()
                             }}
-                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-danger text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-danger/85 disabled:opacity-60"
+                            className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
+                            aria-label={busy ? 'Concluir e adicionar à fila' : 'Concluir e enviar'}
                           >
-                            <MicOff className="size-4" strokeWidth={2.25} />
+                            {sendWaiting ? (
+                              <Spinner className="size-3.5" />
+                            ) : (
+                              <ArrowUp className="size-4" strokeWidth={2.25} />
+                            )}
                           </button>
                         </Tip>
-                      </>
-                    )}
-                    {!blocked && !dictating && (
-                      <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
-                        <button
-                          type="button"
-                          disabled={!canSend}
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            void submit()
-                          }}
-                          className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
-                          aria-label="Enviar"
-                        >
-                          <ArrowUp className="size-4" strokeWidth={2.25} />
-                        </button>
-                      </Tip>
-                    )}
-                  </div>
+                      </div>
+                    </>
+                  ) : (
+                    // normal: [ clip | skills | host | </> · estado | … | modelo | contexto | gasto |
+                    //           [ telefone | mic | ˅ ] | (parar) | enviar ]
+                    <>
+                      {!blocked && (
+                        <Tip label={attachTip}>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              void pickFiles(session.id)
+                            }}
+                            className="flex size-7 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg"
+                            aria-label="Anexar arquivos"
+                          >
+                            <Paperclip className="size-4" />
+                          </button>
+                        </Tip>
+                      )}
+                      {!blocked && chat && <SkillPickerButton chat={chat} sessionId={session.id} />}
+                      {chat && <ComposerHost chat={chat} />}
+                      <span className="flex shrink-0 items-center gap-1.5 text-[11px] whitespace-nowrap text-faint">
+                        <ComposerApiInfo running={busy} />
+                        {busy ? (
+                          <ComposerStatus
+                            text={
+                              question || session.status === 'awaiting_input'
+                                ? 'Aguardando sua resposta'
+                                : retry || session.status === 'awaiting_retry'
+                                  ? 'Aguardando sua decisão (falha de conexão)'
+                                  : session.status === 'awaiting_approval'
+                                    ? 'Aguardando aprovação'
+                                    : session.status === 'waiting'
+                                      ? 'Aguardando subagentes'
+                                      : compaction?.state === 'running'
+                                        ? 'Compactando conversa…'
+                                        : 'Trabalhando…'
+                            }
+                          />
+                        ) : (
+                          <ComposerHint />
+                        )}
+                      </span>
+                      <div data-bar-spacer className="min-w-0 flex-1" />
+                      <div className="flex shrink-0 items-center gap-1">
+                        {chat && (
+                          <ModelPill
+                            providerId={sessionProviderId(
+                              chat.config,
+                              session.depth > 0 ? session : null
+                            )}
+                            model={session.depth > 0 ? session.model : chat.config.model}
+                          />
+                        )}
+                        {chat && <ContextMeter chat={chat} session={session} />}
+                        {chat && <SpendButton chat={chat} />}
+                        {!blocked && (
+                          <span className="ml-1 flex shrink-0 empty:hidden">
+                            <VoiceGroup
+                              dictation={dictation}
+                              session={session}
+                              dictationOff={
+                                callActive ? 'Ditado indisponível durante a chamada de voz' : null
+                              }
+                            />
+                          </span>
+                        )}
+                        {busy && (
+                          <Tip label="Parar">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void run(() => api.agent.stop(session.id), 'Falha ao parar')
+                              }}
+                              className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-elevated text-fg transition-colors hover:bg-hover"
+                              aria-label="Parar"
+                              data-testid="agent-stop-button"
+                            >
+                              <Square className="size-3" fill="currentColor" />
+                            </button>
+                          </Tip>
+                        )}
+                        {!blocked && (
+                          <Tip label={busy ? 'Adicionar à fila' : 'Enviar'} shortcut="Enter">
+                            <button
+                              type="button"
+                              data-testid="composer-send"
+                              disabled={!canSend}
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                void submit()
+                              }}
+                              className="ml-0.5 flex size-8 shrink-0 items-center justify-center rounded-xl bg-accent text-white shadow-[inset_0_1px_0_rgb(255_255_255/0.18)] transition-[background-color,opacity] hover:bg-[#9a70f8] disabled:bg-active disabled:text-faint disabled:shadow-none"
+                              aria-label="Enviar"
+                            >
+                              <ArrowUp className="size-4" strokeWidth={2.25} />
+                            </button>
+                          </Tip>
+                        )}
+                      </div>
+                    </>
+                  )}
                 </div>
               </BarLevelsContext.Provider>
             </div>

@@ -29,7 +29,13 @@ import {
 
 // ---------------- helpers ----------------
 
-const BASE_API: SttEndpointConfig = { ...DEFAULT_STT_SETTINGS.api, apiKey: 'sk-test' }
+/** Endpoint já RESOLVIDO pelo main (provedor Groq cadastrado → endereço + chave). */
+const BASE_API: SttEndpointConfig = {
+  ...DEFAULT_STT_SETTINGS.api,
+  providerId: 'p-groq',
+  baseUrl: 'https://api.groq.com/openai/v1',
+  apiKey: 'sk-test'
+}
 
 const sttSettings = (
   over: Partial<SttSettings> = {},
@@ -243,6 +249,13 @@ test('transcribeAudio: rede, config (sem chave/baseUrl/modelo) e resposta sem "t
     transcribeAudio(INPUT, { settings: sttSettings({}, { baseUrl: '' }) })
   )
   assert.equal((eBase as SttError).kind, 'config')
+  assert.match((eBase as SttError).message, /escolha um em Configurações → Áudio/)
+  // sem provedor resolvido (setting sem `providerId`): mesmo erro de config
+  const eNone = await capture(() =>
+    transcribeAudio(INPUT, { settings: { ...DEFAULT_STT_SETTINGS } })
+  )
+  assert.equal((eNone as SttError).kind, 'config')
+  assert.match((eNone as SttError).message, /nenhum provedor de transcrição/)
   const eModel = await capture(() =>
     transcribeAudio(INPUT, { settings: sttSettings({}, { model: '' }) })
   )

@@ -1,6 +1,12 @@
-// Helpers (não-componentes) das seções de STT/TTS de Configurações → Áudio: valor do "Endpoint
-// personalizado" no seletor de provedor, família de API efetiva e o player dos bytes de áudio.
-import { voiceProviderSupport, type VoiceProviderSupport } from '@shared/voiceCatalog'
+// Helpers (não-componentes) das seções de STT/TTS de Configurações → Áudio: as
+// opções embutidas do seletor de provedor (local/GPU), família de API efetiva e o player dos bytes
+// de áudio.
+import {
+  providerSupportsVoice,
+  voiceProviderSupport,
+  type VoiceCapability,
+  type VoiceProviderSupport
+} from '@shared/voiceCatalog'
 import { errorMessage } from '../api'
 
 /** Provedor cadastrado como a tela de Áudio o vê (sem chave — o main usa o `providerId`). */
@@ -11,16 +17,13 @@ export interface ProviderOption {
   kind?: string
 }
 
-/** Valor do seletor de provedor para o endpoint personalizado (setting com `providerId: null`). */
-export const CUSTOM_ENDPOINT = '__custom__'
+/** Valores embutidos do seletor de provedor de Áudio: motor local (whisper.cpp/Kokoro) e GPU. */
+export const LOCAL_SOURCE = '__local__'
+export const GPU_SOURCE = '__gpu__'
 
-/** Família de API efetiva do STT/TTS (provedor escolhido, ou a baseUrl do endpoint personalizado). */
-export function effectiveFamily(
-  provider: ProviderOption | null,
-  baseUrl: string
-): VoiceProviderSupport | null {
-  if (provider) return voiceProviderSupport(provider)
-  return baseUrl.trim() ? voiceProviderSupport({ baseUrl }) : null
+/** Família de API do STT/TTS = a do provedor escolhido (null = nenhum provedor). */
+export function effectiveFamily(provider: ProviderOption | null): VoiceProviderSupport | null {
+  return provider ? voiceProviderSupport(provider) : null
 }
 
 // ---------------- reprodução ----------------
@@ -80,3 +83,17 @@ export function playAudioBytes(
     return null
   }
 }
+
+/** O provedor escolhido na setting foi apagado de Configurações → Provedores? */
+export function providerMissing(
+  api: { providerId: string | null },
+  providers: readonly { id: string }[]
+): boolean {
+  return !!api.providerId && !providers.some((p) => p.id === api.providerId)
+}
+
+/** Provedores cadastrados que servem a capacidade (Anthropic não tem áudio; ElevenLabs só fala). */
+export const voiceProvidersFor = (
+  providers: ProviderOption[],
+  capability: VoiceCapability
+): ProviderOption[] => providers.filter((p) => providerSupportsVoice(p, capability))

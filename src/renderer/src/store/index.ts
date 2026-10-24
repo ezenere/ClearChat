@@ -87,9 +87,9 @@ export type SettingsTab =
   | 'web'
   | 'audio'
 
-export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'files'
+export type PanelTab = 'model' | 'chat' | 'tools' | 'memory' | 'voice' | 'files'
 
-const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'memory', 'files']
+const PANEL_TABS: PanelTab[] = ['model', 'chat', 'tools', 'memory', 'voice', 'files']
 
 /** Alvo de "abrir em Configurações → Memórias" (link de tool, card de extração, painel). */
 export interface MemoryFocus {
@@ -108,7 +108,8 @@ const SECTION_TAB: Record<string, PanelTab> = {
   memoria: 'memory',
   'memoria-subagentes': 'memory',
   skills: 'tools',
-  'skills-subagentes': 'tools'
+  'skills-subagentes': 'tools',
+  'voice-call': 'voice'
 }
 
 function loadPanelTab(): PanelTab {

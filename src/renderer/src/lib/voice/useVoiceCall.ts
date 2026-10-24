@@ -14,6 +14,8 @@
 // (fade curto, sem sobrepor o usuário) e o main decide o turno continuado. Pausas na fala viram
 // observações de interjeição DEPOIS do veredito (`interjectionObserved` com `end` — pergunta/
 // comando nunca ganham backchannel).
+// Fase "Preparando a GPU…" (`voiceCall.preparing`, fala/transcrição na GPU local): a captura só
+// começa quando o main avisa que o servidor subiu e aqueceu.
 // Mudo = captura pausada (microfone liberado). Build de dev com `VITE_CLEAR_MOCK=1`: sem captura
 // (o mock `voice` emite os estados/utterances e o `Waveform` simula os níveis; `__clearMockMic`
 // simula falhas do microfone).
@@ -105,6 +107,8 @@ export function useVoiceCall(): void {
   // chave estável (o objeto do estado muda a cada evento — a captura não pode reiniciar à toa)
   const timingKey = useStore((s) => JSON.stringify(s.voiceCall.turnTiming ?? DEFAULT_TURN_TIMING))
   const muted = useStore((s) => s.voiceCall.muted)
+  // "Preparando a GPU…" (Modo avançado): o microfone só abre com o servidor local pronto e aquecido
+  const preparing = useStore((s) => !!s.voiceCall.preparing)
   const volume = useVoiceCallRuntime((s) => s.volume)
 
   const queueRef = useRef<UtteranceQueue | null>(null)
@@ -218,7 +222,11 @@ export function useVoiceCall(): void {
 
   // ---- chamada nova: limpa o erro anterior e confere os clipes (CTA "Gerar clipes" no dock) ----
   useEffect(() => {
-    if (!active) return
+    // fim da chamada: o plano da GPU (aviso/VRAM) da pré-checagem não vale mais
+    if (!active) {
+      useVoiceCallRuntime.setState({ gpuCall: null })
+      return
+    }
     setError(null)
     void refreshClips()
   }, [active])
@@ -316,7 +324,8 @@ export function useVoiceCall(): void {
 
   // ---- captura contínua + porta de fala (fim de turno adaptativo) ----
   useEffect(() => {
-    if (!active || !voice) return
+    // GPU ainda preparando: nada de captura (a 1ª fala não pode esperar a carga dos modelos)
+    if (!active || !voice || preparing) return
     const timing: TurnTiming = (() => {
       try {
         return { ...DEFAULT_TURN_TIMING, ...(JSON.parse(timingKey) as Partial<TurnTiming>) }
@@ -641,7 +650,7 @@ export function useVoiceCall(): void {
       captureRef.current = null
       if (capture) void capture.stop().catch(() => {})
     }
-  }, [active, voice, timingKey, muted, pushChunk, endUtterance, dropSession])
+  }, [active, voice, timingKey, muted, preparing, pushChunk, endUtterance, dropSession])
 
   const toggleMute = useCallback(async (): Promise<void> => {
     const next = !useStore.getState().voiceCall.muted

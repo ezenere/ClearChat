@@ -6,10 +6,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   captureErrorText,
+  dictationPreview,
   insertDictationText,
   isMissingDeviceError,
   mergeDictationDraft,
-  rebaseDictationAnchor
+  planDictationCommit,
+  rebaseDictationAnchor,
+  SEND_FINAL_FAILED_NOTE
 } from '../src/renderer/src/lib/voice/dictation.ts'
 import { formatHotkeyLabel, hotkeyFromEvent } from '../src/renderer/src/lib/voice/hotkeyLabel.ts'
 import {
@@ -95,6 +98,147 @@ test('fluxo: cursor no meio + digitação no fim durante a gravação → final 
   const at = rebaseDictationAnchor(anchor, typed)
   const r = insertDictationText(typed, at.start, at.end, 'João')
   assert.equal(r.value, 'Prezado João, obrigado. Abraços')
+})
+
+// ---------------- campo durante o ditado (digitado + ditado translúcido) ----------------
+
+const joined = (p: ReturnType<typeof dictationPreview>): string =>
+  p.before + p.lead + p.spoken + p.trail + p.after
+
+test('dictationPreview: campo vazio → só o ditado (ou o marcador), sem espaços', () => {
+  assert.deepEqual(dictationPreview('', { text: '', start: 0, end: 0 }, 'Ouvindo…'), {
+    before: '',
+    lead: '',
+    spoken: 'Ouvindo…',
+    trail: '',
+    after: ''
+  })
+  assert.equal(joined(dictationPreview('', null, '  olá mundo ')), 'olá mundo')
+})
+
+test('dictationPreview: digitado + espaço + ditado (cursor no fim)', () => {
+  const p = dictationPreview('Oi, tudo', { text: 'Oi, tudo', start: 8, end: 8 }, 'bem por aí')
+  assert.equal(p.before, 'Oi, tudo')
+  assert.equal(p.lead, ' ')
+  assert.equal(p.spoken, 'bem por aí')
+  assert.equal(p.after, '')
+  assert.equal(joined(p), 'Oi, tudo bem por aí')
+  // digitado terminando em espaço/quebra de linha: sem espaço extra; multi-linha preservado
+  assert.equal(joined(dictationPreview('linha 1\n', null, 'linha 2')), 'linha 1\nlinha 2')
+})
+
+test('dictationPreview: cursor no meio → ditado no ponto de inserção, resto depois', () => {
+  const t = 'Prezado , obrigado.'
+  const p = dictationPreview(t, { text: t, start: 8, end: 8 }, 'João')
+  assert.equal(p.before, 'Prezado ')
+  assert.equal(p.spoken, 'João')
+  assert.equal(p.after, ', obrigado.')
+  assert.equal(joined(p), 'Prezado João, obrigado.')
+  // seleção do início: a prévia já mostra a substituição
+  const s = dictationPreview('um dois três', { text: 'um dois três', start: 3, end: 7 }, 'DOIS')
+  assert.equal(joined(s), 'um DOIS três')
+})
+
+test('dictationPreview ≡ insertDictationText: o texto não pula ao concluir (✓)', () => {
+  const cases: [string, number, number, string][] = [
+    ['', 0, 0, 'olá'],
+    ['abc def', 4, 4, 'XYZ'],
+    ['abcdef', 3, 3, 'XYZ'],
+    ['Olá.', 3, 3, 'mundo'],
+    ['Oi,', 3, 3, 'tudo bem'],
+    ['um dois três', 3, 7, 'DOIS'],
+    ['multi\nlinha', 11, 11, 'fim']
+  ]
+  for (const [v, s, e, spoken] of cases)
+    assert.equal(
+      joined(dictationPreview(v, { text: v, start: s, end: e }, spoken)),
+      insertDictationText(v, s, e, spoken).value,
+      JSON.stringify([v, s, e, spoken])
+    )
+  // sem fala: a prévia é o próprio texto (cancelar não deixa rastro)
+  assert.equal(joined(dictationPreview('abc', null, '')), 'abc')
+})
+
+// ---------------- desfecho do ditado (✓ / × / Enviar) ----------------
+
+test('planDictationCommit: ✓ → o final entra no campo, nada é enviado', () => {
+  assert.deepEqual(
+    planDictationCommit({ settle: 'final', final: ' olá ', sendRequested: false, hasOther: true }),
+    { insert: 'olá', send: false, note: null }
+  )
+})
+
+test('planDictationCommit: × (cancelado) → o campo não muda e nada é enviado', () => {
+  for (const sendRequested of [false, true])
+    assert.deepEqual(
+      planDictationCommit({ settle: 'cancelled', partial: 'meio', sendRequested, hasOther: true }),
+      { insert: null, send: false, note: null }
+    )
+})
+
+test('planDictationCommit: Enviar durante a gravação → final no campo e envia digitado + final', () => {
+  assert.deepEqual(
+    planDictationCommit({
+      settle: 'final',
+      final: 'tudo bem',
+      sendRequested: true,
+      hasOther: false
+    }),
+    { insert: 'tudo bem', send: true, note: null }
+  )
+  // nada foi dito: envia o que já estava digitado (se houver)
+  assert.deepEqual(planDictationCommit({ settle: 'empty', sendRequested: true, hasOther: true }), {
+    insert: null,
+    send: true,
+    note: null
+  })
+  assert.deepEqual(planDictationCommit({ settle: 'empty', sendRequested: true, hasOther: false }), {
+    insert: null,
+    send: false,
+    note: null
+  })
+})
+
+test('planDictationCommit: final falhou → nunca envia a parcial sozinha', () => {
+  // pediu para enviar: a parcial entra no campo com aviso, sem enviar
+  assert.deepEqual(
+    planDictationCommit({
+      settle: 'failed',
+      partial: 'quase',
+      sendRequested: true,
+      hasOther: true
+    }),
+    { insert: 'quase', send: false, note: SEND_FINAL_FAILED_NOTE }
+  )
+  // sem pedido de envio: o card de erro oferece "Inserir o texto parcial" (nada entra sozinho)
+  assert.deepEqual(
+    planDictationCommit({
+      settle: 'failed',
+      partial: 'quase',
+      sendRequested: false,
+      hasOther: true
+    }),
+    { insert: null, send: false, note: null }
+  )
+  assert.deepEqual(
+    planDictationCommit({ settle: 'failed', partial: '', sendRequested: true, hasOther: true }),
+    { insert: null, send: false, note: null }
+  )
+})
+
+test('fluxo: digitado + Enviar durante o ditado → envia o campo com o final no ponto de inserção', () => {
+  const typed = 'Resumo:'
+  const anchor = { text: typed, start: typed.length, end: typed.length }
+  const plan = planDictationCommit({
+    settle: 'final',
+    final: 'três itens',
+    sendRequested: true,
+    hasOther: true
+  })
+  const at = rebaseDictationAnchor(anchor, typed)
+  const sent = insertDictationText(typed, at.start, at.end, plan.insert!).value
+  assert.equal(sent, 'Resumo: três itens')
+  assert.equal(plan.send, true)
 })
 
 test('formatHotkeyLabel: rótulos pt-BR com modificadores em ordem canônica', () => {

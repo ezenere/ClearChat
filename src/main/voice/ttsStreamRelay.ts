@@ -13,7 +13,7 @@
 // Ver SPEC → "Serviço de TTS → Streaming na chamada".
 import type { VoiceCallUtteranceChunkEvent, VoiceCallUtteranceEvent } from '@shared/ipc'
 import type { TtsStreamResult } from './tts'
-import { concatBytes, encodeWav } from './wav'
+import { concatBytes } from './wav'
 
 /** Áudio acumulado antes de entregar o começo da sentença (o resto chega bem mais rápido que o tempo real). */
 export const TTS_STREAM_PREBUFFER_MS = 200
@@ -66,7 +66,7 @@ export class TtsStreamRelay {
   /**
    * `synth` da chamada: `start(signal)` abre a síntese (normalmente `synthesizeStream`). Sem
    * streaming → os bytes completos. Com streaming → resolve com o começo (≥ pré-buffer) e segue
-   * baixando em segundo plano; áudio que acabou dentro do pré-buffer vira WAV completo.
+   * baixando em segundo plano; áudio que acabou dentro do pré-buffer vira um bloco PCM fechado.
    */
   async synth(
     signal: AbortSignal,
@@ -95,9 +95,11 @@ export class TtsStreamRelay {
         throw e
       }
       if (n.done) {
-        // a sentença inteira coube no pré-buffer: bytes completos (sem streaming)
+        // a sentença inteira coube no pré-buffer: bytes completos (sem streaming), ainda PCM cru —
+        // toca pelo MESMO player Web Audio das outras frases (emendada sem buraco na anterior; um
+        // WAV ia para o <audio>, que não encadeia)
         this.#deps.onFirstAudio?.(Date.now() - r.t0, false)
-        return { audio: encodeWav(concatBytes(head), r.sampleRate), mime: 'audio/wav' }
+        return { audio: concatBytes(head), mime: `audio/pcm;rate=${r.sampleRate}` }
       }
       head.push(n.value)
       size += n.value.length

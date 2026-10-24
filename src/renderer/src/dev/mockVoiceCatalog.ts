@@ -166,10 +166,9 @@ const ELEVEN_VOICES = {
   ]
 }
 
-/** `voice.catalog` do mock. `providers()`/`customBaseUrl()` leem o estado atual do mock. */
+/** `voice.catalog` do mock. `providers()` lê o estado atual do mock. */
 export function createMockVoiceCatalog(
   providers: () => Provider[],
-  customBaseUrl: (capability: 'stt' | 'tts') => string,
   delay: <T>(v: T, ms?: number) => Promise<T>
 ): {
   list(input: VoiceCatalogRequest): Promise<VoiceCatalogView>
@@ -190,7 +189,17 @@ export function createMockVoiceCatalog(
     list: async (input) => {
       const v = base(input)
       const p = input.providerId ? providers().find((x) => x.id === input.providerId) : null
-      const url = p ? p.baseUrl : customBaseUrl(input.capability)
+      if (!p)
+        return delay({
+          ...v,
+          error: input.providerId
+            ? 'o provedor escolhido não existe mais (Configurações → Provedores)'
+            : null,
+          hint: input.providerId
+            ? null
+            : 'escolha um provedor em Configurações → Áudio para listar os modelos'
+        })
+      const url = p.baseUrl
       if (/openrouter\.ai/.test(url)) {
         const r = parseOpenRouterAudioModels(
           input.capability === 'stt' ? OPENROUTER_TRANSCRIPTION : OPENROUTER_SPEECH,
@@ -230,6 +239,23 @@ export function createMockVoiceCatalog(
           300
         )
       }
+      // Groq cadastrado em Provedores: com a chave lista os whisper; sem chave, 401
+      if (/groq\.com/.test(url) && p.apiKey)
+        return delay(
+          {
+            ...v,
+            source: 'openai',
+            freeText: true,
+            models:
+              input.capability === 'stt'
+                ? [
+                    { id: 'whisper-large-v3-turbo', label: 'whisper-large-v3-turbo' },
+                    { id: 'whisper-large-v3', label: 'whisper-large-v3' }
+                  ]
+                : []
+          },
+          250
+        )
       if (/groq\.com/.test(url))
         return delay({
           ...v,
@@ -237,8 +263,6 @@ export function createMockVoiceCatalog(
           error: 'chave de API inválida ou sem permissão para listar (HTTP 401) — Invalid API Key',
           hint: 'digite o id do modelo (o endpoint não lista modelos)'
         })
-      if (!url.trim())
-        return delay({ ...v, hint: 'informe o endpoint personalizado (baseUrl) para listar' })
       return delay({
         ...v,
         source: 'openai',

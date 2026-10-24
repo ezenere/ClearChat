@@ -1,7 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 // E2E contra o MOCK de UI (Playwright `_electron`, sem backend, sem chave, sem microfone) da UX de
-// áudio: ditado (cancelar durante o "Transcrevendo…" não insere; texto final no cursor do início
-// com desfazer; digitar durante a gravação não corrompe o rascunho; parcial fora da textarea),
+// áudio: composer (ordem da barra e o grupo [ telefone | mic | ˅ ]), ditado (campo com o digitado +
+// o ditado translúcido — "Ouvindo…" sem texto, mic roxo com texto —, sem título "Gravando"; ✓
+// conclui no cursor do início com desfazer; × e Esc descartam; Enviar conclui e envia; final que
+// falha ao enviar → parcial no campo com aviso; cancelar durante o "Transcrevendo…" não insere),
 // falhas do microfone (salvo desconectado → padrão + aviso; permissão negada dispensável; perdido
 // no meio), botões de parar distintos com o agente ocupado, chamada de voz (falha visível em toast,
 // pré-checagem, barra da chamada NO LUGAR do composer em 1440/1100/900 com e sem painel — sem
@@ -88,7 +90,7 @@ async function open(scenario: string, chat: string): Promise<void> {
 const composer = (): ReturnType<Page['locator']> =>
   page.locator('[data-testid="composer-column"] textarea')
 const recording = (): ReturnType<Page['locator']> =>
-  page.locator('[data-testid="voice-mic-button"][aria-pressed="true"]')
+  page.locator('[data-testid="voice-recording"][data-state="recording"]')
 const dialog = (): ReturnType<Page['locator']> => page.locator('[role="dialog"]')
 
 async function openAudioSettings(): Promise<void> {
@@ -148,36 +150,261 @@ app.on('window-all-closed', () => app.quit())
   // ---------------- ditado ----------------
 
   await step(
-    'ditado: parcial fica FORA da textarea; digitar no fim durante a gravação é seguro',
+    'composer: ordem [clip | host | </> | … | modelo | [telefone | mic | ˅] | enviar]',
     async () => {
       await open('chat', 'Ideias de nomes para o app')
-      await composer().fill('Começo')
+      const order = await page.evaluate(() => {
+        const bar = document.querySelector<HTMLElement>('[data-testid=composer-toolbar]')!
+        const x = (sel: string): number | null => {
+          const el = bar.querySelector<HTMLElement>(sel)
+          if (!el) return null
+          const r = el.getBoundingClientRect()
+          return r.width ? r.left : null
+        }
+        const group = bar.querySelector<HTMLElement>('[data-testid=voice-group]')!
+        const kids = [...group.children].map(
+          (c) =>
+            (c as HTMLElement).dataset.testid ??
+            (c.querySelector('[data-testid]') as HTMLElement | null)?.dataset.testid
+        )
+        const gr = group.getBoundingClientRect()
+        return {
+          mode: bar.dataset.mode,
+          clip: x('[aria-label="Anexar arquivos"]'),
+          model: x('[data-testid=model-pill]'),
+          group: gr.left,
+          groupRight: gr.right,
+          send: x('[data-testid=composer-send]'),
+          kids,
+          groupBorder: getComputedStyle(group).borderTopWidth,
+          menuLabel: group
+            .querySelector('[data-testid=voice-mic-menu-button]')
+            ?.getAttribute('aria-label')
+        }
+      })
+      assert.equal(order.mode, 'normal')
+      assert(order.clip !== null && order.model !== null && order.send !== null, 'itens')
+      assert(order.clip < order.model, 'clip antes do modelo')
+      assert(order.model < order.group, 'modelo antes do grupo de voz')
+      assert(order.groupRight <= order.send, 'grupo de voz antes do enviar')
+      // UM controle com três segmentos, a seta (microfone da chamada E do ditado) por último
+      assert.deepEqual(order.kids, [
+        'voice-call-button',
+        'voice-mic-button',
+        'voice-mic-menu-button'
+      ])
+      assert.equal(order.groupBorder, '1px')
+      assert.equal(order.menuLabel, 'Microfone (ditado e chamada)')
+      await page
+        .getByTestId('composer-column')
+        .screenshot({ path: join(SHOTS, 'composer-01-normal.png') })
+      return order.kids.join(' | ')
+    }
+  )
+
+  await step(
+    'ditado: "Ouvindo…" translúcido depois do digitado → parcial translúcida + mic roxo; sem "Gravando"',
+    async () => {
+      await open('chat', 'Ideias de nomes para o app')
+      await composer().fill('Linha digitada\nsegunda linha')
       await page.getByTestId('voice-mic-button').click()
       await recording().waitFor()
-      await page.getByTestId('voice-partial').waitFor()
-      // as parciais do mock chegam em ~350 ms cada
+      const draft = page.getByTestId('voice-draft')
+      await draft.waitFor()
+      // nada transcrito ainda: o marcador "Ouvindo…" (itálico, translúcido) depois do digitado
+      const empty = await page.evaluate(() => {
+        const sp = document.querySelector<HTMLElement>('[data-testid=voice-partial]')!
+        const cs = getComputedStyle(sp)
+        return {
+          text: document.querySelector<HTMLElement>('[data-testid=voice-draft]')!.innerText,
+          kind: sp.dataset.state,
+          italic: cs.fontStyle,
+          color: cs.color,
+          mic: document.querySelector<HTMLElement>('[data-testid=voice-recording]')!.dataset
+            .hasText,
+          bar: document.querySelector<HTMLElement>('[data-testid=composer-toolbar]')!.innerText
+        }
+      })
+      assert.equal(empty.text, 'Linha digitada\nsegunda linha Ouvindo…')
+      assert.equal(empty.kind, 'placeholder')
+      assert.equal(empty.italic, 'italic')
+      assert.match(empty.color, /rgba\(.*0\.3\d*\)|oklab|color-mix/, `cor ${empty.color}`)
+      assert.equal(empty.mic, 'false')
+      assert(!/Gravando/.test(await page.locator('body').innerText()), 'título "Gravando…"')
+      // durante o ditado a barra só tem mic + waveform + [ × | ✓ ] + enviar
+      for (const id of ['model-pill', 'voice-group', 'host-indicator'])
+        assert.equal(
+          await page.getByTestId('composer-toolbar').getByTestId(id).count(),
+          0,
+          `${id} na barra do ditado`
+        )
+      assert.equal(
+        await page
+          .getByTestId('composer-toolbar')
+          .getByRole('button', { name: 'Anexar arquivos' })
+          .count(),
+        0
+      )
+      await page.getByTestId('voice-waveform').waitFor()
+      await page
+        .getByTestId('composer-column')
+        .screenshot({ path: join(SHOTS, 'composer-02-recording-empty.png') })
+      // parcial chega: translúcida, no lugar do marcador; o mic fica roxo
       await page.waitForFunction(
-        () => document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
+        () =>
+          document.querySelector<HTMLElement>('[data-testid=voice-partial]')?.dataset.state ===
+            'partial' &&
+          document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
         undefined,
         { timeout: 4000 }
       )
-      // digita no fim enquanto grava: o valor da textarea é SÓ o texto do usuário
-      await composer().focus()
-      await page.keyboard.press('End')
-      await page.keyboard.type(' e fim')
-      const during = await composer().inputValue()
-      assert.equal(during, 'Começo e fim')
-      assert(!during.includes('▌'), 'cursor ▌ dentro do texto editável')
-      await shot('after-dictation-partial-ghost')
-      await page.getByTestId('voice-stop-button').click()
+      const live = await page.evaluate(() => {
+        const sp = document.querySelector<HTMLElement>('[data-testid=voice-partial]')!
+        const typed = document.querySelector<HTMLElement>('[data-testid=voice-draft-typed]')!
+        const ta = document.querySelector<HTMLTextAreaElement>(
+          '[data-testid=composer-column] textarea'
+        )!
+        const icon = document.querySelector<HTMLElement>('[data-testid=voice-recording]')!
+        return {
+          italic: getComputedStyle(sp).fontStyle,
+          spoken: getComputedStyle(sp).color,
+          typed: getComputedStyle(typed).color,
+          value: ta.value,
+          hidden: getComputedStyle(ta).display,
+          mic: icon.dataset.hasText,
+          micColor: getComputedStyle(icon).color
+        }
+      })
+      assert.equal(live.mic, 'true')
+      assert.equal(live.micColor, 'rgb(167, 139, 250)', 'mic roxo (accent-strong) com texto')
+      assert.notEqual(live.spoken, live.typed, 'ditado com a mesma cor do digitado')
+      assert.equal(live.italic, 'normal')
+      // a textarea (escondida) continua com SÓ o texto do usuário
+      assert.equal(live.value, 'Linha digitada\nsegunda linha')
+      assert.equal(live.hidden, 'none', 'textarea no lugar do campo do ditado')
+      await page
+        .getByTestId('composer-column')
+        .screenshot({ path: join(SHOTS, 'composer-03-recording-text.png') })
+      // ✓: o final entra como texto normal (na textarea) no ponto de inserção, sem enviar
+      await page.getByTestId('voice-finish-button').click()
+      const want = `Linha digitada\nsegunda linha ${MOCK_FINAL}`
       await page.waitForFunction(
-        (want) =>
+        (w) =>
           (document.querySelector('[data-testid=composer-column] textarea') as HTMLTextAreaElement)
-            ?.value === want,
-        `Começo e fim ${MOCK_FINAL}`,
+            ?.value === w,
+        want,
         { timeout: 5000 }
       )
-      return await composer().inputValue()
+      await page.getByTestId('voice-draft').waitFor({ state: 'detached' })
+      assert.equal(
+        await page.getByTestId('composer-toolbar').getAttribute('data-mode'),
+        'normal',
+        'barra volta ao normal'
+      )
+      await page.getByTestId('voice-live').waitFor({ state: 'attached' })
+      assert.equal(await page.getByTestId('voice-live').innerText(), 'Transcrição pronta')
+      await page
+        .getByTestId('composer-column')
+        .screenshot({ path: join(SHOTS, 'composer-04-after-finish.png') })
+      return `${empty.color} → ${live.spoken} (digitado ${live.typed}) · mic ${live.micColor}`
+    }
+  )
+
+  await step('ditado: × e Esc descartam o ditado (o campo volta como estava)', async () => {
+    await open('chat', 'Ideias de nomes para o app')
+    await composer().fill('fica assim')
+    await page.getByTestId('voice-mic-button').click()
+    await recording().waitFor()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
+      undefined,
+      { timeout: 4000 }
+    )
+    await page.getByTestId('voice-cancel-button').click()
+    await page.getByTestId('voice-draft').waitFor({ state: 'detached', timeout: 3000 })
+    await page.waitForTimeout(1000)
+    assert.equal(await composer().inputValue(), 'fica assim')
+    // Esc (o foco vai para o campo do ditado ao começar)
+    await page.getByTestId('voice-mic-button').click()
+    await recording().waitFor()
+    const focused = await page.evaluate(
+      () => (document.activeElement as HTMLElement | null)?.dataset.testid ?? ''
+    )
+    assert.equal(focused, 'voice-draft', 'foco no campo do ditado')
+    await page.keyboard.press('Escape')
+    await page.getByTestId('voice-draft').waitFor({ state: 'detached', timeout: 3000 })
+    await page.waitForTimeout(1000)
+    assert.equal(await composer().inputValue(), 'fica assim')
+    const back = await composer().evaluate((el) => document.activeElement === el)
+    assert(back, 'foco volta à textarea')
+    return 'rascunho intacto (× e Esc)'
+  })
+
+  await step('ditado: Enviar durante a gravação conclui e envia digitado + final', async () => {
+    await open('chat', 'Script de backup')
+    await composer().fill('Resumo:')
+    const before = await page.locator('[data-role=user], [data-testid=user-message]').count()
+    await page.getByTestId('voice-mic-button').click()
+    await recording().waitFor()
+    await page.waitForFunction(
+      () => document.querySelector('[data-testid=voice-partial]')?.textContent?.includes('Olá'),
+      undefined,
+      { timeout: 4000 }
+    )
+    await page.getByTestId('composer-send').click()
+    // esperando a final: o enviar mostra que está concluindo (não envia a parcial)
+    await page.locator('[data-testid=composer-send][data-waiting=true]').waitFor({ timeout: 1500 })
+    const want = `Resumo: ${MOCK_FINAL}`
+    await page.waitForFunction(
+      (w) => document.querySelector('[data-testid=chat-scroller]')?.textContent?.includes(w),
+      want,
+      { timeout: 6000 }
+    )
+    await page.getByTestId('voice-draft').waitFor({ state: 'detached' })
+    assert.equal(await composer().inputValue(), '', 'campo limpo depois de enviar')
+    const after = await page.locator('[data-role=user], [data-testid=user-message]').count()
+    return `enviado "${want.slice(0, 40)}…" (${before} → ${after} msgs do usuário)`
+  })
+
+  await step(
+    'ditado: Enviar com a final falhando → parcial no campo com aviso, nada enviado',
+    async () => {
+      await open('chat', 'Script de backup')
+      await composer().fill('Nota:')
+      await page.evaluate(() => {
+        ;(window as any).__clearMockSttFinal = 'fail'
+      })
+      try {
+        await page.getByTestId('voice-mic-button').click()
+        await recording().waitFor()
+        await page.waitForFunction(
+          () =>
+            document
+              .querySelector('[data-testid=voice-partial]')
+              ?.textContent?.includes('Olá mundo'),
+          undefined,
+          { timeout: 4000 }
+        )
+        const sent0 = await page.getByTestId('chat-scroller').innerText()
+        await page.getByTestId('composer-send').click()
+        await page.getByTestId('voice-send-note').waitFor({ timeout: 5000 })
+        assert.match(
+          await page.getByTestId('voice-send-note').innerText(),
+          /final falhou — o texto parcial entrou no campo/
+        )
+        const value = await composer().inputValue()
+        assert.match(value, /^Nota: Olá mundo/)
+        const sent1 = await page.getByTestId('chat-scroller').innerText()
+        assert(!sent1.includes('Nota: Olá'), 'a parcial foi enviada sozinha')
+        assert.equal(sent0.length > 0, true)
+        await composer().fill('')
+        await page.getByRole('button', { name: 'Dispensar aviso do ditado' }).click()
+        return value
+      } finally {
+        await page.evaluate(() => {
+          ;(window as any).__clearMockSttFinal = undefined
+        })
+      }
     }
   )
 
@@ -190,8 +417,16 @@ app.on('window-all-closed', () => app.quit())
       await composer().evaluate((el: HTMLTextAreaElement) => el.setSelectionRange(7, 7))
       await page.getByTestId('voice-mic-button').click()
       await recording().waitFor()
-      await page.waitForTimeout(500)
-      await page.getByTestId('voice-stop-button').click()
+      // a prévia já mostra o ditado NO cursor (entre "Início " e "fim")
+      await page.waitForFunction(
+        () =>
+          /^Início Olá.* fim$/.test(
+            document.querySelector<HTMLElement>('[data-testid=voice-draft]')?.innerText ?? ''
+          ),
+        undefined,
+        { timeout: 4000 }
+      )
+      await page.getByTestId('voice-finish-button').click()
       const want = `Início ${MOCK_FINAL} fim`
       await page.waitForFunction(
         (w) =>
@@ -204,7 +439,7 @@ app.on('window-all-closed', () => app.quit())
       await page.keyboard.press('Control+z')
       await page.waitForTimeout(150)
       const undone = await composer().inputValue()
-      assert.equal(undone, 'Início fim', 'desfazer remove a inserção do ditado')
+      assert.equal(undone, 'Início fim', `desfazer remove a inserção do ditado ("${undone}")`)
       return `"${want}" → Ctrl+Z → "${undone}"`
     }
   )
@@ -215,9 +450,9 @@ app.on('window-all-closed', () => app.quit())
     await page.getByTestId('voice-mic-button').click()
     await recording().waitFor()
     await page.waitForTimeout(400)
-    await page.getByTestId('voice-stop-button').click()
+    await page.getByTestId('voice-finish-button').click()
     // o mock leva ~700 ms para devolver a final: cancela no meio
-    await page.getByTestId('voice-stop-button').and(page.locator('[disabled]')).waitFor()
+    await page.getByTestId('voice-finish-button').and(page.locator('[disabled]')).waitFor()
     await page.getByTestId('voice-cancel-button').click()
     await page.getByTestId('voice-cancel-button').waitFor({ state: 'detached', timeout: 3000 })
     await page.waitForTimeout(1200)
@@ -225,38 +460,36 @@ app.on('window-all-closed', () => app.quit())
     return 'rascunho intacto'
   })
 
-  await step(
-    'agente ocupado + ditado: "Parar o agente" e "Parar gravação" são distintos',
-    async () => {
-      await open('chat', 'Refatorar o parser de SSE')
-      await page.getByTestId('voice-mic-button').click()
-      await recording().waitFor()
-      const agent = page.getByTestId('agent-stop-button')
-      const rec = page.getByTestId('voice-stop-button')
-      await agent.waitFor()
-      await rec.waitFor()
-      const a = await agent.evaluate((el) => ({
-        label: el.getAttribute('aria-label'),
-        icon: el.querySelector('svg')?.getAttribute('class') ?? '',
-        bg: getComputedStyle(el).backgroundColor
-      }))
-      const r = await rec.evaluate((el) => ({
-        label: el.getAttribute('aria-label'),
-        icon: el.querySelector('svg')?.getAttribute('class') ?? '',
-        bg: getComputedStyle(el).backgroundColor
-      }))
-      assert.equal(a.label, 'Parar o agente')
-      assert.equal(r.label, 'Parar gravação')
-      assert.match(a.icon, /lucide-square/)
-      assert.match(r.icon, /lucide-mic-off/)
-      assert.notEqual(a.bg, r.bg, 'mesma cor de fundo')
-      await page
-        .getByTestId('composer-toolbar')
-        .screenshot({ path: join(SHOTS, 'after-stop-buttons.png') })
-      await page.getByTestId('voice-cancel-button').click()
-      return `${a.label} (${a.bg}) × ${r.label} (${r.bg})`
-    }
-  )
+  await step('agente ocupado + ditado: "Parar o agente" e [ × | ✓ ] são distintos', async () => {
+    await open('chat', 'Refatorar o parser de SSE')
+    await page.getByTestId('voice-mic-button').click()
+    await recording().waitFor()
+    const agent = page.getByTestId('agent-stop-button')
+    const fin = page.getByTestId('voice-finish-button')
+    await agent.waitFor()
+    await fin.waitFor()
+    const a = await agent.evaluate((el) => ({
+      label: el.getAttribute('aria-label'),
+      icon: el.querySelector('svg')?.getAttribute('class') ?? ''
+    }))
+    const f = await fin.evaluate((el) => ({
+      label: el.getAttribute('aria-label'),
+      icon: el.querySelector('svg')?.getAttribute('class') ?? ''
+    }))
+    assert.equal(a.label, 'Parar o agente')
+    assert.equal(f.label, 'Concluir transcrição')
+    assert.match(a.icon, /lucide-square/)
+    assert.match(f.icon, /lucide-check/)
+    assert.equal(
+      await page.getByTestId('composer-send').getAttribute('aria-label'),
+      'Concluir e adicionar à fila'
+    )
+    await page
+      .getByTestId('composer-toolbar')
+      .screenshot({ path: join(SHOTS, 'after-stop-buttons.png') })
+    await page.getByTestId('voice-cancel-button').click()
+    return `${a.label} × ${f.label}`
+  })
 
   // ---------------- falhas do microfone ----------------
 
@@ -323,7 +556,7 @@ app.on('window-all-closed', () => app.quit())
       const t2 = page.getByTestId('toast').filter({ hasText: 'Chamada de voz indisponível' })
       await t2.waitFor({ timeout: 4000 })
       const txt = await t2.innerText()
-      assert.match(txt, /chave de API da transcrição/)
+      assert.match(txt, /Transcrição: escolha um provedor em Configurações → Áudio/)
       assert.match(txt, /Kokoro/)
       // runtime local quebrado (espeak-ng ausente — probe `voice.runtime.status`)
       await open('voice-no-espeak', 'Ideias de nomes para o app')
@@ -516,7 +749,7 @@ app.on('window-all-closed', () => app.quit())
   // ---------------- correções de uso real (callfix) ----------------
 
   await step(
-    'ditado: ao parar, o texto já transcrito continua visível ("finalizando…") até a final',
+    'ditado: ao concluir, o texto já transcrito continua visível (translúcido) até a final',
     async () => {
       await open('chat', 'Ideias de nomes para o app')
       await composer().fill('')
@@ -527,9 +760,11 @@ app.on('window-all-closed', () => app.quit())
         undefined,
         { timeout: 4000 }
       )
-      await page.getByTestId('voice-stop-button').click()
+      await page.getByTestId('voice-finish-button').click()
       // o mock leva ~700 ms para a final: nesse meio a parcial NÃO some
-      await page.getByTestId('voice-partial-finalizing').waitFor({ timeout: 1500 })
+      await page
+        .locator('[data-testid=voice-partial][data-state=finalizing]')
+        .waitFor({ timeout: 1500 })
       const ghost = await page.getByTestId('voice-partial').innerText()
       assert(ghost.includes('Olá'), `parcial sumiu ao parar: "${ghost}"`)
       assert(!/Transcrevendo/.test(ghost), 'mostrou "Transcrevendo…" no lugar do texto')
@@ -545,7 +780,7 @@ app.on('window-all-closed', () => app.quit())
         { timeout: 4000 }
       )
       await page.getByTestId('voice-partial').waitFor({ state: 'detached', timeout: 2000 })
-      return 'parcial esmaecida + "finalizando…" → final no lugar'
+      return 'parcial translúcida (finalizando) → final no lugar'
     }
   )
 
@@ -657,21 +892,22 @@ app.on('window-all-closed', () => app.quit())
     'persona: chamada desligada + modo do prompt no editor; chat da persona → telefone desabilitado com o motivo',
     async () => {
       await open('chat', 'Ideias de nomes para o app')
+      // painel do chat: aba própria "Voz" (modelo da chamada + prompt do modo voz visíveis)
+      await panel(true)
+      await page.getByTestId('right-panel').getByRole('tab', { name: 'Voz' }).click()
+      await page.getByTestId('right-panel').getByTestId('voice-call-enabled').waitFor()
+      await page.getByTestId('right-panel').getByTestId('voice-call-model-chat').waitFor()
+      await panel(false)
       await page.getByRole('button', { name: /^Configurações/ }).click()
       await dialog().getByRole('button', { name: 'Personas', exact: true }).click()
       const row = dialog().getByTestId('preset-row').filter({ hasText: 'Revisor de código' })
       await row.getByRole('button', { name: /Editar/ }).click()
       await dialog().getByTestId('preset-editor').waitFor()
-      await dialog().getByRole('tab', { name: 'Chat' }).click()
-      // a seção "Chamada de voz" (recolhida por padrão) abre pelo cabeçalho
-      if (
-        !(await dialog()
-          .getByTestId('voice-call-enabled')
-          .isVisible()
-          .catch(() => false))
-      )
-        await dialog().getByText('Chamada de voz', { exact: true }).click()
+      // aba própria "Voz" no editor de personas (seção aberta por padrão)
+      await dialog().getByRole('tab', { name: 'Voz' }).click()
       await dialog().getByTestId('voice-call-enabled').waitFor()
+      await dialog().getByTestId('voice-call-model-persona').waitFor()
+      await dialog().getByTestId('voice-call-prompt-mode').waitFor()
       // modo do prompt (com a chamada ligada) e depois desligar a chamada nesta persona
       const modes = dialog().getByTestId('voice-call-prompt-mode')
       await modes.locator('[data-value=replace]').click()

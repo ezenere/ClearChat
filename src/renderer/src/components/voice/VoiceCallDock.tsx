@@ -11,10 +11,14 @@
 // Testids: `voice-call-dock`, `voice-call-status`, `voice-call-waveform`, `voice-call-mute`,
 // `voice-call-volume`, `voice-call-end`, `voice-call-error`, `voice-call-pending`,
 // `voice-call-panel-toggle`, `voice-call-shadow`, `voice-call-clips-hint`, `voice-call-elsewhere`
-// (painel: `voice-call-panel`).
+// (painel: `voice-call-panel`); GPU local: `voice-call-preparing` (andamento da fase "Preparando a
+// GPU…" — o microfone ainda não abriu), `voice-call-gpu-notice` (+ `-ok` "Entendi", uma vez por
+// sessão do app) e `voice-call-gpu-warning` (pouca VRAM livre — avisa, não barra).
 import { useEffect, useState } from 'react'
 import {
   Activity,
+  Cpu,
+  Loader2,
   Mic,
   MicOff,
   Phone,
@@ -110,6 +114,7 @@ export function VoiceCallDock(): React.JSX.Element | null {
   const { resolved } = useVoiceCallConfig()
   if (!call.active) return null
   const error = call.error ?? runtimeError
+  const preparing = call.preparing || null
   const shadowCount = timeline.filter(
     (e) => e.kind === 'decision' && !e.played && (e.reason ?? '').includes('shadow')
   ).length
@@ -117,6 +122,7 @@ export function VoiceCallDock(): React.JSX.Element | null {
     <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
       <VoiceCallPanel open={panelOpen} />
       <ClipsHint />
+      <GpuCallNotice preparing={!!preparing} />
       {error && (
         <div
           role="alert"
@@ -146,7 +152,13 @@ export function VoiceCallDock(): React.JSX.Element | null {
         {/* linha 1 (lugar do texto): waveform + fase da chamada + fala pendente */}
         <div className="flex min-w-0 items-center gap-3 px-4 pt-3 pb-1.5">
           <span data-testid="voice-call-waveform" className="flex shrink-0 items-center">
-            <DockWaveform muted={call.muted} />
+            {preparing ? (
+              <span className="flex h-6 w-20 items-center justify-center text-accent-strong">
+                <Loader2 className="size-4 animate-spin" />
+              </span>
+            ) : (
+              <DockWaveform muted={call.muted} />
+            )}
           </span>
           <span
             data-testid="voice-call-status"
@@ -156,9 +168,22 @@ export function VoiceCallDock(): React.JSX.Element | null {
               call.muted && 'text-subtle'
             )}
           >
-            {call.muted ? 'Microfone mudo' : phaseLabel(call.phase)}
+            {preparing
+              ? 'Preparando a GPU…'
+              : call.muted
+                ? 'Microfone mudo'
+                : phaseLabel(call.phase)}
           </span>
           <span className="flex min-w-0 flex-1 flex-col">
+            {preparing && (
+              <span
+                data-testid="voice-call-preparing"
+                title={preparing}
+                className="truncate text-[12px] text-subtle"
+              >
+                {preparing} — o microfone abre em seguida
+              </span>
+            )}
             <LiveTranscript />
             {call.pendingText && (
               <span
@@ -318,5 +343,61 @@ function LiveTranscript(): React.JSX.Element | null {
       {/* rtl + bdi: com texto longo, o FIM (o que acabou de ser dito) fica visível */}
       <bdi>“{live.text}”</bdi>
     </span>
+  )
+}
+
+/**
+ * Chamada na GPU local: aviso (uma vez por sessão do app, "Entendi") de que a GPU vai ser usada —
+ * só durante o "Preparando a GPU…" — e o de pouca VRAM livre (a chamada segue; fecha no ×).
+ */
+function GpuCallNotice({ preparing }: { preparing: boolean }): React.JSX.Element | null {
+  const plan = useVoiceCallRuntime((s) => s.gpuCall)
+  const seen = useVoiceCallRuntime((s) => s.gpuNoticeSeen)
+  const closed = useVoiceCallRuntime((s) => s.gpuWarningClosed)
+  if (!plan) return null
+  const notice = preparing && !seen ? plan.notice : null
+  const warning = !closed ? plan.warning : null
+  if (!notice && !warning) return null
+  return (
+    <div className="space-y-1.5">
+      {notice && (
+        <div
+          data-testid="voice-call-gpu-notice"
+          role="status"
+          className="flex items-center gap-2 rounded-xl border border-accent/25 bg-accent/[0.06] px-3 py-1.5 text-[11.5px] text-fg/85"
+        >
+          <Cpu className="size-3.5 shrink-0 text-accent-strong" />
+          <span className="min-w-0 flex-1">
+            {notice}. O servidor local liga agora e desliga sozinho depois de um tempo sem uso.
+          </span>
+          <button
+            type="button"
+            data-testid="voice-call-gpu-notice-ok"
+            onClick={() => useVoiceCallRuntime.setState({ gpuNoticeSeen: true })}
+            className="shrink-0 rounded-md border border-border px-2 py-0.5 text-[11.5px] transition-colors hover:bg-hover"
+          >
+            Entendi
+          </button>
+        </div>
+      )}
+      {warning && (
+        <div
+          data-testid="voice-call-gpu-warning"
+          role="alert"
+          className="flex items-center gap-2 rounded-xl border border-warning/30 bg-warning/[0.07] px-3 py-1.5 text-[11.5px] text-warning"
+        >
+          <TriangleAlert className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">{warning}.</span>
+          <button
+            type="button"
+            aria-label="Fechar aviso de VRAM"
+            onClick={() => useVoiceCallRuntime.setState({ gpuWarningClosed: true })}
+            className="shrink-0 rounded-md p-1 transition-colors hover:bg-warning/15"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      )}
+    </div>
   )
 }

@@ -1,4 +1,5 @@
 import {
+  AudioLines,
   Braces,
   BrainCircuit,
   FolderTree,
@@ -12,7 +13,7 @@ import type { Chat } from '@shared/types'
 import { cn } from '../../lib/format'
 import { useStore, type PanelTab } from '../../store'
 import { IconButton } from '../ui/controls'
-import { ChatTab, MemoryTab, ModelTab, ToolsTab } from './ConfigTabs'
+import { ChatTab, MemoryTab, ModelTab, ToolsTab, VoiceTab } from './ConfigTabs'
 import { Note } from './fields'
 import { ModelLabel } from '../ui/ModelLabel'
 import { sessionProviderId } from '@shared/models'
@@ -23,6 +24,7 @@ const TABS: { id: PanelTab; label: string; icon: typeof Sparkles }[] = [
   { id: 'chat', label: 'Chat', icon: MessageSquareText },
   { id: 'tools', label: 'Tools', icon: Wrench },
   { id: 'memory', label: 'Memória', icon: BrainCircuit },
+  { id: 'voice', label: 'Voz', icon: AudioLines },
   { id: 'files', label: 'Arquivos', icon: FolderTree }
 ]
 
@@ -128,6 +130,8 @@ export function RightPanel({
           <ToolsTab chat={chat} />
         ) : tab === 'memory' ? (
           <MemoryTab chat={chat} />
+        ) : tab === 'voice' ? (
+          <VoiceTab chat={chat} />
         ) : (
           <FilesTab key={chat.id} chat={chat} />
         )}

@@ -545,7 +545,14 @@ const silence = (ms: number): Uint8Array => new Uint8Array(Math.round((ms * RATE
 const sttSettings = (over: Partial<SttSettings> = {}): SttSettings => ({
   ...DEFAULT_STT_SETTINGS,
   ...over,
-  api: { ...DEFAULT_STT_SETTINGS.api, apiKey: 'sk-test', ...(over.api ?? {}) }
+  // endpoint já resolvido pelo main (provedor Groq cadastrado → endereço + chave)
+  api: {
+    ...DEFAULT_STT_SETTINGS.api,
+    providerId: 'p-groq',
+    baseUrl: 'https://api.groq.com/openai/v1',
+    apiKey: 'sk-test',
+    ...(over.api ?? {})
+  }
 })
 /** fetch falso do /audio/transcriptions: devolve textos em sequência (ou lança/status). */
 function fakeStt(plan: (n: number, bytes: number) => Response | Promise<Response>): {

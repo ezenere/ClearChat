@@ -311,15 +311,15 @@ test('relay: resolve com ~200 ms de áudio, marca a utterance como streaming e d
   assert.equal(utts[1].streaming, undefined)
 })
 
-test('relay: sentença inteira dentro do pré-buffer → WAV completo; sem streaming → bytes completos', async () => {
+test('relay: sentença inteira dentro do pré-buffer → bloco PCM fechado (mesmo player); sem streaming → bytes completos', async () => {
   const relay = new TtsStreamRelay({ emitUtterance: () => {}, emitChunk: () => {} })
   const s = controlledStream(1000)
   const p = relay.synth(new AbortController().signal, async () => s.result)
   s.push(100)
   s.end()
   const r = await p
-  assert.equal(r.mime, 'audio/wav')
-  assert.equal(r.audio.length, 44 + 100)
+  assert.match(r.mime, /^audio\/pcm;rate=\d+$/)
+  assert.equal(r.audio.length, 100)
   const full = await relay.synth(new AbortController().signal, async () => ({
     streaming: false,
     result: { audio: new Uint8Array([9]), mime: 'audio/wav', model: 'k', backend: 'local', ms: 1 }

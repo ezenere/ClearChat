@@ -1,15 +1,10 @@
 // Descoberta de modelos/vozes de STT/TTS (Configurações → Áudio): parsers puros
 // (`src/shared/voiceCatalog.ts` — OpenRouter `/models?output_modalities=…`, ElevenLabs `/v1/models`
-// + `/v1/voices`, OpenAI-compatível `/models`), correção de apelidos, vínculo setting → provedor,
-// `listVoiceCatalog` com fetch mockado (URLs/headers por família, cache de 10 min, erros legíveis,
-// chave nunca na visão), prévias só de URLs conhecidas e a migração real no banco
-// (`migrateVoiceProviderLinks`, padrão de e2e/voiceSettings.test.ts). Rodar: npm run test:unit
-import { after, test } from 'node:test'
+// + `/v1/voices`, OpenAI-compatível `/models`), correção de apelidos, `listVoiceCatalog` com fetch
+// mockado (só provedores cadastrados; URLs/headers por família, cache de 10 min, erros legíveis,
+// chave nunca na visão) e prévias só de URLs conhecidas. Rodar: npm run test:unit
+import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { registerHooks } from 'node:module'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import {
   CALL_TTS_EXCLUDED_OPENROUTER,
   CALL_TTS_MODELS_ELEVENLABS,
@@ -20,7 +15,6 @@ import {
   describeVoice,
   formatLatency,
   isCallTtsModel,
-  linkVoiceEndpointProvider,
   orderVoicesForPt,
   parseElevenLabsModels,
   parseElevenLabsVoices,
@@ -267,80 +261,6 @@ test('resolveModelAlias: id sem prefixo do OpenRouter, _/. trocados e ambiguidad
   assert.equal(resolveModelAlias('whisper', ['a/whisper', 'b/whisper']), null)
 })
 
-// ---------------- migração (puro) ----------------
-
-const OR = {
-  id: 'p-or',
-  baseUrl: 'https://openrouter.ai/api/v1/',
-  apiKey: 'sk-or-REAL',
-  kind: 'openrouter'
-}
-const GROQ = {
-  id: 'p-groq',
-  baseUrl: 'https://api.groq.com/openai/v1',
-  apiKey: 'gsk-REAL',
-  kind: 'openai'
-}
-const ANT = { id: 'p-ant', baseUrl: 'https://api.anthropic.com/v1', apiKey: 'x', kind: 'anthropic' }
-
-test('linkVoiceEndpointProvider: baseUrl igual + chave vazia liga ao provedor e corrige o modelo do OpenRouter', () => {
-  const r = linkVoiceEndpointProvider(
-    {
-      providerId: null,
-      baseUrl: 'https://openrouter.ai/api/v1',
-      apiKey: '',
-      model: 'whisper-large-v3-turbo'
-    },
-    [GROQ, OR],
-    'stt'
-  )
-  assert.equal(r.linked, 'p-or')
-  assert.equal(r.api.providerId, 'p-or')
-  assert.deepEqual(r.model, { from: 'whisper-large-v3-turbo', to: 'openai/whisper-large-v3-turbo' })
-  assert.equal(r.api.model, 'openai/whisper-large-v3-turbo')
-})
-
-test('linkVoiceEndpointProvider: chave própria diferente fica como endpoint personalizado; providerId válido só corrige o modelo', () => {
-  const own = linkVoiceEndpointProvider(
-    {
-      providerId: null,
-      baseUrl: 'https://api.groq.com/openai/v1',
-      apiKey: 'gsk-OUTRA',
-      model: 'whisper-large-v3-turbo'
-    },
-    [GROQ],
-    'stt'
-  )
-  assert.equal(own.linked, null)
-  assert.equal(own.api.providerId, null)
-  assert.equal(own.model, null) // Groq usa o id sem prefixo
-  const same = linkVoiceEndpointProvider(
-    {
-      providerId: null,
-      baseUrl: 'https://api.groq.com/openai/v1',
-      apiKey: 'gsk-REAL',
-      model: 'whisper-large-v3-turbo'
-    },
-    [GROQ],
-    'stt'
-  )
-  assert.equal(same.linked, 'p-groq')
-  const linked = linkVoiceEndpointProvider(
-    { providerId: 'p-or', baseUrl: '', apiKey: '', model: 'whisper-large-v3-turbo' },
-    [OR],
-    'stt'
-  )
-  assert.equal(linked.linked, null)
-  assert.equal(linked.api.model, 'openai/whisper-large-v3-turbo')
-  // provedor sem áudio nunca é ligado
-  const ant = linkVoiceEndpointProvider(
-    { providerId: null, baseUrl: 'https://api.anthropic.com/v1', apiKey: '', model: 'x' },
-    [ANT],
-    'tts'
-  )
-  assert.equal(ant.linked, null)
-})
-
 // ---------------- curadoria da chamada (TTS remoto) ----------------
 
 const orModel = (
@@ -546,11 +466,13 @@ const PROVIDERS: Record<string, VoiceCatalogProvider> = {
     baseUrl: 'https://api.anthropic.com/v1',
     apiKey: 'sk-ant-SECRET-4'
   },
-  nokey: { id: 'nokey', kind: 'elevenlabs', baseUrl: 'https://api.elevenlabs.io', apiKey: '' }
+  nokey: { id: 'nokey', kind: 'elevenlabs', baseUrl: 'https://api.elevenlabs.io', apiKey: '' },
+  // servidor local OpenAI-compatível cadastrado em Provedores (localhost, sem chave)
+  loc: { id: 'loc', kind: 'openai', baseUrl: 'http://localhost:9000/v1', apiKey: '' },
+  ftp: { id: 'ftp', kind: 'openai', baseUrl: 'ftp://x/v1', apiKey: 'k' }
 }
 const deps = (f: typeof fetch, now = () => 1_000_000): VoiceCatalogDeps => ({
   provider: (id) => PROVIDERS[id] ?? null,
-  customEndpoint: () => ({ baseUrl: 'http://localhost:9000/v1', apiKey: 'own-SECRET-5' }),
   fetch: f,
   now
 })
@@ -688,7 +610,7 @@ test('listVoiceCatalog (ElevenLabs): /v1/models sem permissão não é erro (lis
   assert.equal(w.models.length, 3)
 })
 
-test('listVoiceCatalog (genérico + endpoint personalizado): Bearer da chave própria, heurística e dica', async () => {
+test('listVoiceCatalog (genérico + servidor local sem chave): Bearer só com chave, heurística e dica', async () => {
   resetVoiceCatalogCache()
   const m = mockFetch(() => ({ body: { data: [{ id: 'llama' }, { id: 'whisper-1' }] } }))
   const gq = await listVoiceCatalog({ capability: 'stt', providerId: 'gq' }, deps(m.fetch))
@@ -699,31 +621,35 @@ test('listVoiceCatalog (genérico + endpoint personalizado): Bearer da chave pr�
     ['whisper-1']
   )
   assert.equal(gq.freeText, true)
-  const custom = await listVoiceCatalog({ capability: 'tts', providerId: null }, deps(m.fetch))
+  const local = await listVoiceCatalog({ capability: 'tts', providerId: 'loc' }, deps(m.fetch))
   assert.equal(m.calls[1].url, 'http://localhost:9000/v1/models')
-  assert.equal(m.calls[1].headers.Authorization, 'Bearer own-SECRET-5')
-  assert.match(custom.hint ?? '', /nenhum parece de fala/)
-  assert.ok(custom.voices.some((x) => x.id === 'alloy'))
-  noSecrets(custom)
+  assert.equal(m.calls[1].headers.Authorization, undefined, 'sem chave → sem Authorization')
+  assert.match(local.hint ?? '', /nenhum parece de fala/)
+  assert.ok(local.voices.some((x) => x.id === 'alloy'))
+  noSecrets(local)
   // 404 do /models → texto livre com erro legível
   resetVoiceCatalogCache()
   const nf = mockFetch(() => ({ status: 404, body: 'Not Found' }))
-  const v = await listVoiceCatalog({ capability: 'stt', providerId: null }, deps(nf.fetch))
+  const v = await listVoiceCatalog({ capability: 'stt', providerId: 'loc' }, deps(nf.fetch))
   assert.match(v.error ?? '', /não tem esta listagem \(HTTP 404\)/)
   assert.equal(v.freeText, true)
 })
 
-test('listVoiceCatalog: Anthropic sem áudio, provedor apagado e endpoint inválido', async () => {
+test('listVoiceCatalog: Anthropic sem áudio, provedor apagado, sem provedor e endpoint inválido', async () => {
   const m = mockFetch(() => ({ body: {} }))
   const an = await listVoiceCatalog({ capability: 'tts', providerId: 'an' }, deps(m.fetch))
   assert.match(an.hint ?? '', /não tem API de áudio/)
   const gone = await listVoiceCatalog({ capability: 'tts', providerId: 'sumiu' }, deps(m.fetch))
   assert.match(gone.error ?? '', /não existe mais/)
-  const bad = await listVoiceCatalog(
-    { capability: 'stt', providerId: null },
-    { ...deps(m.fetch), customEndpoint: () => ({ baseUrl: '', apiKey: '' }) }
+  // sem provedor (pedido inválido — não há mais endpoint fora de Provedores)
+  const none = await listVoiceCatalog(
+    { capability: 'stt', providerId: '' },
+    { provider: () => PROVIDERS.gq, fetch: m.fetch }
   )
-  assert.match(bad.hint ?? '', /informe o endpoint/)
+  assert.match(none.hint ?? '', /escolha um provedor/)
+  assert.equal(none.error, null)
+  const bad = await listVoiceCatalog({ capability: 'stt', providerId: 'ftp' }, deps(m.fetch))
+  assert.match(bad.error ?? '', /endpoint inválido/)
   assert.equal(m.calls.length, 0)
 })
 
@@ -748,96 +674,4 @@ test('fetchVoicePreview: só baixa prévias publicadas por uma listagem (https),
     /desconhecida/
   )
   await assert.rejects(fetchVoicePreview('file:///etc/passwd', { fetch: f }), /desconhecida/)
-})
-
-// ---------------- migração no banco real (main/voice.ts) ----------------
-
-const TMP = mkdtempSync(join(process.env.CLEARCHAT_TEST_TMP || tmpdir(), 'clearchat-vcat-'))
-after(() => rmSync(TMP, { recursive: true, force: true }))
-process.env.CLEARCHAT_TEST_USERDATA = TMP
-const ELECTRON_STUB =
-  'data:text/javascript,' +
-  encodeURIComponent(`
-export const app = { getPath: () => process.env.CLEARCHAT_TEST_USERDATA, getVersion: () => '0.0.0', isPackaged: false }
-export default { app }
-`)
-registerHooks({
-  resolve(spec, ctx, next) {
-    if (spec === 'electron') return { url: ELECTRON_STUB, shortCircuit: true }
-    return next(spec, ctx)
-  }
-})
-let dbOpened = false
-after(async () => {
-  if (dbOpened) (await import('../src/main/db.ts')).closeDb()
-})
-
-test('migrateVoiceProviderLinks: liga STT ao OpenRouter cadastrado (modelo corrigido), mantém TTS com chave própria, uma vez só; chave nunca na visão', async () => {
-  const repo = await import('../src/main/repo.ts')
-  const voice = await import('../src/main/voice.ts')
-  dbOpened = true
-  const or = repo.providersRepo.create({
-    name: 'OpenRouter',
-    kind: 'openrouter',
-    baseUrl: 'https://openrouter.ai/api/v1',
-    apiKey: 'sk-or-PROVIDER-KEY',
-    headers: {}
-  })
-  repo.settingsRepo.set('sttSettings', {
-    mode: 'api',
-    api: {
-      providerId: null,
-      baseUrl: 'https://openrouter.ai/api/v1/',
-      apiKey: '',
-      model: 'whisper-large-v3-turbo'
-    },
-    local: null,
-    livePartials: true
-  })
-  repo.settingsRepo.set('ttsSettings', {
-    backend: 'api',
-    api: {
-      providerId: null,
-      baseUrl: 'https://openrouter.ai/api/v1',
-      apiKey: 'sk-or-OWN-OTHER-KEY',
-      model: 'elevenlabs/eleven-flash-v2.5',
-      voice: 'sarah'
-    },
-    local: null
-  })
-  const changes = voice.migrateVoiceProviderLinks()
-  assert.deepEqual(changes, [
-    `stt → provedor ${or.id}`,
-    'stt modelo whisper-large-v3-turbo → openai/whisper-large-v3-turbo'
-  ])
-  const v = voice.getVoiceSettingsView()
-  assert.equal(v.sttSettings.api.providerId, or.id)
-  assert.equal(v.sttSettings.api.model, 'openai/whisper-large-v3-turbo')
-  // TTS com chave própria diferente: continua endpoint personalizado, chave preservada
-  assert.equal(v.ttsSettings.api.providerId, null)
-  assert.equal(
-    repo.settingsRepo.get<{ api: { apiKey: string } }>('ttsSettings')?.api.apiKey,
-    'sk-or-OWN-OTHER-KEY'
-  )
-  assert.ok(!JSON.stringify(v).includes('PROVIDER-KEY'))
-  assert.ok(!JSON.stringify(v).includes('OWN-OTHER-KEY'))
-  // os serviços resolvem a chave do provedor no main
-  assert.equal(voice.getVoiceSettings().stt.api.apiKey, 'sk-or-PROVIDER-KEY')
-  // endpoint personalizado para a descoberta: baseUrl + chave própria (só no main)
-  assert.deepEqual(voice.getVoiceCustomEndpoint('tts'), {
-    baseUrl: 'https://openrouter.ai/api/v1',
-    apiKey: 'sk-or-OWN-OTHER-KEY'
-  })
-  // segunda execução: nada (flag gravada)
-  repo.settingsRepo.set('sttSettings', {
-    ...repo.settingsRepo.get('sttSettings')!,
-    api: {
-      providerId: null,
-      baseUrl: 'https://openrouter.ai/api/v1',
-      apiKey: '',
-      model: 'whisper-1'
-    }
-  })
-  assert.deepEqual(voice.migrateVoiceProviderLinks(), [])
-  assert.equal(voice.getVoiceSettingsView().sttSettings.api.providerId, null)
 })

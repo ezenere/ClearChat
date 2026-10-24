@@ -1,5 +1,5 @@
 // Serviço de transcrição de voz (STT) do main — cliente do endpoint OpenAI-compatível
-// `/audio/transcriptions` (padrão Groq) + política pura de backend (api/local/híbrido). Sem Electron,
+// `/audio/transcriptions` (do provedor cadastrado) + política pura de backend (api/local/híbrido). Sem Electron,
 // sem UI, sem IPC (a fiação vem na fatia de integração) e sem backend local (os modelos locais entram
 // em outra fatia; aqui o motor local é injetado como `SttLocalBackend`). O main é dono da rede e das
 // chaves: a `apiKey` nunca sai daqui. Contratos de config em `@shared/voice` (`SttSettings`).
@@ -63,7 +63,7 @@ export type SttErrorKind =
   | 'http' // demais 4xx/5xx (fallback só em 5xx)
   | 'network' // conexão — ECONNREFUSED/DNS/reset… (cai no fallback)
   | 'timeout' // tempo esgotado (cai no fallback)
-  | 'config' // sem chave/modelo/baseUrl ou backend indisponível (nunca cai no fallback)
+  | 'config' // sem provedor/chave/modelo ou backend indisponível (nunca cai no fallback)
 
 /** Erro de transcrição com categoria, status HTTP e backend de origem. */
 export class SttError extends Error {
@@ -215,7 +215,7 @@ function httpError(status: number, raw: string, url: string): SttError {
  * quando informado, `response_format: 'json'`; chave no header `Authorization: Bearer …`, nunca
  * devolvida ao chamador). Sucesso → `{ text, model, baseUrl, ms }`. Erros → `SttError` legível
  * (`kind`/`status`): `auth` (401/403), `quota` (429/402), `http` (demais 4xx/5xx, com o corpo
- * resumido), `network`, `timeout` (padrão 60 s, `timeoutMs`), `config` (sem chave/modelo/baseUrl).
+ * resumido), `network`, `timeout` (padrão 60 s, `timeoutMs`), `config` (sem provedor/chave/modelo).
  * Abort do `signal` propaga como `AbortError`.
  */
 /** Endpoint na própria máquina (localhost/127.0.0.1/::1)? */
@@ -233,18 +233,25 @@ export async function transcribeAudio(
   opts: SttTranscribeOptions
 ): Promise<TranscribeResult> {
   const api = opts.settings.api
-  const baseUrl = api.baseUrl.trim().replace(/\/+$/, '')
+  // endereço/chave resolvidos pelo main a partir do provedor cadastrado (ou do servidor da GPU)
+  const baseUrl = (api.baseUrl ?? '').trim().replace(/\/+$/, '')
   const model = api.model.trim()
-  const key = api.apiKey.trim()
+  const key = (api.apiKey ?? '').trim()
   if (!baseUrl)
-    throw new SttError('config', 'endereço da API de transcrição não configurado', {
-      backend: 'api'
-    })
+    throw new SttError(
+      'config',
+      'nenhum provedor de transcrição escolhido — escolha um em Configurações → Áudio',
+      { backend: 'api' }
+    )
   if (!model)
     throw new SttError('config', 'modelo de transcrição não configurado', { backend: 'api' })
-  // servidor local (localhost) pode rodar sem chave — como o TTS e a checagem da chamada
+  // provedor local (localhost, cadastrado em Provedores) pode rodar sem chave — como o TTS
   if (!key && !isLocalEndpoint(baseUrl))
-    throw new SttError('config', 'chave de API de transcrição não configurada', { backend: 'api' })
+    throw new SttError(
+      'config',
+      'chave de API de transcrição não configurada no provedor (Configurações → Provedores)',
+      { backend: 'api' }
+    )
 
   const url = `${baseUrl}/audio/transcriptions`
   const timeoutMs = opts.timeoutMs ?? STT_DEFAULT_TIMEOUT_MS
@@ -319,13 +326,15 @@ export interface SttBackendContext {
  * Qual backend transcreve (pura, testável):
  * - `api` → sempre 'api' (parciais via API melhor-esforço, chunked ~1 s);
  * - `local` → sempre 'local' — mesmo sem motor pronto (aí o erro é visível: config errada nunca
- *   vaza o áudio para a API);
+ *   vaza o áudio para a API); `gpu` idem (o motor injetado é o whisper da GPU local);
  * - `hybrid` → 'local' para as **parciais** quando o motor está pronto (streaming de verdade; sem
  *   pronto, cai em 'api' melhor-esforço) e 'api' para a **transcrição final** (mais precisa), com
  *   fallback para 'local' em erro de disponibilidade (ver `transcribeWithFallback`).
  */
 export function chooseSttBackend(settings: SttSettings, ctx: SttBackendContext): SttBackend {
-  if (settings.mode === 'local') return 'local'
+  // `gpu` (Modo avançado): o whisper do servidor local da GPU entra como o motor "local" injetado
+  // (parciais, especulação e final por ele; nada vai para a API)
+  if (settings.mode === 'local' || settings.mode === 'gpu') return 'local'
   if (settings.mode === 'api') return 'api'
   return ctx.purpose === 'partial' && ctx.hasLocalReady ? 'local' : 'api'
 }

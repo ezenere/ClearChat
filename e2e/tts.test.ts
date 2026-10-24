@@ -42,18 +42,19 @@ import {
 
 // ---------------- helpers ----------------
 
-const apiSettings = (over: Partial<TtsSettings['api']> = {}): TtsSettings =>
-  normalizeTtsSettings({
-    backend: 'api',
-    api: {
-      providerId: null,
-      baseUrl: 'https://tts.example/v1',
-      apiKey: 'sk-test',
-      model: 'tts-model',
-      voice: 'alloy',
-      ...over
-    }
-  })
+/** Settings de fala por API com o endpoint já RESOLVIDO pelo main (provedor → endereço + chave). */
+const apiSettings = (over: Partial<TtsSettings['api']> = {}): TtsSettings => {
+  const api = {
+    providerId: 'p-tts',
+    baseUrl: 'https://tts.example/v1',
+    apiKey: 'sk-test',
+    model: 'tts-model',
+    voice: 'alloy',
+    ...over
+  }
+  const stored = normalizeTtsSettings({ backend: 'api', api })
+  return { ...stored, api: { ...stored.api, baseUrl: api.baseUrl, apiKey: api.apiKey } }
+}
 
 const localSettings = (): TtsSettings =>
   normalizeTtsSettings({
@@ -255,7 +256,8 @@ test('tts api: rede, timeout e abort (AbortError nunca vira TtsError)', async ()
 test('tts api: config — sem baseUrl, sem modelo e texto vazio', async () => {
   await assert.rejects(
     synthesize({ text: 'oi', settings: apiSettings({ baseUrl: '' }) }),
-    (e: unknown) => e instanceof TtsError && e.kind === 'config' && /endereço/.test(e.message)
+    (e: unknown) =>
+      e instanceof TtsError && e.kind === 'config' && /nenhum provedor de fala/.test(e.message)
   )
   await assert.rejects(
     synthesize({ text: 'oi', settings: apiSettings({ model: '' }) }),

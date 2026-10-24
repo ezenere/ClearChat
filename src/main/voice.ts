@@ -1,11 +1,10 @@
 // Áudio/voz — ligação com o app: as settings globais (`audioInput`, `sttSettings`, `ttsSettings`,
 // `voiceCallDefaults`) no settings genérico do banco, sempre lidas completas e normalizadas.
-// Escrita tipada por `setVoiceSetting` (normaliza + grava + devolve o valor gravado). A `apiKey` de
-// stt/tts fica no JSON da setting mas NUNCA sai daqui: a visão de IPC (`getVoiceSettingsView`) a
-// devolve mascarada (`maskKey`) e a escrita por cima do valor mascarado preserva a chave real (o
-// mesmo padrão de `webSearchApiKeys`/`PROTECTED_SETTINGS` — os dois grupos são settings protegidos
-// do `settings:get/set` genérico). A transcrição vive em `voice/stt.ts` + `voice/session.ts`.
-// Ver SPEC.md → "Áudio".
+// Escrita tipada por `setVoiceSetting` (normaliza + grava + devolve o valor gravado). As settings
+// de stt/tts guardam só o PROVEDOR (`providerId`), o modelo, a voz e as opções — endereço e chave
+// vêm do provedor cadastrado em Configurações → Provedores, resolvidos aqui só para os serviços do
+// main (`getVoiceSettings`; a chave nunca vai ao renderer). A transcrição vive em `voice/stt.ts` +
+// `voice/session.ts`. Ver SPEC.md → "Áudio".
 import type { VoiceSettingKind, VoiceSettingsMap, VoiceSettingsView } from '@shared/ipc'
 import {
   AUDIO_INPUT_SETTING,
@@ -26,8 +25,6 @@ import {
   type TtsSettings,
   type VoiceCallDefaults
 } from '@shared/voice'
-import { maskKey } from '@shared/webSearchSettings'
-import { linkVoiceEndpointProvider, type VoiceCapability } from '@shared/voiceCatalog'
 import type { Provider } from '@shared/types'
 import { providerKind } from '@shared/providerKinds'
 import type { LocalModelCatalogEntry } from './voice/catalog'
@@ -55,24 +52,27 @@ function readVoiceSettings(): VoiceSettings {
 }
 
 /**
- * Endpoint efetivo de STT/TTS: com `providerId` apontando para um provedor salvo, `baseUrl` e
- * `apiKey` vêm do provedor (a chave dele nunca é copiada para a setting nem sai do main); provedor
- * ausente/apagado → os campos próprios da setting (endpoint avulso). Puro (lookup injetado).
+ * Endpoint efetivo de STT/TTS: `baseUrl` e `apiKey` vêm SEMPRE do provedor cadastrado do
+ * `providerId` (a chave dele nunca é copiada para a setting nem sai do main). Sem provedor
+ * escolhido, ou apagado/sem endereço → sem `baseUrl`/`apiKey` (o cliente recusa com erro de config
+ * "escolha um provedor"). Puro (lookup injetado).
  */
 export function resolveVoiceEndpoint<
-  T extends { providerId: string | null; baseUrl: string; apiKey: string }
+  T extends { providerId: string | null; baseUrl?: string; apiKey?: string }
 >(api: T, lookup: (id: string) => Pick<Provider, 'baseUrl' | 'apiKey'> | null): T {
+  const { baseUrl: _b, apiKey: _k, ...stored } = api
+  void _b
+  void _k
   const id = api.providerId?.trim()
-  if (!id) return api
-  const p = lookup(id)
-  if (!p || !p.baseUrl.trim()) return api
-  return { ...api, baseUrl: p.baseUrl.trim(), apiKey: p.apiKey.trim() }
+  const p = id ? lookup(id) : null
+  if (!p || !p.baseUrl.trim()) return stored as T
+  return { ...stored, baseUrl: p.baseUrl.trim(), apiKey: p.apiKey.trim() } as T
 }
 
 /**
  * Settings de áudio/voz completas para os SERVIÇOS do main (ausente/inválido → os padrões de
  * `@shared/voice`), com o `providerId` de stt/tts resolvido para o endpoint/chave do provedor salvo.
- * Nunca vai ao renderer (a visão é `getVoiceSettingsView`, sem resolver e mascarada).
+ * Nunca vai ao renderer (a visão é `getVoiceSettingsView`, sem resolver).
  */
 export function getVoiceSettings(): VoiceSettings {
   const v = readVoiceSettings()
@@ -97,79 +97,18 @@ export function withTtsProviderKind<T extends { providerId: string | null }>(
   return p ? { ...api, providerKind: providerKind(p) } : api
 }
 
-/**
- * Endpoint PERSONALIZADO salvo na setting da capacidade (baseUrl + chave própria, sem resolver o
- * `providerId`) — a descoberta de modelos (`voice:catalog:list` com `providerId: null`) lista com
- * ele. A chave nunca sai do main.
- */
-export function getVoiceCustomEndpoint(capability: VoiceCapability): {
-  baseUrl: string
-  apiKey: string
-} {
-  const v = readVoiceSettings()
-  const api = capability === 'stt' ? v.stt.api : v.tts.api
-  return { baseUrl: api.baseUrl, apiKey: api.apiKey }
-}
-
-/** Flag da migração "endpoint avulso → provedor cadastrado" (uma vez por banco). */
-export const VOICE_PROVIDER_LINK_FLAG = 'migration.voiceProviderLink'
+// ---------------- visão para a UI ----------------
 
 /**
- * Migração (uma vez) da UI antiga de campos livres para provedor + modelo: liga `sttSettings.api`
- * / `ttsSettings.api` ao provedor cadastrado com a mesma `baseUrl` (só quando a chave própria está
- * vazia ou é a do provedor — senão fica "endpoint personalizado") e corrige o modelo sem prefixo
- * no OpenRouter (`whisper-large-v3-turbo` → `openai/whisper-large-v3-turbo`) — ver
- * `linkVoiceEndpointProvider`. Grava pelo `setVoiceSetting` (a chave própria é preservada).
- * Devolve o que mudou (para log).
- */
-export function migrateVoiceProviderLinks(): string[] {
-  if (settingsRepo.get(VOICE_PROVIDER_LINK_FLAG)) return []
-  const providers = providersRepo.list()
-  const v = readVoiceSettings()
-  const changes: string[] = []
-  const stt = linkVoiceEndpointProvider(v.stt.api, providers, 'stt')
-  if (stt.linked || stt.model) {
-    // chave ausente no `set` = preserva a chave própria salva
-    const { apiKey: _k, ...api } = stt.api
-    void _k
-    setVoiceSetting('sttSettings', { ...v.stt, api })
-    if (stt.linked) changes.push(`stt → provedor ${stt.linked}`)
-    if (stt.model) changes.push(`stt modelo ${stt.model.from} → ${stt.model.to}`)
-  }
-  const tts = linkVoiceEndpointProvider(v.tts.api, providers, 'tts')
-  if (tts.linked || tts.model) {
-    const { apiKey: _k, ...api } = tts.api
-    void _k
-    setVoiceSetting('ttsSettings', { ...v.tts, api })
-    if (tts.linked) changes.push(`tts → provedor ${tts.linked}`)
-    if (tts.model) changes.push(`tts modelo ${tts.model.from} → ${tts.model.to}`)
-  }
-  settingsRepo.set(VOICE_PROVIDER_LINK_FLAG, 1)
-  return changes
-}
-
-// ---------------- visão para a UI (chaves de API mascaradas) ----------------
-
-const maskStt = (s: SttSettings): SttSettings => ({
-  ...s,
-  api: { ...s.api, apiKey: maskKey(s.api.apiKey) ?? '' }
-})
-const maskTts = (s: TtsSettings): TtsSettings => ({
-  ...s,
-  api: { ...s.api, apiKey: maskKey(s.api.apiKey) ?? '' }
-})
-
-/**
- * Os 4 grupos como a UI os vê (`voice:settings:get`): completos e normalizados, com
- * `api.apiKey` **mascarada** (`maskKey`; `''` quando não há chave). A chave real nunca sai do main.
+ * Os 4 grupos como a UI os vê (`voice:settings:get`): completos e normalizados, SEM resolver o
+ * `providerId` — endereço e chave do provedor nunca entram na visão.
  */
 export function getVoiceSettingsView(): VoiceSettingsView {
-  // sem resolver o `providerId`: a chave do provedor nunca entra na visão (nem mascarada)
   const v = readVoiceSettings()
   return {
     audioInput: v.audioInput,
-    sttSettings: maskStt(v.stt),
-    ttsSettings: maskTts(v.tts),
+    sttSettings: v.stt,
+    ttsSettings: v.tts,
     voiceCallDefaults: v.voiceCallDefaults
   }
 }
@@ -177,36 +116,9 @@ export function getVoiceSettingsView(): VoiceSettingsView {
 // ---------------- escrita (voice:settings:set) ----------------
 
 /**
- * O que fazer com a `api.apiKey` vinda num `set`:
- * - `undefined` (campo ausente), lixo, a própria chave ou o valor **mascarado** → preserva a chave
- *   salva (gravar por cima da máscara nunca apaga a chave real — padrão de `webSearchApiKeys`);
- * - `null` ou `''` → remove a chave;
- * - qualquer outra string (aparada) → nova chave.
- */
-function resolveKeyWrite(incoming: unknown, stored: string): string | undefined {
-  if (incoming === undefined) return undefined
-  if (incoming === null) return ''
-  if (typeof incoming !== 'string') return undefined // lixo nunca apaga a chave
-  const v = incoming.trim()
-  if (!v) return ''
-  if (v === stored || v === (maskKey(stored) ?? '')) return undefined
-  return v
-}
-
-const asObj = (v: unknown): Record<string, unknown> =>
-  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
-
-/** `raw` com `api.apiKey` resolvida (chave preservada/gravada/removida) antes do normalizador. */
-function withResolvedKey(raw: unknown, stored: string): Record<string, unknown> {
-  const api = asObj(asObj(raw).api)
-  const write = resolveKeyWrite(api.apiKey, stored)
-  return { ...asObj(raw), api: { ...api, apiKey: write === undefined ? stored : write } }
-}
-
-/**
- * Normaliza, grava um dos 4 grupos (pelas chaves de setting) e devolve o valor gravado — com
- * `api.apiKey` mascarada nos grupos stt/tts (mesma visão de `getVoiceSettingsView`). Grupo
- * desconhecido → erro legível.
+ * Normaliza, grava um dos 4 grupos (pelas chaves de setting) e devolve o valor gravado (a mesma
+ * visão de `getVoiceSettingsView`; `baseUrl`/`apiKey` vindos no valor são descartados pelo
+ * normalizador). Grupo desconhecido → erro legível.
  */
 export function setVoiceSetting(kind: 'audioInput', value: unknown): AudioInputSettings
 export function setVoiceSetting(kind: 'sttSettings', value: unknown): SttSettings
@@ -227,16 +139,14 @@ export function setVoiceSetting(
       return saved
     }
     case 'sttSettings': {
-      const stored = normalizeSttSettings(settingsRepo.get(STT_SETTINGS_SETTING))
-      const saved = normalizeSttSettings(withResolvedKey(value, stored.api.apiKey))
+      const saved = normalizeSttSettings(value)
       settingsRepo.set(STT_SETTINGS_SETTING, saved)
-      return maskStt(saved)
+      return saved
     }
     case 'ttsSettings': {
-      const stored = normalizeTtsSettings(settingsRepo.get(TTS_SETTINGS_SETTING))
-      const saved = normalizeTtsSettings(withResolvedKey(value, stored.api.apiKey))
+      const saved = normalizeTtsSettings(value)
       settingsRepo.set(TTS_SETTINGS_SETTING, saved)
-      return maskTts(saved)
+      return saved
     }
     case 'voiceCallDefaults': {
       const saved = normalizeVoiceCallDefaults(value)
@@ -252,7 +162,7 @@ export function setVoiceSetting(
 /**
  * Mantém `installed` de `sttSettings.local`/`ttsSettings.local` em sincronia com o disco quando um
  * modelo local é instalado/removido pelos canais `voice:models:*` (a escrita passa por
- * `setVoiceSetting`, então a `apiKey` nunca é tocada). Instalar **escolhe** o modelo como atual
+ * `setVoiceSetting`). Instalar **escolhe** o modelo como atual
  * (`installed: true`); remover o atual derruba o flag para `false` (a seleção engine/modelo fica —
  * a UI oferece "Baixar novamente"). Remover um modelo que não é o atual não mexe nas settings.
  * Idempotente; a SEMÂNTICA de "pronto para transcrever" não é o flag — é `deriveHasLocalReady`

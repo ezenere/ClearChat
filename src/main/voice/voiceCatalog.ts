@@ -1,7 +1,7 @@
 // Descoberta de modelos/vozes de STT e TTS nos provedores cadastrados (canal `voice:catalog:list`)
 // e prévias de voz publicadas pelo provedor (`voice:catalog:preview`). O main é dono da rede e das
-// chaves: a chave do provedor (ou do endpoint personalizado) só entra no header da listagem e nunca
-// volta na visão. Cache de 10 min por capacidade+provedor+endpoint(+hash da chave). Sem Electron
+// chaves: a chave do provedor só entra no header da listagem e nunca volta na visão. Cache de
+// 10 min por capacidade+provedor+endpoint(+hash da chave). Sem Electron
 // (dependências injetáveis — testes com fetch mockado). Ver SPEC.md → "Áudio → Provedor, modelo e
 // voz (descoberta)".
 import { createHash } from 'node:crypto'
@@ -40,8 +40,6 @@ export interface VoiceCatalogProvider {
 export interface VoiceCatalogDeps {
   /** Provedor cadastrado pelo id (null = apagado). */
   provider: (id: string) => VoiceCatalogProvider | null
-  /** Endpoint personalizado salvo na setting da capacidade (baseUrl + chave própria). */
-  customEndpoint: (capability: VoiceCapability) => { baseUrl: string; apiKey: string }
   fetch?: typeof fetch
   now?: () => number
   /** Timeout de cada GET (padrão 15 s). */
@@ -279,9 +277,8 @@ async function discover(
 }
 
 /**
- * Modelos (e vozes, no TTS) que o provedor oferece para a capacidade. `providerId` null = o
- * endpoint personalizado salvo na setting. Nunca lança: falhas viram `error` legível (com lista
- * embutida quando existe). Resultado em cache por `VOICE_CATALOG_CACHE_MS` (falhas não ficam em
+ * Modelos (e vozes, no TTS) que o provedor cadastrado oferece para a capacidade. Nunca lança:
+ * falhas viram `error` legível (com lista embutida quando existe). Resultado em cache por `VOICE_CATALOG_CACHE_MS` (falhas não ficam em
  * cache). A visão NUNCA carrega a chave.
  */
 export async function listVoiceCatalog(
@@ -290,7 +287,7 @@ export async function listVoiceCatalog(
 ): Promise<VoiceCatalogView> {
   const now = deps.now ?? Date.now
   const capability: VoiceCapability = req.capability === 'stt' ? 'stt' : 'tts'
-  const providerId = typeof req.providerId === 'string' && req.providerId ? req.providerId : null
+  const providerId = typeof req.providerId === 'string' ? req.providerId.trim() : ''
   const empty = (error: string | null, hint: string | null = null): VoiceCatalogView => ({
     capability,
     providerId,
@@ -302,37 +299,25 @@ export async function listVoiceCatalog(
     hint,
     fetchedAt: now()
   })
-  let family: VoiceProviderSupport | null
-  let baseUrl: string
-  let apiKey: string
-  let extra: Record<string, string> | undefined
-  if (providerId) {
-    const p = deps.provider(providerId)
-    if (!p) return empty('o provedor escolhido não existe mais (Configurações → Provedores)')
-    family = voiceProviderSupport(p)
-    if (!family || !providerSupportsVoice(p, capability))
-      return {
-        ...empty(null, null),
-        source: family ?? 'none',
-        freeText: false,
-        hint:
-          family === 'elevenlabs'
-            ? 'o ElevenLabs direto só serve a fala (TTS) aqui'
-            : 'este provedor não tem API de áudio'
-      }
-    baseUrl = p.baseUrl
-    apiKey = p.apiKey
-    extra = p.headers
-  } else {
-    const c = deps.customEndpoint(capability)
-    baseUrl = c.baseUrl
-    apiKey = c.apiKey
-    family = baseUrl.trim() ? voiceProviderSupport({ baseUrl }) : null
-    if (!family) return empty(null, 'informe o endpoint personalizado (baseUrl) para listar')
-  }
+  if (!providerId)
+    return empty(null, 'escolha um provedor em Configurações → Áudio para listar os modelos')
+  const p = deps.provider(providerId)
+  if (!p) return empty('o provedor escolhido não existe mais (Configurações → Provedores)')
+  const family = voiceProviderSupport(p)
+  if (!family || !providerSupportsVoice(p, capability))
+    return {
+      ...empty(null, null),
+      source: family ?? 'none',
+      freeText: false,
+      hint:
+        family === 'elevenlabs'
+          ? 'o ElevenLabs direto só serve a fala (TTS) aqui'
+          : 'este provedor não tem API de áudio'
+    }
+  const { baseUrl, apiKey, headers: extra } = p
   if (!/^https?:\/\//i.test(baseUrl.trim()))
     return empty('endpoint inválido (use http:// ou https://)')
-  const cacheKey = `${capability}|${providerId ?? 'custom'}|${voiceBaseUrlKeyOf(baseUrl)}|${keyHash(apiKey)}`
+  const cacheKey = `${capability}|${providerId}|${voiceBaseUrlKeyOf(baseUrl)}|${keyHash(apiKey)}`
   const hit = cache.get(cacheKey)
   if (!req.refresh && hit && now() - hit.fetchedAt < VOICE_CATALOG_CACHE_MS) return hit
   const found = await discover(capability, family, baseUrl, apiKey, extra, deps)

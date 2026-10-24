@@ -3,7 +3,7 @@ import { join, resolve } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
 import { closeDb, getDb, getDbPath } from './db'
-import { registerIpc, resetVoiceForWebContents } from './ipc'
+import { registerIpc, resetVoiceForWebContents, shutdownGpuVoice } from './ipc'
 import { shutdownSttWorker } from './voice/sttWorkerHost'
 import { shutdownTtsWorker } from './voice/ttsWorkerHost'
 import { registerEventWindow } from './events'
@@ -224,8 +224,12 @@ app.on('before-quit', () => {
   shutdownRunner()
   shutdownSttWorker()
   shutdownTtsWorker()
+  shutdownGpuVoice()
   killAllProcesses()
 })
 // garantia: nenhum process group de process_start fica órfão
-process.on('exit', () => killAllProcesses(0))
+process.on('exit', () => {
+  killAllProcesses(0)
+  shutdownGpuVoice()
+})
 app.on('will-quit', () => closeDb())

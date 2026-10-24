@@ -608,26 +608,49 @@ function asConfig(v: unknown): VoiceCallConfig {
 
 // ---------------- pré-checagem da chamada (renderer, pura) ----------------
 
-test('voiceCallReadiness: padrões de fábrica apontam o que falta (chave STT, Kokoro)', () => {
+/** Provedores cadastrados como a pré-checagem os vê (sem chave). */
+const PROVS = [
+  { id: 'p-groq', baseUrl: 'https://api.groq.com/openai/v1', kind: 'openai' },
+  { id: 'p-el', baseUrl: 'https://api.elevenlabs.io', kind: 'elevenlabs' }
+]
+
+test('voiceCallReadiness: padrões de fábrica apontam o que falta (provedor de STT, Kokoro)', () => {
   const problems = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 })
   assert.equal(problems.length, 2)
-  assert.match(problems[0], /Transcrição: configure a chave/)
+  assert.match(problems[0], /Transcrição: escolha um provedor em Configurações → Áudio/)
   assert.match(problems[1], /Fala: baixe o modelo Kokoro/)
+  // nenhum provedor que sirva transcrição cadastrado (ElevenLabs só fala) → aponta Provedores
+  const none = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 }, null, null, [PROVS[1]])
+  assert.match(none[0], /cadastre um provedor que sirva transcrição em Configurações → Provedores/)
+  // com provedor cadastrado mas não escolhido → só "escolha"
+  const pick = voiceCallReadiness({ sttSettings: STT0, ttsSettings: TTS0 }, null, null, PROVS)
+  assert.match(pick[0], /Transcrição: escolha um provedor em Configurações → Áudio\./)
 })
 
-test('voiceCallReadiness: pronta com chave (máscara) + Kokoro instalado; casos por modo/backend', () => {
-  const stt: SttSettings = { ...STT0, api: { ...STT0.api, apiKey: 'gsk_…abcd' } }
+test('voiceCallReadiness: pronta com provedor + Kokoro instalado; casos por modo/backend', () => {
+  const stt: SttSettings = { ...STT0, api: { ...STT0.api, providerId: 'p-groq' } }
   const tts: TtsSettings = {
     ...TTS0,
     local: { engine: 'kokoro', voice: 'pf_dora', installed: true }
   }
   assert.deepEqual(voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }), [])
-  // endpoint local de STT dispensa chave
-  const localUrl: SttSettings = {
-    ...STT0,
-    api: { ...STT0.api, baseUrl: 'http://127.0.0.1:9000/v1' }
-  }
-  assert.deepEqual(voiceCallReadiness({ sttSettings: localUrl, ttsSettings: tts }), [])
+  assert.deepEqual(
+    voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }, null, null, PROVS),
+    []
+  )
+  // provedor escolhido apagado de Provedores
+  assert.match(
+    voiceCallReadiness({ sttSettings: stt, ttsSettings: tts }, null, null, [PROVS[1]])[0],
+    /o provedor escolhido não existe mais/
+  )
+  // sem modelo
+  assert.match(
+    voiceCallReadiness({
+      sttSettings: { ...stt, api: { ...stt.api, model: ' ' } },
+      ttsSettings: tts
+    })[0],
+    /escolha o modelo de transcrição/
+  )
   // modo local sem modelo instalado
   const local: SttSettings = { ...STT0, mode: 'local', local: null }
   assert.match(voiceCallReadiness({ sttSettings: local, ttsSettings: tts })[0], /motor local/)
@@ -640,7 +663,7 @@ test('voiceCallReadiness: pronta com chave (máscara) + Kokoro instalado; casos 
   assert.deepEqual(voiceCallReadiness({ sttSettings: hybridLocal, ttsSettings: tts }), [])
   assert.match(
     voiceCallReadiness({ sttSettings: { ...STT0, mode: 'hybrid' }, ttsSettings: tts })[0],
-    /híbrido/
+    /híbrido\): escolha um provedor[^]*instale um modelo local/
   )
   // Chatterbox ainda não funciona
   const chatterbox: TtsSettings = {
@@ -648,29 +671,37 @@ test('voiceCallReadiness: pronta com chave (máscara) + Kokoro instalado; casos 
     local: { engine: 'chatterbox', voice: '', installed: true }
   }
   assert.match(voiceCallReadiness({ sttSettings: stt, ttsSettings: chatterbox })[0], /Kokoro/)
-  // TTS por API: endpoint/modelo e chave
+  // TTS por API: provedor e modelo
   const ttsApi: TtsSettings = { ...TTS0, backend: 'api' }
   assert.match(
     voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApi })[0],
-    /endpoint e o modelo/
+    /Fala: escolha um provedor em Configurações → Áudio/
   )
-  const ttsApiNoKey: TtsSettings = {
+  const ttsApiNoModel: TtsSettings = {
     ...TTS0,
     backend: 'api',
-    api: { ...TTS0.api, baseUrl: 'https://api.openai.com/v1', model: 'gpt-4o-mini-tts' }
+    api: { ...TTS0.api, providerId: 'p-el' }
   }
-  assert.match(voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApiNoKey })[0], /chave/)
+  assert.match(
+    voiceCallReadiness({ sttSettings: stt, ttsSettings: ttsApiNoModel })[0],
+    /escolha o modelo de fala/
+  )
   assert.deepEqual(
-    voiceCallReadiness({
-      sttSettings: stt,
-      ttsSettings: { ...ttsApiNoKey, api: { ...ttsApiNoKey.api, apiKey: 'sk-…wxyz' } }
-    }),
+    voiceCallReadiness(
+      {
+        sttSettings: stt,
+        ttsSettings: { ...ttsApiNoModel, api: { ...ttsApiNoModel.api, model: 'eleven_flash_v2_5' } }
+      },
+      null,
+      null,
+      PROVS
+    ),
     []
   )
 })
 
 test('voiceCallReadiness: probe de runtime (espeak-ng ausente / whisper quebrado) bloqueia o motor local', () => {
-  const stt: SttSettings = { ...STT0, api: { ...STT0.api, apiKey: 'gsk_…abcd' } }
+  const stt: SttSettings = { ...STT0, api: { ...STT0.api, providerId: 'p-groq' } }
   const tts: TtsSettings = {
     ...TTS0,
     local: { engine: 'kokoro', voice: 'pf_dora', installed: true }

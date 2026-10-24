@@ -12,6 +12,22 @@ import {
   type ToolName
 } from './types'
 import { planVoiceReasoning, type VoiceReasoningRules } from './voiceCallParams'
+import {
+  DEFAULT_TTS_GPU,
+  GPU_STT_ENGINE_ID,
+  isGpuTtsEngineId,
+  normalizeOmniSteps,
+  type SttGpuConfig,
+  type TtsGpuConfig
+} from './gpuVoice'
+// contrato do modo GPU também a partir daqui (as settings `ttsSettings.gpu`/`sttSettings.gpu`)
+export {
+  DEFAULT_STT_GPU,
+  DEFAULT_TTS_GPU,
+  OMNIVOICE_DEFAULT_STEPS,
+  type SttGpuConfig,
+  type TtsGpuConfig
+} from './gpuVoice'
 
 // ---------------- settings keys (tabela `settings`, JSON; ver SPEC → Banco) ----------------
 
@@ -52,24 +68,33 @@ export const DEFAULT_AUDIO_INPUT: AudioInputSettings = {
 
 // ---------------- transcrição (settings `sttSettings`) ----------------
 
-/** Onde transcrever: API remota, motor local ou híbrido (API com fallback local). */
-export type SttMode = 'api' | 'local' | 'hybrid'
-export const STT_MODES: readonly SttMode[] = ['api', 'local', 'hybrid']
+/**
+ * Onde transcrever: API remota, motor local, híbrido (API com fallback local) ou `gpu` — o
+ * whisper-large-v3-turbo no servidor local da GPU ("Modo avançado (GPU local)", `sttSettings.gpu`).
+ */
+export type SttMode = 'api' | 'local' | 'hybrid' | 'gpu'
+export const STT_MODES: readonly SttMode[] = ['api', 'local', 'hybrid', 'gpu']
 
 /** Motor de transcrição local. */
 export type SttLocalEngine = 'whisper.cpp' | 'vosk' | 'nemotron'
 export const STT_LOCAL_ENGINES: readonly SttLocalEngine[] = ['whisper.cpp', 'vosk', 'nemotron']
 
-/** Endpoint de transcrição (API), no formato OpenAI `/audio/transcriptions`. */
+/**
+ * Endpoint de transcrição (API), no formato OpenAI `/audio/transcriptions`. GRAVADO só com o
+ * provedor e o modelo: endereço e chave vêm SEMPRE do provedor cadastrado em Configurações →
+ * Provedores (um servidor local OpenAI-compatível em localhost, sem chave, também é um provedor).
+ */
 export interface SttEndpointConfig {
-  /** Provedor salvo (id de `providers`); null = endpoint avulso (baseUrl + apiKey). */
+  /** Provedor cadastrado (id de `providers`); null = nenhum escolhido (a API não transcreve). */
   providerId: string | null
-  /** Base da API (padrão Groq: 'https://api.groq.com/openai/v1'). */
-  baseUrl: string
-  /** Chave da API (guardada no JSON da setting; a UI mostra mascarada). */
-  apiKey: string
-  /** Modelo de transcrição (padrão Groq: 'whisper-large-v3-turbo'). */
+  /** Modelo de transcrição (padrão: 'whisper-large-v3-turbo'). */
   model: string
+  /**
+   * Endereço/chave do provedor, preenchidos SÓ pelo main ao resolver o `providerId`
+   * (`getVoiceSettings`) ou o servidor da GPU — nunca gravados nem enviados ao renderer.
+   */
+  baseUrl?: string
+  apiKey?: string
 }
 
 export interface SttLocalConfig {
@@ -84,7 +109,7 @@ export interface SttLocalConfig {
 export interface SttSettings {
   /** Onde transcrever (padrão 'api'). */
   mode: SttMode
-  /** Endpoint de API (padrão: Groq `whisper-large-v3-turbo`). */
+  /** Provedor + modelo de API (padrão: nenhum provedor escolhido, `whisper-large-v3-turbo`). */
   api: SttEndpointConfig
   /** Motor local; null = nenhum instalado. */
   local: SttLocalConfig | null
@@ -97,12 +122,15 @@ export interface SttSettings {
    * voz sempre reaproveita (latência).
    */
   reusePartialFinal?: boolean
+  /**
+   * Modo `gpu`: motor do servidor local da GPU (aditivo — só gravado com o modo `gpu` ou quando
+   * escolhido). Local do dispositivo: NUNCA sincroniza (SPEC → "Modo avançado (GPU local)").
+   */
+  gpu?: SttGpuConfig
 }
 
 export const DEFAULT_STT_API: SttEndpointConfig = {
   providerId: null,
-  baseUrl: 'https://api.groq.com/openai/v1',
-  apiKey: '',
   model: 'whisper-large-v3-turbo'
 }
 
@@ -132,24 +160,86 @@ export const DEFAULT_STT_SETTINGS: SttSettings = {
 export type TtsLocalEngine = 'kokoro' | 'chatterbox'
 export const TTS_LOCAL_ENGINES: readonly TtsLocalEngine[] = ['kokoro', 'chatterbox']
 
-/** Endpoint de síntese (API). */
+/**
+ * Endpoint de síntese (API). GRAVADO só com o provedor, o modelo, a voz e as opções: endereço e
+ * chave vêm SEMPRE do provedor cadastrado em Configurações → Provedores.
+ */
 export interface TtsEndpointConfig {
-  /** Provedor salvo (id de `providers`); null = endpoint avulso (baseUrl + apiKey). */
+  /** Provedor cadastrado (id de `providers`); null = nenhum escolhido (a API não sintetiza). */
   providerId: string | null
-  /** Base da API (padrão: vazia — endpoint não configurado até a UI preencher). */
-  baseUrl: string
-  /** Chave da API (guardada no JSON da setting; a UI mostra mascarada). */
-  apiKey: string
   /** Modelo de síntese (padrão: vazio — não configurado). */
   model: string
   /** Voz pedida à API; null = a voz padrão da API. */
   voice: string | null
+  /**
+   * Endereço/chave do provedor, preenchidos SÓ pelo main ao resolver o `providerId`
+   * (`getVoiceSettings`) ou o servidor da GPU — nunca gravados nem enviados ao renderer.
+   */
+  baseUrl?: string
+  apiKey?: string
   /**
    * Tipo do provedor salvo (`providerId`), preenchido SÓ pelo main ao resolver o endpoint
    * (`getVoiceSettings`) — nunca gravado nem enviado ao renderer. `'elevenlabs'` = ElevenLabs
    * direta (REST `/v1/text-to-speech` + WebSocket na chamada — `voice/elevenlabs*.ts`).
    */
   providerKind?: string
+  /**
+   * ElevenLabs direta: a chamada usa o WebSocket multi-contexto (texto em streaming) quando o
+   * modelo aceita. Ausente = ligado (padrão); `false` = força HTTP por frase. Gravado só quando
+   * `false` (aditivo; settings de voz são locais — não sincronizam).
+   */
+  elevenLabsWs?: boolean
+}
+
+/** Modelos da ElevenLabs que o WebSocket `stream-input` não aceita (v3/v4 → HTTP por frase). */
+export function elevenLabsWsSupportsModel(modelId: string): boolean {
+  return !/^eleven_v[34]/i.test(modelId.trim())
+}
+
+/** Nome curto do modelo da ElevenLabs para os avisos ("eleven_v4_turbo" → "v4 Turbo"). */
+const elevenModelShort = (id: string): string => {
+  const m = /^eleven_(v\d+)(?:_(\w+))?/i.exec(id.trim())
+  if (!m) return id
+  const rest = (m[2] ?? '').replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+  return [m[1].toLowerCase(), rest].filter(Boolean).join(' ')
+}
+
+/** Como a fala da CHAMADA chega do provedor (indicador da aba Áudio → Fala). */
+export interface TtsCallTransport {
+  /** true = WebSocket multi-contexto (texto em streaming); false = HTTP por frase. */
+  ws: boolean
+  /** Por que é HTTP (pt-BR, minúsculo); null quando é WebSocket. */
+  reason: string | null
+  /** O interruptor "Streaming por WebSocket" se aplica (ElevenLabs direta + modelo que aceita). */
+  toggle: boolean
+}
+
+/**
+ * Transporte da fala na chamada para o backend de API — espelho PURO da decisão do main
+ * (`elevenLabsCallOptions`): WebSocket só na ElevenLabs direta, com modelo que aceita e o
+ * interruptor ligado; o resto é HTTP por frase. `family` = família do provedor escolhido.
+ */
+export function ttsCallTransport(
+  api: Pick<TtsEndpointConfig, 'model' | 'elevenLabsWs'>,
+  family: 'elevenlabs' | 'openrouter' | 'openai' | null
+): TtsCallTransport {
+  if (family !== 'elevenlabs')
+    return {
+      ws: false,
+      reason:
+        family === 'openrouter'
+          ? 'o OpenRouter não tem WebSocket de fala'
+          : 'só a ElevenLabs direta tem WebSocket de fala',
+      toggle: false
+    }
+  if (!elevenLabsWsSupportsModel(api.model))
+    return {
+      ws: false,
+      reason: `o ${elevenModelShort(api.model)} não suporta WebSocket`,
+      toggle: false
+    }
+  if (api.elevenLabsWs === false) return { ws: false, reason: 'desligado por você', toggle: true }
+  return { ws: true, reason: null, toggle: true }
 }
 
 export interface TtsLocalConfig {
@@ -162,18 +252,24 @@ export interface TtsLocalConfig {
 }
 
 export interface TtsSettings {
-  /** Onde sintetizar (padrão 'local' — Kokoro). */
-  backend: 'api' | 'local'
-  /** Endpoint de API (padrão: não configurado). */
+  /**
+   * Onde sintetizar (padrão 'local' — Kokoro). `gpu` = servidor local da GPU ("Modo avançado (GPU
+   * local)" — motor/voz em `gpu`; o main resolve URL/token, que nunca vão ao renderer).
+   */
+  backend: 'api' | 'local' | 'gpu'
+  /** Provedor + modelo + voz de API (padrão: não configurado). */
   api: TtsEndpointConfig
   /** Motor local (padrão: Kokoro não instalado); null = o usuário limpou explicitamente. */
   local: TtsLocalConfig | null
+  /**
+   * Backend `gpu`: motor/voz/passos (aditivo — só gravado com o backend `gpu` ou quando escolhido).
+   * Local do dispositivo: NUNCA sincroniza (SPEC → "Modo avançado (GPU local)").
+   */
+  gpu?: TtsGpuConfig
 }
 
 export const DEFAULT_TTS_API: TtsEndpointConfig = {
   providerId: null,
-  baseUrl: '',
-  apiKey: '',
   model: '',
   voice: null
 }
@@ -544,10 +640,9 @@ export function normalizeSttSettings(v: unknown): SttSettings {
       src && (STT_MODES as readonly string[]).includes(src.mode as string)
         ? (src.mode as SttMode)
         : DEFAULT_STT_SETTINGS.mode,
+    // só provedor + modelo: `baseUrl`/`apiKey` gravados por versões de desenvolvimento são descartados
     api: {
       providerId: strOrNull(api?.providerId),
-      baseUrl: strOr(api?.baseUrl, DEFAULT_STT_API.baseUrl),
-      apiKey: typeof api?.apiKey === 'string' ? api.apiKey.trim() : DEFAULT_STT_API.apiKey,
       model: strOr(api?.model, DEFAULT_STT_API.model)
     },
     // null = nenhum motor instalado (objeto inválido também cai em null)
@@ -561,7 +656,21 @@ export function normalizeSttSettings(v: unknown): SttSettings {
         }
       : null,
     livePartials: boolOr(src?.livePartials, DEFAULT_STT_SETTINGS.livePartials),
-    reusePartialFinal: boolOr(src?.reusePartialFinal, true)
+    reusePartialFinal: boolOr(src?.reusePartialFinal, true),
+    // aditivo: com o modo `gpu` (ou um `gpu` salvo) — o único motor é o whisper-large-v3-turbo
+    ...(src?.mode === 'gpu' || asObject(src?.gpu) ? { gpu: { engine: GPU_STT_ENGINE_ID } } : {})
+  }
+}
+
+/** `ttsSettings.gpu` normalizado (null = ausente/lixo). */
+export function normalizeTtsGpu(v: unknown): TtsGpuConfig | null {
+  const g = asObject(v)
+  if (!g) return null
+  const steps = normalizeOmniSteps(g.steps)
+  return {
+    engine: isGpuTtsEngineId(g.engine) ? g.engine : DEFAULT_TTS_GPU.engine,
+    voice: strOrNull(g.voice),
+    ...(steps !== undefined ? { steps } : {})
   }
 }
 
@@ -575,13 +684,15 @@ export function normalizeTtsSettings(v: unknown): TtsSettings {
   const api = asObject(src?.api)
   const local = asObject(src?.local)
   return {
-    backend: src?.backend === 'api' ? 'api' : DEFAULT_TTS_SETTINGS.backend,
+    backend:
+      src?.backend === 'api' || src?.backend === 'gpu' ? src.backend : DEFAULT_TTS_SETTINGS.backend,
+    // provedor + modelo + voz + opções (`baseUrl`/`apiKey`/`providerKind` nunca são gravados)
     api: {
       providerId: strOrNull(api?.providerId),
-      baseUrl: strOr(api?.baseUrl, DEFAULT_TTS_API.baseUrl),
-      apiKey: typeof api?.apiKey === 'string' ? api.apiKey.trim() : DEFAULT_TTS_API.apiKey,
       model: strOr(api?.model, DEFAULT_TTS_API.model),
-      voice: strOrNull(api?.voice)
+      voice: strOrNull(api?.voice),
+      // aditivo: só o `false` explícito é gravado (ausente = WebSocket ligado)
+      ...(api?.elevenLabsWs === false ? { elevenLabsWs: false } : {})
     },
     // null explícito = limpo pelo usuário; ausente/lixo → o motor padrão (Kokoro)
     local:
@@ -594,7 +705,13 @@ export function normalizeTtsSettings(v: unknown): TtsSettings {
                 : DEFAULT_TTS_LOCAL.engine,
             voice: strOr(local?.voice, DEFAULT_TTS_LOCAL.voice),
             installed: local?.installed === true
-          }
+          },
+    // aditivo: com o backend `gpu` (padrão OmniVoice) ou um `gpu` salvo
+    ...(() => {
+      const gpu =
+        normalizeTtsGpu(src?.gpu) ?? (src?.backend === 'gpu' ? { ...DEFAULT_TTS_GPU } : null)
+      return gpu ? { gpu } : {}
+    })()
   }
 }
 
@@ -960,6 +1077,12 @@ export interface VoiceCallState {
   /** Fala já transcrita aguardando o próximo turno (máx. 1; '' = nenhuma). */
   pendingText: string
   error: string | null
+  /**
+   * Fase "Preparando a GPU…" (Modo avançado): andamento legível da subida/aquecimento do servidor
+   * local ("Iniciando OmniVoice…", "Aquecendo OmniVoice + Whisper…"). Presente = o microfone ainda
+   * NÃO abre; ausente/null = pronta. Aditivo (só aparece com fala/transcrição na GPU).
+   */
+  preparing?: string | null
 }
 
 /** Estado "desligado" (retorno de `voice:call:stop` / inicial do store). */

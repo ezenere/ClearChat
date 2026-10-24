@@ -7,6 +7,8 @@ export interface SelectOption<T extends string> {
   value: T
   label: ReactNode
   description?: ReactNode
+  /** Opção visível mas não escolhível (a `description` diz por quê). */
+  disabled?: boolean
 }
 
 export function Select<T extends string>({
@@ -70,7 +72,7 @@ export function Select<T extends string>({
           } else if (e.key === 'ArrowUp') {
             e.preventDefault()
             setHi((h) => Math.max(0, h - 1))
-          } else if (e.key === 'Enter' && options[hi]) {
+          } else if (e.key === 'Enter' && options[hi] && !options[hi].disabled) {
             e.preventDefault()
             pick(options[hi].value)
           }
@@ -103,11 +105,14 @@ export function Select<T extends string>({
             <button
               key={o.value}
               type="button"
+              disabled={o.disabled}
+              aria-disabled={o.disabled || undefined}
               onMouseEnter={() => setHi(i)}
-              onClick={() => pick(o.value)}
+              onClick={() => !o.disabled && pick(o.value)}
               className={cn(
                 'flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px]',
-                i === hi ? 'bg-hover text-fg' : 'text-fg/90'
+                i === hi ? 'bg-hover text-fg' : 'text-fg/90',
+                o.disabled && 'cursor-not-allowed opacity-50'
               )}
             >
               <span className="min-w-0 flex-1">

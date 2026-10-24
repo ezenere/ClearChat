@@ -311,7 +311,7 @@ app.on('window-all-closed', () => app.quit())
   })
 
   await step(
-    'recolhimento: 1440 / 1100 / 900 px × painel × arquivo, sem overflow; host = ícone no composer',
+    'recolhimento: 1440 / 1100 / 900 px × painel × arquivo (± ditado), sem overflow; host = ícone no composer',
     async () => {
       await open('chat', 'Refatorar o parser de SSE')
       const HOST = 'Workstation do escritório (Linux)'
@@ -353,9 +353,35 @@ app.on('window-all-closed', () => app.quit())
                 .map(([k, v]) => `${k}=${v}`)
                 .join(',')}`
             )
-            assert.ok(await indicator.isVisible(), `${tag}: ícone do host visível`)
-            assert.equal((await indicator.innerText()).trim(), '', `${tag}: só ícone`)
-            if (w === 900 && !p && !file) {
+            // o grupo de voz [ telefone | mic | ˅ ] nunca some; o ícone do host e o </> recolhem
+            // antes dele (a seta do microfone vai para o botão direito do mic no nível 1)
+            const group = page.getByTestId('composer-toolbar').getByTestId('voice-group')
+            assert.ok(await group.isVisible(), `${tag}: grupo de voz visível`)
+            if (g.levels['voice-controls'] !== '0')
+              assert.ok(
+                g.levels['composer-host'] === '2' && g.levels['composer-info'] === '2',
+                `${tag}: host e </> recolhem antes do grupo de voz`
+              )
+            if (g.levels['composer-host'] !== '2') {
+              assert.ok(await indicator.isVisible(), `${tag}: ícone do host visível`)
+              assert.equal((await indicator.innerText()).trim(), '', `${tag}: só ícone`)
+            }
+            if (w === 1440 && !p && !file)
+              assert.ok(await indicator.isVisible(), `${tag}: ícone do host visível em 1440`)
+            // barra do ditado (mic + waveform + [ × | ✓ ] + enviar) também cabe
+            // (combinações mais estreitas sem o painel sobreposto com fundo escuro)
+            if (file && ((w === 1440 && p) || (w === 900 && !p))) {
+              await group.getByTestId('voice-mic-button').click()
+              await page.getByTestId('voice-draft').waitFor()
+              await page.waitForTimeout(450)
+              const d = await barsGeo()
+              assert.deepEqual(d.overflow, [], `${tag} (ditado): overflow`)
+              await page.getByTestId('voice-finish-button').waitFor()
+              await shot(`05-bars-${tag}-ditado`)
+              await page.getByTestId('voice-cancel-button').click()
+              await page.getByTestId('voice-draft').waitFor({ state: 'detached' })
+            }
+            if (w === 900 && !p && !file && (await indicator.isVisible())) {
               await indicator.hover()
               await page
                 .getByRole('tooltip')

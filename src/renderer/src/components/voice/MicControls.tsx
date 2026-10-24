@@ -1,61 +1,107 @@
-// Botão de microfone do composer (ditado por voz): clique inicia/para a gravação; a seta abre o
-// menu de seleção de microfone (`role="menu"` com itens `menuitemradio` — "Padrão do sistema" +
-// dispositivos reais; as entradas sintéticas do Chromium "Default"/"Communications" ficam de fora
-// e o nome do padrão atual vai no rótulo do "Padrão do sistema"; microfone salvo que sumiu aparece
-// marcado como desconectado), atualiza em hotplug, grava `audioInput.deviceId` e tem o atalho para
-// Configurações → Áudio. O foco entra no item marcado ao abrir; ↑/↓ navegam, Esc fecha.
+// Grupo de voz do composer — UM controle `[ telefone | mic | ˅ ]` (`voice-group`, borda única com
+// três segmentos): o telefone entra/sai da chamada (`VoiceCallButton`, com as regras dele), o mic
+// inicia o ditado e a seta abre o menu do MICROFONE — o mesmo da chamada e do ditado, por isso fica
+// depois dos dois (`role="menu"` com itens `menuitemradio` — "Padrão do sistema" + dispositivos
+// reais; as entradas sintéticas do Chromium "Default"/"Communications" ficam de fora e o nome do
+// padrão atual vai no rótulo do "Padrão do sistema"; microfone salvo que sumiu aparece marcado como
+// desconectado), atualiza em hotplug, grava `audioInput.deviceId` e tem o atalho para
+// Configurações → Áudio. O foco entra no item marcado ao abrir; ↑/↓ navegam, Esc fecha. Barra
+// apertada (`BAR_ITEMS['voice-controls']` nível 1): a seta some e o menu continua no botão direito
+// do mic (ou na tecla de menu de contexto/Shift+F10 com o mic focado). Durante o ditado o grupo
+// inteiro dá lugar à barra da gravação (Composer).
 import { Check, ChevronDown, Mic, Settings2, TriangleAlert } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import type { Session } from '@shared/types'
 import type { DictationControls } from '../../lib/voice/useDictation'
 import { useInputDeviceList } from '../../lib/voice/useInputDevices'
+import { formatHotkeyLabel } from '../../lib/voice/hotkeyLabel'
 import { menuInputDevices } from '../../lib/audio/devices'
+import { barAttrs, useBarLevel } from '../../lib/useBarCollapse'
 import { cn } from '../../lib/format'
 import { useStore } from '../../store'
 import { Popover } from '../ui/layers'
 import { Tip } from '../ui/Tooltip'
+import { VoiceCallButton } from './VoiceCallButton'
 
-/** Botão Mic + chevron do menu de microfone (esconde-se sem `window.api.voice`). */
-export function MicButton({
+/** Rótulo do menu/seta: o microfone vale para o ditado E para a chamada. */
+export const MIC_MENU_LABEL = 'Microfone (ditado e chamada)'
+
+/** Segmento do grupo (altura cheia, sem cantos próprios — o grupo arredonda e recorta). */
+const SEGMENT =
+  'flex h-full shrink-0 items-center justify-center text-subtle transition-colors hover:bg-hover hover:text-fg focus-visible:bg-hover focus-visible:text-fg focus-visible:outline-none'
+
+/**
+ * `[ telefone | mic | ˅ ]` na barra do composer (some sem `window.api.voice`). `dictationOff`:
+ * motivo para o ditado não estar disponível agora (ex.: chamada ativa em outro chat) — o mic fica
+ * visível porém inerte, com o motivo no tooltip; o telefone segue as regras dele.
+ */
+export function VoiceGroup({
   dictation,
-  compact
+  session,
+  dictationOff
 }: {
   dictation: DictationControls
-  /** Barra apertada: só o botão do mic (sem o chevron do menu). */
-  compact?: boolean
+  session: Session
+  dictationOff?: string | null
 }): React.JSX.Element | null {
+  const level = useBarLevel('voice-controls')
   const [open, setOpen] = useState(false)
-  const anchor = useRef<HTMLButtonElement>(null)
+  const group = useRef<HTMLDivElement>(null)
+  const micRef = useRef<HTMLButtonElement>(null)
   const menuButton = useRef<HTMLButtonElement>(null)
-  const recording = dictation.state === 'recording'
   if (!dictation.available) return null
+  const compact = level > 0
   const close = (): void => {
     setOpen(false)
-    menuButton.current?.focus()
+    ;(menuButton.current ?? micRef.current)?.focus()
   }
+  const ptt =
+    dictation.settings.pttEnabled && dictation.settings.pttKey
+      ? formatHotkeyLabel(dictation.settings.pttKey)
+      : ''
+  const micLabel = dictationOff
+    ? dictationOff
+    : compact
+      ? 'Ditar por voz · botão direito: microfone (ditado e chamada)'
+      : 'Ditar por voz'
   return (
-    <>
-      <Tip label={recording ? 'Parar gravação' : 'Ditar por voz'}>
+    <div
+      {...barAttrs('voice-controls', level)}
+      ref={group}
+      role="group"
+      aria-label="Voz: chamada, ditado e microfone"
+      data-testid="voice-group"
+      className="flex h-[30px] shrink-0 items-stretch divide-x divide-border overflow-hidden rounded-lg border border-border bg-elevated/40"
+    >
+      <VoiceCallButton session={session} className="rounded-none!" />
+      <Tip label={micLabel} shortcut={!dictationOff && ptt ? `segure ${ptt}` : undefined}>
         <button
           type="button"
-          ref={anchor}
+          ref={micRef}
           data-testid="voice-mic-button"
+          aria-label="Ditar por voz"
+          aria-disabled={dictationOff ? true : undefined}
           onClick={(e) => {
             e.stopPropagation()
-            void (recording ? dictation.stop() : dictation.start())
+            if (!dictationOff) void dictation.start()
           }}
-          aria-label={recording ? 'Parar gravação' : 'Ditar por voz'}
-          aria-pressed={recording}
+          onContextMenu={(e) => {
+            // o menu do microfone também no botão direito (a seta some na barra apertada)
+            e.preventDefault()
+            e.stopPropagation()
+            setOpen(true)
+          }}
           className={cn(
-            'flex size-7 shrink-0 items-center justify-center rounded-lg text-subtle transition-colors hover:bg-hover hover:text-fg',
-            recording &&
-              'bg-accent/15 text-accent-strong hover:bg-accent/25 hover:text-accent-strong'
+            SEGMENT,
+            'w-7',
+            dictationOff && 'cursor-default opacity-40 hover:bg-transparent'
           )}
         >
-          <Mic className={cn('size-4', recording && 'animate-pulse-soft')} />
+          <Mic className="size-4" />
         </button>
       </Tip>
       {!compact && (
-        <Tip label="Escolher microfone">
+        <Tip label={MIC_MENU_LABEL}>
           <button
             type="button"
             ref={menuButton}
@@ -64,24 +110,21 @@ export function MicButton({
               e.stopPropagation()
               setOpen((o) => !o)
             }}
-            aria-label="Escolher microfone"
+            aria-label={MIC_MENU_LABEL}
             aria-haspopup="menu"
             aria-expanded={open}
-            className={cn(
-              '-ml-1.5 flex h-7 w-5 shrink-0 items-center justify-center rounded-md text-faint transition-colors hover:bg-hover hover:text-fg',
-              open && 'bg-hover text-fg'
-            )}
+            className={cn(SEGMENT, 'w-5 text-faint', open && 'bg-hover text-fg')}
           >
             <ChevronDown className="size-3.5" />
           </button>
         </Tip>
       )}
       {open && (
-        <Popover open={open} onClose={close} anchor={anchor} width={300} maxHeight={360}>
+        <Popover open={open} onClose={close} anchor={group} width={300} maxHeight={360} align="end">
           <MicMenu dictation={dictation} onClose={close} />
         </Popover>
       )}
-    </>
+    </div>
   )
 }
 
@@ -139,13 +182,13 @@ function MicMenu({
     <div
       ref={menuRef}
       role="menu"
-      aria-label="Microfone do ditado"
+      aria-label={MIC_MENU_LABEL}
       data-testid="voice-mic-menu"
       onClick={(e) => e.stopPropagation()}
       onKeyDown={onKeyDown}
     >
       <p className="border-b border-border px-3 py-2 text-[11px] text-subtle">
-        Microfone do ditado (o mesmo de Configurações → Áudio)
+        Microfone do ditado e da chamada (o mesmo de Configurações → Áudio)
       </p>
       <div className="max-h-[260px] overflow-y-auto p-1">
         <MenuItem

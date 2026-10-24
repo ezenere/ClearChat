@@ -676,7 +676,7 @@ function startSpeculation(
   // veredito: motor local sempre que pronto (rápido, nada sai da máquina — inclusive no modo api);
   // sem motor, pela API só com permissão (no modo local nunca)
   const backend: 'local' | 'api' | null =
-    settings.mode === 'local'
+    settings.mode === 'local' || settings.mode === 'gpu'
       ? localReady
         ? 'local'
         : null
@@ -979,7 +979,7 @@ export function startTranscribeSession(
           baseUrl:
             backend === 'local'
               ? 'local'
-              : state.opts.settings.api.baseUrl.trim().replace(/\/+$/, ''),
+              : (state.opts.settings.api.baseUrl ?? '').trim().replace(/\/+$/, ''),
           ms,
           backend,
           fellBack: false
@@ -1015,7 +1015,7 @@ export function startTranscribeSession(
             baseUrl:
               r.backend === 'local'
                 ? 'local'
-                : state.opts.settings.api.baseUrl.trim().replace(/\/+$/, ''),
+                : (state.opts.settings.api.baseUrl ?? '').trim().replace(/\/+$/, ''),
             ms: r.ms,
             backend: r.backend,
             fellBack: false,
@@ -1055,7 +1055,7 @@ export function startTranscribeSession(
             baseUrl:
               backend === 'local'
                 ? 'local'
-                : state.opts.settings.api.baseUrl.trim().replace(/\/+$/, ''),
+                : (state.opts.settings.api.baseUrl ?? '').trim().replace(/\/+$/, ''),
             ms: 0,
             backend,
             fellBack: false

@@ -52,8 +52,8 @@ export interface VoiceCatalogVoice {
 /** Resultado de `voice:catalog:list` — nunca contém chave de API. */
 export interface VoiceCatalogView {
   capability: VoiceCapability
-  /** Provedor consultado; null = endpoint personalizado da setting. */
-  providerId: string | null
+  /** Provedor cadastrado consultado. */
+  providerId: string
   /** De onde veio a lista ('static' = tabela embutida porque a listagem falhou/não existe). */
   source: VoiceProviderSupport | 'static' | 'none'
   models: VoiceCatalogModel[]
@@ -81,8 +81,8 @@ export interface VoiceCatalogView {
 /** Pedido de `voice:catalog:list`. */
 export interface VoiceCatalogRequest {
   capability: VoiceCapability
-  /** Provedor cadastrado; null = endpoint personalizado salvo na setting do mesmo `capability`. */
-  providerId: string | null
+  /** Provedor cadastrado (Configurações → Provedores) a listar. */
+  providerId: string
   /** Ignora o cache (botão "Atualizar"). */
   refresh?: boolean
 }
@@ -134,11 +134,6 @@ export function providerSupportsVoice(
   const s = voiceProviderSupport(p)
   if (!s) return false
   return capability === 'tts' || s !== 'elevenlabs'
-}
-
-/** Base URL comparável (minúsculas, sem barras finais) — vínculo setting ↔ provedor. */
-export function voiceBaseUrlKey(url: string): string {
-  return (url ?? '').trim().replace(/\/+$/, '').toLowerCase()
 }
 
 // ---------------- helpers ----------------
@@ -438,7 +433,7 @@ export function describeVoice(id: string, modelId = ''): VoiceCatalogVoice {
 
 /**
  * Apelidos conhecidos de modelos de áudio sem o prefixo do OpenRouter (o id que funciona na Groq,
- * na OpenAI ou na API própria do fornecedor). Usado sem rede — na migração das settings.
+ * na OpenAI ou na API própria do fornecedor). Usado sem rede.
  */
 export const OPENROUTER_MODEL_ALIASES: Record<string, string> = {
   'whisper-large-v3-turbo': 'openai/whisper-large-v3-turbo',
@@ -484,53 +479,6 @@ export function resolveModelAlias(
   const hits = ids.filter((x) => aliasKey(x) === key)
   if (hits.length === 1) return { id: hits[0], corrected: true }
   return null
-}
-
-// ---------------- migração das settings (endpoint → provedor) ----------------
-
-/**
- * Vínculo de um endpoint de STT/TTS salvo com os provedores cadastrados (migração da UI antiga de
- * campos livres): `providerId` já válido → mantém; senão, `baseUrl` igual à de um provedor E chave
- * própria vazia (ou igual à do provedor) → passa a usar o provedor; com chave própria diferente
- * fica como "endpoint personalizado" (trocar mudaria a conta cobrada). Com o provedor resolvido
- * sendo o OpenRouter, um modelo sem prefixo conhecido em `OPENROUTER_MODEL_ALIASES` é corrigido.
- * Puro: devolve o `api` novo e o que mudou (null = nada).
- */
-export function linkVoiceEndpointProvider<
-  T extends { providerId: string | null; baseUrl: string; apiKey: string; model: string }
->(
-  api: T,
-  providers: readonly { id: string; baseUrl: string; apiKey: string; kind?: unknown }[],
-  capability: VoiceCapability
-): { api: T; linked: string | null; model: { from: string; to: string } | null } {
-  let next = api
-  let linked: string | null = null
-  let provider = api.providerId ? (providers.find((p) => p.id === api.providerId) ?? null) : null
-  if (!provider && api.baseUrl.trim()) {
-    const key = voiceBaseUrlKey(api.baseUrl)
-    const own = api.apiKey.trim()
-    const match = providers.find(
-      (p) =>
-        voiceBaseUrlKey(p.baseUrl) === key &&
-        providerSupportsVoice(p, capability) &&
-        (!own || own === p.apiKey.trim())
-    )
-    if (match) {
-      provider = match
-      linked = match.id
-      next = { ...next, providerId: match.id }
-    }
-  }
-  let model: { from: string; to: string } | null = null
-  if (provider && voiceProviderSupport(provider) === 'openrouter') {
-    const cur = next.model.trim()
-    const to = cur && !cur.includes('/') ? OPENROUTER_MODEL_ALIASES[cur] : undefined
-    if (to) {
-      model = { from: cur, to }
-      next = { ...next, model: to }
-    }
-  }
-  return { api: next, linked, model }
 }
 
 // ---------------- curadoria para a chamada (TTS remoto) ----------------

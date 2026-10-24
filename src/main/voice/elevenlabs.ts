@@ -8,6 +8,7 @@
 // no main: só vai no header `xi-api-key` (ou no 1º frame do WebSocket) — nunca num resultado.
 // Ver SPEC.md → "Áudio → ElevenLabs direto".
 import type { TtsEndpointConfig } from '@shared/voice'
+import { elevenLabsWsSupportsModel as sharedWsSupportsModel } from '@shared/voice'
 import { connectionErrorText } from '@shared/network'
 import { abortError } from '../tools/util'
 import {
@@ -75,7 +76,7 @@ export const ELEVENLABS_PREMADE_VOICES: Readonly<Record<string, string>> = {
 
 /**
  * O endpoint de síntese é a ElevenLabs direta? Provedor salvo do tipo `elevenlabs`
- * (`providerKind`, resolvido no main) ou host `*.elevenlabs.io` num endpoint avulso.
+ * (`providerKind`, resolvido no main) ou host `*.elevenlabs.io` (provedor de outro tipo).
  */
 export function isElevenLabsEndpoint(
   api: Pick<TtsEndpointConfig, 'baseUrl'> & { providerKind?: string | null }
@@ -83,7 +84,7 @@ export function isElevenLabsEndpoint(
   if (api.providerKind === 'elevenlabs') return true
   if (api.providerKind) return false
   try {
-    const host = new URL(api.baseUrl.trim()).hostname.toLowerCase()
+    const host = new URL((api.baseUrl ?? '').trim()).hostname.toLowerCase()
     return host === 'elevenlabs.io' || host.endsWith('.elevenlabs.io')
   } catch {
     return false
@@ -117,7 +118,8 @@ export function elevenLabsVoiceId(voice: string | null | undefined): string {
  * por sentença (`/stream`).
  */
 export function elevenLabsWsSupportsModel(modelId: string): boolean {
-  return !/^eleven_v[34]/i.test(modelId)
+  // fonte única (a UI mostra o mesmo veredito no indicador "Na chamada: …")
+  return sharedWsSupportsModel(modelId)
 }
 
 /**
@@ -141,7 +143,7 @@ export interface ElevenLabsConfig {
 /** `ttsSettings.api` → configuração ElevenLabs (erro `config` legível sem chave). */
 export function elevenLabsConfig(api: TtsEndpointConfig): ElevenLabsConfig {
   const baseUrl = elevenLabsBase(api.baseUrl)
-  const apiKey = api.apiKey.trim()
+  const apiKey = (api.apiKey ?? '').trim()
   if (!apiKey)
     throw new TtsError('config', 'informe a chave da ElevenLabs (Provedores → ElevenLabs)', {
       backend: 'api'
@@ -463,7 +465,7 @@ export interface ElevenLabsVoice {
   previewUrl?: string
 }
 
-/** Entrada mínima para as listagens (provedor salvo ou endpoint avulso). */
+/** Entrada mínima para as listagens (provedor cadastrado). */
 export interface ElevenLabsAccess {
   baseUrl: string
   apiKey: string

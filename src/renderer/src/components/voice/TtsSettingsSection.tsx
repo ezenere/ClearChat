@@ -1,13 +1,17 @@
-// Configurações → Áudio → Fala (TTS): backend (Local/API). API: PROVEDOR (cadastrados em
-// Provedores que servem fala — OpenRouter, ElevenLabs direto, OpenAI-compatível — ou "Endpoint
-// personalizado" no avançado), MODELO e VOZ listados pelo provedor (descoberta no main), com ▶
-// prévia por voz. Local: motor Kokoro, voz e os pesos para baixar (o catálogo local só aparece
-// aqui). "Testar voz" (frase de demonstração com a config salva), "Gerar clipes de voz" e a
-// contagem dos clipes da voz atual (com estado "desatualizados"). A chave nunca passa pela tela.
-import { Play, Square, TriangleAlert } from 'lucide-react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+// Configurações → Áudio → Fala (TTS). PROVEDOR = um dos cadastrados em Configurações → Provedores
+// que serve fala (OpenRouter, ElevenLabs direto, OpenAI-compatível — inclusive um servidor local)
+// ou as opções embutidas "Local — Kokoro" e "Local (GPU)" (Modo avançado; só escolhível com um
+// motor de voz da GPU instalado — senão desabilitada com o link). Com provedor: MODELO no mesmo
+// seletor do chat (agrupado por provedor, latência medida à direita, lista curada para a chamada)
+// e VOZ no mesmo desenho (busca, grupos por idioma, ▶ prévia por linha). Kokoro: voz + pesos para
+// baixar. GPU: motor + voz agrupada (`GpuTtsPanel`). "Testar voz", "Gerar clipes de voz" e a
+// contagem dos clipes. Endereço e chave ficam só no provedor cadastrado — a chave nunca passa pela
+// tela.
+import { Play, Settings2, Square } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { TtsVoicesView, VoiceModelInfo, VoiceRuntimeStatus } from '@shared/ipc'
-import type { TtsLocalEngine, TtsSettings } from '@shared/voice'
+import type { ModelRef } from '@shared/models'
+import { ttsCallTransport, type TtsSettings } from '@shared/voice'
 import {
   CALL_TTS_RECOMMENDED,
   describeVoice,
@@ -19,46 +23,44 @@ import {
 } from '@shared/voiceCatalog'
 import { api, errorMessage } from '../../lib/api'
 import type { LocalModelAction } from '../../lib/voice/modelList'
-import { useVoiceCatalog } from '../../lib/voice/useVoiceCatalog'
+import { useVoiceCatalogs } from '../../lib/voice/useVoiceCatalogs'
+import { useStore } from '../../store'
 import { Button, Label } from '../ui/controls'
 import { Select } from '../ui/Select'
+import { ToggleRow } from '../panel/fields'
 import { ApiInfo, C, HelpTip } from '../ui/Tooltip'
+import { AudioSection, WarnNote } from './audioUi'
+import { groupCatalogVoices } from './catalogVoiceGroups'
 import {
-  ApiKeyField,
-  BaseUrlField,
-  CatalogStatus,
-  CustomEndpointDisclosure,
   DismissibleError,
   LocalModelList,
   VoiceModelField,
   VoicePicker,
-  VoiceProviderSelect
+  VoiceSourceSelect
 } from './voiceSettingsParts'
 import {
-  CUSTOM_ENDPOINT,
   effectiveFamily,
+  GPU_SOURCE,
+  LOCAL_SOURCE,
   playAudioBytes,
+  providerMissing,
   type ProviderOption
 } from '../../lib/voice/voiceSettingsHelpers'
+import { gpuConfigFor, installedTtsEngines } from '../../lib/voice/gpu/gpuUi'
+import type { GpuStatus } from '../../lib/voice/gpu/types'
+import { useGpuStatus } from '../../lib/voice/gpu/useGpuStatus'
+import { GpuSectionLink, GpuTtsPanel } from './gpu/GpuBackendPanels'
 
-const TTS_BACKEND_LABELS: Record<TtsSettings['backend'], { label: string; description: string }> = {
-  api: {
-    label: 'API',
-    description: 'Provedor remoto (OpenRouter, ElevenLabs, OpenAI…) — o texto falado sai do app'
-  },
-  local: {
-    label: 'Local',
-    description: 'Motor Kokoro no dispositivo — o texto nunca sai do computador'
-  }
+/** "Local (GPU)": completa `gpu` (1º motor instalado + voz sugerida) quando falta ou sumiu. */
+function toGpu(t: TtsSettings, status: GpuStatus | null): TtsSettings {
+  const installed = installedTtsEngines(status)
+  const cur = installed.find((e) => e.id === t.gpu?.engine)
+  const gpu = cur ? t.gpu : installed[0] ? gpuConfigFor(installed[0], t.gpu) : t.gpu
+  return { ...t, backend: 'gpu', ...(gpu ? { gpu } : {}) }
 }
 
 /** Mensagem do IPC sem o prefixo da classe (`TtsError: …`) — o texto do main já é legível. */
 const ipcError = (e: unknown): string => errorMessage(e).replace(/^[A-Z]\w*Error: /, '')
-
-const TTS_ENGINE_LABELS: Record<TtsLocalEngine, string> = {
-  kokoro: 'kokoro (Kokoro-82M, ONNX)',
-  chatterbox: 'chatterbox — ainda não suportado'
-}
 
 /** Modelo/voz sugeridos ao trocar de provedor (só quando o salvo não serve à família nova). */
 const TTS_DEFAULTS: Record<VoiceProviderSupport, { model: string; voice: string | null }> = {
@@ -75,7 +77,7 @@ const modelFitsFamily = (model: string, family: VoiceProviderSupport | null): bo
   return true
 }
 
-/** Primeiro provedor do OpenRouter (atalho "Usar OpenRouter (ElevenLabs Flash)"). */
+/** Atalho "Usar OpenRouter (ElevenLabs Flash)" (com um OpenRouter cadastrado em Provedores). */
 const OPENROUTER_PRESET = { model: 'elevenlabs/eleven-flash-v2.5', voice: 'sarah' } as const
 
 type Clips = {
@@ -101,23 +103,22 @@ export function TtsSettingsSection({
   models: VoiceModelInfo[]
   modelProgress: Record<string, { bytes: number; total: number }>
   runtime: VoiceRuntimeStatus | null
-  /** Grava `ttsSettings` (a máscara da chave no valor = preserva a chave salva). */
+  /** Grava `ttsSettings`. */
   onCommit: (next: TtsSettings) => Promise<boolean>
   onModelAction: (model: VoiceModelInfo, action: LocalModelAction['action']) => void
 }): React.JSX.Element | null {
   const voiceApi = api.voice
-  const isApi = tts.backend === 'api'
+  const setSettingsOpen = useStore((s) => s.setSettingsOpen)
+  const backend = tts.backend
+  const isApi = backend === 'api'
+  const isGpu = backend === 'gpu'
+  const { status: gpuStatus, available: gpuAvailable } = useGpuStatus()
+  const gpuEngines = installedTtsEngines(gpuStatus)
   const provider = providers.find((p) => p.id === tts.api.providerId) ?? null
-  const isCustom = !provider
-  const family = effectiveFamily(provider, tts.api.baseUrl)
-  const [advancedOpen, setAdvancedOpen] = useState<boolean | null>(null)
-  const advanced = advancedOpen ?? isCustom
-  const catalog = useVoiceCatalog(
-    'tts',
-    provider?.id ?? null,
-    isApi,
-    isCustom ? tts.api.baseUrl : ''
-  )
+  const missing = isApi && providerMissing(tts.api, providers)
+  const family = effectiveFamily(provider)
+  const catalogs = useVoiceCatalogs('tts', isApi ? (provider?.id ?? null) : null)
+  const catalog = catalogs.stateFor(isApi ? (provider?.id ?? null) : null).catalog
   /** Vozes do motor local atual (`voice:tts:voices`). */
   const [localVoices, setLocalVoices] = useState<TtsVoicesView['local']>([])
   const [test, setTest] = useState<{ state: 'idle' | 'busy' | 'playing'; error: string | null }>({
@@ -138,7 +139,7 @@ export function TtsSettingsSection({
   const playing = useRef<{ el: HTMLAudioElement; url: string } | null>(null)
 
   const refreshClips = useCallback((): void => {
-    void voiceApi?.tts.clips
+    void api.voice?.tts.clips
       .list()
       .then((m) =>
         setClips((c) => ({
@@ -148,14 +149,14 @@ export function TtsSettingsSection({
         }))
       )
       .catch(() => void 0)
-  }, [voiceApi])
+  }, [setClips])
 
   const refreshLocalVoices = useCallback((): void => {
-    void voiceApi?.tts
+    void api.voice?.tts
       .voices()
       .then((v) => setLocalVoices(v.local))
       .catch(() => void 0)
-  }, [voiceApi])
+  }, [])
 
   useEffect(() => {
     refreshClips()
@@ -182,30 +183,63 @@ export function TtsSettingsSection({
   // fechar o modal (desmontar) interrompe teste/prévia
   useEffect(() => () => stopPlaying(), [])
 
+  const commit = useCallback(
+    async (next: TtsSettings): Promise<boolean> => {
+      const ok = await onCommit(next)
+      // voz/backend/motor mudaram → a contagem de clipes é a do cache da voz nova
+      refreshClips()
+      return ok
+    },
+    [onCommit, refreshClips]
+  )
+
+  /**
+   * Troca de modelo (ou de provedor+modelo, pelo seletor agrupado): a voz salva que o modelo novo
+   * não aceita (OpenRouter: `supported_voices`) vira a 1ª recomendada para pt-BR (ou a 1ª da lista);
+   * modelo sem vozes (ex.: Fish Audio) = voz padrão.
+   */
+  const pickModel = useCallback(
+    (ref: ModelRef) => {
+      const m = catalogs.entries[ref.providerId]?.catalog?.models.find((x) => x.id === ref.model)
+      let voice = tts.api.voice
+      if (m?.voiceIds) {
+        if (!m.voiceIds.length) voice = null
+        else if (!voice || !m.voiceIds.includes(voice))
+          voice = m.ptVoices?.find((v) => m.voiceIds!.includes(v)) ?? m.voiceIds[0]
+      }
+      void commit({
+        ...tts,
+        api: { ...tts.api, providerId: ref.providerId, model: ref.model, voice }
+      })
+    },
+    [catalogs.entries, commit, tts]
+  )
+
+  // vozes do modelo escolhido (OpenRouter: `supported_voices` do modelo; ElevenLabs: da conta),
+  // pt primeiro: as recomendadas do modelo para pt-BR, depois pt-BR/pt/multilíngue/resto
+  const model =
+    catalog?.models.find((m) => m.id === tts.api.model) ??
+    catalog?.hiddenModels?.find((m) => m.id === tts.api.model) ??
+    null
+  const voices: VoiceCatalogVoice[] = useMemo(() => {
+    const allVoices = catalog?.voices ?? []
+    return orderVoicesForPt(
+      model?.voiceIds?.length
+        ? model.voiceIds.map(
+            (id) => allVoices.find((v) => v.id === id) ?? describeVoice(id, model.id)
+          )
+        : model?.voiceIds && family === 'openrouter'
+          ? [] // modelo sem vozes listadas (ex.: Fish Audio): só a voz padrão
+          : allVoices,
+      model?.ptVoices ?? []
+    )
+  }, [catalog, model, family])
+  const noVoiceList = !!model?.voiceIds && model.voiceIds.length === 0
+
   if (!voiceApi) return null
 
-  const commit = async (next: TtsSettings): Promise<boolean> => {
-    const ok = await onCommit(next)
-    // voz/backend/motor mudaram → a contagem de clipes é a do cache da voz nova
-    refreshClips()
-    return ok
-  }
   const saveApi = (patch: Partial<TtsSettings['api']>): void => {
     void commit({ ...tts, api: { ...tts.api, ...patch } })
-  }
-  /**
-   * Troca de modelo: a voz salva que o modelo novo não aceita (OpenRouter: `supported_voices`) vira
-   * a 1ª recomendada para pt-BR (ou a 1ª da lista); modelo sem vozes (ex.: Fish Audio) = voz padrão.
-   */
-  const commitModel = (model: string): void => {
-    const m = catalog.catalog?.models.find((x) => x.id === model)
-    let voice = tts.api.voice
-    if (m?.voiceIds) {
-      if (!m.voiceIds.length) voice = null
-      else if (!voice || !m.voiceIds.includes(voice))
-        voice = m.ptVoices?.find((v) => m.voiceIds!.includes(v)) ?? m.voiceIds[0]
-    }
-    void commit({ ...tts, api: { ...tts.api, model, voice } })
   }
   /** "Usar ElevenLabs Flash v2.5" do aviso de modelo lento (lista curada). */
   const curatedFamily = family === 'openrouter' || family === 'elevenlabs' ? family : null
@@ -220,56 +254,39 @@ export function TtsSettingsSection({
       }
     : undefined
 
-  const pickProvider = (v: string): void => {
-    if (v === CUSTOM_ENDPOINT) {
-      setAdvancedOpen(true)
-      saveApi({ providerId: null })
-      return
-    }
+  const pickSource = (v: string): void => {
+    if (v === LOCAL_SOURCE)
+      return void commit({ ...tts, backend: 'local' }).then(refreshLocalVoices)
+    if (v === GPU_SOURCE) return void commit(toGpu(tts, gpuStatus))
     const p = providers.find((x) => x.id === v)
     const fam = p ? voiceProviderSupport(p) : null
     const keep = modelFitsFamily(tts.api.model, fam)
-    setAdvancedOpen(false)
-    saveApi({
-      providerId: v,
-      ...(keep || !fam ? {} : { model: TTS_DEFAULTS[fam].model, voice: TTS_DEFAULTS[fam].voice })
+    void commit({
+      ...tts,
+      backend: 'api',
+      api: {
+        ...tts.api,
+        providerId: v,
+        ...(keep || !fam ? {} : { model: TTS_DEFAULTS[fam].model, voice: TTS_DEFAULTS[fam].voice })
+      }
     })
   }
 
   const openRouter = providers.find((p) => voiceProviderSupport(p) === 'openrouter') ?? null
   const presetActive = isApi && family === 'openrouter' && tts.api.model === OPENROUTER_PRESET.model
   const applyPreset = (): void => {
+    if (!openRouter) return setSettingsOpen(true, 'providers')
     void commit({
       ...tts,
       backend: 'api',
       api: {
         ...tts.api,
-        providerId: openRouter?.id ?? tts.api.providerId,
-        ...(openRouter ? {} : { baseUrl: 'https://openrouter.ai/api/v1' }),
+        providerId: openRouter.id,
         model: OPENROUTER_PRESET.model,
         voice: OPENROUTER_PRESET.voice
       }
     })
   }
-
-  // vozes do modelo escolhido (OpenRouter: `supported_voices` do modelo; ElevenLabs: da conta),
-  // pt primeiro: as recomendadas do modelo para pt-BR, depois pt-BR/pt/multilíngue/resto
-  const model =
-    catalog.catalog?.models.find((m) => m.id === tts.api.model) ??
-    catalog.catalog?.hiddenModels?.find((m) => m.id === tts.api.model) ??
-    null
-  const allVoices = catalog.catalog?.voices ?? []
-  const voices: VoiceCatalogVoice[] = orderVoicesForPt(
-    model?.voiceIds?.length
-      ? model.voiceIds.map(
-          (id) => allVoices.find((v) => v.id === id) ?? describeVoice(id, model.id)
-        )
-      : model?.voiceIds && family === 'openrouter'
-        ? [] // modelo sem vozes listadas (ex.: Fish Audio): só a voz padrão
-        : allVoices,
-    model?.ptVoices ?? []
-  )
-  const noVoiceList = !!model?.voiceIds && model.voiceIds.length === 0
 
   const play = (
     audio: Uint8Array,
@@ -316,39 +333,40 @@ export function TtsSettingsSection({
   }
 
   /** ▶ prévia de uma voz: `preview_url` do provedor (baixado pelo main) ou a frase sintetizada. */
-  const runPreview = (v: VoiceCatalogVoice): void => {
-    if (preview?.id === v.id && preview.state === 'playing') {
+  const runPreview = (id: string, label: string): void => {
+    if (preview?.id === id && preview.state === 'playing') {
       stopPlaying()
       setPreview(null)
       return
     }
+    const v = voices.find((x) => x.id === id)
     setTest((s) => ({ ...s, state: 'idle' }))
     setPreviewError(null)
-    setPreview({ id: v.id, state: 'busy' })
+    setPreview({ id, state: 'busy' })
     const get =
-      v.previewUrl && voiceApi.catalog
+      v?.previewUrl && voiceApi.catalog
         ? voiceApi.catalog.preview({ url: v.previewUrl })
         : voiceApi.tts.test({
-            voice: v.id,
+            voice: id,
             ...(isApi && tts.api.model ? { model: tts.api.model } : {}),
             text: VOICE_PREVIEW_PHRASE
           })
     void get
       .then((r) => {
-        setPreview({ id: v.id, state: 'playing' })
+        setPreview({ id, state: 'playing' })
         play(
           r.audio,
           r.mime,
           () => setPreview(null),
           (msg) => {
             setPreview(null)
-            setPreviewError(`Prévia de “${v.label}”: ${msg}`)
+            setPreviewError(`Prévia de “${label}”: ${msg}`)
           }
         )
       })
       .catch((e) => {
         setPreview(null)
-        setPreviewError(`Prévia de “${v.label}”: ${ipcError(e)}`)
+        setPreviewError(`Prévia de “${label}”: ${ipcError(e)}`)
       })
   }
 
@@ -371,348 +389,367 @@ export function TtsSettingsSection({
   }
 
   const engine = tts.local?.engine ?? 'kokoro'
-  const currentVoiceLabel = isApi
-    ? tts.api.voice
-      ? (voices.find((v) => v.id === tts.api.voice)?.label ?? tts.api.voice)
-      : 'voz padrão'
-    : (localVoices.find((v) => v.id === tts.local?.voice)?.label ?? tts.local?.voice ?? 'pf_dora')
+  const gpuEngine = gpuStatus?.engines.find((e) => e.id === tts.gpu?.engine) ?? null
+  const currentVoiceLabel = isGpu
+    ? (gpuEngine?.voices.find((v) => v.id === tts.gpu?.voice)?.label ??
+      tts.gpu?.voice ??
+      'voz padrão do motor')
+    : isApi
+      ? tts.api.voice
+        ? (voices.find((v) => v.id === tts.api.voice)?.label ?? tts.api.voice)
+        : 'voz padrão'
+      : (localVoices.find((v) => v.id === tts.local?.voice)?.label ?? tts.local?.voice ?? 'pf_dora')
 
   return (
-    <section className="border-t border-border pt-4" data-testid="tts-section">
-      <div className="mb-3 flex items-baseline gap-2">
-        <span className="text-[13px] font-medium text-fg/90">Fala (TTS)</span>
-        <HelpTip label="Fala (TTS)">
+    <AudioSection
+      title="Fala (TTS)"
+      testId="tts-section"
+      help={
+        <>
           <p>
-            Síntese de fala da chamada de voz: um provedor de API (cadastrado em Configurações →
-            Provedores — OpenRouter, ElevenLabs, OpenAI-compatível) ou o motor local Kokoro (pesos
-            ONNX baixados aqui; a fonemização pt-BR usa o <C>espeak-ng</C> do sistema). Modelos e
-            vozes vêm da lista do provedor (OpenRouter: <C>/models?output_modalities=speech</C>, com
-            as vozes de cada modelo).
+            Síntese de fala da chamada de voz: um provedor cadastrado em Configurações → Provedores
+            (OpenRouter, ElevenLabs, OpenAI-compatível — inclusive um servidor local, como o
+            Kokoro-FastAPI), o motor local Kokoro (pesos ONNX baixados aqui; a fonemização pt-BR usa
+            o <C>espeak-ng</C> do sistema) ou a GPU (Modo avançado). Modelos e vozes vêm da lista do
+            provedor.
           </p>
-          <p className="mt-2">
-            A chave do provedor fica no processo principal e nunca chega à tela.
-          </p>
-        </HelpTip>
-        <TtsApiInfo tts={tts} baseUrl={provider?.baseUrl ?? tts.api.baseUrl} family={family} />
-      </div>
-      <div className="space-y-4">
-        <div>
-          <Label>Backend</Label>
-          <Select
-            value={tts.backend}
-            label="Backend de fala"
-            className="h-8 w-full max-w-[360px]"
-            menuMinWidth={360}
-            onChange={(backend) => void commit({ ...tts, backend })}
-            options={(['local', 'api'] as TtsSettings['backend'][]).map((b) => ({
-              value: b,
-              label: TTS_BACKEND_LABELS[b].label,
-              description: TTS_BACKEND_LABELS[b].description
-            }))}
-          />
-        </div>
-        {!presetActive && (
-          <div className="flex flex-wrap items-center gap-2" data-testid="tts-preset">
-            <Button
-              size="sm"
-              variant="secondary"
-              data-testid="tts-preset-openrouter"
-              onClick={applyPreset}
-            >
-              Usar OpenRouter (ElevenLabs Flash)
-            </Button>
-            <span className="text-[11px] text-subtle">
-              {openRouter
-                ? `fala rápida pela API, com o provedor “${openRouter.name}”`
-                : 'cadastre o OpenRouter em Provedores (ou cole a chave no endpoint personalizado)'}
-            </span>
-            <HelpTip label="Híbrido rápido">
-              <p>
-                Combinação recomendada para a chamada de voz: transcrição <C>híbrida</C> (whisper{' '}
-                <C>base</C> local como reserva) e fala pelo OpenRouter com o ElevenLabs Flash v2.5
-                (~0,5 s até o 1º áudio; o áudio chega em streaming). O texto falado vai ao
-                OpenRouter (cobrança por caractere). O Kokoro local continua disponível offline.
-              </p>
-            </HelpTip>
-          </div>
-        )}
-
-        {isApi ? (
-          <div className="space-y-3" data-testid="tts-api">
-            <div>
-              <Label help="Provedores de Configurações → Provedores que servem fala (o endpoint e a chave vêm do provedor). Servidor fora da lista (ex.: Kokoro-FastAPI local): Endpoint personalizado.">
-                Provedor
-              </Label>
-              <VoiceProviderSelect
-                capability="tts"
-                providers={providers}
-                value={provider ? provider.id : CUSTOM_ENDPOINT}
-                onChange={pickProvider}
-                testId="tts-provider"
-              />
-              {tts.api.providerId && !provider && (
-                <p className="mt-1 text-[11px] text-warning" role="alert">
-                  O provedor escolhido não existe mais — usando o endpoint personalizado abaixo.
-                </p>
-              )}
-            </div>
-            <div>
-              <Label help="Só os modelos testados para a chamada de voz: 1º áudio em até ~0,9 s numa frase curta e pt-BR aceitável (medido; o badge mostra o tempo). Os lentos ou sem pt-BR ficam fora da lista; um id livre fica no Avançado, sem garantia.">
-                Modelo
-              </Label>
-              <VoiceModelField
-                capability="tts"
-                state={catalog}
-                value={tts.api.model}
-                onCommit={commitModel}
-                testId="tts-model"
-                placeholder={
-                  family === 'openrouter' ? 'elevenlabs/eleven-flash-v2.5' : 'gpt-4o-mini-tts'
-                }
-                family={family}
-                recommended={recommended}
-              />
-            </div>
-            <div>
-              <Label help="Voz pedida ao provedor. A lista vem do modelo escolhido (OpenRouter: supported_voices; ElevenLabs: as vozes da sua conta). ▶ toca uma prévia (a do provedor quando existe; senão sintetiza uma frase curta — custa como uma frase falada). 'Outra voz (ID)' aceita qualquer id.">
-                Voz
-              </Label>
-              <VoicePicker
-                voices={voices}
-                value={tts.api.voice}
-                onChange={(voice) => saveApi({ voice })}
-                onPreview={runPreview}
-                previewing={preview}
-                allowDefault={family === 'openai' || noVoiceList}
-              />
-              <CatalogStatus state={catalog} kind="vozes" />
-            </div>
-            <CustomEndpointDisclosure
-              open={advanced}
-              onToggle={() => setAdvancedOpen(!advanced)}
-              testId="tts-advanced"
-            >
-              {isCustom ? (
-                <>
-                  <div>
-                    <Label help="Base OpenAI-compatível (o app chama {baseUrl}/audio/speech). Ex.: Kokoro-FastAPI local.">
-                      Endpoint (baseUrl)
-                    </Label>
-                    <BaseUrlField
-                      value={tts.api.baseUrl}
-                      onCommit={(baseUrl) => saveApi({ baseUrl })}
-                      testId="tts-base-url"
-                      placeholder="http://localhost:8880/v1"
-                      label="Endpoint de síntese de fala (baseUrl)"
-                    />
-                  </div>
-                  <div>
-                    <Label help="Chave do endpoint personalizado (header Authorization: Bearer). Endpoint local pode ficar sem chave.">
-                      Chave de API
-                    </Label>
-                    <ApiKeyField
-                      mask={tts.api.apiKey}
-                      onSave={(key) =>
-                        commit({ ...tts, api: { ...tts.api, apiKey: key as string } })
-                      }
-                      what="fala"
-                      testId="tts-api-key"
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="flex flex-wrap items-center gap-2 text-[11px] text-subtle">
-                  <span>
-                    Usando o provedor “{provider.name}”. Para um servidor fora dos Provedores:
-                  </span>
-                  <button
-                    type="button"
-                    data-testid="tts-use-custom"
-                    onClick={() => pickProvider(CUSTOM_ENDPOINT)}
-                    className="rounded px-1 text-accent-strong underline-offset-2 hover:underline"
-                  >
-                    usar endpoint personalizado
-                  </button>
-                </div>
-              )}
-            </CustomEndpointDisclosure>
-          </div>
+          <p>A chave do provedor fica no processo principal e nunca chega à tela.</p>
+        </>
+      }
+      info={
+        isGpu ? (
+          <ApiInfo title="Fala local (GPU)">
+            <p>
+              Nada sai do computador: cada frase da resposta vai ao servidor local da GPU (
+              <C>POST http://127.0.0.1:&lt;porta&gt;/v1/audio/speech</C> com o motor, a voz e o
+              texto, chave aleatória por sessão) e o áudio volta em streaming.
+            </p>
+          </ApiInfo>
         ) : (
-          <div className="space-y-3" data-testid="tts-local">
-            <div className="flex flex-wrap items-center gap-2">
-              <Label className="mb-0">Motor local</Label>
-              <Select
-                value={engine}
-                label="Motor local de fala"
-                className="h-8 w-[300px]"
-                menuMinWidth={320}
-                onChange={(e) => {
+          <TtsApiInfo tts={tts} baseUrl={provider?.baseUrl ?? ''} family={family} />
+        )
+      }
+    >
+      <div>
+        <Label help="Provedores de Configurações → Provedores que servem fala (o endpoint e a chave vêm de lá), o motor local Kokoro (no computador) ou a GPU (Modo avançado, abaixo).">
+          Provedor
+        </Label>
+        <VoiceSourceSelect
+          capability="tts"
+          providers={providers}
+          value={backend === 'local' ? LOCAL_SOURCE : isGpu ? GPU_SOURCE : (provider?.id ?? null)}
+          onChange={pickSource}
+          local={{
+            label: 'Local — Kokoro',
+            description: 'No computador (CPU) — o texto nunca sai daqui'
+          }}
+          gpu={
+            gpuAvailable || isGpu
+              ? {
+                  enabled: gpuEngines.length > 0,
+                  description: gpuEngines.length
+                    ? `Motores na sua placa de vídeo: ${gpuEngines.map((e) => e.label).join(', ')}`
+                    : 'Instale um motor de voz no Modo avançado (GPU local), abaixo'
+                }
+              : null
+          }
+          testId="tts-provider"
+        />
+        {gpuAvailable && !gpuEngines.length && !isGpu && (
+          <p className="mt-1.5 text-[11.5px] text-subtle" data-testid="tts-gpu-hint">
+            Local (GPU): instale um motor de voz no <GpuSectionLink testId="tts-gpu-install-link" />{' '}
+            para usar a sua placa de vídeo.
+          </p>
+        )}
+      </div>
+
+      {missing && (
+        <WarnNote testId="tts-provider-missing">
+          O provedor escolhido não existe mais — escolha outro acima.
+        </WarnNote>
+      )}
+
+      {!presetActive && (
+        <div className="flex flex-wrap items-center gap-2" data-testid="tts-preset">
+          <Button
+            size="sm"
+            variant="secondary"
+            data-testid="tts-preset-openrouter"
+            icon={openRouter ? undefined : <Settings2 className="size-3.5" />}
+            onClick={applyPreset}
+          >
+            {openRouter ? 'Usar OpenRouter (ElevenLabs Flash)' : 'Cadastrar o OpenRouter'}
+          </Button>
+          <span className="text-[11.5px] text-subtle">
+            {openRouter
+              ? `fala rápida pela API, com o provedor “${openRouter.name}”`
+              : 'em Provedores, para a fala rápida pela API (ElevenLabs Flash)'}
+          </span>
+          <HelpTip label="Fala rápida pela API">
+            Combinação recomendada para a chamada de voz: fala pelo OpenRouter com o ElevenLabs
+            Flash v2.5 (~0,5 s até o 1º áudio; o áudio chega em streaming) e transcrição com o motor
+            local como reserva. O texto falado vai ao OpenRouter (cobrança por caractere). O Kokoro
+            local continua disponível offline.
+          </HelpTip>
+        </div>
+      )}
+
+      {isApi && provider && (
+        <div className="space-y-3" data-testid="tts-api">
+          <div>
+            <Label help="Modelos de fala dos provedores cadastrados, agrupados por provedor (escolher um de outro grupo troca o provedor). Só os testados para a chamada de voz: 1º áudio em até ~0,9 s numa frase curta e pt-BR aceitável (o badge mostra o tempo medido). Um id livre é aceito, com o aviso de que não foi testado.">
+              Modelo
+            </Label>
+            <VoiceModelField
+              capability="tts"
+              catalogs={catalogs}
+              providers={providers}
+              value={{ providerId: tts.api.providerId, model: tts.api.model }}
+              onChange={pickModel}
+              testId="tts-model"
+              family={family}
+              recommended={recommended}
+            />
+          </div>
+          <div>
+            <Label help="Voz pedida ao provedor, agrupada por idioma (pt-BR primeiro; as recomendadas para o modelo no topo). A lista vem do modelo escolhido (OpenRouter: supported_voices; ElevenLabs: as vozes da sua conta). ▶ toca uma prévia (a do provedor quando existe; senão sintetiza uma frase curta — custa como uma frase falada). Digitar um id na busca permite usar qualquer voz.">
+              Voz
+            </Label>
+            <VoicePicker
+              groups={groupCatalogVoices(voices)}
+              value={tts.api.voice}
+              onChange={(voice) => saveApi({ voice })}
+              onPreview={runPreview}
+              previewing={preview}
+              defaultLabel={
+                family === 'openai' || noVoiceList ? 'Voz padrão da API (sem voice)' : undefined
+              }
+            />
+          </div>
+          <CallTransport tts={tts} family={family} onCommit={commit} />
+        </div>
+      )}
+
+      {isGpu && <GpuTtsPanel tts={tts} status={gpuStatus} onCommit={commit} />}
+
+      {backend === 'local' && (
+        <div className="space-y-3" data-testid="tts-local">
+          <div>
+            <Label
+              help="Voz do Kokoro-82M (ONNX). As vozes pt-BR vêm dos voice packs baixados abaixo (sem o pack instalado, a síntese avisa)."
+              hint={
+                <span className={tts.local?.installed ? 'text-success' : 'text-warning'}>
+                  Kokoro {tts.local?.installed ? 'instalado' : 'não instalado — baixe abaixo'}
+                </span>
+              }
+            >
+              Voz
+            </Label>
+            <Select
+              value={tts.local?.voice ?? 'pf_dora'}
+              label="Voz do motor local"
+              disabled={engine !== 'kokoro'}
+              onChange={(voice) =>
+                void commit({
+                  ...tts,
+                  local: {
+                    engine: tts.local?.engine ?? 'kokoro',
+                    voice,
+                    installed: tts.local?.installed ?? false
+                  }
+                })
+              }
+              options={
+                localVoices.length
+                  ? localVoices.map((v) => ({
+                      value: v.id,
+                      label: v.installed ? `${v.label} — instalada` : `${v.label} — baixar abaixo`
+                    }))
+                  : [{ value: 'pf_dora', label: 'pf_dora (padrão)' }]
+              }
+            />
+          </div>
+          {engine !== 'kokoro' && (
+            <WarnNote>
+              O Chatterbox ainda não funciona —{' '}
+              <button
+                type="button"
+                className="underline underline-offset-2"
+                onClick={() =>
                   void commit({
                     ...tts,
                     local: {
-                      engine: e as TtsLocalEngine,
+                      engine: 'kokoro',
                       voice: tts.local?.voice ?? '',
                       installed: tts.local?.installed ?? false
                     }
                   }).then(refreshLocalVoices)
-                }}
-                // Chatterbox ainda não sintetiza: só aparece se já estiver salvo (para trocar)
-                options={(engine === 'chatterbox'
-                  ? (['kokoro', 'chatterbox'] as TtsLocalEngine[])
-                  : (['kokoro'] as TtsLocalEngine[])
-                ).map((e) => ({ value: e, label: TTS_ENGINE_LABELS[e] }))}
-              />
-              <span
-                className={`rounded-full border px-1.5 py-px text-[10px] leading-4 ${
-                  tts.local?.installed
-                    ? 'border-success/30 text-success'
-                    : 'border-warning/30 text-warning'
-                }`}
-              >
-                {tts.local?.installed ? 'instalado' : 'não instalado'}
-              </span>
-            </div>
-            {runtime && engine === 'kokoro' && !runtime.ttsLocal.available && (
-              <p
-                className="flex items-start gap-1 text-[11px] text-warning"
-                role="alert"
-                data-testid="tts-runtime-warning"
-              >
-                <TriangleAlert className="mt-0.5 size-3 shrink-0" /> Motor local não está pronto:{' '}
-                {runtime.ttsLocal.reason ?? 'runtime indisponível'}
-              </p>
-            )}
-            <div>
-              <Label help="Voz do motor local. As vozes pt-BR do Kokoro vêm dos voice packs baixados aqui embaixo (sem o pack instalado, a síntese avisa).">
-                Voz
-              </Label>
-              <Select
-                value={tts.local?.voice ?? 'pf_dora'}
-                label="Voz do motor local"
-                className="h-8 w-full max-w-[360px]"
-                menuMinWidth={360}
-                disabled={engine !== 'kokoro'}
-                onChange={(voice) =>
-                  void commit({
-                    ...tts,
-                    local: {
-                      engine: tts.local?.engine ?? 'kokoro',
-                      voice,
-                      installed: tts.local?.installed ?? false
-                    }
-                  })
                 }
-                options={
-                  localVoices.length
-                    ? localVoices.map((v) => ({
-                        value: v.id,
-                        label: v.installed ? `${v.label} — instalada` : `${v.label} — baixar abaixo`
-                      }))
-                    : [{ value: 'pf_dora', label: 'pf_dora (padrão)' }]
-                }
-              />
-              {engine !== 'kokoro' && (
-                <p className="mt-1.5 flex items-center gap-1 text-[11px] text-warning" role="alert">
-                  <TriangleAlert className="size-3 shrink-0" /> O Chatterbox ainda não funciona —
-                  escolha o motor kokoro ou o backend de API.
-                </p>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ---- testar voz + clipes ---- */}
-        <div className="flex flex-wrap items-center gap-2">
-          <Button
-            size="sm"
-            variant="secondary"
-            data-testid="tts-test"
-            data-state={test.state}
-            disabled={test.state === 'busy'}
-            icon={
-              test.state === 'playing' ? (
-                <Square className="size-3" fill="currentColor" />
-              ) : (
-                <Play className="size-3.5" />
-              )
-            }
-            onClick={runTest}
-          >
-            {test.state === 'busy'
-              ? 'Sintetizando…'
-              : test.state === 'playing'
-                ? 'Parar teste'
-                : 'Testar voz'}
-          </Button>
-          <Button
-            size="sm"
-            variant="secondary"
-            data-testid="tts-clips-generate"
-            disabled={clips.busy}
-            onClick={runClips}
-          >
-            {clips.stale || clips.count ? 'Gerar clipes de novo' : 'Gerar clipes de voz'}
-          </Button>
-          <HelpTip label="Clipes de voz">
-            <p>
-              Os clipes (interjeições e falas de espera da chamada de voz) são gerados com a voz e o
-              backend atuais (API → pelo provedor; Local → pelo Kokoro) e ficam em cache em{' '}
-              <C>userData/voice-clips</C>, um cache por voz. Ao trocar a voz ou as frases, gere de
-              novo — sem clipes, interjeições e falas de espera não tocam.
-            </p>
-          </HelpTip>
-          {clips.busy && (
-            <span className="text-[11px] text-subtle tabular-nums" data-testid="tts-clips-progress">
-              gerando clipes… {clips.done}/{clips.total || '…'}
-            </span>
+              >
+                usar o Kokoro
+              </button>
+              .
+            </WarnNote>
           )}
-          {!clips.busy && clips.count !== null && clips.count > 0 && (
-            <span className="text-[11px] text-subtle" data-testid="tts-clips-count">
-              {clips.count} clipes gerados para “{currentVoiceLabel}”
-            </span>
-          )}
-          {!clips.busy && clips.count === 0 && (
-            <span className="text-[11px] text-warning" data-testid="tts-clips-missing">
-              {clips.stale
-                ? `clipes de “${currentVoiceLabel}” desatualizados (frases ou modelo mudaram) — gere de novo`
-                : `sem clipes para “${currentVoiceLabel}”`}
-            </span>
+          {runtime && engine === 'kokoro' && !runtime.ttsLocal.available && (
+            <WarnNote testId="tts-runtime-warning">
+              Motor local não está pronto: {runtime.ttsLocal.reason ?? 'runtime indisponível'}
+            </WarnNote>
           )}
         </div>
-        {test.state === 'playing' && (
-          <p className="text-[11px] text-subtle" role="status" data-testid="tts-test-playing">
-            Tocando “Olá, isto é um teste.” com {isApi ? tts.api.model || 'o modelo' : 'o Kokoro'} ·{' '}
-            {currentVoiceLabel}
-          </p>
+      )}
+
+      {/* ---- testar voz + clipes ---- */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button
+          size="sm"
+          variant="secondary"
+          data-testid="tts-test"
+          data-state={test.state}
+          disabled={test.state === 'busy'}
+          icon={
+            test.state === 'playing' ? (
+              <Square className="size-3" fill="currentColor" />
+            ) : (
+              <Play className="size-3.5" />
+            )
+          }
+          onClick={runTest}
+        >
+          {test.state === 'busy'
+            ? 'Sintetizando…'
+            : test.state === 'playing'
+              ? 'Parar teste'
+              : 'Testar voz'}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          data-testid="tts-clips-generate"
+          disabled={clips.busy}
+          onClick={runClips}
+        >
+          {clips.stale || clips.count ? 'Gerar clipes de novo' : 'Gerar clipes de voz'}
+        </Button>
+        <HelpTip label="Clipes de voz">
+          Os clipes (interjeições e falas de espera da chamada de voz) são gerados com a voz e o
+          provedor atuais (provedor de API, Kokoro ou o motor da GPU) e ficam em cache em{' '}
+          <C>userData/voice-clips</C>, um cache por voz. Ao trocar a voz ou as frases, gere de novo
+          — sem clipes, interjeições e falas de espera não tocam.
+        </HelpTip>
+        {clips.busy && (
+          <span className="text-[11.5px] text-subtle tabular-nums" data-testid="tts-clips-progress">
+            gerando clipes… {clips.done}/{clips.total || '…'}
+          </span>
         )}
-        <DismissibleError
-          error={test.error}
-          onDismiss={() => setTest((s) => ({ ...s, error: null }))}
-          testId="tts-error"
-          dismissLabel="Dispensar erro de síntese de fala"
-        />
-        <DismissibleError
-          error={previewError}
-          onDismiss={() => setPreviewError(null)}
-          testId="tts-preview-error"
-          dismissLabel="Dispensar erro da prévia de voz"
-        />
-        <DismissibleError
-          error={clips.error}
-          onDismiss={() => setClips((c) => ({ ...c, error: null }))}
-          testId="tts-clips-error"
-          dismissLabel="Dispensar erro de clipes"
-        />
-        {!isApi && (
-          <LocalModelList
-            kind="tts"
-            models={models}
-            progress={modelProgress}
-            onAction={onModelAction}
-          />
+        {!clips.busy && clips.count !== null && clips.count > 0 && (
+          <span className="text-[11.5px] text-subtle" data-testid="tts-clips-count">
+            {clips.count} clipes gerados para “{currentVoiceLabel}”
+          </span>
+        )}
+        {!clips.busy && clips.count === 0 && (
+          <span className="text-[11.5px] text-warning" data-testid="tts-clips-missing">
+            {clips.stale
+              ? `clipes de “${currentVoiceLabel}” desatualizados (frases ou modelo mudaram) — gere de novo`
+              : `sem clipes para “${currentVoiceLabel}”`}
+          </span>
         )}
       </div>
-    </section>
+      {test.state === 'playing' && (
+        <p className="text-[11.5px] text-subtle" role="status" data-testid="tts-test-playing">
+          Tocando “Olá, isto é um teste.” com{' '}
+          {isApi
+            ? tts.api.model || 'o modelo'
+            : isGpu
+              ? (gpuEngine?.label ?? 'o motor da GPU')
+              : 'o Kokoro'}{' '}
+          · {currentVoiceLabel}
+        </p>
+      )}
+      <DismissibleError
+        error={test.error}
+        onDismiss={() => setTest((s) => ({ ...s, error: null }))}
+        testId="tts-error"
+        dismissLabel="Dispensar erro de síntese de fala"
+      />
+      <DismissibleError
+        error={previewError}
+        onDismiss={() => setPreviewError(null)}
+        testId="tts-preview-error"
+        dismissLabel="Dispensar erro da prévia de voz"
+      />
+      <DismissibleError
+        error={clips.error}
+        onDismiss={() => setClips((c) => ({ ...c, error: null }))}
+        testId="tts-clips-error"
+        dismissLabel="Dispensar erro de clipes"
+      />
+      {backend === 'local' && (
+        <LocalModelList
+          kind="tts"
+          models={models}
+          progress={modelProgress}
+          onAction={onModelAction}
+        />
+      )}
+    </AudioSection>
+  )
+}
+
+/**
+ * Como a fala da CHAMADA chega do provedor: "WebSocket (texto em streaming)" na ElevenLabs direta
+ * com modelo que aceita (interruptor "Streaming por WebSocket", padrão ligado) ou "HTTP por frase"
+ * com o motivo. Mesma decisão do main (`elevenLabsCallOptions` ↔ `ttsCallTransport`). "Testar
+ * voz" e os clipes usam sempre o REST.
+ */
+function CallTransport({
+  tts,
+  family,
+  onCommit
+}: {
+  tts: TtsSettings
+  family: VoiceProviderSupport | null
+  onCommit: (next: TtsSettings) => Promise<boolean>
+}): React.JSX.Element {
+  const t = ttsCallTransport(tts.api, family)
+  const help =
+    'WebSocket: o texto da resposta vai para a ElevenLabs enquanto o modelo ainda escreve e o áudio começa a voltar antes de a frase terminar — o 1º som sai mais cedo e a fala flui entre frases. HTTP por frase: o app espera cada frase ficar pronta e faz uma request por frase (um pouco mais de latência, mais simples; é o que os outros provedores usam). "Testar voz" e os clipes usam sempre HTTP.'
+  const line = (
+    <span data-testid="tts-call-transport-text">
+      Na chamada:{' '}
+      {t.ws ? (
+        <span className="text-success">WebSocket (texto em streaming)</span>
+      ) : (
+        <>
+          <span className="text-fg/85">HTTP por frase</span>
+          {t.reason ? ` — ${t.reason}` : ''}
+        </>
+      )}
+    </span>
+  )
+  const setWs = (on: boolean): void => {
+    // ligado = sem o campo (padrão); desligado = `false` explícito
+    const { elevenLabsWs: _drop, ...api } = tts.api
+    void _drop
+    void onCommit({ ...tts, api: on ? api : { ...api, elevenLabsWs: false } })
+  }
+  return (
+    <div data-testid="tts-call-transport" data-ws={t.ws}>
+      {t.toggle ? (
+        <ToggleRow
+          label="Streaming por WebSocket"
+          checked={tts.api.elevenLabsWs !== false}
+          onChange={setWs}
+          help={help}
+          status={line}
+        />
+      ) : (
+        <p className="flex items-center gap-1.5 text-[11.5px] text-subtle">
+          {line}
+          <HelpTip label="Na chamada: WebSocket ou HTTP">{help}</HelpTip>
+        </p>
+      )}
+    </div>
   )
 }
 

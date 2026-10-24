@@ -6,8 +6,9 @@
 // a especulativa reaproveitada quando o usuário não voltou a falar) → `turn(text)` envia pelo MESMO
 // caminho do composer (`sendTurn` = runner.send — fila/⚡ respeitadas; o histórico é idêntico ao de
 // um turno de texto) → preâmbulo curto (filler) → resposta em streaming → TTS POR SENTENÇA (a 1ª
-// frase também corta na vírgula; bytes na ordem, sem sobreposição; a 1ª frase espera o preâmbulo
-// terminar — nunca corta no meio da palavra) → próxima escuta.
+// frase também corta na vírgula, exceto com o TTS de texto em streaming; bytes na ordem, sem
+// sobreposição; a 1ª frase espera o preâmbulo terminar — nunca corta no meio da palavra) → próxima
+// escuta.
 //
 // A fala do assistente vem dos eventos do runner (`onAgentEvent`): `draft` (conteúdo acumulado em
 // streaming, com monotonicidade por passo) e `message-added` (flush autoritativo do passo). Erros
@@ -173,7 +174,8 @@ export interface VoiceCallDeps {
    * [tts-feed] TTS de entrada em streaming (ElevenLabs WebSocket — `elevenlabsStream.ts`), lido a
    * cada uso; null/ausente = só o `synth` por sentença (os demais backends). Ganchos best-effort:
    * o texto da sentença incompleta vai ao TTS antes do corte e o corte já faz o flush; o `synth`
-   * da sentença continua sendo chamado na ordem (ele pega o que o feed preparou).
+   * da sentença continua sendo chamado na ordem (ele pega o que o feed preparou); o fim da resposta
+   * (`end`) fecha o contexto. Com feed, a 1ª frase NÃO corta na vírgula.
    */
   ttsFeed?: () => TtsTextFeed | null
 }
@@ -196,6 +198,8 @@ export class VoiceCallManager {
   #error: string | null = null
   /** Motivo do fim da chamada por falha (fica no estado inativo até a próxima chamada). */
   #endedReason: string | null = null
+  /** Fase "Preparando a GPU…" (texto do andamento; null = pronta — o renderer abre o microfone). */
+  #preparing: string | null = null
   /** Uma falha transitória no meio de um stream já aconteceu (a segunda encerra a chamada). */
   #transientStrike = false
   // ---- feed do texto do assistente (por passo do loop; monotônico contra rewinds de retry) ----
@@ -292,6 +296,7 @@ export class VoiceCallManager {
     this.#muted = false
     this.#error = null
     this.#endedReason = null
+    this.#preparing = null
     this.#transientStrike = false
     this.#turnSilenceMs = resolveTurnSilenceMs(defaults.turn, audioInput)
     const timing = resolveTurnTiming(defaults.turn)
@@ -323,6 +328,7 @@ export class VoiceCallManager {
     this.#chatId = null
     this.#muted = false
     this.#error = null
+    this.#preparing = null
     this.#turn = null
     this.#carry = null
     try {
@@ -602,8 +608,24 @@ export class VoiceCallManager {
       turnSilenceMs: this.#turnSilenceMs,
       turnTiming: this.#turnTiming,
       pendingText: this.#machine.pendingText,
-      error: this.#sessionId ? this.#error : this.#endedReason
+      error: this.#sessionId ? this.#error : this.#endedReason,
+      // aditivo: só presente durante o preparo da GPU (estados sem GPU ficam iguais aos de antes)
+      ...(this.#sessionId && this.#preparing ? { preparing: this.#preparing } : {})
     }
+  }
+
+  /**
+   * Fase de preparo da GPU local (subida/aquecimento do servidor antes do microfone abrir):
+   * `text` = andamento legível; null = pronta. Sem chamada ativa não faz nada.
+   */
+  setPreparing(text: string | null): VoiceCallState {
+    if (!this.#sessionId) return this.state()
+    const next = typeof text === 'string' && text.trim() ? text.trim() : null
+    if (next !== this.#preparing) {
+      this.#preparing = next
+      this.#emitState()
+    }
+    return this.state()
   }
 
   /**
@@ -784,7 +806,11 @@ export class VoiceCallManager {
       return
     }
     if (e.type === 'session-updated' && e.session.id === sessionId) {
-      if (!isBusyStatus(e.session.status)) this.#machine.responseDone()
+      if (!isBusyStatus(e.session.status)) {
+        this.#machine.responseDone()
+        // [tts-feed] a resposta acabou: o contexto do TTS em streaming fecha (a última frase termina)
+        this.#ttsFeedCall((f) => f.end?.())
+      }
       this.#emitState()
       return
     }
@@ -834,8 +860,12 @@ export class VoiceCallManager {
     for (;;) {
       const { sentences, rest } = splitSentences(this.#feed, {
         final,
-        // 1º pedaço da resposta: a vírgula também corta (o TTS começa antes)
-        ...(this.#sentencesThisTurn === 0 ? { commaCutMin: FIRST_CHUNK_COMMA_MIN } : {})
+        // 1º pedaço da resposta: a vírgula também corta (o TTS por sentença começa antes) — NÃO
+        // com o TTS de texto em streaming ([tts-feed], ElevenLabs por WebSocket): lá o texto já
+        // gera antes do corte e a vírgula partia a 1ª frase em duas (prosódia quebrada no meio)
+        ...(this.#sentencesThisTurn === 0 && !this.#hasTtsFeed()
+          ? { commaCutMin: FIRST_CHUNK_COMMA_MIN }
+          : {})
       })
       for (const s of sentences) this.#queueSentence(s)
       this.#feed = rest
@@ -973,6 +1003,15 @@ export class VoiceCallManager {
       if (feed) fn(feed)
     } catch (e) {
       console.warn('[clearchat] voz: tts-feed falhou:', e instanceof Error ? e.message : e)
+    }
+  }
+
+  /** Há TTS de texto em streaming nesta chamada? */
+  #hasTtsFeed(): boolean {
+    try {
+      return !!this.#deps.ttsFeed?.()
+    } catch {
+      return false
     }
   }
 

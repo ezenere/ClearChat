@@ -15,12 +15,14 @@ export type BarItemId =
   | 'session-switcher'
   | 'auto-approve'
   | 'processes'
-  // composer (o ícone do host, tamanho fixo, não é item)
+  // composer
   | 'composer-status'
   | 'context-meter'
   | 'model-pill'
   | 'spend'
   | 'voice-controls'
+  | 'composer-host'
+  | 'composer-info'
   | 'composer-hint'
 
 export interface BarItemSpec {
@@ -65,9 +67,15 @@ export const BAR_ITEMS: Record<BarItemId, BarItemSpec> = {
   spend: { priority: 30, levels: [0, 2], doc: 'ícone + "$0,42" → ícone' },
   'voice-controls': {
     priority: 20,
-    levels: [0, 1, 2],
-    doc: 'mic + menu do microfone + telefone → só o mic → some (coluna muito estreita)'
+    levels: [0, 1],
+    doc: '[ telefone | mic | ˅ ] → [ telefone | mic ] (o menu do microfone vai para o botão direito do mic); nunca some'
   },
+  'composer-host': {
+    priority: 16,
+    levels: [0, 2],
+    doc: 'ícone do host (local/remoto, só com sync) → some (a linha do host acima do composer continua)'
+  },
+  'composer-info': { priority: 14, levels: [0, 2], doc: '</> "Sua mensagem" (API) → some' },
   'composer-hint': {
     priority: 10,
     levels: [0, 2],
