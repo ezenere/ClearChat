@@ -640,7 +640,12 @@ export interface VoiceApi {
      * Transcrição final da fala do usuário. Sem resposta em andamento envia já (mesmo caminho do
      * composer — fila/⚡ respeitadas); com resposta em voo fica como PRÓXIMO turno (máx. 1).
      */
-    turn(input: { text: string }): Promise<VoiceCallState>
+    /**
+     * Transcrição final da fala → turno. `speechMs` = tempo com VOZ da fala (do 1º ao último quadro
+     * acima do limiar — sem o silêncio antes/depois nem a espera do fim de turno); o preâmbulo
+     * compara com a "Fala mínima" (`interjections.minSpeechMs`). Ausente = desconhecido.
+     */
+    turn(input: { text: string; speechMs?: number }): Promise<VoiceCallState>
     /** A fila de reprodução do renderer esvaziou (tudo que foi emitido já tocou). */
     playbackIdle(): Promise<VoiceCallState>
     /**
@@ -861,9 +866,11 @@ export interface VoiceCallUtteranceEvent {
   mime: string
   /**
    * Origem do áudio (timeline/UI; ausente = 'sentence'): sentença da resposta, filler pós-turno
-   * ou interjeição na fala do usuário (clipes `resolveClip` — SPEC → "Chamada de voz").
+   * ou interjeição na fala do usuário (clipes `resolveClip` — SPEC → "Chamada de voz") ou frase de
+   * demora sintetizada ao vivo ("Só mais um instante…", "Desculpe a demora…" — tratada como clipe:
+   * pulada se não tocar, descartada quando o usuário fala, nunca no histórico).
    */
-  kind?: 'sentence' | 'filler' | 'interjection'
+  kind?: 'sentence' | 'filler' | 'interjection' | 'delay'
   /**
    * Ganho relativo da utterance (0–1, multiplica o volume da chamada); ausente = 1. Interjeições
    * (backchannel) tocam mais baixo (`interjections.volume`, padrão 0.6).

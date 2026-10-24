@@ -67,6 +67,7 @@ const SKIP_LABELS: Record<string, string> = {
   disabled: 'desligado',
   stale: 'observação velha (chegou tarde)',
   'short-speech': 'fala curta demais',
+  'below-min-speech': 'menos voz que a "Fala mínima"',
   'short-pause': 'pausa curta demais',
   cooldown: 'intervalo mínimo entre interjeições',
   'turn-end': 'fim de turno provável (pergunta/comando)',
@@ -83,11 +84,27 @@ const SKIP_LABELS: Record<string, string> = {
     'sem veredito a tempo (STT pela API é lento; um motor local de transcrição resolve)',
   'late-verdict': 'o veredito chegou tarde (pausa já longa)',
   'assistant-audio': 'áudio do assistente tocando',
-  'answer-speaking': 'a resposta está sendo falada'
+  'answer-speaking': 'a resposta está sendo falada',
+  // frases de demora ("manter viva"/desculpa)
+  'answer-first': 'a resposta chegou antes',
+  'answer-coming': 'a resposta já está sintetizando',
+  'not-ready': 'não ficou pronta antes da resposta',
+  'keepalive-playing': '"manter viva" tocando',
+  'keepalive-recent': '"manter viva" acabou de sair',
+  'clip-playing': 'outro clipe tocando',
+  'user-speaking': 'você falando',
+  'barge-in': 'barge-in',
+  'new-turn': 'turno novo',
+  'response-done': 'a resposta terminou',
+  'send-failed': 'o envio falhou',
+  'no-response': 'sem resposta em voo',
+  hangup: 'o agente encerrou a chamada',
+  cancelled: 'resposta cancelada'
 }
 
 /** Motivo (com prefixo `delay/`/`tools/` dos preâmbulos ou `phase-…`) → texto. */
 function skipLabel(reason: string): string {
+  if (reason.startsWith('tts-error')) return `falha na síntese${reason.slice(9)}`
   const r = reason.includes('/') ? reason.slice(reason.lastIndexOf('/') + 1) : reason
   if (r.startsWith('phase-')) return `fase ${r.slice(6)}`
   return SKIP_LABELS[r] ?? r
@@ -109,7 +126,9 @@ function describeTimelineEvent(e: VoiceCallTimelineEvent): string {
       }`
     }
     case 'clip-emitted':
-      return `clipe ${e.class ?? '?'} emitido`
+      return e.text
+        ? `frase ${e.class ?? '?'} emitida: "${e.text.slice(0, 40)}"`
+        : `clipe ${e.class ?? '?'} emitido`
     case 'clip-cancelled':
       return `clipe ${e.class ?? '?'} cancelado`
     case 'sentence-emitted':
@@ -226,6 +245,12 @@ export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element |
         <span>
           decisões: {metrics.decisions} ({metrics.played} tocadas)
         </span>
+        {metrics.delayPlayed.keepAlive + metrics.delayPlayed.apology > 0 && (
+          <span data-testid="voice-call-delay-played">
+            frases de demora: {metrics.delayPlayed.keepAlive} manter viva ·{' '}
+            {metrics.delayPlayed.apology} desculpa
+          </span>
+        )}
         {playbackErrors > 0 && (
           <span data-testid="voice-call-playback-errors" className="text-danger">
             falhas ao tocar: {playbackErrors}
@@ -274,11 +299,15 @@ export function VoiceCallPanel({ open }: { open: boolean }): React.JSX.Element |
   )
 }
 
-/** Por que os atos de fala curta não tocaram (motivo × vezes) — interjeições e preâmbulos. */
+/** Por que os atos de fala curta não tocaram (motivo × vezes) — interjeições, preâmbulos e frases de demora. */
 function SkipReadout({
   skipped
 }: {
-  skipped: { interjection: Record<string, number>; filler: Record<string, number> }
+  skipped: {
+    interjection: Record<string, number>
+    filler: Record<string, number>
+    delay: Record<string, number>
+  }
 }): React.JSX.Element | null {
   const row = (
     label: string,
@@ -300,11 +329,13 @@ function SkipReadout({
   }
   const a = row('Interjeição', skipped.interjection, 'voice-call-skips-interjection')
   const b = row('Preâmbulo', skipped.filler, 'voice-call-skips-filler')
-  if (!a && !b) return null
+  const c = row('Frase de demora', skipped.delay, 'voice-call-skips-delay')
+  if (!a && !b && !c) return null
   return (
     <div data-testid="voice-call-skips" className="space-y-0.5 text-[10.5px] text-subtle">
       {a}
       {b}
+      {c}
     </div>
   )
 }

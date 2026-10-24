@@ -22,10 +22,20 @@ export interface VoiceCallMetrics {
   decisionToAudioMs: DecisionLatency | null
   /**
    * Por que NÃO tocou (motivo → vezes), separado em interjeições (inclui as observações que a
-   * política recusou — `class: 'NONE'`) e preâmbulos — o painel "Atos de fala curta" explica.
+   * política recusou — `class: 'NONE'`), preâmbulos e frases de demora (`KEEPALIVE`/`APOLOGY`) —
+   * o painel "Atos de fala curta" explica.
    */
-  skipped: { interjection: Record<string, number>; filler: Record<string, number> }
+  skipped: {
+    interjection: Record<string, number>
+    filler: Record<string, number>
+    delay: Record<string, number>
+  }
+  /** Frases de demora que tocaram ("manter viva" e desculpa). */
+  delayPlayed: { keepAlive: number; apology: number }
 }
+
+/** Classes das frases de demora sintetizadas ao vivo (fora das métricas de interjeição). */
+export const DELAY_PHRASE_CLASSES: readonly string[] = ['KEEPALIVE', 'APOLOGY']
 
 /** Percentil por ordem (p em [0,1]; lista não vazia e já ordenada). */
 function percentile(sorted: number[], p: number): number {
@@ -46,13 +56,21 @@ export function computeVoiceCallMetrics(
   const first = list[0]?.ts ?? 0
   const last = now ?? list[list.length - 1]?.ts ?? first
   const elapsedMs = Math.max(0, last - first)
+  const isDelay = (e: VoiceCallTimelineEvent): boolean =>
+    DELAY_PHRASE_CLASSES.includes(e.class ?? '')
   const decisions = list.filter(
-    (e) => e.kind === 'decision' && e.class !== 'FILLER' && e.class !== 'NONE'
+    (e) => e.kind === 'decision' && e.class !== 'FILLER' && e.class !== 'NONE' && !isDelay(e)
   )
-  const skipped: VoiceCallMetrics['skipped'] = { interjection: {}, filler: {} }
+  const skipped: VoiceCallMetrics['skipped'] = { interjection: {}, filler: {}, delay: {} }
+  const delayPlayed = { keepAlive: 0, apology: 0 }
   for (const e of list) {
+    if (e.kind === 'decision' && e.played && isDelay(e)) {
+      if (e.class === 'KEEPALIVE') delayPlayed.keepAlive++
+      else delayPlayed.apology++
+    }
     if (e.kind !== 'decision' || e.played) continue
-    const bucket = e.class === 'FILLER' ? skipped.filler : skipped.interjection
+    const bucket =
+      e.class === 'FILLER' ? skipped.filler : isDelay(e) ? skipped.delay : skipped.interjection
     const reason = e.reason || '?'
     bucket[reason] = (bucket[reason] ?? 0) + 1
   }
@@ -78,6 +96,7 @@ export function computeVoiceCallMetrics(
     decisionToAudioMs: latencies.length
       ? { p50: percentile(latencies, 0.5), p95: percentile(latencies, 0.95) }
       : null,
-    skipped
+    skipped,
+    delayPlayed
   }
 }

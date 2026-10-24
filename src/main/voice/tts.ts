@@ -563,6 +563,24 @@ export async function synthesizeStream(
   }
 }
 
+/**
+ * Síntese com os bytes COMPLETOS para frases curtas da chamada (frases de demora — "Só mais um
+ * instante…"): como `synthesizeStream`, mas o PCM progressivo é juntado num bloco PCM cru
+ * (`audio/pcm;rate=N`, sem streaming — toca pelo mesmo player Web Audio das frases da resposta e
+ * se emenda nelas sem buraco); motor local / wav / mp3 → os bytes como vieram. ElevenLabs direta
+ * vai pelo REST (`synthesizeElevenLabsStream`), nunca pelo WebSocket da resposta.
+ */
+export async function synthesizeBlock(
+  input: Omit<TtsSynthesizeInput, 'format'>,
+  opts: TtsSynthesizeOptions = {}
+): Promise<{ audio: Uint8Array; mime: string }> {
+  const r = await synthesizeStream(input, opts)
+  if (!r.streaming) return { audio: r.result.audio, mime: r.result.mime }
+  const parts: Uint8Array[] = []
+  for await (const c of r.chunks) parts.push(c)
+  return { audio: concatBytes(parts), mime: `audio/pcm;rate=${r.sampleRate}` }
+}
+
 /** Junta um stream PCM num WAV completo (clipes/"Testar voz" quando só há o stream). */
 export async function collectPcmStream(stream: TtsPcmStream): Promise<TtsSynthesizeResult> {
   const parts: Uint8Array[] = []

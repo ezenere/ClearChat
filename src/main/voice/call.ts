@@ -33,6 +33,8 @@ import {
   DEFAULT_FILLER_DELAY_MS,
   DEFAULT_TURN_SILENCE_MS,
   DEFAULT_TURN_TIMING,
+  normalizeDelayPhrases,
+  resolveDelayPhrasePools,
   resolveFillerPool,
   resolveTurnSilenceMs,
   resolveTurnTiming,
@@ -46,18 +48,27 @@ import {
   type TurnTiming,
   type VoiceCallConfig,
   type VoiceCallDefaults,
-  type VoiceCallState
+  type VoiceCallState,
+  type VoiceDelayPhrases
 } from '@shared/voice'
 import {
+  DELAY_RECENT_WINDOW,
+  EMPTY_DELAY_STATE,
   EMPTY_FILLER_STATE,
   EVAL_TAIL_MAX_CHARS,
   FILLER_RECENT_WINDOW,
   INTERJECTION_MAX_AGE_MS,
+  apologyDueAt,
+  apologySkipReason,
   classifyFillerContext,
   decideInterjection,
   fillerShouldFire,
+  fillerBelowMinSpeech,
   fillerTooShort,
+  keepAliveDueAt,
+  pickDelayPhrase,
   pickFillerPhrase,
+  type DelayPhraseState,
   type FillerState,
   type InterjectionObservation
 } from '@shared/voicePolicy'
@@ -82,8 +93,11 @@ export interface VoiceCallUtterance {
   id: string
   audio: Uint8Array
   mime: string
-  /** Origem do áudio (sentença da resposta, filler ou interjeição); ausente = 'sentence'. */
-  kind?: 'sentence' | 'filler' | 'interjection'
+  /**
+   * Origem do áudio (sentença da resposta, filler, interjeição ou frase de demora sintetizada ao
+   * vivo); ausente = 'sentence'.
+   */
+  kind?: 'sentence' | 'filler' | 'interjection' | 'delay'
   /** Ganho relativo (0–1; ausente = 1) — interjeições tocam mais baixo. */
   gain?: number
 }
@@ -140,6 +154,15 @@ export interface VoiceCallDeps {
   sendTurn(sessionId: string, text: string, meta?: MessageMeta): void
   /** Síntese de uma sentença (bytes completos). Abort = descartada (barge-in/stop). */
   synth(text: string, signal: AbortSignal): Promise<{ audio: Uint8Array; mime: string }>
+  /**
+   * Síntese de uma FRASE DE DEMORA ("Só mais um instante…", "Desculpe a demora…"): mesma voz e
+   * backend da chamada, mas uma request à parte da resposta (ElevenLabs: REST — nunca o contexto
+   * WebSocket da resposta, que misturaria o texto/alinhamento) e com os bytes completos. Pode
+   * correr em paralelo com a síntese da resposta. Ausente = `synth`.
+   */
+  synthPhrase?(text: string, signal: AbortSignal): Promise<{ audio: Uint8Array; mime: string }>
+  /** Timers das frases de demora (padrão `setTimeout`; testes injetam um relógio fake). */
+  timers?: { set(fn: () => void, ms: number): unknown; clear(handle: unknown): void }
   /** Estado da chamada para o renderer (canal `voice:call:state`). */
   emitState(state: VoiceCallState): void
   /** Utterance falada para o renderer (canal `voice:call:utterance`). */
@@ -243,6 +266,13 @@ export interface VoiceCallTranscript {
   audioMs?: number
 }
 
+/** Desculpa do turno (frase de demora): síntese em voo (`ready` null) ou pronta. */
+interface ApologyEntry {
+  abort: AbortController
+  text: string
+  ready: { audio: Uint8Array; mime: string } | null
+}
+
 /** Turno do usuário em andamento (o que o histórico tem dele). */
 interface TurnInfo {
   text: string
@@ -250,6 +280,8 @@ interface TurnInfo {
   toolsRan: boolean
   /** `meta.voice` da fala que abriu o turno (turno continuado soma a duração). */
   voice?: VoiceMessageMeta
+  /** Tempo com VOZ da fala do turno (ms — `VoicedSpan` do renderer); null = desconhecido. */
+  voicedMs?: number | null
 }
 
 export class VoiceCallManager {
@@ -322,12 +354,38 @@ export class VoiceCallManager {
   #lastInterjectVariant: Partial<Record<string, number>> = {}
   /** Última interjeição emitida (id + classe) — cancelada quando o usuário volta a falar/stop. */
   #interjectUtt: { id: string; cls: string; n: number } | null = null
+  // ---- frases de demora (sintetizadas ao vivo; nunca no histórico — SPEC → "Frases de demora") ----
+  #delay: DelayPhraseState = { ...EMPTY_DELAY_STATE }
+  #delayTimer: unknown = null
+  /** Geração das frases de demora: reset/stop/barge-in descartam as sínteses em voo. */
+  #delayGen = 0
+  /** Síntese em voo da frase "manter viva" (abortada quando a resposta chega antes). */
+  #keepAliveAbort: AbortController | null = null
+  /** Desculpa do turno: síntese em voo (`ready` null) ou pronta, esperando a 1ª frase. */
+  #apology: ApologyEntry | null = null
+  /** Frase de demora emitida e ainda tocando (até o `playback-idle`). */
+  #delayPlaying: { id: string; kind: 'keepalive' | 'apology' } | null = null
+  /** Última frase "manter viva" EMITIDA no turno (ms) — a desculpa não emenda nela. */
+  #lastKeepAliveEmittedAt: number | null = null
+  /** Índices usados por último em cada pool (nunca repete os últimos `DELAY_RECENT_WINDOW`). */
+  #delayRecent: { keepalive: number[]; apology: number[] } = { keepalive: [], apology: [] }
+  /** Tools em execução agora (depois da 1ª frase só elas reabrem o "manter viva"). */
+  #toolsRunningIds = new Set<string>()
   // ---- histórico e custos da chamada (marcadores, meta.voice) ----
   #meter: CallMeter | null = null
   /** Última transcrição final ainda não usada num turno (vira o `meta.voice` da fala). */
   #lastTranscript: VoiceCallTranscript | null = null
-  /** Falas transcritas acumuladas para o próximo envio (fila/turno continuado unem várias). */
-  #speechAcc: { audioMs: number; model?: string } = { audioMs: 0 }
+  /**
+   * Falas transcritas acumuladas para o próximo envio (fila/turno continuado unem várias).
+   * `voicedMs` = tempo com VOZ (renderer; sem silêncio antes/depois nem a espera do fim de turno)
+   * — null enquanto nenhuma fala trouxe a medida.
+   */
+  #speechAcc: { audioMs: number; model?: string; voicedMs: number | null } = {
+    audioMs: 0,
+    voicedMs: null
+  }
+  /** Tempo com voz do turno sendo enviado (o `message-added` do usuário arma o preâmbulo com ele). */
+  #sendingVoicedMs: number | null = null
   /** Marcador de fim esperando a sessão ficar ociosa (o turno do agente ainda rodava). */
   #pendingEnd: {
     sessionId: string
@@ -346,18 +404,24 @@ export class VoiceCallManager {
       if (this.#sessionId) {
         // antes do envio: o `message-added` do usuário pode chegar DENTRO do sendTurn (síncrono)
         // e completar o id da mensagem
+        const voicedMs = this.#speechAcc.voicedMs
         const voice = this.#takeSpeechMeta()
-        this.#turn = { text, userMessageId: null, toolsRan: false, voice }
+        this.#turn = { text, userMessageId: null, toolsRan: false, voice, voicedMs }
         const before = this.#turn
         if (this.#meter) this.#meter.turns++
-        this.#deps.sendTurn(this.#sessionId, text, { voice })
+        this.#sendingVoicedMs = voicedMs
+        try {
+          this.#deps.sendTurn(this.#sessionId, text, { voice })
+        } finally {
+          this.#sendingVoicedMs = null
+        }
         this.#emitTimeline({
           ts: this.#now(),
           kind: 'turn-sent',
           text: text.slice(0, EVAL_TAIL_MAX_CHARS)
         })
         // o preâmbulo entra logo (se a resposta não vier antes); o message-added já armou
-        if (this.#turn === before) this.#armFiller(text)
+        if (this.#turn === before) this.#armFiller(text, voicedMs)
       }
     })
     deps.onEvent((e) => this.#onAgentEvent(e))
@@ -422,6 +486,7 @@ export class VoiceCallManager {
     this.#clearSynth()
     this.#ttsFeedCall((f) => f.close()) // [tts-feed] fim da chamada: fecha a conexão
     this.#resetFiller(true)
+    this.#resetDelay(true, 'stopped')
     this.#cancelInterject()
     this.#machine.stop()
     this.#sessionId = null
@@ -499,8 +564,10 @@ export class VoiceCallManager {
   speechBegin(input?: { dropped?: string[] }): VoiceCallState {
     if (!this.#sessionId) return this.state()
     this.#cancelHangup('speech') // o usuário continuou falando: a chamada não cai
-    // a interjeição/preâmbulo tocando sai de cena (o renderer já cortou com fade)
+    // a interjeição/preâmbulo tocando sai de cena (o renderer já cortou com fade); frases de
+    // demora param (nunca falam por cima do usuário — o turno novo/continuado rearma)
     this.#resetFiller(true)
+    this.#resetDelay(true, 'user-speaking')
     this.#cancelInterject()
     // a fala anterior ainda está transcrevendo (o silêncio fechou o turno no meio da frase): o
     // texto dela será unido ao desta fala em vez de virar turno sozinho
@@ -539,7 +606,7 @@ export class VoiceCallManager {
    * composer); com resposta em voo fica como PRÓXIMO turno (máx. 1 pendente) — salvo o turno
    * CONTINUADO (resposta retida e ainda não ouvida): o turno anterior é refeito com a fala unida.
    */
-  turn(text: string): VoiceCallState {
+  turn(text: string, opts?: { speechMs?: number | null }): VoiceCallState {
     if (!this.#sessionId) return this.state()
     this.#error = null
     let t = typeof text === 'string' ? text.trim() : ''
@@ -550,6 +617,11 @@ export class VoiceCallManager {
       this.#speechAcc.audioMs += Math.max(0, tr.audioMs ?? 0)
       if (tr.model) this.#speechAcc.model = tr.model
     }
+    // tempo com VOZ da fala (renderer): é ele — não a duração do áudio, que inclui o silêncio do
+    // fim de turno — que o preâmbulo compara com a "Fala mínima"
+    const sp = opts?.speechMs
+    if (t && typeof sp === 'number' && Number.isFinite(sp) && sp >= 0)
+      this.#speechAcc.voicedMs = (this.#speechAcc.voicedMs ?? 0) + Math.round(sp)
     if (this.#carry?.awaiting) {
       // transcrição da fala que o usuário continuou: guardada para a próxima (nada é enviado)
       this.#carry = { awaiting: false, text: [this.#carry.text, t].filter(Boolean).join(' ') }
@@ -589,7 +661,13 @@ export class VoiceCallManager {
     this.#playbackActive = false
     this.#fillerUttId = null
     this.#interjectUtt = null
+    this.#delayPlaying = null
     this.#machine.playbackIdle()
+    // esperando a resposta: o silêncio começa agora (a frase "manter viva" conta daqui)
+    if (this.#delay.turnStartedAt != null) {
+      this.#delay.silentSince = this.#now()
+      this.#scheduleDelay()
+    }
     // filler segurado enquanto um clipe tocava (ex.: interjeição): tenta de novo agora
     void this.#tryFiller()
     if (this.#checkHangup()) return this.state()
@@ -611,6 +689,7 @@ export class VoiceCallManager {
       : [...this.#uttKey.keys()]
     this.#playbackActive = false
     this.#resetFiller(true) // quem falou é o usuário: sem filler no meio da fala dele
+    this.#resetDelay(true, 'barge-in')
     this.#interruptAnswer(played)
     this.#machine.bargeIn()
     this.#emitState()
@@ -703,6 +782,7 @@ export class VoiceCallManager {
     if (!this.#sessionId) return this.state()
     this.#error = error
     this.#machine.sendFailed()
+    this.#resetDelay(false, 'send-failed')
     this.#emitState()
     return this.state()
   }
@@ -817,6 +897,8 @@ export class VoiceCallManager {
     const merged = canMerge && prev ? `${prev.text.trim()} ${text}`.trim() : text
     // a fala anterior volta no turno unido: a duração dela soma no `meta.voice` do reenvio
     if (canMerge && prev?.voice?.durationMs) this.#speechAcc.audioMs += prev.voice.durationMs
+    if (canMerge && typeof prev?.voicedMs === 'number')
+      this.#speechAcc.voicedMs = (this.#speechAcc.voicedMs ?? 0) + prev.voicedMs
     this.#machine.replacePending(merged)
     this.#emitTimeline({
       ts: this.#now(),
@@ -917,9 +999,12 @@ export class VoiceCallManager {
                 .join(' ')
                 .trim()
         this.#resetResponse()
-        this.#turn = { text, userMessageId: m.id, toolsRan: false }
+        // fala da chamada sendo enviada agora (dentro do `sendTurn`): o tempo com voz dela; digitada
+        // ou drenada da fila → desconhecido (a "Fala mínima" não se aplica)
+        const voicedMs = this.#sendingVoicedMs
+        this.#turn = { text, userMessageId: m.id, toolsRan: false, voicedMs }
         this.#machine.responseBegan()
-        this.#armFiller(text) // turno disparado também por mensagem digitada durante a chamada
+        this.#armFiller(text, voicedMs) // turno disparado também por mensagem digitada durante a chamada
         return
       }
       if (m.message.role === 'assistant' && !isDisplayOnly(m.meta)) {
@@ -950,12 +1035,27 @@ export class VoiceCallManager {
     if (e.type === 'session-updated' && e.session.id === sessionId) {
       if (!isBusyStatus(e.session.status)) {
         this.#machine.responseDone()
+        // a resposta acabou de gerar: nada mais a esperar (a frase tocando termina; sínteses em voo
+        // caem) — SALVO a 1ª frase ainda sintetizando (resposta que veio de uma vez depois de muito
+        // raciocínio): a desculpa pronta ainda entra antes dela
+        const firstPending =
+          !this.#delay.answerSpoken && (this.#synthRunning || this.#synthQueue.length > 0)
+        if (!firstPending) this.#resetDelay(false, 'response-done')
         // [tts-feed] a resposta acabou: o contexto do TTS em streaming fecha (a última frase termina)
         this.#ttsFeedCall((f) => f.end?.())
         if (this.#checkHangup()) return
       }
       this.#emitState()
       return
+    }
+    if (e.type === 'tool-running' && e.sessionId === sessionId) {
+      // frases de demora: depois da 1ª frase só uma tool rodando reabre o "manter viva"
+      if (e.running) this.#toolsRunningIds.add(e.toolCallId)
+      else this.#toolsRunningIds.delete(e.toolCallId)
+      if (this.#delay.turnStartedAt != null) {
+        this.#delay.toolsRunning = this.#toolsRunningIds.size > 0
+        this.#scheduleDelay()
+      }
     }
     if (e.type === 'tool-running' && e.sessionId === sessionId && e.running) {
       if (this.#turn) this.#turn.toolsRan = true
@@ -1103,6 +1203,9 @@ export class VoiceCallManager {
         if (this.#synthAbort === abort) this.#synthAbort = null
         if (item.gen !== this.#synthGen) continue // descartada enquanto sintetizava
         this.#transientStrike = false // sentença sintetizada: a falta transitória anterior caduca
+        // 1ª frase da resposta pronta: a frase "manter viva" em síntese cai; a desculpa pronta (e
+        // só pronta) entra ANTES dela — a frase espera na fila do renderer, sem corte
+        if (!this.#delay.answerSpoken) this.#onFirstAnswerAudio()
         this.#uttSeq++
         // 1ª frase pronta: o preâmbulo não sai mais (se já está tocando, a frase ESPERA ele terminar
         // na fila do renderer — nunca corta no meio da palavra)
@@ -1185,6 +1288,7 @@ export class VoiceCallManager {
     this.#uttKey = new Map()
     this.#sentencesThisTurn = 0
     this.#resetFiller(true) // turno novo: o filler do turno anterior (se tocando) é cancelado
+    this.#resetDelay(true, 'new-turn')
   }
 
   // ---------------- preâmbulo pós-turno (regra v2 — SPEC → "Fillers") ----------------
@@ -1199,13 +1303,20 @@ export class VoiceCallManager {
    * Arma o preâmbulo do turno: depois de `delayMs` (padrão 250 ms) sem a 1ª frase da resposta
    * pronta — ou já, com tools em execução — toca UM clipe `FILLER` escolhido pelo contexto da fala
    * (pergunta/comando/correção/pedido longo), sem repetir os últimos usados. Fala curta demais
-   * ("oi", "valeu") não ganha preâmbulo. Em modo sombra decide mas não toca.
+   * ("oi", "valeu") ou com menos VOZ que a "Fala mínima" (`voicedMs` < `interjections.minSpeechMs`
+   * — tempo com voz, sem o silêncio do fim de turno) não ganha preâmbulo. Em modo sombra decide
+   * mas não toca.
    */
-  #armFiller(text: string): void {
+  #armFiller(text: string, voicedMs: number | null = null): void {
     this.#resetFiller(true)
+    this.#armDelayPhrases() // frases de demora valem em todo turno respondido (fala curta inclusive)
     const resolved = this.#resolved()
     this.#fillerContext = classifyFillerContext(text)
-    const short = fillerTooShort(text)
+    // curta = poucas palavras (e não pergunta) OU menos VOZ que a "Fala mínima" configurada
+    // (`interjections.minSpeechMs`) — medida só no tempo com voz, nunca no silêncio do fim de turno
+    const fewWords = fillerTooShort(text)
+    const belowMin = fillerBelowMinSpeech(voicedMs, resolved.interjections.minSpeechMs)
+    const short = fewWords || belowMin
     this.#filler = {
       turnStartedAt: this.#now(),
       toolsRunning: false,
@@ -1221,7 +1332,12 @@ export class VoiceCallManager {
         kind: 'decision',
         class: 'FILLER',
         played: false,
-        reason: !resolved.fillers.enabled ? 'disabled' : 'short-speech'
+        reason: !resolved.fillers.enabled
+          ? 'disabled'
+          : belowMin && !fewWords
+            ? 'below-min-speech'
+            : 'short-speech',
+        ...(voicedMs != null ? { speechMs: voicedMs } : {})
       })
       return
     }
@@ -1417,6 +1533,314 @@ export class VoiceCallManager {
     }
   }
 
+  // ---------------- frases de demora (sintetizadas ao vivo — SPEC → "Frases de demora") ----------------
+
+  /** Config global das frases de demora (lida a cada uso — Configurações podem mudá-la). */
+  #delayConfig(): VoiceDelayPhrases {
+    return normalizeDelayPhrases(this.#deps.settings().defaults.delayPhrases)
+  }
+
+  #setDelayTimer(fn: () => void, ms: number): unknown {
+    if (this.#deps.timers) return this.#deps.timers.set(fn, ms)
+    const t = setTimeout(fn, ms)
+    ;(t as { unref?: () => void }).unref?.()
+    return t
+  }
+
+  #clearDelayTimer(): void {
+    const t = this.#delayTimer
+    this.#delayTimer = null
+    if (t == null) return
+    if (this.#deps.timers) this.#deps.timers.clear(t)
+    else clearTimeout(t as ReturnType<typeof setTimeout>)
+  }
+
+  /** Arma as frases de demora do turno (o turno foi enviado e a resposta vai ser falada). */
+  #armDelayPhrases(): void {
+    this.#resetDelay(false, 'new-turn')
+    const now = this.#now()
+    this.#delay = {
+      ...EMPTY_DELAY_STATE,
+      turnStartedAt: now,
+      // algo ainda tocando (fila de turnos): o silêncio só começa no `playback-idle`
+      silentSince: this.#playbackActive ? null : now
+    }
+    this.#lastKeepAliveEmittedAt = null
+    this.#toolsRunningIds.clear()
+    this.#scheduleDelay()
+  }
+
+  /**
+   * Desarma as frases de demora: timer, sínteses em voo (abortadas — o motivo vai à timeline) e,
+   * com `cancelPlaying`, a frase tocando (o renderer corta com fade).
+   */
+  #resetDelay(cancelPlaying: boolean, reason: string): void {
+    this.#clearDelayTimer()
+    this.#delayGen++
+    const ka = this.#keepAliveAbort
+    this.#keepAliveAbort = null
+    if (ka) {
+      ka.abort(reason)
+      this.#delaySkip('KEEPALIVE', reason)
+    }
+    const ap = this.#apology
+    this.#apology = null
+    if (ap) {
+      ap.abort.abort(reason)
+      this.#delaySkip('APOLOGY', reason, ap.text)
+    }
+    this.#delay = { ...EMPTY_DELAY_STATE }
+    const p = this.#delayPlaying
+    if (cancelPlaying && p) {
+      this.#delayPlaying = null
+      this.#deps.emitUtteranceCancel(p.id)
+      this.#emitTimeline({
+        ts: this.#now(),
+        kind: 'clip-cancelled',
+        class: p.kind === 'keepalive' ? 'KEEPALIVE' : 'APOLOGY',
+        id: p.id
+      })
+    }
+  }
+
+  /** Decisão "não tocou" de uma frase de demora na timeline (o painel explica o motivo). */
+  #delaySkip(cls: 'KEEPALIVE' | 'APOLOGY', reason: string, text?: string): void {
+    this.#emitTimeline({
+      ts: this.#now(),
+      kind: 'decision',
+      class: cls,
+      played: false,
+      reason,
+      ...(text ? { text: text.slice(0, EVAL_TAIL_MAX_CHARS) } : {})
+    })
+  }
+
+  /**
+   * Por que uma frase de demora não pode sair AGORA (null = pode): chamada ativa, sem desligamento
+   * armado, resposta em voo e ainda falada (sem barge-in/retenção), usuário calado, nada da
+   * resposta sintetizando e nada tocando.
+   */
+  #delayBlock(): string | null {
+    if (!this.#sessionId) return 'stopped'
+    if (this.#hangup) return 'hangup'
+    if (this.#speakCancelled || this.#holdAnswer) return 'cancelled'
+    // frase da resposta sintetizando (mesmo com o turno do agente já terminado de gerar)
+    if (this.#synthRunning || this.#synthQueue.length) return 'answer-coming'
+    if (!this.#machine.responseInFlight) return 'no-response'
+    const phase = this.#machine.phase
+    // com a resposta em voo, "Ouvindo…"/"Transcrevendo…" = o usuário falando
+    if (phase === 'listening' || phase === 'transcribing') return 'user-speaking'
+    if (phase === 'speaking') return 'answer-coming'
+    if (this.#playbackActive) return 'assistant-audio'
+    return null
+  }
+
+  /** Reagenda o timer para o próximo momento devido (frase "manter viva"/desculpa). */
+  #scheduleDelay(): void {
+    this.#clearDelayTimer()
+    if (!this.#sessionId || this.#delay.turnStartedAt == null) return
+    const cfg = this.#delayConfig()
+    const due: number[] = []
+    const ka = keepAliveDueAt(this.#delay, cfg)
+    if (ka != null && !this.#keepAliveAbort) due.push(ka)
+    const ap = apologyDueAt(this.#delay, cfg)
+    if (ap != null) due.push(ap)
+    if (!due.length) return
+    const wait = Math.max(0, Math.min(...due) - this.#now())
+    this.#delayTimer = this.#setDelayTimer(() => {
+      this.#delayTimer = null
+      this.#onDelayTimer()
+    }, wait)
+  }
+
+  #onDelayTimer(): void {
+    if (!this.#sessionId || this.#delay.turnStartedAt == null) return
+    const cfg = this.#delayConfig()
+    const now = this.#now()
+    const apDue = apologyDueAt(this.#delay, cfg)
+    if (apDue != null && now >= apDue) void this.#startApology(cfg)
+    const kaDue = keepAliveDueAt(this.#delay, cfg)
+    if (kaDue != null && now >= kaDue && !this.#keepAliveAbort) {
+      const why = this.#delayBlock()
+      if (!why) void this.#fireKeepAlive(cfg)
+      else if (why === 'assistant-audio') {
+        this.#delay.silentSince = null // algo tocando: o `playback-idle` recomeça a contagem
+      } else if (why === 'answer-coming') {
+        this.#delay.silentSince = now // a resposta está sintetizando: recomeça (sem laço)
+      } else {
+        this.#delaySkip('KEEPALIVE', why)
+        this.#resetDelay(false, why)
+        return
+      }
+    }
+    this.#scheduleDelay()
+  }
+
+  /** Síntese da frase de demora (request à parte; sem o dep, a síntese de sentença). */
+  #phraseSynth(text: string, signal: AbortSignal): Promise<{ audio: Uint8Array; mime: string }> {
+    return this.#deps.synthPhrase
+      ? this.#deps.synthPhrase(text, signal)
+      : this.#deps.synth(text, signal)
+  }
+
+  /**
+   * Frase "manter viva" devida: sorteia do pool (sem repetir as últimas), sintetiza ao vivo e toca
+   * se, quando ficar pronta, ainda nada da resposta saiu (ou a tool ainda roda) e nada toca.
+   */
+  async #fireKeepAlive(cfg: VoiceDelayPhrases): Promise<void> {
+    const decidedAt = this.#now()
+    this.#delay.keepAlives++
+    this.#delay.lastKeepAliveAt = decidedAt
+    this.#delay.silentSince = null // até tocar (ou falhar — aí a contagem recomeça)
+    const pool = resolveDelayPhrasePools(cfg).keepAlive
+    const idx = pickDelayPhrase(pool, this.#delayRecent.keepalive, () => this.#rng())
+    if (idx == null) return
+    const text = pool[idx]
+    if (this.#resolved().interjections.shadow) {
+      this.#delaySkip('KEEPALIVE', 'shadow', text)
+      this.#delay.silentSince = decidedAt
+      this.#scheduleDelay()
+      return
+    }
+    this.#delayRecent.keepalive = [...this.#delayRecent.keepalive, idx].slice(-DELAY_RECENT_WINDOW)
+    const gen = this.#delayGen
+    const abort = new AbortController()
+    this.#keepAliveAbort = abort
+    // caracteres enviados à síntese (custo da voz da chamada, como as sentenças)
+    if (this.#meter) this.#meter.tts.chars += text.length
+    let r: { audio: Uint8Array; mime: string }
+    try {
+      r = await this.#phraseSynth(text, abort.signal)
+    } catch (e) {
+      if (this.#keepAliveAbort === abort) this.#keepAliveAbort = null
+      if (abort.signal.aborted || gen !== this.#delayGen) return // quem abortou já registrou
+      // frase de demora nunca derruba a chamada: falha = pula (a resposta decide o resto)
+      this.#delaySkip('KEEPALIVE', `tts-error: ${e instanceof Error ? e.message : String(e)}`, text)
+      this.#delay.silentSince = this.#now()
+      this.#scheduleDelay()
+      return
+    }
+    if (this.#keepAliveAbort === abort) this.#keepAliveAbort = null
+    if (abort.signal.aborted || gen !== this.#delayGen) return
+    const why =
+      this.#delayBlock() ??
+      (this.#delay.answerSpoken && !this.#delay.toolsRunning ? 'answer-first' : null)
+    if (why) {
+      this.#delaySkip('KEEPALIVE', why, text)
+      if (why !== 'assistant-audio') this.#delay.silentSince = this.#now()
+      this.#scheduleDelay()
+      return
+    }
+    this.#lastKeepAliveEmittedAt = this.#now()
+    this.#emitDelayUtterance('keepalive', text, r, decidedAt)
+    this.#scheduleDelay()
+  }
+
+  /**
+   * Espera passou de `apologyAfterMs` sem a 1ª frase da resposta: sintetiza a desculpa EM PARALELO
+   * (fica pronta esperando); quem decide se toca é a chegada da 1ª frase (`#onFirstAnswerAudio`).
+   */
+  async #startApology(cfg: VoiceDelayPhrases): Promise<void> {
+    this.#delay.apologyStarted = true
+    const pool = resolveDelayPhrasePools(cfg).apology
+    const idx = pickDelayPhrase(pool, this.#delayRecent.apology, () => this.#rng())
+    if (idx == null) return
+    const text = pool[idx]
+    if (this.#resolved().interjections.shadow) {
+      this.#delaySkip('APOLOGY', 'shadow', text)
+      return
+    }
+    const why = this.#delayBlock()
+    // tocando algo (preâmbulo/"manter viva") não impede a síntese; o resto, sim — e com a resposta
+    // já sintetizando a desculpa chegaria tarde (e disputaria o motor local com ela)
+    if (why && why !== 'assistant-audio') {
+      this.#delaySkip('APOLOGY', why, text)
+      return
+    }
+    this.#delayRecent.apology = [...this.#delayRecent.apology, idx].slice(-DELAY_RECENT_WINDOW)
+    const gen = this.#delayGen
+    const abort = new AbortController()
+    const entry: ApologyEntry = { abort, text, ready: null }
+    this.#apology = entry
+    if (this.#meter) this.#meter.tts.chars += text.length
+    try {
+      const r = await this.#phraseSynth(text, abort.signal)
+      if (abort.signal.aborted || gen !== this.#delayGen || this.#apology !== entry) return
+      entry.ready = r // bytes completos: esperam a 1ª frase o tempo que for
+    } catch (e) {
+      if (abort.signal.aborted || gen !== this.#delayGen || this.#apology !== entry) return
+      this.#apology = null
+      this.#delaySkip('APOLOGY', `tts-error: ${e instanceof Error ? e.message : String(e)}`, text)
+    }
+  }
+
+  /**
+   * A 1ª frase da resposta ficou pronta (vai ser emitida agora): a frase "manter viva" em síntese é
+   * abortada; a desculpa toca ANTES da frase só se já está pronta e nenhuma "manter viva" está
+   * tocando/acabou de sair — senão é descartada (a resposta nunca espera por ela).
+   */
+  #onFirstAnswerAudio(): void {
+    const s = this.#delay
+    s.answerSpoken = true
+    s.silentSince = null
+    const ka = this.#keepAliveAbort
+    this.#keepAliveAbort = null
+    if (ka) {
+      ka.abort('answer-first')
+      this.#delaySkip('KEEPALIVE', 'answer-first')
+    }
+    const ap = this.#apology
+    this.#apology = null
+    if (ap && s.turnStartedAt != null) {
+      const now = this.#now()
+      const skip = apologySkipReason({
+        ready: !!ap.ready,
+        now,
+        keepAlivePlaying: this.#playbackActive && this.#delayPlaying?.kind === 'keepalive',
+        lastKeepAliveEmittedAt: this.#lastKeepAliveEmittedAt,
+        clipPlaying: this.#playbackActive
+      })
+      if (skip || !ap.ready) {
+        if (!ap.ready) ap.abort.abort('not-ready')
+        this.#delaySkip('APOLOGY', skip ?? 'not-ready', ap.text)
+      } else {
+        this.#emitDelayUtterance('apology', ap.text, ap.ready, s.turnStartedAt)
+      }
+    } else if (ap) {
+      ap.abort.abort('reset')
+    }
+    this.#scheduleDelay() // depois da 1ª frase só uma tool rodando reabre o "manter viva"
+  }
+
+  /** Emite a frase de demora na fila de utterances (kind `delay` — clipe: fora do histórico). */
+  #emitDelayUtterance(
+    kind: 'keepalive' | 'apology',
+    text: string,
+    r: { audio: Uint8Array; mime: string },
+    since: number
+  ): void {
+    const cls = kind === 'keepalive' ? 'KEEPALIVE' : 'APOLOGY'
+    this.#uttSeq++
+    const id = `u${this.#uttSeq}`
+    this.#delayPlaying = { id, kind }
+    this.#playbackActive = true
+    this.#filler.usedThisTurn = true // o momento do preâmbulo passou (nunca depois de uma destas)
+    this.#deps.emitUtterance({ id, audio: r.audio, mime: r.mime, kind: 'delay' })
+    const now = this.#now()
+    const short = text.slice(0, EVAL_TAIL_MAX_CHARS)
+    this.#emitTimeline({
+      ts: now,
+      kind: 'decision',
+      class: cls,
+      id,
+      played: true,
+      latencyMs: Math.max(0, now - since),
+      text: short,
+      reason: kind === 'keepalive' ? 'waiting' : 'late-answer'
+    })
+    this.#emitTimeline({ ts: now, kind: 'clip-emitted', class: cls, id, text: short })
+  }
+
   // ---------------- histórico e custos (marcadores, meta.voice) ----------------
 
   /**
@@ -1461,7 +1885,7 @@ export class VoiceCallManager {
   /** `meta.voice` da próxima mensagem do usuário (consome o acumulado das falas). */
   #takeSpeechMeta(): VoiceMessageMeta {
     const acc = this.#speechAcc
-    this.#speechAcc = { audioMs: 0 }
+    this.#speechAcc = { audioMs: 0, voicedMs: null }
     const v: VoiceMessageMeta = { source: 'call' }
     if (this.#meter) v.callId = this.#meter.callId
     if (acc.audioMs > 0) v.durationMs = Math.round(acc.audioMs)
@@ -1513,7 +1937,7 @@ export class VoiceCallManager {
       tts: { backend: ttsBackend, ...(ttsModel ? { model: ttsModel } : {}), chars: 0, audioMs: 0 }
     }
     this.#lastTranscript = null
-    this.#speechAcc = { audioMs: 0 }
+    this.#speechAcc = { audioMs: 0, voicedMs: null }
     this.#endCallIds = new Set()
     const mark: VoiceCallMark = { callId, phase: 'start', startedAt }
     this.#writeMarker(sessionId, CALL_START_TEXT, mark)
@@ -1635,6 +2059,7 @@ export class VoiceCallManager {
       reason = null
     }
     this.#hangup = { reason, timer: null }
+    this.#resetDelay(false, 'hangup') // despedida: nada de "só mais um instante" depois dela
     this.#emitTimeline({ ts: this.#now(), kind: 'hangup-armed', ...(reason ? { reason } : {}) })
     this.#checkHangup()
   }

@@ -155,7 +155,7 @@ import {
   releaseSttModel,
   sttEngineUnavailableReason
 } from './voice/sttLocal'
-import { synthesize, synthesizeStream, TTS_TEST_PHRASE } from './voice/tts'
+import { synthesize, synthesizeBlock, synthesizeStream, TTS_TEST_PHRASE } from './voice/tts'
 import { TtsStreamRelay } from './voice/ttsStreamRelay'
 import { classifyVoiceError, voiceProviderLabel } from './voice/callErrors'
 import { ElevenLabsCallTts, elevenLabsCallOptions } from './voice/elevenlabsStream'
@@ -456,8 +456,8 @@ export function registerIpc(): void {
   const evalLogger = createEvalLogger(app.getPath('userData'), (e) =>
     console.log('[clearchat] voice-eval:', e)
   )
-  // custos/tempos da chamada: áudio de RESPOSTA gerado (frases; clipes pré-gerados não contam) —
-  // PCM em streaming pela taxa da utterance, WAV pelo cabeçalho
+  // custos/tempos da chamada: áudio GERADO na chamada (frases da resposta e frases de demora —
+  // clipes pré-gerados não contam) — PCM em streaming pela taxa da utterance, WAV pelo cabeçalho
   const pcmRates = new Map<string, number>()
   const meterUtterance = (u: {
     id: string
@@ -465,7 +465,8 @@ export function registerIpc(): void {
     mime: string
     kind?: string
   }): void => {
-    if (!voiceCallsRef?.state().active || (u.kind && u.kind !== 'sentence')) return
+    if (!voiceCallsRef?.state().active || (u.kind && u.kind !== 'sentence' && u.kind !== 'delay'))
+      return
     const ms = audioDurationMs(u.audio, u.mime)
     if (ms) voiceCallsRef.noteTtsAudio(ms)
     const rate = /^audio\/pcm/i.test(u.mime) ? Number(/rate=(\d+)/i.exec(u.mime)?.[1] ?? 24_000) : 0
@@ -542,6 +543,13 @@ export function registerIpc(): void {
               { text, settings: getVoiceSettings().tts },
               { local: ttsLocalEngine(), signal: s }
             )
+      ),
+    // frases de demora ("Só mais um instante…", "Desculpe a demora…"): mesma voz/backend, request à
+    // parte com os bytes completos — a ElevenLabs vai pelo REST, nunca no contexto WS da resposta
+    synthPhrase: (text, signal) =>
+      synthesizeBlock(
+        { text, settings: getVoiceSettings().tts },
+        { local: ttsLocalEngine(), signal }
       ),
     ttsFeed: () => (elevenOpts() ? elevenCall : null),
     emitState: (state) => sendToWindows(VOICE_CALL_STATE_CHANNEL, state),
@@ -1405,8 +1413,11 @@ export function registerIpc(): void {
       return voiceCalls.speechBegin({ dropped })
     },
     [IPC.voice.callSpeechEnd]: () => voiceCalls.speechEnd(),
-    [IPC.voice.callTurn]: (input: { text: string }) =>
-      voiceCalls.turn(input && typeof input.text === 'string' ? input.text : ''),
+    [IPC.voice.callTurn]: (input: { text: string; speechMs?: unknown }) =>
+      voiceCalls.turn(input && typeof input.text === 'string' ? input.text : '', {
+        // tempo com VOZ da fala (renderer — `VoicedSpan`): o preâmbulo compara com a "Fala mínima"
+        speechMs: typeof input?.speechMs === 'number' ? input.speechMs : null
+      }),
     [IPC.voice.callPlaybackIdle]: () => voiceCalls.playbackIdle(),
     [IPC.voice.callBargeIn]: (input?: { playedIds?: unknown }) => {
       ttsRelay.abortAll() // o renderer já descartou a fila: os downloads em curso param

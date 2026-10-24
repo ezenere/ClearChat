@@ -413,6 +413,60 @@ export interface VoiceFillerDefaults extends VoiceFillers {
 /** Espera padrão do preâmbulo depois do turno enviado (ms). */
 export const DEFAULT_FILLER_DELAY_MS = 250
 
+/**
+ * Frases de demora da chamada (`voiceCallDefaults.delayPhrases`, global): sintetizadas AO VIVO pela
+ * mesma voz da chamada (sem clipes pré-gerados) quando a resposta demora. Duas situações:
+ * - **manter viva** (`keepAlivePool`): depois do preâmbulo, sem áudio da resposta por
+ *   `keepAliveAfterMs` de silêncio → "Só mais um instante…" (no máx. 2 por turno, 1 a cada ~6 s);
+ * - **desculpa** (`apologyPool`): a 1ª frase da resposta ficou pronta depois de `apologyAfterMs`
+ *   desde o turno → "Desculpe a demora, vamos lá." antes dela (sintetizada em paralelo; só toca se
+ *   ficou pronta antes da resposta — nunca atrasa a síntese da resposta).
+ * Não entram no histórico (como os preâmbulos); os caracteres contam no custo da voz da chamada.
+ */
+export interface VoiceDelayPhrases {
+  /** Liga as frases de demora (padrão true). */
+  enabled: boolean
+  /** Silêncio (ms) esperando a resposta antes de uma frase "manter viva" (padrão 3000). */
+  keepAliveAfterMs: number
+  /** Espera (ms) desde o turno acima da qual a resposta ganha uma desculpa antes (padrão 5000). */
+  apologyAfterMs: number
+  /** Frases "manter viva"; null = `DEFAULT_KEEPALIVE_POOL`. */
+  keepAlivePool: string[] | null
+  /** Frases de desculpa; null = `DEFAULT_APOLOGY_POOL`. */
+  apologyPool: string[] | null
+}
+
+/** Frases "manter viva" padrão (curtas, ~1 s — enquanto a resposta não sai). */
+export const DEFAULT_KEEPALIVE_POOL: readonly string[] = [
+  'Só mais um instante…',
+  'Tô quase lá…',
+  'Deixa eu terminar de ver isso…',
+  'Já te respondo…'
+]
+
+/** Frases de desculpa padrão (antes da 1ª frase de uma resposta que demorou). */
+export const DEFAULT_APOLOGY_POOL: readonly string[] = [
+  'Desculpe a demora, vamos lá.',
+  'Pronto, desculpa a espera.',
+  'Foi mal a demora, olha só…'
+]
+
+/** Máximo de frases por pool de demora. */
+export const DELAY_PHRASE_POOL_MAX = 12
+/** Tamanho máximo de uma frase de demora (chars). */
+export const DELAY_PHRASE_MAX_CHARS = 80
+
+export const DEFAULT_DELAY_PHRASES: VoiceDelayPhrases = {
+  enabled: true,
+  keepAliveAfterMs: 3000,
+  apologyAfterMs: 5000,
+  keepAlivePool: null,
+  apologyPool: null
+}
+
+/** Limites dos tempos das frases de demora (ms) — fora deles o valor é preso no limite. */
+export const DELAY_PHRASE_MS_RANGE = { min: 1000, max: 60_000 } as const
+
 /** Modelo próprio da chamada de voz (null = herda o modelo do chat). */
 export interface VoiceCallModelConfig {
   /** Provedor (id de `providers`). */
@@ -498,6 +552,11 @@ export interface VoiceCallDefaults {
   basePrompt: string | null
   /** "O agente pode encerrar a chamada" (tool `end_call` nos turnos da chamada; padrão true). */
   endCall: boolean
+  /**
+   * Frases de demora sintetizadas ao vivo ("Só mais um instante…", "Desculpe a demora, vamos
+   * lá.") — ver `VoiceDelayPhrases`. Aditivo (ausente no registro = os padrões).
+   */
+  delayPhrases: VoiceDelayPhrases
 }
 
 /**
@@ -568,7 +627,8 @@ export const DEFAULT_VOICE_CALL_DEFAULTS: VoiceCallDefaults = {
   model: null,
   basePromptEnabled: true,
   basePrompt: null,
-  endCall: true
+  endCall: true,
+  delayPhrases: { ...DEFAULT_DELAY_PHRASES }
 }
 
 /** Config "vazia": tudo null = herda os padrões globais (`voiceCallDefaults`) e o próprio chat. */
@@ -881,7 +941,55 @@ export function normalizeVoiceCallDefaults(v: unknown): VoiceCallDefaults {
     model: normalizeVoiceCallModel(src?.model),
     basePromptEnabled: boolOr(src?.basePromptEnabled, d.basePromptEnabled),
     basePrompt: promptOrNull(src?.basePrompt),
-    endCall: boolOr(src?.endCall, d.endCall)
+    endCall: boolOr(src?.endCall, d.endCall),
+    delayPhrases: normalizeDelayPhrases(src?.delayPhrases)
+  }
+}
+
+/** Pool de frases de demora: textos aparados (≤ 80 chars, sem duplicatas, máx. 12); vazio/lixo → null. */
+export function normalizeDelayPhrasePool(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null
+  const out: string[] = []
+  for (const item of v) {
+    const text =
+      typeof item === 'string'
+        ? item.replace(/\s+/g, ' ').trim().slice(0, DELAY_PHRASE_MAX_CHARS).trim()
+        : ''
+    if (!text || out.includes(text)) continue
+    out.push(text)
+    if (out.length >= DELAY_PHRASE_POOL_MAX) break
+  }
+  return out.length ? out : null
+}
+
+/** Frases de demora completas (ausente/lixo → `DEFAULT_DELAY_PHRASES`; tempos presos em 1–60 s). */
+export function normalizeDelayPhrases(v: unknown): VoiceDelayPhrases {
+  const src = asObject(v)
+  const d = DEFAULT_DELAY_PHRASES
+  const ms = (x: unknown, def: number): number => {
+    const n = typeof x === 'number' && Number.isFinite(x) ? Math.round(x) : NaN
+    if (Number.isNaN(n) || n <= 0) return def
+    return Math.min(DELAY_PHRASE_MS_RANGE.max, Math.max(DELAY_PHRASE_MS_RANGE.min, n))
+  }
+  return {
+    enabled: boolOr(src?.enabled, d.enabled),
+    keepAliveAfterMs: ms(src?.keepAliveAfterMs, d.keepAliveAfterMs),
+    apologyAfterMs: ms(src?.apologyAfterMs, d.apologyAfterMs),
+    keepAlivePool: normalizeDelayPhrasePool(src?.keepAlivePool),
+    apologyPool: normalizeDelayPhrasePool(src?.apologyPool)
+  }
+}
+
+/** Pools efetivos das frases de demora (null → os padrões). */
+export function resolveDelayPhrasePools(
+  p: Pick<VoiceDelayPhrases, 'keepAlivePool' | 'apologyPool'>
+): {
+  keepAlive: string[]
+  apology: string[]
+} {
+  return {
+    keepAlive: normalizeDelayPhrasePool(p.keepAlivePool) ?? [...DEFAULT_KEEPALIVE_POOL],
+    apology: normalizeDelayPhrasePool(p.apologyPool) ?? [...DEFAULT_APOLOGY_POOL]
   }
 }
 

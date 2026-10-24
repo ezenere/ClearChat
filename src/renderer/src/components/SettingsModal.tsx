@@ -5,7 +5,7 @@ import { defaultModelRef } from '@shared/models'
 import { inferProviderKind, PROVIDER_KIND_LABEL, providerKind } from '@shared/providerKinds'
 import type { Provider } from '@shared/types'
 import { api, errorMessage } from '../lib/api'
-import { cn, shortPath } from '../lib/format'
+import { shortPath } from '../lib/format'
 import { useStore, type SettingsTab } from '../store'
 import { PresetEditor, PresetsList } from './presets/PresetsSettings'
 import { PresetIcon } from './presets/PresetIcon'
@@ -26,6 +26,8 @@ import { AccountSettings } from './sync/AccountSettings'
 import { VersionFooter } from './UpdateNotice'
 import { AutoTitleSettings } from './AutoTitleSettings'
 import { AudioSettings } from './voice/AudioSettings'
+import { SettingsNav } from './SettingsNav'
+import { settingsNavItem } from '../lib/settingsNav'
 
 function toDraft(p?: Provider): ProviderDraft {
   return p
@@ -304,14 +306,14 @@ export function SettingsModal(): React.JSX.Element {
   const open = useStore((s) => s.settingsOpen)
   const setOpen = useStore((s) => s.setSettingsOpen)
   const tab = useStore((s) => s.settingsTab)
-  const providers = useStore((s) => s.providers)
-  const presets = useStore((s) => s.presets)
   const [editing, setEditing] = useState<string | 'new' | null>(null)
   const [editingPreset, setEditingPreset] = useState<string | 'new' | null>(null)
   const setTab = (t: SettingsTab): void => {
     setOpen(true, t)
     setEditingPreset(null)
   }
+
+  const item = settingsNavItem(tab)
 
   return (
     <Modal
@@ -322,42 +324,61 @@ export function SettingsModal(): React.JSX.Element {
         setEditingPreset(null)
       }}
       title="Configurações"
-      footer={<VersionFooter />}
-      width={
-        (tab === 'presets' && editingPreset) || tab === 'memory' || tab === 'skills' ? 720 : 680
-      }
+      width={1040}
+      height="min(800px, 84vh)"
+      bare
+      bodyClassName="border-t border-border"
     >
-      {/* 9 abas cabem numa linha no modal de 680 px (sem barra de rolagem); janela estreita quebra a
-          linha em vez de cortar o rótulo */}
-      <div data-testid="settings-tabs" className="mb-5 flex flex-wrap border-b border-border">
-        {(
-          [
-            ['account', 'Conta'],
-            ['providers', 'Provedores'],
-            ['presets', 'Personas'],
-            ['defaults', 'Novos chats'],
-            ['approvals', 'Aprovações'],
-            ['memory', 'Memórias'],
-            ['skills', 'Skills'],
-            ['web', 'Pesquisa na web'],
-            ['audio', 'Áudio']
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            aria-current={tab === id ? 'page' : undefined}
-            onClick={() => setTab(id)}
-            className={cn(
-              '-mb-px shrink-0 border-b-2 px-[5px] pb-2 text-[12.5px] whitespace-nowrap transition-colors',
-              tab === id ? 'border-accent text-fg' : 'border-transparent text-subtle hover:text-fg'
-            )}
+      <SettingsNav tab={tab} onSelect={setTab} panelId="settings-panel" />
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div
+          key={tab}
+          id="settings-panel"
+          role="region"
+          aria-labelledby="settings-panel-title"
+          data-testid="settings-content"
+          data-tab={tab}
+          className="min-h-0 flex-1 overflow-y-auto px-5 pt-4 pb-5"
+        >
+          <h3
+            id="settings-panel-title"
+            className="mb-3 text-[15px] font-semibold tracking-tight text-fg"
           >
-            {label}
-          </button>
-        ))}
+            {item.label}
+          </h3>
+          <SettingsPanel
+            tab={tab}
+            editing={editing}
+            setEditing={setEditing}
+            editingPreset={editingPreset}
+            setEditingPreset={setEditingPreset}
+          />
+        </div>
+        <div className="flex shrink-0 items-center gap-2 border-t border-border bg-bg/30 px-5 py-3">
+          <VersionFooter />
+        </div>
       </div>
+    </Modal>
+  )
+}
 
+function SettingsPanel({
+  tab,
+  editing,
+  setEditing,
+  editingPreset,
+  setEditingPreset
+}: {
+  tab: SettingsTab
+  editing: string | 'new' | null
+  setEditing: (v: string | 'new' | null) => void
+  editingPreset: string | 'new' | null
+  setEditingPreset: (v: string | 'new' | null) => void
+}): React.JSX.Element {
+  const providers = useStore((s) => s.providers)
+  const presets = useStore((s) => s.presets)
+  return (
+    <>
       {tab === 'account' ? (
         <AccountSettings />
       ) : tab === 'providers' ? (
@@ -408,6 +429,6 @@ export function SettingsModal(): React.JSX.Element {
       ) : (
         <DefaultsSection />
       )}
-    </Modal>
+    </>
   )
 }

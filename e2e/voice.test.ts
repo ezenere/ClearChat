@@ -286,7 +286,15 @@ test('voiceCallDefaults: parcial completa com os padrões; nested normalizado', 
     model: null,
     basePromptEnabled: true,
     basePrompt: null,
-    endCall: true
+    endCall: true,
+    // frases de demora (aditivo): ausente = os padrões
+    delayPhrases: {
+      enabled: true,
+      keepAliveAfterMs: 3000,
+      apologyAfterMs: 5000,
+      keepAlivePool: null,
+      apologyPool: null
+    }
   })
   assert.deepEqual(normalizeVoiceCallDefaults({ fillers: null }), DEFAULT_VOICE_CALL_DEFAULTS)
   // "O agente pode encerrar a chamada": false explícito vale; lixo → padrão (ligado)

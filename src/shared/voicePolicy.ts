@@ -145,7 +145,12 @@ export function pickFillerPhrase(
     const cs = pool[i].contexts.length ? pool[i].contexts : (['generic'] as FillerContext[])
     return cs.includes(c)
   }
-  const all = pool.map((_, i) => i)
+  // frase SÓ de pergunta ("Boa pergunta, deixa eu pensar.") nunca sai sem uma pergunta na
+  // transcrição — nem como último recurso
+  const questionOnly = (i: number): boolean =>
+    pool[i].contexts.length > 0 && pool[i].contexts.every((c) => c === 'question')
+  const all = pool.map((_, i) => i).filter((i) => ctx === 'question' || !questionOnly(i))
+  if (!all.length) return null
   const fresh = (xs: number[]): number[] => xs.filter((i) => !window.includes(i))
   let cands = fresh(all.filter((i) => fits(i, ctx)))
   if (!cands.length && ctx !== 'generic') cands = fresh(all.filter((i) => fits(i, 'generic')))
@@ -169,6 +174,179 @@ export function pickFillerPhrase(
 export function fillerTooShort(text: string): boolean {
   const t = String(text ?? '').trim()
   return wordCount(t) < FILLER_MIN_WORDS && !isQuestionLike(t)
+}
+
+/**
+ * A fala teve menos VOZ que o mínimo configurado (`interjections.minSpeechMs` — "Fala mínima",
+ * que vale para interjeições E para o preâmbulo)? `voicedMs` = tempo com voz da fala (do 1º ao
+ * último quadro acima do limiar — `VoicedSpan.spanMs`), SEM o silêncio antes/depois nem a espera
+ * do fim de turno; null = desconhecido (mensagem digitada, renderer antigo) → não barra.
+ */
+export function fillerBelowMinSpeech(
+  voicedMs: number | null | undefined,
+  minSpeechMs: number
+): boolean {
+  if (typeof voicedMs !== 'number' || !Number.isFinite(voicedMs)) return false
+  const min = Number.isFinite(minSpeechMs) && minSpeechMs > 0 ? minSpeechMs : 0
+  return voicedMs < min
+}
+
+/**
+ * Tempo com VOZ de uma fala (renderer — quadros RMS da captura): `spanMs` = do início do 1º quadro
+ * acima do limiar ao fim do último (as pausas internas contam — é a duração da fala), sem o
+ * silêncio antes do 1º nem depois do último quadro com voz (o silêncio que fecha o turno, a espera
+ * do veredito/da transcrição); `voicedMs` = só os quadros com voz.
+ */
+export class VoicedSpan {
+  #elapsed = 0
+  #first: number | null = null
+  #lastEnd = 0
+  #voiced = 0
+
+  /** Duração da fala (1º → último quadro com voz, ms; 0 sem voz). */
+  get spanMs(): number {
+    return this.#first == null ? 0 : Math.max(0, this.#lastEnd - this.#first)
+  }
+
+  /** Soma dos quadros com voz (ms). */
+  get voicedMs(): number {
+    return this.#voiced
+  }
+
+  push(rms: number, frameMs: number, threshold: number): void {
+    const dt = Number.isFinite(frameMs) && frameMs > 0 ? frameMs : 0
+    if (rms >= threshold) {
+      if (this.#first == null) this.#first = this.#elapsed
+      this.#voiced += dt
+      this.#lastEnd = this.#elapsed + dt
+    }
+    this.#elapsed += dt
+  }
+
+  reset(): void {
+    this.#elapsed = 0
+    this.#first = null
+    this.#lastEnd = 0
+    this.#voiced = 0
+  }
+}
+
+// ---------------- frases de demora (sintetizadas ao vivo — SPEC → "Frases de demora") ----------------
+
+/** No máximo N frases "manter viva" por turno. */
+export const KEEPALIVE_MAX_PER_TURN = 2
+/** Intervalo mínimo entre duas frases "manter viva" (ms, entre as decisões). */
+export const KEEPALIVE_COOLDOWN_MS = 6000
+/**
+ * A desculpa NÃO toca quando uma frase "manter viva" saiu há menos que isto (ms) — o usuário acabou
+ * de ouvir "só mais um instante"; emendar "desculpe a demora" soaria repetitivo.
+ */
+export const APOLOGY_AFTER_KEEPALIVE_MS = 4000
+/** Frase de demora não repete nenhuma das últimas N do mesmo pool (limitado a pool − 1). */
+export const DELAY_RECENT_WINDOW = 2
+
+/** Estado das frases de demora no turno em andamento (o `VoiceCallManager` guarda). */
+export interface DelayPhraseState {
+  /** Turno disparado em (ms); null = desarmado (sem turno esperando resposta). */
+  turnStartedAt: number | null
+  /** Desde quando nada toca esperando a resposta (ms); null = algo audível agora. */
+  silentSince: number | null
+  /** Frases "manter viva" decididas neste turno. */
+  keepAlives: number
+  /** Última decisão de "manter viva" (ms) — o cooldown conta daqui. */
+  lastKeepAliveAt: number | null
+  /** A 1ª frase da resposta já ficou pronta (a desculpa não sai mais). */
+  answerSpoken: boolean
+  /** Há tool em execução agora (depois da 1ª frase, só aí volta a "manter viva"). */
+  toolsRunning: boolean
+  /** A síntese da desculpa já foi pedida neste turno. */
+  apologyStarted: boolean
+}
+
+export const EMPTY_DELAY_STATE: DelayPhraseState = {
+  turnStartedAt: null,
+  silentSince: null,
+  keepAlives: 0,
+  lastKeepAliveAt: null,
+  answerSpoken: false,
+  toolsRunning: false,
+  apologyStarted: false
+}
+
+/**
+ * Momento (ms) em que a próxima frase "manter viva" fica devida; null = nenhuma neste turno (ou
+ * enquanto algo toca). Regras: silêncio ≥ `keepAliveAfterMs` esperando a resposta — antes da 1ª
+ * frase dela, ou depois dela só com tool rodando —, no máx. `KEEPALIVE_MAX_PER_TURN` por turno e
+ * `KEEPALIVE_COOLDOWN_MS` entre elas.
+ */
+export function keepAliveDueAt(
+  s: DelayPhraseState,
+  cfg: { enabled: boolean; keepAliveAfterMs: number }
+): number | null {
+  if (!cfg.enabled || s.turnStartedAt == null || s.silentSince == null) return null
+  if (s.keepAlives >= KEEPALIVE_MAX_PER_TURN) return null
+  if (s.answerSpoken && !s.toolsRunning) return null
+  let due = s.silentSince + Math.max(0, cfg.keepAliveAfterMs)
+  if (s.lastKeepAliveAt != null) due = Math.max(due, s.lastKeepAliveAt + KEEPALIVE_COOLDOWN_MS)
+  return due
+}
+
+/** Momento (ms) em que a síntese da desculpa começa; null = não neste turno. */
+export function apologyDueAt(
+  s: DelayPhraseState,
+  cfg: { enabled: boolean; apologyAfterMs: number }
+): number | null {
+  if (!cfg.enabled || s.turnStartedAt == null || s.answerSpoken || s.apologyStarted) return null
+  return s.turnStartedAt + Math.max(0, cfg.apologyAfterMs)
+}
+
+/** Por que a desculpa pronta NÃO toca antes da 1ª frase (null = toca). */
+export type ApologySkip = 'not-ready' | 'keepalive-playing' | 'keepalive-recent' | 'clip-playing'
+
+/**
+ * A desculpa toca antes da 1ª frase da resposta? Só pronta (nunca se espera a síntese dela), sem
+ * frase "manter viva" tocando ou recente (`APOLOGY_AFTER_KEEPALIVE_MS`) e sem outro clipe tocando
+ * (a resposta já vai esperar ele terminar).
+ */
+export function apologySkipReason(input: {
+  ready: boolean
+  now: number
+  keepAlivePlaying: boolean
+  lastKeepAliveEmittedAt: number | null
+  clipPlaying: boolean
+}): ApologySkip | null {
+  if (!input.ready) return 'not-ready'
+  if (input.keepAlivePlaying) return 'keepalive-playing'
+  if (
+    input.lastKeepAliveEmittedAt != null &&
+    input.now - input.lastKeepAliveEmittedAt < APOLOGY_AFTER_KEEPALIVE_MS
+  )
+    return 'keepalive-recent'
+  if (input.clipPlaying) return 'clip-playing'
+  return null
+}
+
+/**
+ * Sorteia uma frase do pool (índice) sem repetir as últimas `DELAY_RECENT_WINDOW` (limitado a
+ * pool − 1, para sempre sobrar candidata); pool vazio → null.
+ */
+export function pickDelayPhrase(
+  pool: readonly string[],
+  recent: readonly number[],
+  rng: () => number = Math.random
+): number | null {
+  if (!pool.length) return null
+  const n = Math.min(DELAY_RECENT_WINDOW, pool.length - 1)
+  const window = n > 0 ? recent.slice(-n) : [] // slice(-0) devolveria tudo
+  const cands = pool.map((_, i) => i).filter((i) => !window.includes(i))
+  const list = cands.length ? cands : pool.map((_, i) => i)
+  let r = typeof rng === 'function' ? Number(rng()) : NaN
+  if (!Number.isFinite(r)) r = Math.random()
+  const k = Math.min(
+    list.length - 1,
+    Math.floor(Math.min(Math.max(r, 0), 0.999999999) * list.length)
+  )
+  return list[k]
 }
 
 // ---------------- variantes de clipe ----------------

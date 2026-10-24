@@ -36,7 +36,8 @@ import {
   INTERJECTION_MAX_AGE_MS,
   INTERJECTION_TAIL_CHARS,
   InterjectionWatcher,
-  PlaybackHold
+  PlaybackHold,
+  VoicedSpan
 } from '@shared/voicePolicy'
 import { AdaptiveTurnGate, classifyUtteranceEnd, type UtteranceEnd } from '@shared/voiceTurn'
 import { DEFAULT_SILENCE_THRESHOLD } from '../audio/silence'
@@ -125,6 +126,11 @@ export function useVoiceCall(): void {
   const policyRef = useRef<InterjectionPolicy>(DEFAULT_INTERJECTION_POLICY)
   /** Detector de pausas na fala do usuário (observações → política de interjeições no main). */
   const watcherRef = useRef<InterjectionWatcher | null>(null)
+  /**
+   * Tempo com VOZ da fala atual (1º → último quadro acima do limiar): vai com o turno e é o que o
+   * preâmbulo compara com a "Fala mínima" — o silêncio que fecha o turno e a espera não contam.
+   */
+  const voicedRef = useRef(new VoicedSpan())
   /** Fala do usuário durante a reprodução: backchannel (curta) × barge-in (longa). */
   const holdRef = useRef<PlaybackHold | null>(null)
   /** Cauda da transcrição parcial ao vivo DA FALA ATUAL (escolhe a classe da interjeição). */
@@ -179,7 +185,7 @@ export function useVoiceCall(): void {
    * Fim da fala: `speech-end` + transcrição final → `voice:call:turn` (texto pode ser vazio).
    * `reuseSpeculative`: o usuário não falou depois da última especulação — ela vira a final.
    */
-  const endUtterance = useCallback((reuseSpeculative = false): void => {
+  const endUtterance = useCallback((reuseSpeculative = false, speechMs?: number): void => {
     void api.voice?.call.speechEnd().catch(() => {})
     chainRef.current = chainRef.current
       .then(async () => {
@@ -198,7 +204,10 @@ export function useVoiceCall(): void {
           const result = await v.transcribe.stop(id, { reuseSpeculative, reusePartial: true })
           // a barra mostra o texto que foi enviado (até a próxima fala)
           setLive(result.text, 'final')
-          await v.call.turn({ text: result.text })
+          await v.call.turn({
+            text: result.text,
+            ...(typeof speechMs === 'number' ? { speechMs: Math.round(speechMs) } : {})
+          })
         } catch (err) {
           setError(errorMessage(err))
           await v.call.turn({ text: '' }).catch(() => {})
@@ -283,10 +292,12 @@ export function useVoiceCall(): void {
             ? 'o preâmbulo'
             : item.kind === 'interjection'
               ? 'a interjeição'
-              : 'uma frase da resposta'
-        // clipe (preâmbulo/interjeição) não é essencial: pula com o registro no painel; frase da
-        // resposta que não toca encerra a chamada (nunca uma resposta muda)
-        if (item.kind === 'filler' || item.kind === 'interjection') {
+              : item.kind === 'delay'
+                ? 'a frase de demora'
+                : 'uma frase da resposta'
+        // clipe (preâmbulo/interjeição/frase de demora) não é essencial: pula com o registro no
+        // painel; frase da resposta que não toca encerra a chamada (nunca uma resposta muda)
+        if (item.kind === 'filler' || item.kind === 'interjection' || item.kind === 'delay') {
           setError(`Não foi possível tocar ${what}: ${reason}`)
           return
         }
@@ -425,9 +436,10 @@ export function useVoiceCall(): void {
         // a especulação pedida nesta pausa cobre toda a fala (o usuário não voltou a falar): ela
         // vira a final — MESMO ainda em voo (especulação pela API é lenta: o turno fecha no
         // silêncio fixo e a final espera a especulação em vez de subir o áudio de novo)
-        endUtterance(askedSeq === gate.specSeq && askedSeq > 0)
+        endUtterance(askedSeq === gate.specSeq && askedSeq > 0, voicedRef.current.spanMs)
       }
       watcherRef.current?.reset()
+      voicedRef.current.reset()
     }
 
     /** Pausa cruzou ~250 ms: transcrição especulativa (na ordem dos pushes) → veredito. */
@@ -480,6 +492,11 @@ export function useVoiceCall(): void {
     const onLevel = (rms: number): void => {
       setLevel(rms)
       const ev = gate.push(rms, FRAME_MS)
+      // tempo com voz da fala: zera no início dela e mede só enquanto ela está aberta (o silêncio
+      // do fim fica de fora — o span termina no último quadro com voz)
+      if (ev === 'start') voicedRef.current.reset()
+      if (ev === 'start' || speakingRef.current)
+        voicedRef.current.push(rms, FRAME_MS, DEFAULT_SILENCE_THRESHOLD)
       if (rms >= DEFAULT_SILENCE_THRESHOLD) {
         // o usuário (voltou a) falar: interjeição tocando sai na hora (sem sobrepor a fala dele)
         const queue = queueRef.current

@@ -8,8 +8,8 @@
 // no meio), botões de parar distintos com o agente ocupado, chamada de voz (falha visível em toast,
 // pré-checagem, barra da chamada NO LUGAR do composer em 1440/1100/900 com e sem painel — sem
 // textarea, rascunho intacto ao encerrar, pílula "Chamada ativa em…" nos outros chats, aprovações e
-// pergunta clicáveis acima da barra —, CTA de clipes ausentes, botão some com a chamada desligada) e Configurações (abas cabem sem
-// rolagem; Esc na captura da tecla do PTT não fecha o modal; tecla que digita é recusada).
+// pergunta clicáveis acima da barra —, CTA de clipes ausentes, botão some com a chamada desligada) e Configurações (barra lateral de abas sem
+// cortes; Esc na captura da tecla do PTT não fecha o modal; tecla que digita é recusada).
 // Cenários do mock: `?scenario=voice-mic-missing|voice-mic-denied|voice-mic-lost|voice-call-fail|
 // voice-not-ready|voice-no-espeak` (ver `dev/mockApi.ts` → binding `voice`). Screenshots em $CLEARCHAT_E2E_DIR/shots.
 //
@@ -680,40 +680,53 @@ app.on('window-all-closed', () => app.quit())
 
   // ---------------- Configurações → Áudio ----------------
 
-  await step('Configurações: abas cabem numa linha sem rolagem (1440 e 1100)', async () => {
-    const out: string[] = []
-    for (const [w, h] of [
-      [1440, 860],
-      [1100, 800]
-    ] as const) {
-      await setSize(w, h)
-      await openAudioSettings()
-      const g = await page.getByTestId('settings-tabs').evaluate((el) => {
-        const box = el.getBoundingClientRect()
-        const btns = [...el.querySelectorAll('button')].map((b) => b.getBoundingClientRect())
-        return {
-          scroll: el.scrollWidth > el.clientWidth + 1,
-          rows: new Set(btns.map((b) => Math.round(b.top))).size,
-          outside: btns.filter((b) => b.right > box.right + 1 || b.left < box.left - 1).length,
-          labels: [...el.querySelectorAll('button')].map((b) => b.textContent)
+  await step(
+    'Configurações: barra lateral de abas sem cortes nem rolagem (1440 e 1100)',
+    async () => {
+      const out: string[] = []
+      for (const [w, h] of [
+        [1440, 860],
+        [1100, 800]
+      ] as const) {
+        await setSize(w, h)
+        await openAudioSettings()
+        const g = await page.getByTestId('settings-nav').evaluate((el) => {
+          const box = el.getBoundingClientRect()
+          const btns = [...el.querySelectorAll('button')]
+          return {
+            scroll: el.scrollWidth > el.clientWidth + 1,
+            outside: btns.filter((b) => {
+              const r = b.getBoundingClientRect()
+              return r.right > box.right + 1 || r.left < box.left - 1
+            }).length,
+            // rótulo inteiro (sem reticências)
+            cut: btns.filter((b) =>
+              [...b.querySelectorAll('span')].some((s) => s.scrollWidth > s.clientWidth + 1)
+            ).length,
+            labels: btns.map((b) => b.getAttribute('aria-label')),
+            active: btns
+              .filter((b) => b.getAttribute('aria-current') === 'page')
+              .map((b) => b.getAttribute('aria-label'))
+          }
+        })
+        assert(!g.scroll, `rolagem horizontal em ${w}`)
+        assert.equal(g.outside, 0, `aba cortada em ${w}`)
+        assert.equal(g.cut, 0, `rótulo com reticências em ${w}`)
+        assert(g.labels.includes('Áudio'), 'rótulo "Áudio"')
+        assert.deepEqual(g.active, ['Áudio'])
+        if (w === 1440) {
+          await page
+            .getByTestId('settings-sidebar')
+            .screenshot({ path: join(SHOTS, 'after-tabbar.png') })
+          await shot('after-settings-audio')
         }
-      })
-      assert(!g.scroll, `rolagem horizontal em ${w}`)
-      assert.equal(g.rows, 1, `abas em ${g.rows} linhas em ${w}`)
-      assert.equal(g.outside, 0, `aba cortada em ${w}`)
-      assert(g.labels.includes('Áudio'), 'rótulo "Áudio" inteiro')
-      if (w === 1440) {
-        await page
-          .getByTestId('settings-tabs')
-          .screenshot({ path: join(SHOTS, 'after-tabbar.png') })
-        await shot('after-settings-audio')
+        await page.keyboard.press('Escape')
+        await dialog().waitFor({ state: 'detached' })
+        out.push(`${w}: ${g.labels.length} abas`)
       }
-      await page.keyboard.press('Escape')
-      await dialog().waitFor({ state: 'detached' })
-      out.push(`${w}: 1 linha`)
+      return out.join(' · ')
     }
-    return out.join(' · ')
-  })
+  )
 
   await step(
     'Configurações → Áudio: Esc na captura da tecla do PTT NÃO fecha o modal',
@@ -1135,6 +1148,37 @@ app.on('window-all-closed', () => app.quit())
     await page.keyboard.press('Escape')
     await dialog().waitFor({ state: 'detached' })
   })
+
+  await step(
+    'Configurações → Áudio → Chamada de voz: "Frases de demora" (tempos + pools recolhidos)',
+    async () => {
+      await open('chat', 'Ideias de nomes para o app')
+      await openAudioSettings()
+      const box = page.getByTestId('voice-call-delay-phrases')
+      await box.scrollIntoViewIfNeeded()
+      const sw = box.getByRole('switch', { name: 'Frases de demora' })
+      assert.equal(await sw.getAttribute('aria-checked'), 'true', 'ligadas por padrão')
+      assert.equal(await box.getByTestId('voice-call-keepalive-after').inputValue(), '3000')
+      assert.equal(await box.getByTestId('voice-call-apology-after').inputValue(), '5000')
+      const pools = box.getByTestId('voice-call-delay-pools')
+      assert.equal(await pools.evaluate((d) => (d as HTMLDetailsElement).open), false, 'recolhido')
+      await pools.locator('summary').click()
+      const ka = box.getByTestId('voice-call-keepalive-pool')
+      assert.match(await ka.inputValue(), /Só mais um instante…/)
+      await ka.fill('Um segundinho só.\nJá volto.')
+      await box.getByTestId('voice-call-apology-after').click() // blur salva
+      await box.getByTestId('voice-call-keepalive-pool-reset').waitFor()
+      await box.screenshot({ path: join(SHOTS, 'audio-delay-phrases.png') })
+      await box.getByTestId('voice-call-keepalive-pool-reset').click()
+      assert.match(await ka.inputValue(), /Só mais um instante…/, 'restaurado')
+      await sw.click()
+      assert.equal(await sw.getAttribute('aria-checked'), 'false')
+      assert.equal(await box.getByTestId('voice-call-keepalive-after').count(), 0, 'tempos somem')
+      await sw.click()
+      await page.keyboard.press('Escape')
+      await dialog().waitFor({ state: 'detached' })
+    }
+  )
 
   await app.close()
   const failed = results.filter((r) => !r.ok)

@@ -50,9 +50,12 @@ export interface VoiceCallUsage {
     /** 'api' (OpenAI-compatível/OpenRouter), 'elevenlabs' (direta), 'local' ou 'gpu'. */
     backend: 'api' | 'elevenlabs' | 'local' | 'gpu'
     model?: string
-    /** Caracteres enviados à síntese (frases da resposta; clipes pré-gerados não contam). */
+    /**
+     * Caracteres enviados à síntese (frases da resposta e frases de demora sintetizadas ao vivo;
+     * clipes pré-gerados não contam).
+     */
     chars: number
-    /** Áudio de resposta gerado (ms — PCM/WAV medidos; mp3 não conta). */
+    /** Áudio gerado na chamada (frases da resposta e de demora; ms — PCM/WAV medidos; mp3 não conta). */
     audioMs: number
     /** Custo (estimado pelo preço de lista por caractere quando `estimated`). */
     cost?: number

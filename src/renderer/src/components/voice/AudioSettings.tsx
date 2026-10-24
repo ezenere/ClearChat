@@ -43,6 +43,7 @@ import { AudioSection, NumberRow, SubHeading, WarnNote } from './audioUi'
 import { SttSettingsSection } from './SttSettingsSection'
 import { TtsSettingsSection } from './TtsSettingsSection'
 import { VoiceCallModelEditor } from './VoiceCallModelEditor'
+import { DelayPhrasesSettings } from './DelayPhrasesSettings'
 import { GpuModeSection } from './gpu/GpuModeSection'
 import type { ProviderOption } from '../../lib/voice/voiceSettingsHelpers'
 import { useInputDeviceList } from '../../lib/voice/useInputDevices'
@@ -592,6 +593,10 @@ export function AudioSettings(): React.JSX.Element | null {
           ariaLabel="Silêncio para fala inacabada (ms)"
           onCommit={(v) => saveCallDefaults({ turn: { ...turn, unfinishedSilenceMs: v } })}
         />
+        <DelayPhrasesSettings
+          value={callDefaults.delayPhrases}
+          onChange={(delayPhrases) => saveCallDefaults({ delayPhrases })}
+        />
       </AudioSection>
 
       {/* ---- chamada de voz: modelo da chamada padrão (global) + parâmetros ---- */}
@@ -677,7 +682,7 @@ export function AudioSettings(): React.JSX.Element | null {
         />
         <NumberRow
           label="Fala mínima"
-          help="Sua fala acumulada antes de uma interjeição poder sair."
+          help="Tempo com voz da sua fala (do primeiro ao último trecho falado — o silêncio do fim de turno não conta) antes de uma interjeição poder sair. Vale também para o preâmbulo: fala com menos voz que isto não ganha o “Hum, deixa eu ver…”."
           value={ij.minSpeechMs}
           min={0}
           step={100}

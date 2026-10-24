@@ -22,7 +22,9 @@ export function Modal({
   children,
   footer,
   width = 560,
-  bodyClassName
+  height,
+  bodyClassName,
+  bare
 }: {
   open: boolean
   onClose: () => void
@@ -31,7 +33,11 @@ export function Modal({
   children: ReactNode
   footer?: ReactNode
   width?: number
+  /** Altura fixa (CSS — ex.: `min(800px, 84vh)`); sem ela o modal cresce com o conteúdo. */
+  height?: string
   bodyClassName?: string
+  /** Corpo sem padding nem rolagem própria (o conteúdo monta o próprio layout — ex.: Configurações). */
+  bare?: boolean
 }): React.JSX.Element | null {
   useEscapeLayer(open, onClose)
   if (!open) return null
@@ -46,7 +52,7 @@ export function Modal({
         role="dialog"
         aria-modal="true"
         className="flex max-h-[84vh] w-full animate-pop-in flex-col overflow-hidden rounded-2xl border border-border-strong/60 bg-surface shadow-modal"
-        style={{ maxWidth: width }}
+        style={{ maxWidth: width, height }}
       >
         <div className="flex shrink-0 items-start gap-3 px-5 pt-4 pb-3">
           <div className="min-w-0 flex-1">
@@ -57,7 +63,13 @@ export function Modal({
             <X />
           </IconButton>
         </div>
-        <div className={cn('min-h-0 flex-1 overflow-y-auto px-5 pb-5', bodyClassName)}>
+        <div
+          className={cn(
+            'min-h-0 flex-1',
+            bare ? 'flex overflow-hidden' : 'overflow-y-auto px-5 pb-5',
+            bodyClassName
+          )}
+        >
           {children}
         </div>
         {footer && (

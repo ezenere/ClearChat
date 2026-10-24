@@ -18,3 +18,7 @@ playwright-report
 
 # laboratório local de TTS/STT em GPU (venv, modelos, áudios) — nunca commitar
 gpu-tts-lab/
+
+# cache do Python (servidor da GPU)
+__pycache__/
+*.pyc
