@@ -1,0 +1,7 @@
+# Repositórios separados (cada um com o seu git)
+/ClearChatDesktop/
+/ClearChatMobile/
+/ClearChatWebsite/
+
+node_modules/
+.DS_Store
