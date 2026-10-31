@@ -10,7 +10,7 @@ repositório guarda só o que é compartilhado entre eles.
 |---|---|---|
 | [`ClearChatDesktop/`](https://github.com/ezenere/ClearChatDesktop) | `ezenere/ClearChatDesktop` | App desktop (Electron + React + TypeScript) — Windows, macOS e Linux. Releases e downloads. |
 | [`ClearChatWebsite/`](https://github.com/ezenere/ClearChatWebsite) | `ezenere/ClearChatWebsite` | Servidor de sync (FastAPI + Postgres), site (landing, cadastro, painel que decifra no navegador) e admin. Self-host com Docker Compose. |
-| `ClearChatMobile/` | — (ainda local) | App mobile (Expo / React Native) — Android primeiro, iOS depois. |
+| [`ClearChatMobile/`](https://github.com/ezenere/ClearChatMobile) | `ezenere/ClearChatMobile` | App mobile (Expo / React Native) — Android primeiro, iOS depois. |
 
 ## O que fica aqui
 
@@ -24,9 +24,10 @@ repositório guarda só o que é compartilhado entre eles.
 ## Montar a pasta
 
 ```bash
-git clone <este repositório> ClearChat && cd ClearChat
+git clone https://github.com/ezenere/ClearChat.git && cd ClearChat
 git clone https://github.com/ezenere/ClearChatDesktop.git
 git clone https://github.com/ezenere/ClearChatWebsite.git
+git clone https://github.com/ezenere/ClearChatMobile.git
 node scripts/protocol.mjs check
 ```
 

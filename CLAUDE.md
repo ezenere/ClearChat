@@ -4,11 +4,9 @@ Esta pasta contém três repositórios git **separados** (ignorados aqui) e este
 compartilhado. Antes de mexer num deles, leia o `CLAUDE.md` daquele repositório.
 
 - `ClearChatDesktop/` — app Electron (`ezenere/ClearChatDesktop`; até 2026-10-31 se chamava
-  `ezenere/ClearChat` — o GitHub redireciona, e os apps instalados consultam a release pelo nome antigo:
-  **nunca crie um repositório novo chamado `ezenere/ClearChat`**, isso quebraria o redirecionamento e o
-  aviso de atualização das versões ≤ 0.10.x).
+  `ezenere/ClearChat`, nome que agora é deste repositório pai).
 - `ClearChatWebsite/` — servidor de sync + site + admin (`ezenere/ClearChatWebsite`).
-- `ClearChatMobile/` — app Expo/React Native (ainda sem remoto).
+- `ClearChatMobile/` — app Expo/React Native (`ezenere/ClearChatMobile`).
 
 ## Protocolo de sync (compartilhado)
 
